@@ -3444,6 +3444,7 @@ impl SsboSnapshotCache {
             return;
         }
         let barrier_gen = self.mirror.cbuf_barrier_gen;
+        super::watchdog::phase(super::watchdog::Phase::CbufResync, barrier_gen);
         super::pusher::kickprof::count(super::pusher::kickprof::CBUF_BARRIER_SYNCS, 1);
         let keys: Vec<u64> = self.mirror.cbuf_chunk_registry.clone();
         let mut removed: Vec<u64> = Vec::new();
@@ -3506,6 +3507,7 @@ impl SsboSnapshotCache {
         forward_spans: &mut Vec<(u64, usize)>,
     ) -> bool {
         let chunk_base = key << MIRROR_CHUNK_SHIFT;
+        super::watchdog::phase(super::watchdog::Phase::CbufPages, chunk_base);
         self.mirror_ensure_chunk(key);
         let barrier_mode = self.cbuf_barrier_mode;
         if barrier_mode {
@@ -5841,6 +5843,7 @@ fn flush_accum_with_boundary(
         }
         return true;
     }
+    super::watchdog::phase(super::watchdog::Phase::Flush, batch.len() as u64);
     let mut boundary_completed = true;
     let kickoff_profile = super::pusher::kickprof::start();
     let profile = nvprof_enabled();
@@ -11323,12 +11326,28 @@ pub fn sync_render_thread() -> bool {
     let Some(rt) = crate::render_thread::maybe_render_thread() else {
         return true;
     };
-    if rt.finish(std::time::Duration::from_secs(5)) {
+    let blocked_started = super::pusher::kickprof::rate_start();
+    let finished = rt.finish(std::time::Duration::from_secs(5));
+    super::pusher::kickprof::add_blocked(blocked_started);
+    if finished {
         true
     } else {
         log::warn!("render scheduler finish timed out");
         false
     }
+}
+
+pub fn sync_render_thread_until(interrupted: impl Fn() -> bool) -> bool {
+    if interrupted() {
+        return false;
+    }
+    let Some(rt) = crate::render_thread::maybe_render_thread() else {
+        return true;
+    };
+    let blocked_started = super::pusher::kickprof::rate_start();
+    let finished = rt.finish_until(interrupted);
+    super::pusher::kickprof::add_blocked(blocked_started);
+    finished
 }
 
 fn execute_one(
@@ -15825,6 +15844,7 @@ fn map_blend_factor(v: u32) -> vk::BlendFactor {
         0x0012 => vk::BlendFactor::SRC1_ALPHA,
         0x0013 => vk::BlendFactor::ONE_MINUS_SRC1_ALPHA,
         _ => {
+            crate::gpu::pusher::note_pb_anomaly("unknown-encoding");
             log::warn!(
                 "map_blend_factor: unknown encoding {:#x}, defaulting to ONE",
                 v
@@ -15847,6 +15867,7 @@ fn map_blend_op(v: u32) -> vk::BlendOp {
         0x0004 => vk::BlendOp::MIN,
         0x0005 => vk::BlendOp::MAX,
         _ => {
+            crate::gpu::pusher::note_pb_anomaly("unknown-encoding");
             log::warn!("map_blend_op: unknown encoding {:#x}, defaulting to ADD", v);
             vk::BlendOp::ADD
         }
@@ -15908,6 +15929,7 @@ fn map_stencil_op(v: u32) -> vk::StencilOp {
         7 | 0x8507 => vk::StencilOp::INCREMENT_AND_WRAP,
         8 | 0x8508 => vk::StencilOp::DECREMENT_AND_WRAP,
         _ => {
+            crate::gpu::pusher::note_pb_anomaly("unknown-encoding");
             log::warn!(
                 "map_stencil_op: unknown encoding {:#x}, defaulting to KEEP",
                 v
@@ -18909,6 +18931,7 @@ fn sass_read_diag(
     }
     let start = addr.wrapping_add(SPH_SIZE as u64);
     let range = mappings.cpu_range_for(start);
+    crate::gpu::pusher::note_pb_anomaly("sassfail");
     log::warn!(
         "[sassfail] {} addr={:#x} region={:#x} off={:#x} start={:#x} range={:?} {}",
         stage,

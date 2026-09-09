@@ -307,36 +307,149 @@ pub use nexium_gpu::{
 };
 
 pub const FRAME_QUEUE_CAPACITY: usize = 4;
+const FRAME_QUEUE_STALL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn note_frame_replaced_after_stall(waited: std::time::Duration) {
+    static REPLACED: AtomicU64 = AtomicU64::new(0);
+    let n = REPLACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        log::warn!(
+            "[frame-queue] presenter stalled {:.0} ms with {} frames queued; replaced the oldest frame (#{})",
+            waited.as_secs_f64() * 1000.0,
+            FRAME_QUEUE_CAPACITY,
+            n
+        );
+    }
+    if gpu::watchdog::armed() && (n == 4 || n % 64 == 0) {
+        gpu::stackdump::dump_all_threads("frame-queue presenter stall");
+    }
+}
 
 pub struct FrameQueueState {
-    frames: Mutex<VecDeque<QueuedFrame>>,
+    frames: Mutex<FrameQueueContents>,
     frame_available: Condvar,
     space_available: Condvar,
     closed: AtomicBool,
+    presenter_stalled: AtomicBool,
+}
+
+#[derive(Default)]
+struct FrameQueueContents {
+    pending: VecDeque<QueuedFrame>,
+    deadline_shift: std::time::Duration,
+    last_source_deadline: Option<std::time::Instant>,
+}
+
+impl FrameQueueContents {
+    fn push(&mut self, mut frame: QueuedFrame, stalled: bool, now: std::time::Instant) {
+        let source_deadline = frame.present_at;
+        if source_deadline.is_none()
+            || source_deadline
+                .zip(self.last_source_deadline)
+                .is_some_and(|(deadline, previous)| deadline < previous)
+        {
+            self.deadline_shift = std::time::Duration::ZERO;
+        }
+        self.last_source_deadline = source_deadline;
+        frame.present_at =
+            source_deadline.and_then(|deadline| deadline.checked_sub(self.deadline_shift));
+        let mut retained_correction = std::time::Duration::ZERO;
+        if let Some(deadline) = frame
+            .present_at
+            .filter(|deadline| stalled && *deadline > now)
+        {
+            let correction = deadline.duration_since(now);
+            self.deadline_shift = self.deadline_shift.saturating_add(correction);
+            retained_correction = correction;
+            frame.present_at = Some(now);
+        }
+        if stalled {
+            let retained_lead = self
+                .pending
+                .iter()
+                .filter_map(|frame| frame.present_at)
+                .max()
+                .map_or(std::time::Duration::ZERO, |deadline| {
+                    deadline.saturating_duration_since(now)
+                });
+            retained_correction = retained_correction.max(retained_lead);
+        }
+        if retained_correction != std::time::Duration::ZERO {
+            for retained in &mut self.pending {
+                retained.present_at = retained
+                    .present_at
+                    .and_then(|deadline| deadline.checked_sub(retained_correction));
+            }
+            note_frame_deadlines_rebased(retained_correction, self.deadline_shift);
+        }
+        self.pending.push_back(frame);
+    }
+}
+
+fn note_frame_deadlines_rebased(correction: std::time::Duration, total: std::time::Duration) {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*TRACE.get_or_init(|| std::env::var_os("NEXIUM_FRAME_QUEUE_TRACE").is_some()) {
+        return;
+    }
+    static REBASED: AtomicU64 = AtomicU64::new(0);
+    let count = REBASED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 4 || count.is_power_of_two() {
+        log::warn!(
+            "[frame-queue] rebased future deadlines correction_ms={:.3} total_ms={:.3} count={}",
+            correction.as_secs_f64() * 1000.0,
+            total.as_secs_f64() * 1000.0,
+            count,
+        );
+    }
 }
 
 impl FrameQueueState {
     pub fn new() -> Self {
         Self {
-            frames: Mutex::new(VecDeque::new()),
+            frames: Mutex::new(FrameQueueContents::default()),
             frame_available: Condvar::new(),
             space_available: Condvar::new(),
             closed: AtomicBool::new(false),
+            presenter_stalled: AtomicBool::new(false),
+        }
+    }
+
+    fn note_consumer_progress(resumed: bool) {
+        if resumed {
+            log::info!("[frame-queue] presenter resumed; FIFO backpressure restored");
         }
     }
 
     fn enqueue(&self, frame: QueuedFrame) -> bool {
         let mut frames = self.frames.lock();
-        while frames.len() >= FRAME_QUEUE_CAPACITY {
+        let mut stalled_since = None;
+        while frames.pending.len() >= FRAME_QUEUE_CAPACITY {
             if self.closed.load(Ordering::Acquire) {
                 return false;
             }
-            self.space_available.wait(&mut frames);
+            if self.presenter_stalled.load(Ordering::Acquire) {
+                frames.pending.pop_front();
+                break;
+            }
+            let started = *stalled_since.get_or_insert_with(std::time::Instant::now);
+            let waited = started.elapsed();
+            if waited >= FRAME_QUEUE_STALL_GRACE {
+                frames.pending.pop_front();
+                self.presenter_stalled.store(true, Ordering::Release);
+                note_frame_replaced_after_stall(waited);
+                break;
+            }
+            self.space_available
+                .wait_for(&mut frames, FRAME_QUEUE_STALL_GRACE - waited);
         }
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
-        frames.push_back(frame);
+        frames.push(
+            frame,
+            self.presenter_stalled.load(Ordering::Acquire),
+            std::time::Instant::now(),
+        );
         drop(frames);
         self.frame_available.notify_one();
         true
@@ -345,12 +458,15 @@ impl FrameQueueState {
     fn pop_front_due(&self, now: std::time::Instant) -> Option<QueuedFrame> {
         let mut frames = self.frames.lock();
         let is_due = frames
+            .pending
             .front()
             .and_then(|frame| frame.present_at)
             .is_none_or(|deadline| deadline <= now);
-        let frame = is_due.then(|| frames.pop_front()).flatten();
+        let frame = is_due.then(|| frames.pending.pop_front()).flatten();
+        let resumed = frame.is_some() && self.presenter_stalled.swap(false, Ordering::AcqRel);
         drop(frames);
         if frame.is_some() {
+            Self::note_consumer_progress(resumed);
             self.space_available.notify_one();
         }
         frame
@@ -363,7 +479,7 @@ impl FrameQueueState {
             if stopping() || self.closed.load(Ordering::Acquire) {
                 return None;
             }
-            let Some(front) = frames.front() else {
+            let Some(front) = frames.pending.front() else {
                 self.frame_available.wait_for(&mut frames, STOP_POLL);
                 continue;
             };
@@ -373,8 +489,10 @@ impl FrameQueueState {
                     .wait_for(&mut frames, (deadline - now).min(STOP_POLL));
                 continue;
             }
-            let frame = frames.pop_front();
+            let frame = frames.pending.pop_front();
+            let resumed = self.presenter_stalled.swap(false, Ordering::AcqRel);
             drop(frames);
+            Self::note_consumer_progress(resumed);
             self.space_available.notify_one();
             return frame;
         }
@@ -387,17 +505,19 @@ impl FrameQueueState {
     }
 
     fn drain(&self) -> Vec<QueuedFrame> {
-        let frames: Vec<_> = std::mem::take(&mut *self.frames.lock())
-            .into_iter()
-            .collect();
+        let mut queue = self.frames.lock();
+        let frames: Vec<_> = std::mem::take(&mut queue.pending).into_iter().collect();
+        let resumed = !frames.is_empty() && self.presenter_stalled.swap(false, Ordering::AcqRel);
+        drop(queue);
         if !frames.is_empty() {
+            Self::note_consumer_progress(resumed);
             self.space_available.notify_all();
         }
         frames
     }
 
     fn len(&self) -> usize {
-        self.frames.lock().len()
+        self.frames.lock().pending.len()
     }
 }
 
@@ -825,14 +945,119 @@ pub enum AsyncPresentSubmit {
 
 struct AsyncGpuQueue {
     gpu: Arc<GpuContext>,
+    frame_queue: FrameQueue,
     tx: crossbeam::channel::Sender<QueuedAsyncGpuSubmission>,
     pending: Arc<std::sync::atomic::AtomicUsize>,
     capacity: usize,
     profile: Option<AsyncGpuQueueProfile>,
     defer_small_rts: bool,
+    hard_kicks: bool,
     failed: Arc<std::sync::atomic::AtomicBool>,
     stopping: Arc<std::sync::atomic::AtomicBool>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct AsyncGpuWait<'a> {
+    failed: &'a AtomicBool,
+    stopping: &'a AtomicBool,
+    closed: &'a AtomicBool,
+    poll_interval: std::time::Duration,
+    report_interval: std::time::Duration,
+}
+
+impl AsyncGpuWait<'_> {
+    fn cancelled(&self) -> bool {
+        self.stopping.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire)
+    }
+
+    fn interrupted(&self) -> bool {
+        self.failed.load(Ordering::Acquire) || self.cancelled()
+    }
+
+    fn send<T>(
+        &self,
+        tx: &crossbeam::channel::Sender<T>,
+        mut value: T,
+        label: &str,
+    ) -> Result<(), T> {
+        let mut report = AsyncGpuWaitReport::new(self.report_interval);
+        loop {
+            if self.interrupted() {
+                return Err(value);
+            }
+            match tx.send_timeout(value, self.poll_interval) {
+                Ok(()) => return Ok(()),
+                Err(crossbeam::channel::SendTimeoutError::Timeout(returned)) => {
+                    value = returned;
+                    report.waiting(label);
+                }
+                Err(crossbeam::channel::SendTimeoutError::Disconnected(returned)) => {
+                    log::error!("[async-gpu] {label} disconnected");
+                    self.failed.store(true, Ordering::Release);
+                    return Err(returned);
+                }
+            }
+        }
+    }
+
+    fn receive_barrier(&self, rx: &crossbeam::channel::Receiver<bool>) -> bool {
+        let mut report = AsyncGpuWaitReport::new(self.report_interval);
+        loop {
+            if self.interrupted() {
+                return false;
+            }
+            match rx.recv_timeout(self.poll_interval) {
+                Ok(true) => return true,
+                Ok(false) => {
+                    log::error!("[async-gpu] drain barrier reported failure");
+                    self.failed.store(true, Ordering::Release);
+                    return false;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    report.waiting("drain barrier");
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    log::error!("[async-gpu] drain barrier disconnected");
+                    self.failed.store(true, Ordering::Release);
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+struct AsyncGpuWaitReport {
+    started: std::time::Instant,
+    next_report: std::time::Duration,
+    interval: std::time::Duration,
+    progress: (u64, u64),
+}
+
+impl AsyncGpuWaitReport {
+    fn new(interval: std::time::Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            next_report: interval,
+            interval,
+            progress: gpu::watchdog::progress_snapshot(),
+        }
+    }
+
+    fn waiting(&mut self, label: &str) {
+        let waited = self.started.elapsed();
+        if waited < self.next_report {
+            return;
+        }
+        let progress = gpu::watchdog::progress_snapshot();
+        log::warn!(
+            "[async-gpu] {label} pending waited_ms={:.1} worker_progress={} render_progress={}",
+            waited.as_secs_f64() * 1000.0,
+            progress.0.wrapping_sub(self.progress.0),
+            progress.1.wrapping_sub(self.progress.1),
+        );
+        self.progress = progress;
+        self.next_report = waited.saturating_add(self.interval);
+    }
 }
 
 struct AsyncPresentPendingGuard {
@@ -1042,9 +1267,24 @@ impl AsyncGpuQueueProfile {
 impl AsyncGpuQueue {
     fn new(
         gpu: Arc<GpuContext>,
+        frame_queue: FrameQueue,
         mem_read: AsyncMemoryRead,
         mem_write: AsyncMemoryWrite,
         mem_copy: AsyncMemoryCopy,
+    ) -> Self {
+        let hard_kicks =
+            async_gpu_hard_kicks_value(std::env::var("NEXIUM_ASYNC_GPU").ok().as_deref())
+                && !gpu::gpu_pipeline_enabled();
+        Self::new_with_mode(gpu, frame_queue, mem_read, mem_write, mem_copy, hard_kicks)
+    }
+
+    fn new_with_mode(
+        gpu: Arc<GpuContext>,
+        frame_queue: FrameQueue,
+        mem_read: AsyncMemoryRead,
+        mem_write: AsyncMemoryWrite,
+        mem_copy: AsyncMemoryCopy,
+        hard_kicks: bool,
     ) -> Self {
         let capacity = async_gpu_queue_depth();
         if gpu::gpu_pipeline_enabled() {
@@ -1069,17 +1309,24 @@ impl AsyncGpuQueue {
         let failed_worker = Arc::clone(&failed);
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping_worker = Arc::clone(&stopping);
+        let worker_frame_queue = Arc::clone(&frame_queue);
         let worker_gpu = Arc::clone(&gpu);
         let profile = async_gpu_queue_profile_enabled().then(AsyncGpuQueueProfile::new);
-        let defer_small_rts = !gpu::eager_small_rt_writeback_enabled()
-            || matches!(
-                std::env::var("NEXIUM_ASYNC_GPU_DEFER_SMALLRT")
-                    .ok()
-                    .as_deref(),
-                Some("1") | Some("true") | Some("on") | Some("yes")
-            );
+        let defer_small_rts = !hard_kicks
+            && (!gpu::eager_small_rt_writeback_enabled()
+                || matches!(
+                    std::env::var("NEXIUM_ASYNC_GPU_DEFER_SMALLRT")
+                        .ok()
+                        .as_deref(),
+                    Some("1") | Some("true") | Some("on") | Some("yes")
+                ));
         if defer_small_rts {
             log::info!("nexium-nvdrv: async GPU small-RT writeback deferred to queue barriers");
+        }
+        if hard_kicks {
+            log::info!(
+                "nexium-nvdrv: async GPU queue uses hard kick boundaries (sync-path semantics per kick)"
+            );
         }
         log::info!("nexium-nvdrv: async GPU queue depth={capacity}");
         let worker = std::thread::Builder::new()
@@ -1097,6 +1344,8 @@ impl AsyncGpuQueue {
                     }
                     let _ = SetThreadPriority(GetCurrentThread(), 2);
                 }
+                gpu::watchdog::register_worker_thread();
+                gpu::watchdog::install();
                 let pipeline = gpu::gpu_pipeline_enabled();
                 let make_on_complete =
                     |completion: Option<AsyncGpuCompletion>,
@@ -1114,6 +1363,7 @@ impl AsyncGpuQueue {
                             pending_guard.complete();
                         })
                     };
+                gpu::watchdog::phase(gpu::watchdog::Phase::Idle, 0);
                 while let Ok(queued) = rx.recv() {
                     if matches!(&queued.submission, AsyncGpuSubmission::Shutdown) {
                         break;
@@ -1137,7 +1387,16 @@ impl AsyncGpuQueue {
                         ) => {
                             let on_complete =
                                 Some(make_on_complete(completion, pending_guard));
-                            if defer_small_rts {
+                            gpu::watchdog::phase(gpu::watchdog::Phase::Kick, entries.len() as u64);
+                            if hard_kicks {
+                                worker_gpu.process_inline_gpfifo(
+                                    &entries,
+                                    |addr, buf| mem_read(addr, buf),
+                                    |addr, buf| mem_write(addr, buf),
+                                    |src, dst, len| mem_copy(src, dst, len),
+                                    on_complete,
+                                );
+                            } else if defer_small_rts {
                                 worker_gpu.process_inline_gpfifo_soft_deferred(
                                     &entries,
                                     |addr, buf| mem_read(addr, buf),
@@ -1163,14 +1422,17 @@ impl AsyncGpuQueue {
                             },
                             Some(pending_guard),
                         ) => {
-                            let deadline = std::time::Instant::now()
-                                + std::time::Duration::from_secs(3);
+                            gpu::watchdog::phase(gpu::watchdog::Phase::Present, 0);
                             if !reserve_ordered_present_slot_until(&pending, limit, || {
                                 stopping_worker.load(Ordering::Acquire)
-                                    || std::time::Instant::now() >= deadline
+                                    || worker_frame_queue.closed.load(Ordering::Acquire)
+                                    || failed_worker.load(Ordering::Acquire)
                             }) {
-                                log::error!("[ordered-present] inflight reservation timed out");
-                                failed_worker.store(true, Ordering::Release);
+                                if stopping_worker.load(Ordering::Acquire)
+                                    || worker_frame_queue.closed.load(Ordering::Acquire)
+                                {
+                                    pending_guard.complete();
+                                }
                                 return;
                             }
                             let job = guarded_present_job(pending, job);
@@ -1218,6 +1480,7 @@ impl AsyncGpuQueue {
                             }
                         }
                         (AsyncGpuSubmission::Barrier(done), None) => {
+                            gpu::watchdog::phase(gpu::watchdog::Phase::Barrier, 0);
                             if pipeline {
                                 match worker_gpu.prep_drain_barrier(done, defer_small_rts) {
                                     gpu::prep::PrepBarrierDispatch::Queued => {}
@@ -1257,6 +1520,7 @@ impl AsyncGpuQueue {
                         log::error!("[async-gpu] submission panicked; queue failed");
                         failed_worker.store(true, Ordering::Release);
                     }
+                    gpu::watchdog::phase(gpu::watchdog::Phase::Idle, 0);
                 }
             });
         let worker = match worker {
@@ -1268,49 +1532,69 @@ impl AsyncGpuQueue {
         };
         Self {
             gpu,
+            frame_queue,
             tx,
             pending,
             capacity,
             profile,
             defer_small_rts,
+            hard_kicks,
             failed,
             stopping,
             worker: Mutex::new(Some(worker)),
         }
     }
 
+    fn wait_context(&self) -> AsyncGpuWait<'_> {
+        AsyncGpuWait {
+            failed: &self.failed,
+            stopping: &self.stopping,
+            closed: &self.frame_queue.closed,
+            poll_interval: std::time::Duration::from_millis(10),
+            report_interval: std::time::Duration::from_secs(3),
+        }
+    }
+
     fn submit(&self, submission: AsyncGpuSubmission) -> bool {
-        if self.failed.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
+        let wait = self.wait_context();
+        if wait.interrupted() {
             return false;
         }
         let (pending_guard, inflight) =
             AsyncGpuPendingGuard::reserve(Arc::clone(&self.pending), Arc::clone(&self.failed));
         let queued_submission = QueuedAsyncGpuSubmission::tracked(submission, pending_guard);
-        let (queued, was_full, blocked_ns) = if self.profile.is_some() {
-            match self.tx.try_send(queued_submission) {
-                Ok(()) => (true, false, 0),
-                Err(crossbeam::channel::TrySendError::Full(queued_submission)) => {
-                    let started = std::time::Instant::now();
-                    let queued = self.tx.send(queued_submission).is_ok();
-                    (queued, true, started.elapsed().as_nanos() as u64)
-                }
-                Err(crossbeam::channel::TrySendError::Disconnected(_)) => (false, false, 0),
+        let (result, was_full, blocked_ns) = match self.tx.try_send(queued_submission) {
+            Ok(()) => (Ok(()), false, 0),
+            Err(crossbeam::channel::TrySendError::Full(queued_submission)) => {
+                let started = std::time::Instant::now();
+                let result = wait.send(&self.tx, queued_submission, "submission enqueue");
+                (result, true, started.elapsed().as_nanos() as u64)
             }
-        } else {
-            (self.tx.send(queued_submission).is_ok(), false, 0)
+            Err(crossbeam::channel::TrySendError::Disconnected(queued_submission)) => {
+                self.failed.store(true, Ordering::Release);
+                (Err(queued_submission), false, 0)
+            }
+        };
+        let queued = match result {
+            Ok(()) => true,
+            Err(mut queued_submission) => {
+                if wait.cancelled() {
+                    if let Some(pending) = queued_submission.pending.take() {
+                        pending.complete();
+                    }
+                }
+                false
+            }
         };
         if let Some(profile) = &self.profile {
             profile.submitted(was_full, blocked_ns, inflight, self.capacity);
         }
-        if queued {
-            true
-        } else {
-            false
-        }
+        queued
     }
 
     fn drain(&self) -> AsyncGpuDrain {
-        if self.failed.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
+        let wait = self.wait_context();
+        if wait.interrupted() {
             return AsyncGpuDrain {
                 completed: false,
                 barrier_send_ns: 0,
@@ -1331,11 +1615,11 @@ impl AsyncGpuQueue {
         }
         let (done_tx, done_rx) = crossbeam::channel::bounded(1);
         let send_started = std::time::Instant::now();
-        if self
-            .tx
-            .send_timeout(
+        if wait
+            .send(
+                &self.tx,
                 QueuedAsyncGpuSubmission::untracked(AsyncGpuSubmission::Barrier(done_tx)),
-                std::time::Duration::from_secs(3),
+                "drain barrier enqueue",
             )
             .is_err()
         {
@@ -1347,19 +1631,7 @@ impl AsyncGpuQueue {
         }
         let barrier_send_ns = send_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let wait_started = std::time::Instant::now();
-        let completed = match done_rx.recv_timeout(std::time::Duration::from_secs(3)) {
-            Ok(true) => true,
-            Ok(false) => {
-                log::error!("[async-gpu] drain barrier reported failure");
-                self.failed.store(true, Ordering::Release);
-                false
-            }
-            Err(error) => {
-                log::error!("[async-gpu] drain barrier failed: {error}");
-                self.failed.store(true, Ordering::Release);
-                false
-            }
-        };
+        let completed = wait.receive_barrier(&done_rx);
         AsyncGpuDrain {
             completed,
             barrier_send_ns,
@@ -1435,9 +1707,17 @@ fn gpu_thread_flag_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
+            "1" | "true" | "on" | "yes" | "hard" | "soft"
         )
     })
+}
+
+fn async_gpu_soft_kicks_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim().eq_ignore_ascii_case("soft"))
+}
+
+fn async_gpu_hard_kicks_value(value: Option<&str>) -> bool {
+    !async_gpu_soft_kicks_value(value)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1454,17 +1734,22 @@ fn gpu_thread_mode_request(
     gpu_pipeline: Option<&str>,
 ) -> GpuThreadModeRequest {
     let sync_prep = gpu_thread_flag_enabled(sync_prep);
+    let async_default = async_gpu.is_none();
     let async_gpu = gpu_thread_flag_enabled(async_gpu);
     let gpu_pipeline = gpu_thread_flag_enabled(gpu_pipeline);
     if sync_prep && (async_gpu || gpu_pipeline) {
         GpuThreadModeRequest::Conflict
     } else if sync_prep {
         GpuThreadModeRequest::SyncPrepThread
-    } else if async_gpu {
+    } else if async_gpu || async_default || gpu_pipeline {
         GpuThreadModeRequest::AsyncGpu
     } else {
         GpuThreadModeRequest::Inline
     }
+}
+
+fn async_gpu_requires_quarantine(async_gpu: Option<&str>, gpu_pipeline: Option<&str>) -> bool {
+    async_gpu_soft_kicks_value(async_gpu) || gpu_thread_flag_enabled(gpu_pipeline)
 }
 
 fn ioctl_requires_async_gpu_drain(device: NvDevice, cmd: u16) -> bool {
@@ -1583,7 +1868,9 @@ impl Nvdrv {
             .get_or_init(|| match nexium_gpu::Renderer::new() {
                 Ok(r) => {
                     log::info!("nexium-nvdrv: Vulkan Renderer initialized");
-                    self.gpu.pusher.lock().set_renderer(Some(r.clone()));
+                    self.gpu
+                        .lock_pusher("lib.rs:set_renderer")
+                        .set_renderer(Some(r.clone()));
                     Some(r)
                 }
                 Err(e) => {
@@ -1791,16 +2078,21 @@ impl Nvdrv {
             log::error!("nexium-nvdrv: async GPU queue rejected while sync prep thread is active");
             return;
         }
-        if !gpu::experimental_gpu_scheduling_enabled() {
+        if async_gpu_requires_quarantine(async_gpu.as_deref(), gpu_pipeline.as_deref())
+            && !gpu::experimental_gpu_scheduling_enabled()
+        {
             log::warn!(
-                "nexium-nvdrv: asynchronous GPU submission quarantined; developer opt-in requires NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1"
+                "nexium-nvdrv: soft-boundary asynchronous GPU submission quarantined; developer opt-in requires NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1"
             );
             return;
         }
         if self.gpu_async.is_none() {
-            log::info!("nexium-nvdrv: async GPU submit thread ENABLED");
+            log::info!(
+                "nexium-nvdrv: async GPU submit thread ENABLED (set NEXIUM_ASYNC_GPU=0 for synchronous submission)"
+            );
             self.gpu_async = Some(Arc::new(AsyncGpuQueue::new(
                 Arc::clone(&self.gpu),
+                Arc::clone(&self.frame_queue),
                 mem_read,
                 mem_write,
                 mem_copy,
@@ -1821,6 +2113,16 @@ impl Nvdrv {
     }
 
     pub fn wait_gpu_idle_checked(&self) -> bool {
+        let interrupted = || {
+            self.frame_queue.closed.load(Ordering::Acquire)
+                || self
+                    .gpu_async
+                    .as_ref()
+                    .is_some_and(|queue| queue.wait_context().interrupted())
+        };
+        if interrupted() {
+            return false;
+        }
         let prep_completed = if self.sync_prep_thread {
             self.gpu.drain_prep_thread(false)
         } else {
@@ -1831,6 +2133,10 @@ impl Nvdrv {
         if let Some(queue) = &self.gpu_async {
             let queue_started = std::time::Instant::now();
             let drain = queue.drain();
+            if !drain.completed {
+                self.poll_gpu_completions();
+                return false;
+            }
             queue_completed = drain.completed;
             let queue_ns = queue_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             queue_profile = Some((
@@ -1843,21 +2149,22 @@ impl Nvdrv {
             self.poll_gpu_completions();
         }
         let render_started = std::time::Instant::now();
-        let render_completed = gpu::vk_dispatch::sync_render_thread();
+        let render_completed = gpu::vk_dispatch::sync_render_thread_until(&interrupted);
         let render_ns = render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.poll_gpu_completions();
+        if !render_completed {
+            return false;
+        }
         let mut completions_completed = true;
         if let Some((queue, ..)) = queue_profile {
-            let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while queue.pending.load(Ordering::Acquire) != 0
-                && std::time::Instant::now() < completion_deadline
-            {
+            let mut report = AsyncGpuWaitReport::new(std::time::Duration::from_secs(3));
+            while queue.pending.load(Ordering::Acquire) != 0 {
+                if interrupted() {
+                    return false;
+                }
                 self.poll_gpu_completions();
+                report.waiting("renderer-backed completions");
                 std::thread::yield_now();
-            }
-            if queue.pending.load(Ordering::Acquire) != 0 {
-                log::error!("[gpu-sync] timed out draining renderer-backed GPU completions");
-                completions_completed = false;
             }
             if queue.failed.load(Ordering::Acquire) {
                 log::error!("[gpu-sync] asynchronous GPU queue failed");
@@ -5657,6 +5964,14 @@ impl Default for Nvdrv {
 mod tests {
     use super::*;
 
+    struct CloseTestFrameQueue<'a>(&'a FrameQueueState);
+
+    impl Drop for CloseTestFrameQueue<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
     fn install_test_sync_prep_thread(nvdrv: &mut Nvdrv) {
         let read: AsyncMemoryRead = Arc::new(|_, bytes| {
             bytes.fill(0);
@@ -5694,8 +6009,14 @@ mod tests {
     fn sync_prep_mode_is_opt_in_and_mutually_exclusive() {
         assert_eq!(
             gpu_thread_mode_request(None, None, None),
-            GpuThreadModeRequest::Inline
+            GpuThreadModeRequest::AsyncGpu
         );
+        for disabled in ["", "0", "false", "off", "no", "unexpected"] {
+            assert_eq!(
+                gpu_thread_mode_request(None, Some(disabled), None),
+                GpuThreadModeRequest::Inline
+            );
+        }
         assert_eq!(
             gpu_thread_mode_request(Some("1"), None, None),
             GpuThreadModeRequest::SyncPrepThread
@@ -5715,6 +6036,10 @@ mod tests {
         for disabled in ["", "0", "false", "off", "no", "unexpected"] {
             assert_eq!(
                 gpu_thread_mode_request(Some(disabled), None, None),
+                GpuThreadModeRequest::AsyncGpu
+            );
+            assert_eq!(
+                gpu_thread_mode_request(Some(disabled), Some("0"), None),
                 GpuThreadModeRequest::Inline
             );
         }
@@ -5830,6 +6155,304 @@ mod tests {
     }
 
     #[test]
+    fn async_gpu_barrier_waits_for_gated_worker_across_poll_expirations() {
+        let failed = AtomicBool::new(false);
+        let stopping = AtomicBool::new(false);
+        let frames = FrameQueueState::new();
+        let wait = AsyncGpuWait {
+            failed: &failed,
+            stopping: &stopping,
+            closed: &frames.closed,
+            poll_interval: std::time::Duration::from_millis(2),
+            report_interval: std::time::Duration::from_millis(5),
+        };
+        let (work_tx, work_rx) = crossbeam::channel::bounded(1);
+        let (entered_tx, entered_rx) = crossbeam::channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+        let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+        let (result_tx, result_rx) = crossbeam::channel::bounded(1);
+        assert!(work_tx.send(AsyncGpuSubmission::Barrier(done_tx)).is_ok());
+
+        std::thread::scope(|scope| {
+            let _close = CloseTestFrameQueue(&frames);
+            scope.spawn(move || {
+                let AsyncGpuSubmission::Barrier(done) = work_rx.recv().unwrap() else {
+                    panic!("expected drain barrier")
+                };
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap();
+                done.send(true).unwrap();
+            });
+            entered_rx.recv().unwrap();
+            scope.spawn(move || result_tx.send(wait.receive_barrier(&done_rx)).unwrap());
+
+            assert_eq!(
+                result_rx.recv_timeout(std::time::Duration::from_millis(30)),
+                Err(crossbeam::channel::RecvTimeoutError::Timeout)
+            );
+            assert!(!failed.load(Ordering::Acquire));
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                result_rx.recv_timeout(std::time::Duration::from_secs(1)),
+                Ok(true)
+            );
+        });
+        assert!(!failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn async_gpu_enqueue_preserves_owned_work_across_poll_expirations() {
+        let failed = AtomicBool::new(false);
+        let stopping = AtomicBool::new(false);
+        let frames = FrameQueueState::new();
+        let wait = AsyncGpuWait {
+            failed: &failed,
+            stopping: &stopping,
+            closed: &frames.closed,
+            poll_interval: std::time::Duration::from_millis(2),
+            report_interval: std::time::Duration::from_millis(5),
+        };
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (result_tx, result_rx) = crossbeam::channel::bounded(1);
+        tx.send(1).unwrap();
+
+        std::thread::scope(|scope| {
+            let _close = CloseTestFrameQueue(&frames);
+            scope.spawn(|| result_tx.send(wait.send(&tx, 2, "test enqueue")).unwrap());
+            assert_eq!(
+                result_rx.recv_timeout(std::time::Duration::from_millis(30)),
+                Err(crossbeam::channel::RecvTimeoutError::Timeout)
+            );
+            assert!(!failed.load(Ordering::Acquire));
+            assert_eq!(rx.recv().unwrap(), 1);
+            assert_eq!(
+                result_rx.recv_timeout(std::time::Duration::from_secs(1)),
+                Ok(Ok(()))
+            );
+            assert_eq!(rx.recv().unwrap(), 2);
+            assert_eq!(rx.try_recv(), Err(crossbeam::channel::TryRecvError::Empty));
+        });
+    }
+
+    #[test]
+    fn async_gpu_wait_cancels_on_frame_queue_close_without_failure() {
+        for enqueue in [false, true] {
+            let failed = AtomicBool::new(false);
+            let stopping = AtomicBool::new(false);
+            let frames = FrameQueueState::new();
+            let wait = AsyncGpuWait {
+                failed: &failed,
+                stopping: &stopping,
+                closed: &frames.closed,
+                poll_interval: std::time::Duration::from_millis(2),
+                report_interval: std::time::Duration::from_millis(5),
+            };
+            let (tx, rx) = crossbeam::channel::bounded(1);
+            let (result_tx, result_rx) = crossbeam::channel::bounded(1);
+            if enqueue {
+                tx.send(true).unwrap();
+            }
+
+            std::thread::scope(|scope| {
+                let _close = CloseTestFrameQueue(&frames);
+                scope.spawn(|| {
+                    let completed = if enqueue {
+                        let result = wait.send(&tx, false, "test enqueue");
+                        assert_eq!(result, Err(false));
+                        result.is_ok()
+                    } else {
+                        wait.receive_barrier(&rx)
+                    };
+                    result_tx.send(completed).unwrap();
+                });
+                assert_eq!(
+                    result_rx.recv_timeout(std::time::Duration::from_millis(10)),
+                    Err(crossbeam::channel::RecvTimeoutError::Timeout)
+                );
+                frames.close();
+                assert_eq!(
+                    result_rx.recv_timeout(std::time::Duration::from_secs(1)),
+                    Ok(false)
+                );
+            });
+            if enqueue {
+                assert_eq!(rx.try_recv(), Ok(true));
+                assert_eq!(rx.try_recv(), Err(crossbeam::channel::TryRecvError::Empty));
+            }
+            assert!(!failed.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn async_gpu_barrier_preserves_failure_and_shutdown_results() {
+        for case in 0..4 {
+            let failed = AtomicBool::new(case == 2);
+            let stopping = AtomicBool::new(case == 3);
+            let closed = AtomicBool::new(false);
+            let wait = AsyncGpuWait {
+                failed: &failed,
+                stopping: &stopping,
+                closed: &closed,
+                poll_interval: std::time::Duration::from_millis(2),
+                report_interval: std::time::Duration::from_millis(5),
+            };
+            let (tx, rx) = crossbeam::channel::bounded(1);
+            if case == 0 {
+                tx.send(false).unwrap();
+            }
+            if case == 1 {
+                drop(tx);
+            }
+            assert!(!wait.receive_barrier(&rx));
+            assert_eq!(failed.load(Ordering::Acquire), case != 3);
+        }
+    }
+
+    #[test]
+    fn async_gpu_enqueue_disconnect_retains_work_and_fails() {
+        let failed = AtomicBool::new(false);
+        let stopping = AtomicBool::new(false);
+        let closed = AtomicBool::new(false);
+        let wait = AsyncGpuWait {
+            failed: &failed,
+            stopping: &stopping,
+            closed: &closed,
+            poll_interval: std::time::Duration::from_millis(2),
+            report_interval: std::time::Duration::from_millis(5),
+        };
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        drop(rx);
+        assert_eq!(wait.send(&tx, 7, "test enqueue"), Err(7));
+        assert!(failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn async_gpu_full_queue_cancellation_preserves_accepted_completions() {
+        let gpu = Arc::new(GpuContext::new());
+        gpu.mappings.write().add(0x5000, 4, 0x9000, 1);
+        let frames = Arc::new(FrameQueueState::new());
+        let (entered_tx, entered_rx) = crossbeam::channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+        let read: AsyncMemoryRead = Arc::new(move |_, bytes| {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            bytes.fill(0);
+            true
+        });
+        let write: AsyncMemoryWrite = Arc::new(|_, _| true);
+        let copy: AsyncMemoryCopy = Arc::new(|_, _, _| true);
+        let queue = AsyncGpuQueue::new_with_mode(
+            Arc::clone(&gpu),
+            Arc::clone(&frames),
+            read,
+            write,
+            copy,
+            true,
+        );
+        assert!(queue.submit(AsyncGpuSubmission::Inline {
+            entries: vec![gpu::CommandListHeader {
+                address_lo: 0x5000,
+                address_hi_and_count: 1 << 10,
+            }],
+            completion: Some(AsyncGpuCompletion {
+                fd: 99,
+                syncpt_id: 7,
+                threshold: 1,
+            }),
+        }));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        for _ in 0..queue.capacity {
+            assert!(queue.submit(AsyncGpuSubmission::Inline {
+                entries: Vec::new(),
+                completion: None,
+            }));
+        }
+        let (result_tx, result_rx) = crossbeam::channel::bounded(1);
+        std::thread::scope(|scope| {
+            let _close = CloseTestFrameQueue(&frames);
+            scope.spawn(|| {
+                result_tx
+                    .send(queue.submit(AsyncGpuSubmission::Inline {
+                        entries: Vec::new(),
+                        completion: Some(AsyncGpuCompletion {
+                            fd: 99,
+                            syncpt_id: 7,
+                            threshold: 2,
+                        }),
+                    }))
+                    .unwrap();
+            });
+            assert_eq!(
+                result_rx.recv_timeout(std::time::Duration::from_millis(30)),
+                Err(crossbeam::channel::RecvTimeoutError::Timeout)
+            );
+            assert_eq!(queue.pending.load(Ordering::Acquire), queue.capacity + 2);
+            frames.close();
+            assert_eq!(
+                result_rx.recv_timeout(std::time::Duration::from_secs(1)),
+                Ok(false)
+            );
+            assert_eq!(queue.pending.load(Ordering::Acquire), queue.capacity + 1);
+            assert!(!queue.failed.load(Ordering::Acquire));
+            assert!(gpu.syncpoint_events().is_empty());
+        });
+
+        let pending = Arc::clone(&queue.pending);
+        let failed = Arc::clone(&queue.failed);
+        release_tx.send(()).unwrap();
+        drop(queue);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(!failed.load(Ordering::Acquire));
+        assert_eq!(
+            gpu.syncpoint_events().iter().copied().collect::<Vec<_>>(),
+            vec![gpu::PendingSyncpointEvent::Completion {
+                fd: 99,
+                syncpt_id: 7,
+                threshold: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn async_gpu_present_reservation_cancels_on_frame_queue_close() {
+        let gpu = Arc::new(GpuContext::new());
+        let frames = Arc::new(FrameQueueState::new());
+        let read: AsyncMemoryRead = Arc::new(|_, bytes| {
+            bytes.fill(0);
+            true
+        });
+        let write: AsyncMemoryWrite = Arc::new(|_, _| true);
+        let copy: AsyncMemoryCopy = Arc::new(|_, _, _| true);
+        let queue = AsyncGpuQueue::new_with_mode(gpu, Arc::clone(&frames), read, write, copy, true);
+        let present_pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let presented = Arc::new(AtomicBool::new(false));
+        let job_presented = Arc::clone(&presented);
+        assert!(queue.submit(AsyncGpuSubmission::Present {
+            job: Box::new(move || job_presented.store(true, Ordering::Release)),
+            pending: Arc::clone(&present_pending),
+            limit: 1,
+        }));
+
+        frames.close();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while queue.pending.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(queue.pending.load(Ordering::Acquire), 0);
+        assert_eq!(present_pending.load(Ordering::Acquire), 1);
+        assert!(!presented.load(Ordering::Acquire));
+        assert!(!queue.failed.load(Ordering::Acquire));
+        assert!(!queue.drain().completed);
+        drop(queue);
+    }
+
+    #[test]
     fn async_gpu_queue_drains_and_joins_cleanly() {
         let gpu = Arc::new(GpuContext::new());
         let read: AsyncMemoryRead = Arc::new(|_, bytes| {
@@ -5838,7 +6461,7 @@ mod tests {
         });
         let write: AsyncMemoryWrite = Arc::new(|_, _| true);
         let copy: AsyncMemoryCopy = Arc::new(|_, _, _| true);
-        let queue = AsyncGpuQueue::new(gpu, read, write, copy);
+        let queue = AsyncGpuQueue::new(gpu, Arc::new(FrameQueueState::new()), read, write, copy);
 
         assert!(queue.submit(AsyncGpuSubmission::Inline {
             entries: Vec::new(),
@@ -5855,6 +6478,69 @@ mod tests {
         let started = std::time::Instant::now();
         drop(queue);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn async_gpu_hard_kick_mode_is_default_and_soft_is_quarantined() {
+        assert!(async_gpu_hard_kicks_value(Some("hard")));
+        assert!(async_gpu_hard_kicks_value(Some(" HARD ")));
+        assert!(async_gpu_hard_kicks_value(Some("1")));
+        assert!(async_gpu_hard_kicks_value(None));
+        assert!(!async_gpu_hard_kicks_value(Some("soft")));
+        assert!(async_gpu_soft_kicks_value(Some(" Soft ")));
+        for value in [None, Some("1"), Some("hard"), Some("soft")] {
+            assert!(matches!(
+                gpu_thread_mode_request(None, value, None),
+                GpuThreadModeRequest::AsyncGpu
+            ));
+        }
+        assert!(matches!(
+            gpu_thread_mode_request(Some("1"), None, None),
+            GpuThreadModeRequest::SyncPrepThread
+        ));
+        assert!(matches!(
+            gpu_thread_mode_request(Some("1"), Some("hard"), None),
+            GpuThreadModeRequest::Conflict
+        ));
+        assert!(!async_gpu_requires_quarantine(None, None));
+        assert!(!async_gpu_requires_quarantine(Some("1"), None));
+        assert!(!async_gpu_requires_quarantine(Some("hard"), Some("0")));
+        assert!(async_gpu_requires_quarantine(Some("soft"), None));
+        assert!(async_gpu_requires_quarantine(None, Some("1")));
+    }
+
+    #[test]
+    fn async_gpu_hard_kick_queue_processes_and_drains() {
+        let gpu = Arc::new(GpuContext::new());
+        let read: AsyncMemoryRead = Arc::new(|_, bytes| {
+            bytes.fill(0);
+            true
+        });
+        let write: AsyncMemoryWrite = Arc::new(|_, _| true);
+        let copy: AsyncMemoryCopy = Arc::new(|_, _, _| true);
+        let queue = AsyncGpuQueue::new_with_mode(
+            gpu,
+            Arc::new(FrameQueueState::new()),
+            read,
+            write,
+            copy,
+            true,
+        );
+        assert!(queue.hard_kicks);
+        assert!(!queue.defer_small_rts);
+
+        assert!(queue.submit(AsyncGpuSubmission::Inline {
+            entries: Vec::new(),
+            completion: None,
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while queue.pending.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(queue.pending.load(Ordering::Acquire), 0);
+        assert!(!queue.failed.load(Ordering::Acquire));
+        assert!(queue.drain().completed);
+        drop(queue);
     }
 
     #[test]
@@ -5942,6 +6628,205 @@ mod tests {
             FRAME_QUEUE_CAPACITY as u64 + 1
         );
         assert!(queue.pop_front_due(std::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn frame_handoff_replaces_oldest_frame_when_the_presenter_stalls() {
+        let queue = Arc::new(FrameQueueState::new());
+        let stats = Arc::new(PipelineStats::default());
+        for value in 0..FRAME_QUEUE_CAPACITY as u8 {
+            enqueue_bounded_frame(&queue, &stats, test_frame(value));
+        }
+        let started = std::time::Instant::now();
+        enqueue_bounded_frame(&queue, &stats, test_frame(FRAME_QUEUE_CAPACITY as u8));
+        assert!(started.elapsed() >= FRAME_QUEUE_STALL_GRACE);
+        assert!(started.elapsed() < FRAME_QUEUE_STALL_GRACE * 4);
+        assert_eq!(queue.len(), FRAME_QUEUE_CAPACITY);
+        let delivered: Vec<u8> = (0..FRAME_QUEUE_CAPACITY)
+            .map(|_| {
+                queue
+                    .pop_front_due(std::time::Instant::now())
+                    .unwrap()
+                    .pixels[0]
+            })
+            .collect();
+        assert_eq!(delivered, vec![1, 2, 3, 4]);
+        assert!(queue.pop_front_due(std::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn frame_handoff_stays_in_mailbox_mode_until_the_presenter_pops_again() {
+        let queue = Arc::new(FrameQueueState::new());
+        let stats = Arc::new(PipelineStats::default());
+        for value in 0..=FRAME_QUEUE_CAPACITY as u8 {
+            enqueue_bounded_frame(&queue, &stats, test_frame(value));
+        }
+        assert!(queue.presenter_stalled.load(Ordering::Acquire));
+        let started = std::time::Instant::now();
+        enqueue_bounded_frame(&queue, &stats, test_frame(9));
+        assert!(started.elapsed() < FRAME_QUEUE_STALL_GRACE);
+        assert_eq!(queue.len(), FRAME_QUEUE_CAPACITY);
+        assert_eq!(
+            queue
+                .pop_front_due(std::time::Instant::now())
+                .unwrap()
+                .pixels[0],
+            2
+        );
+        assert!(!queue.presenter_stalled.load(Ordering::Acquire));
+        enqueue_bounded_frame(&queue, &stats, test_frame(10));
+        let delivered: Vec<u8> = (0..FRAME_QUEUE_CAPACITY)
+            .map(|_| {
+                queue
+                    .pop_front_due(std::time::Instant::now())
+                    .unwrap()
+                    .pixels[0]
+            })
+            .collect();
+        assert_eq!(delivered, vec![3, 4, 9, 10]);
+    }
+
+    #[test]
+    fn frame_handoff_recovers_pacing_after_stalled_future_frames() {
+        let queue = FrameQueueState::new();
+        let period = std::time::Duration::from_nanos(16_666_667);
+        let source_start = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for index in 0..1000u32 {
+            let mut frame = test_frame(index as u8);
+            frame.present_at = Some(source_start + period * index);
+            assert!(queue.enqueue(frame));
+        }
+        assert!(queue.presenter_stalled.load(Ordering::Acquire));
+        assert_eq!(queue.len(), FRAME_QUEUE_CAPACITY);
+
+        let now = std::time::Instant::now();
+        let mut last_deadline = None;
+        for index in 996..1000u32 {
+            let frame = queue
+                .pop_front_due(now)
+                .expect("stalled frame must become due");
+            assert_eq!(frame.pixels[0], index as u8);
+            assert!(frame.present_at.is_some_and(|deadline| deadline <= now));
+            last_deadline = frame.present_at;
+        }
+        assert!(!queue.presenter_stalled.load(Ordering::Acquire));
+
+        let resumed_deadline = last_deadline.unwrap() + period;
+        let mut resumed = test_frame(42);
+        resumed.present_at = Some(source_start + period * 1000);
+        assert!(queue.enqueue(resumed));
+        assert!(queue
+            .pop_front_due(resumed_deadline - std::time::Duration::from_nanos(1))
+            .is_none());
+        let frame = queue.pop_front_due(resumed_deadline).unwrap();
+        assert_eq!(frame.pixels[0], 42);
+        assert_eq!(frame.present_at, Some(resumed_deadline));
+    }
+
+    #[test]
+    fn frame_handoff_resets_deadline_correction_when_source_schedule_resets() {
+        let now = std::time::Instant::now();
+        let period = std::time::Duration::from_nanos(16_666_667);
+        for unpaced_reset in [false, true] {
+            let queue = FrameQueueState::new();
+            queue.presenter_stalled.store(true, Ordering::Release);
+            let mut stalled = test_frame(1);
+            stalled.present_at = Some(now + std::time::Duration::from_secs(60));
+            assert!(queue.enqueue(stalled));
+            assert!(queue.pop_front_due(std::time::Instant::now()).is_some());
+
+            if unpaced_reset {
+                assert!(queue.enqueue(test_frame(2)));
+                assert!(queue.pop_front_due(std::time::Instant::now()).is_some());
+            }
+            let deadline = std::time::Instant::now() + period;
+            let mut reset = test_frame(3);
+            reset.present_at = Some(deadline);
+            assert!(queue.enqueue(reset));
+            assert!(queue
+                .pop_front_due(deadline - std::time::Duration::from_nanos(1))
+                .is_none());
+            assert_eq!(
+                queue.pop_front_due(deadline).unwrap().present_at,
+                Some(deadline)
+            );
+        }
+    }
+
+    #[test]
+    fn frame_handoff_source_reset_unblocks_retained_future_frames() {
+        let period = std::time::Duration::from_nanos(16_666_667);
+        for reset_mode in 0..3 {
+            let queue = FrameQueueState::new();
+            let now = std::time::Instant::now();
+            for index in 0..FRAME_QUEUE_CAPACITY as u32 {
+                let mut frame = test_frame(index as u8);
+                frame.present_at = Some(now + std::time::Duration::from_secs(60) + period * index);
+                assert!(queue.enqueue(frame));
+            }
+            queue.presenter_stalled.store(true, Ordering::Release);
+            let mut reset = test_frame(9);
+            reset.present_at = match reset_mode {
+                0 => None,
+                1 => Some(now - std::time::Duration::from_secs(1)),
+                _ => Some(now + period),
+            };
+            assert!(queue.enqueue(reset));
+
+            let after_enqueue = std::time::Instant::now();
+            for expected in [1, 2, 3, 9] {
+                let frame = queue
+                    .pop_front_due(after_enqueue)
+                    .expect("source reset must unblock retained future frames");
+                assert_eq!(frame.pixels[0], expected);
+            }
+            assert!(!queue.presenter_stalled.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn frame_handoff_drain_restores_fifo_after_consumer_progress() {
+        let queue = FrameQueueState::new();
+        assert!(queue.enqueue(test_frame(1)));
+        queue.presenter_stalled.store(true, Ordering::Release);
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].pixels[0], 1);
+        assert!(!queue.presenter_stalled.load(Ordering::Acquire));
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn frame_handoff_future_deadline_wait_honors_close_and_stop() {
+        for close_queue in [false, true] {
+            let queue = Arc::new(FrameQueueState::new());
+            let stopping = Arc::new(AtomicBool::new(false));
+            let mut frame = test_frame(1);
+            frame.present_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+            assert!(queue.enqueue(frame));
+
+            let worker_queue = Arc::clone(&queue);
+            let worker_stopping = Arc::clone(&stopping);
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                let frame =
+                    worker_queue.wait_pop_front_due(|| worker_stopping.load(Ordering::Acquire));
+                finished_tx.send(frame.is_none()).unwrap();
+            });
+            entered_rx.recv().unwrap();
+            if close_queue {
+                queue.close();
+                assert!(!queue.enqueue(test_frame(2)));
+            } else {
+                stopping.store(true, Ordering::Release);
+            }
+            assert!(finished_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap());
+            worker.join().unwrap();
+        }
     }
 
     #[test]

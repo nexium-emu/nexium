@@ -610,9 +610,12 @@ fn retain_received_if_unsealed<T>(received: T, hard_after: impl FnOnce() -> bool
 fn execute_job(label: &'static str, job: RenderJob, worker_pending: &AtomicUsize) {
     let profile = render_profile_enabled();
     let started = profile.then(std::time::Instant::now);
+    let busy_started = crate::gpu::pusher::kickprof::rate_start();
+    crate::gpu::watchdog::render_phase(label, 0);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
         log::error!("[render-job] job panicked; worker continuing");
     }
+    crate::gpu::pusher::kickprof::add_render_job(busy_started, label);
     if let Some(started) = started {
         if label == "clear" {
             static CLEAR_JOBS: AtomicUsize = AtomicUsize::new(0);
@@ -648,6 +651,8 @@ fn execute_draw_groups(
     };
     let profile = render_profile_enabled();
     let started = profile.then(std::time::Instant::now);
+    let busy_started = crate::gpu::pusher::kickprof::rate_start();
+    crate::gpu::watchdog::render_phase("draw-groups", group_count as u64);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::gpu::vk_dispatch::execute_prepared_draw_batches(draws)
     }))
@@ -655,6 +660,7 @@ fn execute_draw_groups(
     {
         log::error!("[render-job] grouped draw batch panicked; worker continuing");
     }
+    crate::gpu::pusher::kickprof::add_render_busy(busy_started, group_count as u64);
     if let Some(started) = started {
         let elapsed = started.elapsed();
         if elapsed >= std::time::Duration::from_millis(10) {
@@ -728,6 +734,16 @@ fn render_worker(
     draw_work_budget: Arc<DrawWorkBudget>,
 ) {
     let _budget_guard = DrawWorkerBudgetGuard(Arc::clone(&draw_work_budget));
+    crate::gpu::watchdog::register_render_thread();
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
+        }
+        let _ = SetThreadPriority(GetCurrentThread(), 1);
+    }
     let max_groups_per_submission = render_max_groups_per_submission();
     let mut lookahead = None;
     let mut queued_draws = VecDeque::new();
@@ -738,6 +754,7 @@ fn render_worker(
                 if let Some(draw) = queued_draws.pop_front() {
                     RenderWork::Draw(draw)
                 } else {
+                    crate::gpu::watchdog::render_phase("idle-recv", 0);
                     match rx.recv() {
                         Ok(work) => work,
                         Err(_) => break,
@@ -989,6 +1006,8 @@ impl RenderThread {
             .last()
             .and_then(|draw| (!hard_after).then(|| draw.hard_after_handle()));
         let cost = DrawWorkCost::for_draws(&draws);
+        let blocked_started = crate::gpu::pusher::kickprof::rate_start();
+        crate::gpu::watchdog::phase(crate::gpu::watchdog::Phase::RenderWait, cost.groups as u64);
         let mut draw_tail = self.draw_tail.lock().unwrap();
         self.pending.fetch_add(cost.groups, Ordering::AcqRel);
         let reserved = self.draw_work_budget.reserve_blocking(cost, label);
@@ -1018,6 +1037,7 @@ impl RenderThread {
             }
         };
         drop(draw_tail);
+        crate::gpu::pusher::kickprof::add_blocked(blocked_started);
         if let Some(started) = started {
             let elapsed = started.elapsed();
             if elapsed >= std::time::Duration::from_millis(1) {
@@ -1047,6 +1067,7 @@ impl RenderThread {
             .last()
             .and_then(|draw| (!hard_after).then(|| draw.hard_after_handle()));
         let cost = DrawWorkCost::for_draws(&draws);
+        let blocked_started = crate::gpu::pusher::kickprof::rate_start();
         let mut draw_tail = self.draw_tail.lock().unwrap();
         self.pending.fetch_add(1, Ordering::AcqRel);
 
@@ -1084,6 +1105,7 @@ impl RenderThread {
             false
         };
         drop(draw_tail);
+        crate::gpu::pusher::kickprof::add_blocked(blocked_started);
 
         if let Some(started) = started {
             let elapsed = started.elapsed();
@@ -1127,6 +1149,87 @@ impl RenderThread {
         }
         rx.recv_timeout(timeout.saturating_sub(started.elapsed()))
             .is_ok()
+    }
+
+    pub(crate) fn finish_until(&self, interrupted: impl Fn() -> bool) -> bool {
+        if interrupted() {
+            return false;
+        }
+        if self.is_idle() {
+            return true;
+        }
+        let started = Instant::now();
+        let poll_interval = Duration::from_millis(10);
+        let report_interval = Duration::from_secs(3);
+        let mut next_report = report_interval;
+        let mut report_wait = |stage: &str| {
+            let elapsed = started.elapsed();
+            if elapsed >= next_report {
+                log::warn!(
+                    "[render-sync] finish {} pending={} waited_ms={:.1}",
+                    stage,
+                    self.pending.load(Ordering::Acquire),
+                    elapsed.as_secs_f64() * 1000.0,
+                );
+                next_report = elapsed.saturating_add(report_interval);
+            }
+        };
+        let mut draw_tail = loop {
+            if interrupted() {
+                return false;
+            }
+            if let Some(guard) = lock_until_timeout(&self.draw_tail, Instant::now(), poll_interval)
+            {
+                break guard;
+            }
+            report_wait("draw-tail lock");
+        };
+        if interrupted() {
+            return false;
+        }
+        seal_draw_tail_locked(&mut draw_tail);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut work = RenderWork::Job(
+            "scheduler-finish",
+            Box::new(move || {
+                let _ = tx.send(());
+            }),
+        );
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        loop {
+            if interrupted() {
+                self.pending.fetch_sub(1, Ordering::Release);
+                return false;
+            }
+            match self.tx.send_timeout(work, poll_interval) {
+                Ok(()) => break,
+                Err(SendTimeoutError::Timeout(returned)) => {
+                    work = returned;
+                    report_wait("enqueue");
+                }
+                Err(SendTimeoutError::Disconnected(_)) => {
+                    self.pending.fetch_sub(1, Ordering::Release);
+                    log::error!("[render-sync] finish enqueue disconnected");
+                    return false;
+                }
+            }
+        }
+        drop(draw_tail);
+        loop {
+            if interrupted() {
+                return false;
+            }
+            match rx.recv_timeout(poll_interval) {
+                Ok(()) => return true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    report_wait("acknowledgement");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    log::error!("[render-sync] finish acknowledgement disconnected");
+                    return false;
+                }
+            }
+        }
     }
 
     pub(crate) fn seal_draw_tail(&self) {
@@ -1638,6 +1741,170 @@ mod tests {
         );
         assert_eq!(worker.pending.load(Ordering::Acquire), 1);
         submitter.join().unwrap();
+    }
+
+    fn finish_test_worker() -> (
+        Arc<RenderThread>,
+        crossbeam::channel::Receiver<RenderWork>,
+        Arc<AtomicBool>,
+    ) {
+        let (tx, rx) = bounded(1);
+        tx.send(RenderWork::Job("predecessor", Box::new(|| {})))
+            .unwrap();
+        let tail = Arc::new(AtomicBool::new(false));
+        let worker = Arc::new(RenderThread {
+            tx,
+            pending: Arc::new(AtomicUsize::new(1)),
+            draw_tail: Mutex::new(Some(Arc::downgrade(&tail))),
+            draw_work_budget: Arc::new(DrawWorkBudget::new(0, 0)),
+        });
+        (worker, rx, tail)
+    }
+
+    fn run_finish_test_job(worker: &RenderThread, work: RenderWork) {
+        let RenderWork::Job(label, job) = work else {
+            panic!("unexpected render work");
+        };
+        super::execute_job(label, job, worker.pending.as_ref());
+    }
+
+    fn wait_for_finish_reservation(worker: &RenderThread) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.pending.load(Ordering::Acquire) != 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(worker.pending.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn cancellable_finish_retries_backpressure_and_waits_for_one_fifo_marker() {
+        let (worker, rx, tail) = finish_test_worker();
+        let waiter_worker = Arc::clone(&worker);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done_tx.send(waiter_worker.finish_until(|| false)).unwrap();
+        });
+        wait_for_finish_reservation(&worker);
+        assert!(done_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        assert!(tail.load(Ordering::Acquire));
+        assert_eq!(worker.pending.load(Ordering::Acquire), 2);
+
+        run_finish_test_job(&worker, rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        let marker = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        assert!(worker.draw_tail.try_lock().unwrap().is_none());
+        assert!(rx.is_empty());
+        assert_eq!(worker.pending.load(Ordering::Acquire), 1);
+        run_finish_test_job(&worker, marker);
+
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+        waiter.join().unwrap();
+        assert!(worker.is_idle());
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn cancellable_finish_stops_while_draw_tail_is_locked() {
+        let (worker, rx, tail) = finish_test_worker();
+        let held_tail = worker.draw_tail.lock().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter_cancelled = Arc::clone(&cancelled);
+        let waiter_worker = Arc::clone(&worker);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done_tx
+                .send(waiter_worker.finish_until(|| waiter_cancelled.load(Ordering::Acquire)))
+                .unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+        assert_eq!(worker.pending.load(Ordering::Acquire), 1);
+        assert!(!tail.load(Ordering::Acquire));
+        drop(held_tail);
+        waiter.join().unwrap();
+        run_finish_test_job(&worker, rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(worker.is_idle());
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn cancellable_finish_releases_unaccepted_marker_on_cancel() {
+        let (worker, rx, tail) = finish_test_worker();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter_cancelled = Arc::clone(&cancelled);
+        let waiter_worker = Arc::clone(&worker);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done_tx
+                .send(waiter_worker.finish_until(|| waiter_cancelled.load(Ordering::Acquire)))
+                .unwrap();
+        });
+        wait_for_finish_reservation(&worker);
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+        waiter.join().unwrap();
+        assert!(tail.load(Ordering::Acquire));
+        assert_eq!(worker.pending.load(Ordering::Acquire), 1);
+        run_finish_test_job(&worker, rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(worker.is_idle());
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn cancellable_finish_preserves_accepted_marker_on_cancel() {
+        let (worker, rx, _) = finish_test_worker();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter_cancelled = Arc::clone(&cancelled);
+        let waiter_worker = Arc::clone(&worker);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done_tx
+                .send(waiter_worker.finish_until(|| waiter_cancelled.load(Ordering::Acquire)))
+                .unwrap();
+        });
+        wait_for_finish_reservation(&worker);
+        run_finish_test_job(&worker, rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        let marker = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+        waiter.join().unwrap();
+        assert_eq!(worker.pending.load(Ordering::Acquire), 1);
+        run_finish_test_job(&worker, marker);
+        assert!(worker.is_idle());
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn cancellable_finish_reports_enqueue_disconnect_and_restores_accounting() {
+        let (worker, rx, tail) = finish_test_worker();
+        let predecessor = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(rx);
+        assert!(!worker.finish_until(|| false));
+        assert!(tail.load(Ordering::Acquire));
+        assert_eq!(worker.pending.load(Ordering::Acquire), 1);
+        run_finish_test_job(&worker, predecessor);
+        assert!(worker.is_idle());
+    }
+
+    #[test]
+    fn cancellable_finish_reports_dropped_acknowledgement() {
+        let (worker, rx, _) = finish_test_worker();
+        let waiter_worker = Arc::clone(&worker);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done_tx.send(waiter_worker.finish_until(|| false)).unwrap();
+        });
+        wait_for_finish_reservation(&worker);
+        run_finish_test_job(&worker, rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        let marker = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(marker);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+        waiter.join().unwrap();
+        assert_eq!(worker.pending.load(Ordering::Acquire), 1);
+        worker.pending.fetch_sub(1, Ordering::Release);
+        assert!(worker.is_idle());
+        assert!(rx.is_empty());
     }
 
     #[test]

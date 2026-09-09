@@ -137,6 +137,7 @@ impl KeplerMemory {
             static CLAMPED: AtomicU64 = AtomicU64::new(0);
             let n = CLAMPED.fetch_add(1, Ordering::Relaxed);
             if n < 32 || n % 1024 == 0 {
+                crate::gpu::pusher::note_pb_anomaly("i2m-clamp");
                 log::warn!(
                     "[i2m-clamp] #{} bogus inline upload line_len={} line_count={} requested={} → clamped to {} (flags={:#x})",
                     n,

@@ -7720,6 +7720,30 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
 }
 
 impl eframe::App for HorizonApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().visible() != Some(false)) {
+            return;
+        }
+        let Some(handle) = &self.emulation_handle else {
+            return;
+        };
+        let mut dropped = 0u64;
+        while take_next_game_frame(&handle.frame_rx).is_some() {
+            dropped += 1;
+        }
+        if dropped != 0 {
+            gui_rate_stats(2);
+            static NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NOTED.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                log::info!(
+                    "[gui] window not painting (minimized or hidden); dropping game frames until it is shown again"
+                );
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -10665,9 +10689,9 @@ fn debug_windows(
                                 ui,
                                 &mut app_settings.performance_debug.async_gpu,
                                 "Asynchronous GPU Submission",
-                                "Moves guest GPU submissions to a dedicated worker.",
-                                "Developer-only while host completion and device-loss recovery are being hardened.",
-                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_ASYNC_GPU=1",
+                                "Moves guest GPU submissions to a dedicated worker (default on; NEXIUM_ASYNC_GPU=0 restores synchronous submission).",
+                                "Enabled by default since 2026-09-06 with hard per-kick boundaries.",
+                                "NEXIUM_ASYNC_GPU=1",
                             );
                             changed |= performance_debug_toggle(
                                 ui,
@@ -10676,8 +10700,8 @@ fn debug_windows(
                                     .async_gpu_defer_smallrt,
                                 "Deferred Small Render-Target Writeback",
                                 "Batches small render-target readbacks until synchronization is required.",
-                                "Developer-only. Requires the quarantined asynchronous GPU path.",
-                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_ASYNC_GPU=1\nNEXIUM_ASYNC_GPU_DEFER_SMALLRT=1",
+                                "Developer-only. Requires the quarantined soft-boundary asynchronous GPU path.",
+                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_ASYNC_GPU=soft\nNEXIUM_ASYNC_GPU_DEFER_SMALLRT=1",
                             );
                             changed |= performance_debug_toggle(
                                 ui,

@@ -4,7 +4,9 @@ pub mod flat_allocator;
 mod formats;
 pub(crate) mod prep;
 pub mod pusher;
+pub mod stackdump;
 pub mod vk_dispatch;
+pub mod watchdog;
 
 pub use engines::{
     Fermi2D, KeplerCompute, KeplerMemory, Maxwell3D, Maxwell3DRegisters, MaxwellDma,
@@ -1961,6 +1963,29 @@ pub(crate) fn gpu_pipeline_enabled() -> bool {
 
 const BIG_VA_BASE: u64 = 0x4_0000_0000;
 
+pub(crate) struct PusherGuard<'a> {
+    guard: parking_lot::MutexGuard<'a, Pusher>,
+}
+
+impl std::ops::Deref for PusherGuard<'_> {
+    type Target = Pusher;
+    fn deref(&self) -> &Pusher {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for PusherGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Pusher {
+        &mut self.guard
+    }
+}
+
+impl Drop for PusherGuard<'_> {
+    fn drop(&mut self) {
+        watchdog::pusher_lock_released();
+    }
+}
+
 #[derive(Default)]
 pub struct ChannelState {
     pub bound_engine: u32,
@@ -2031,7 +2056,7 @@ impl GpuContext {
         resources: prep::PrepThreadResources,
         behavior: prep::PrepThreadBehavior,
     ) -> bool {
-        let mut pusher = self.pusher.lock();
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
         let previous = std::mem::replace(
             &mut pusher.prep,
             prep::PrepLane::Inline(prep::PrepState::new()),
@@ -2050,7 +2075,7 @@ impl GpuContext {
         job: crate::render_thread::RenderJob,
         flush_small_rts: bool,
     ) -> Result<(), crate::render_thread::RenderJob> {
-        let mut pusher = self.pusher.lock();
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
         match &mut pusher.prep {
             prep::PrepLane::Threaded(handle) => {
                 match handle.send_recover(prep::PrepEvent::Present {
@@ -2071,7 +2096,7 @@ impl GpuContext {
         done: crossbeam::channel::Sender<bool>,
         flush_small_rts: bool,
     ) -> prep::PrepBarrierDispatch {
-        let mut pusher = self.pusher.lock();
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
         match &mut pusher.prep {
             prep::PrepLane::Threaded(handle) => {
                 match handle.send_recover(prep::PrepEvent::DrainBarrier {
@@ -2093,7 +2118,7 @@ impl GpuContext {
     ) -> bool {
         let (done_tx, done_rx) = crossbeam::channel::bounded(1);
         let failed = {
-            let mut pusher = self.pusher.lock();
+            let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
             let prep::PrepLane::Threaded(handle) = &mut pusher.prep else {
                 return true;
             };
@@ -2134,7 +2159,7 @@ impl GpuContext {
     }
 
     pub(crate) fn shutdown_prep_thread(&self, flush_small_rts: bool) -> bool {
-        let mut pusher = self.pusher.lock();
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
         let previous = std::mem::replace(
             &mut pusher.prep,
             prep::PrepLane::Inline(prep::PrepState::new()),
@@ -2254,6 +2279,22 @@ impl GpuContext {
         alloc.lock().free(base, padded)
     }
 
+    pub(crate) fn lock_pusher(&self, site: &'static str) -> PusherGuard<'_> {
+        let started = std::time::Instant::now();
+        let mut reported = 0u64;
+        loop {
+            if let Some(guard) = self.pusher.try_lock_for(std::time::Duration::from_secs(1)) {
+                watchdog::pusher_lock_acquired(site);
+                return PusherGuard { guard };
+            }
+            let waited = started.elapsed();
+            if waited.as_secs() / 2 > reported {
+                reported = waited.as_secs() / 2;
+                watchdog::pusher_lock_wait_report(site, waited);
+            }
+        }
+    }
+
     pub fn submit_gpfifo(
         &self,
         address: u64,
@@ -2344,7 +2385,7 @@ impl GpuContext {
     ) -> (u32, u32) {
         let kp_total = pusher::kickprof::kick_start();
         let kp_locks = pusher::kickprof::start();
-        let mut pusher = self.pusher.lock();
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
         let (on_complete, completion_gate) = gate_syncpoint_completion(on_complete);
         let threaded = pusher.prep.is_threaded();
         let mut maxwell = self.maxwell3d.lock();
@@ -2533,7 +2574,7 @@ impl GpuContext {
         let kp_total = pusher::kickprof::kick_start();
         let kp_locks = pusher::kickprof::start();
         let t0 = std::time::Instant::now();
-        let mut pusher = self.pusher.lock();
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
         let (on_complete, completion_gate) = gate_syncpoint_completion(on_complete);
         let threaded = pusher.prep.is_threaded();
         let mut maxwell = self.maxwell3d.lock();
@@ -2566,8 +2607,7 @@ impl GpuContext {
         pusher.prep_kick_begin();
 
         let t_entries = std::time::Instant::now();
-        let entries = pusher::repair_endform_entries(entries, &mappings);
-        let entries = entries.as_slice();
+        pusher::record_gpfifo_entries(entries, &mappings);
         if pusher::direct_forensics() && entries.iter().any(|e| e.entry_count() > 4096) {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);
@@ -2705,7 +2745,7 @@ impl GpuContext {
     }
 
     pub fn flush_small_rt_writebacks(&self, mem_write: impl Fn(u64, &[u8]) -> bool) -> bool {
-        let mut pusher = self.pusher.lock();
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
         let mappings = self.mappings.read();
         let Some(state) = pusher.prep.inline_state() else {
             return false;
@@ -2717,14 +2757,22 @@ impl GpuContext {
     }
 
     pub(crate) fn flush_prepared_draw_packets(&self) -> bool {
-        match self.pusher.lock().prep.inline_state() {
+        match self
+            .lock_pusher(concat!("gpu/mod.rs:", line!()))
+            .prep
+            .inline_state()
+        {
             Some(state) => state.flush_prepared_draw_packets(),
             None => false,
         }
     }
 
     pub(crate) fn has_prepared_draw_packets(&self) -> bool {
-        match self.pusher.lock().prep.inline_state() {
+        match self
+            .lock_pusher(concat!("gpu/mod.rs:", line!()))
+            .prep
+            .inline_state()
+        {
             Some(state) => state.has_prepared_draw_packets(),
             None => false,
         }

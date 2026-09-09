@@ -9946,6 +9946,7 @@ where
 {
     const BACKPRESSURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
+    nexium_nvdrv::gpu::watchdog::render_phase("present:lane-lock", present_id);
     let delivery_lane = present_delivery_lane(&present_delivery_lanes, binder_id);
     let _delivery_guard = delivery_lane.lock();
     let metadata = PresentMetadata {
@@ -9959,11 +9960,17 @@ where
     let mut next_backpressure_report = std::time::Duration::from_millis(100);
     let mut emitted = false;
     loop {
+        nexium_nvdrv::gpu::watchdog::render_phase("present:readback", present_id);
         let readback = readback_fn(metadata.read_rect);
+        nexium_nvdrv::gpu::watchdog::render_phase("present:readback-done", present_id);
         if let Some(completion) = readback.completion {
             match completion {
                 nexium_nvdrv::PipelinedPresentCompletion::Ready(frame) => {
                     if let Some(metadata) = present_metadata.lock().remove(&frame.present_id) {
+                        nexium_nvdrv::gpu::watchdog::render_phase(
+                            "present:enqueue",
+                            frame.present_id,
+                        );
                         submit_present_frame(
                             frame.width,
                             frame.height,

@@ -256,6 +256,7 @@ impl PrepState {
                 on_complete,
             } => {
                 let joined = self.join_small_rt_writeback(mappings);
+                super::watchdog::phase(super::watchdog::Phase::KickEnd, u64::from(hard_after));
                 let kp_tail = kickprof::start();
                 self.resolve_pending_compute(mappings, mem_write);
                 kickprof::add(kickprof::RESOLVE_TAIL, kp_tail);
@@ -430,6 +431,7 @@ impl PrepState {
                 payload,
                 long,
             } => {
+                super::watchdog::phase(super::watchdog::Phase::Semaphore, gpu_va);
                 self.resolve_pending_compute(mappings, mem_write);
                 self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
                 self.ssbo_snapshot_cache.invalidate_gpu_write(
@@ -536,6 +538,7 @@ impl PrepState {
                 true
             }
             PrepEvent::SemRelease(writes) => {
+                super::watchdog::phase(super::watchdog::Phase::Semaphore, writes.len() as u64);
                 self.resolve_pending_compute(mappings, mem_write);
                 self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
                 let can_complete_asynchronously =
@@ -795,6 +798,10 @@ impl PrepState {
                 true
             }
             PrepEvent::EngineMethods { class, methods } => {
+                super::watchdog::phase(
+                    super::watchdog::Phase::Methods,
+                    (u64::from(class) << 32) | methods.first().map_or(0, |m| u64::from(m.0)),
+                );
                 let started = engb_prof_enabled().then(std::time::Instant::now);
                 let count = methods.len();
                 if class == super::engines::KEPLER_COMPUTE_CLASS {
@@ -1414,6 +1421,7 @@ impl PrepState {
         if !super::engines::maxwell_compute::has_pending_writebacks() {
             return Vec::new();
         }
+        super::watchdog::phase(super::watchdog::Phase::ComputeResolve, 0);
         let Some(renderer) = self.renderer.as_deref() else {
             return Vec::new();
         };
@@ -1435,6 +1443,7 @@ impl PrepState {
     }
 
     pub(crate) fn sync_renderer_idle(&mut self, reason: &str) -> bool {
+        super::watchdog::phase(super::watchdog::Phase::RenderWait, reason.len() as u64);
         let profile = gpu_profile_enabled();
         let started = profile.then(std::time::Instant::now);
         let Some(renderer) = self.renderer.clone() else {
@@ -1452,7 +1461,9 @@ impl PrepState {
             return false;
         }
         let target = renderer.submitted_generation();
+        let blocked_started = super::pusher::kickprof::rate_start();
         let mut completed = renderer.wait_submit_generation(target, Duration::from_secs(3));
+        super::pusher::kickprof::add_blocked(blocked_started);
         if !completed {
             log::error!(
                 "[gpu-sync] {} timeline wait failed target={}; device-idle fallback suppressed",

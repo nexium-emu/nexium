@@ -21,6 +21,11 @@ fn dma_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DMA_TRACE").is_some())
 }
 
+fn dma_semaphore_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DMA_SEMAPHORE_TRACE").is_some())
+}
+
 fn virtual_rt_dma_disabled() -> bool {
     #[cfg(test)]
     {
@@ -110,6 +115,9 @@ fn invalidate_block_linear_aliases(
 
 pub const MAXWELL_DMA_CLASS: u32 = 0xB0B5;
 
+const M_SEMAPHORE_ADDRESS_UPPER: u32 = 0x90;
+const M_SEMAPHORE_ADDRESS_LOWER: u32 = 0x91;
+const M_SEMAPHORE_PAYLOAD: u32 = 0x92;
 const M_OFFSET_IN_UPPER: u32 = 0x100;
 const M_OFFSET_IN_LOWER: u32 = 0x101;
 const M_OFFSET_OUT_UPPER: u32 = 0x102;
@@ -204,6 +212,9 @@ struct LinearRtSource {
 
 #[derive(Default)]
 pub struct MaxwellDma {
+    semaphore_address_upper: u32,
+    semaphore_address_lower: u32,
+    semaphore_payload: u32,
     offset_in_upper: u32,
     offset_in_lower: u32,
     offset_out_upper: u32,
@@ -266,6 +277,9 @@ impl MaxwellDma {
         mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) {
         match method {
+            M_SEMAPHORE_ADDRESS_UPPER => self.semaphore_address_upper = arg,
+            M_SEMAPHORE_ADDRESS_LOWER => self.semaphore_address_lower = arg,
+            M_SEMAPHORE_PAYLOAD => self.semaphore_payload = arg,
             M_OFFSET_IN_UPPER => self.offset_in_upper = arg,
             M_OFFSET_IN_LOWER => self.offset_in_lower = arg,
             M_OFFSET_OUT_UPPER => self.offset_out_upper = arg,
@@ -295,11 +309,43 @@ impl MaxwellDma {
                 self.dst_origin_x = arg & 0xFFFF;
                 self.dst_origin_y = (arg >> 16) & 0xFFFF;
             }
-            M_LAUNCH_DMA => self.launch_dma(arg, mappings, mem_read, mem_write, mem_copy),
+            M_LAUNCH_DMA => {
+                self.trace_semaphore_launch(arg, mappings);
+                self.launch_dma(arg, mappings, mem_read, mem_write, mem_copy);
+            }
             _ => {
                 log::trace!("MaxwellDma: unhandled method {:#x} arg={:#x}", method, arg);
             }
         }
+    }
+
+    fn trace_semaphore_launch(&self, flags: u32, mappings: &GpuMappings) {
+        let semaphore_type = (flags >> 3) & 3;
+        if semaphore_type == 0 || !dma_semaphore_trace_enabled() {
+            return;
+        }
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = COUNT.fetch_add(1, Ordering::Relaxed);
+        if count >= 32 && count % 128 != 0 {
+            return;
+        }
+        let gpu_va = ((u64::from(self.semaphore_address_upper) & 0xff) << 32)
+            | u64::from(self.semaphore_address_lower);
+        log::warn!(
+            "[dma-semaphore] #{} flags={:#x} type={} regs=[{:#x},{:#x},{:#x}] gpu_va={:#x} cpu={:#x?} src={:#x} dst={:#x} line_units={} line_count={}",
+            count,
+            flags,
+            semaphore_type,
+            self.semaphore_address_upper,
+            self.semaphore_address_lower,
+            self.semaphore_payload,
+            gpu_va,
+            mappings.cpu_address_for(gpu_va),
+            self.src_addr(),
+            self.dst_addr(),
+            self.line_length_in,
+            self.line_count,
+        );
     }
 
     fn src_addr(&self) -> u64 {

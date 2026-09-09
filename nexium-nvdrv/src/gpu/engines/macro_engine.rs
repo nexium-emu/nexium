@@ -1,3 +1,4 @@
+use nexium_common::fast_hash::FastMap;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -123,10 +124,14 @@ fn hle_macro(
     kind: HleMacro,
     params: &[u32],
     reg_reader: &dyn Fn(u32) -> u32,
+    writes: Vec<(u32, u32)>,
 ) -> Option<MacroOutput> {
     let p = |i: usize| params.get(i).copied().unwrap_or(0);
     let macro_instance_count = || (reg_reader(REG_DRAW_INSTANCE_COUNT) & p(2)).max(1);
-    let mut out = MacroOutput::default();
+    let mut out = MacroOutput {
+        writes,
+        ..MacroOutput::default()
+    };
     match kind {
         HleMacro::DrawArrays { base_instance } => {
             let topology = p(0) & 0xFFFF;
@@ -573,7 +578,7 @@ fn forensic_report(out: &MacroOutput, params: &[u32]) {
 
 pub struct MacroEngine {
     uploaded_code: HashMap<u32, Vec<u32>>,
-    compiled: HashMap<u32, CompiledMacro>,
+    compiled: FastMap<u32, CompiledMacro>,
     macro_positions: [u32; NUM_MACRO_POSITIONS],
     instruction_ptr: u32,
     start_address_ptr: u32,
@@ -621,7 +626,7 @@ impl MacroEngine {
     fn new_with_options(fast_lle: bool, profile_lle: bool) -> Self {
         Self {
             uploaded_code: HashMap::new(),
-            compiled: HashMap::new(),
+            compiled: FastMap::default(),
             macro_positions: [0; NUM_MACRO_POSITIONS],
             instruction_ptr: 0,
             start_address_ptr: 0,
@@ -674,7 +679,7 @@ impl MacroEngine {
     }
 
     pub fn recycle_output(&mut self, mut output: MacroOutput) {
-        if !output.fast_lle {
+        if !output.fast_lle && !output.hle {
             return;
         }
         output.writes.clear();
@@ -729,9 +734,11 @@ impl MacroEngine {
         let params = self.pending_params.as_slice();
         let code = compiled.code.as_slice();
         let hash = compiled.hash;
-        let hle = compiled
-            .hle
-            .and_then(|kind| hle_macro(kind, params, reg_reader));
+        let hle = compiled.hle.and_then(|kind| {
+            let mut writes = std::mem::take(&mut self.lle_write_scratch);
+            writes.clear();
+            hle_macro(kind, params, reg_reader, writes)
+        });
         if mme_forensics() && self.seen_hashes.insert(hash) {
             let logged_code = if mme_full_code() {
                 code
@@ -1910,7 +1917,7 @@ mod tests {
             let decoded = decoded(code);
             let mut fast = FastInterpreter::new(&decoded, params, &reg_reader, Vec::new());
             fast.run();
-            let hle = hle_macro(kind, params, &reg_reader)
+            let hle = hle_macro(kind, params, &reg_reader, Vec::new())
                 .expect("bounded randomized draws must use the HLE path");
 
             assert_eq!(fast.writes, interpreter.writes);
@@ -1923,7 +1930,7 @@ mod tests {
         }
 
         let oversized_params = [0, 1, 129, 0, 0, 0];
-        assert!(hle_macro(kind, &oversized_params[..param_count], &|_| 0).is_none());
+        assert!(hle_macro(kind, &oversized_params[..param_count], &|_| 0, Vec::new()).is_none());
     }
 
     #[test]
@@ -1977,7 +1984,7 @@ mod tests {
 
             let hle_start = Instant::now();
             for _ in 0..iterations {
-                let output = hle_macro(kind, black_box(params), &reg_reader).unwrap();
+                let output = hle_macro(kind, black_box(params), &reg_reader, Vec::new()).unwrap();
                 black_box(output.writes);
             }
 

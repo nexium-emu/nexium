@@ -932,6 +932,74 @@ const fn build_draw_state_category_table() -> [u8; MAXWELL3D_REGISTER_COUNT] {
 
 const DRAW_STATE_CATEGORY_TABLE: [u8; MAXWELL3D_REGISTER_COUNT] = build_draw_state_category_table();
 
+const METHOD_FLAG_FORCE_DIRTY: u8 = 1;
+const METHOD_FLAG_NEVER_DIRTY: u8 = 2;
+const METHOD_FLAG_REPEAT_NOT_IDEMPOTENT: u8 = 4;
+const METHOD_FLAG_ADDR_HI: u8 = 8;
+const METHOD_FLAG_TABLE_LEN: usize = 0x1000;
+
+fn method_force_dirty(method: u32) -> bool {
+    (0x60..=0x6D).contains(&method) || (0x8E4..=0x8F3).contains(&method)
+}
+
+fn method_never_dirty(method: u32) -> bool {
+    matches!(
+        method,
+        0x35D
+            | 0x35E
+            | 0x4C0
+            | 0x4C1
+            | 0x47D
+            | 0x57A
+            | 0x57B
+            | 0x57C
+            | 0x585
+            | 0x586
+            | 0x5F7
+            | 0x5F8
+            | 0xB2
+    ) || (0x5F9..=0x5FE).contains(&method)
+}
+
+fn method_addr_hi(method: u32) -> bool {
+    method == 0x582
+        || method == 0x6c0
+        || method == 0x8e1
+        || method == 0x554
+        || (method >= 0x200 && method < 0x280 && (method & 0xF) == 0)
+}
+
+fn compute_method_flags(method: u32) -> u8 {
+    let mut flags = 0u8;
+    if method_force_dirty(method) {
+        flags |= METHOD_FLAG_FORCE_DIRTY;
+    }
+    if method_never_dirty(method) {
+        flags |= METHOD_FLAG_NEVER_DIRTY;
+    }
+    if !Maxwell3D::repeat_is_idempotent(method) {
+        flags |= METHOD_FLAG_REPEAT_NOT_IDEMPOTENT;
+    }
+    if method_addr_hi(method) {
+        flags |= METHOD_FLAG_ADDR_HI;
+    }
+    flags
+}
+
+fn method_flags(method: u32) -> u8 {
+    static TABLE: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..METHOD_FLAG_TABLE_LEN as u32)
+            .map(compute_method_flags)
+            .collect::<Vec<u8>>()
+            .into_boxed_slice()
+    });
+    match table.get(method as usize) {
+        Some(flags) => *flags,
+        None => compute_method_flags(method),
+    }
+}
+
 fn mme_forensics() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
@@ -1240,7 +1308,7 @@ impl Maxwell3D {
             return;
         };
 
-        if !register_changed && Self::repeat_is_idempotent(method) {
+        if !register_changed && method_flags(method) & METHOD_FLAG_REPEAT_NOT_IDEMPOTENT == 0 {
             return;
         }
 
@@ -1355,26 +1423,9 @@ impl Maxwell3D {
         let state_value_changed = m >= self.reg_file.len() || self.reg_file[m] != arg;
         let register_changed =
             m >= self.reg_file.len() || self.reg_file_written[m] == 0 || self.reg_file[m] != arg;
-        if (register_changed
-            || (0x60..=0x6D).contains(&method)
-            || (0x8E4..=0x8F3).contains(&method))
-            && !matches!(
-                method,
-                0x35D
-                    | 0x35E
-                    | 0x4C0
-                    | 0x4C1
-                    | 0x47D
-                    | 0x57A
-                    | 0x57B
-                    | 0x57C
-                    | 0x585
-                    | 0x586
-                    | 0x5F7
-                    | 0x5F8
-                    | 0xB2
-            )
-            && !(0x5F9..=0x5FE).contains(&method)
+        let flags = method_flags(method);
+        if (register_changed || flags & METHOD_FLAG_FORCE_DIRTY != 0)
+            && flags & METHOD_FLAG_NEVER_DIRTY == 0
         {
             self.draw_state_dirty_since_last_draw = true;
         }
@@ -1392,11 +1443,7 @@ impl Maxwell3D {
             );
         }
 
-        let addr_hi_reg = method == 0x582
-            || method == 0x6c0
-            || method == 0x8e1
-            || method == 0x554
-            || (method >= 0x200 && method < 0x280 && (method & 0xF) == 0);
+        let addr_hi_reg = flags & METHOD_FLAG_ADDR_HI != 0;
         if addr_hi_reg && arg > 0xFF {
             if mme_forensics() {
                 use std::sync::atomic::{AtomicU32, Ordering};

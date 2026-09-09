@@ -602,9 +602,37 @@ fn try_deliver_pending_frame(
         }
         Err(mpsc::TrySendError::Full(frame)) => {
             *pending_frame = Some(frame);
+            if let Some(hook) = repaint {
+                poke_sleeping_presenter(hook);
+            }
             true
         }
         Err(mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn poke_sleeping_presenter(hook: &RepaintHook) {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static LAST_POKE_MS: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now_ms = EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    let last = LAST_POKE_MS.load(AtomicOrdering::Relaxed);
+    if now_ms.saturating_sub(last) < 16 {
+        return;
+    }
+    if LAST_POKE_MS
+        .compare_exchange(
+            last,
+            now_ms,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        )
+        .is_ok()
+    {
+        hook();
     }
 }
 

@@ -9,6 +9,82 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+fn pb_anomaly_dump_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_PB_ANOMALY_DUMP").is_some())
+}
+
+static PB_ANOMALY_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static PB_ANOMALY_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn note_pb_anomaly(reason: &str) {
+    if !pb_anomaly_dump_enabled() || PB_ANOMALY_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    if let Ok(mut slot) = PB_ANOMALY_REASON.lock() {
+        if !PB_ANOMALY_PENDING.load(Ordering::Relaxed) {
+            *slot = Some(reason.to_string());
+            PB_ANOMALY_PENDING.store(true, Ordering::Release);
+        }
+    }
+}
+
+const PB_ANOMALY_RING_ENTRIES: usize = 8;
+const PB_ANOMALY_RING_WORDS: usize = 4096;
+
+struct PbAnomalyEntry {
+    gpu_va: u64,
+    state_in: (u32, u32, u32, bool, bool),
+    total_words: usize,
+    words: Vec<u32>,
+}
+
+struct PbAnomalyRanges {
+    sequence: u64,
+    total_entries: usize,
+    enabled: bool,
+    entries: Vec<(CommandListHeader, CommandListHeader, Option<(u64, u64)>)>,
+}
+
+static PB_ANOMALY_RANGES: std::sync::Mutex<std::collections::VecDeque<PbAnomalyRanges>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn record_pb_anomaly_ranges(
+    raw: &[CommandListHeader],
+    normalized: &[CommandListHeader],
+    mappings: &GpuMappings,
+    enabled: bool,
+) {
+    if !pb_anomaly_dump_enabled() {
+        return;
+    }
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let entries = raw
+        .iter()
+        .zip(normalized)
+        .take(512)
+        .map(|(raw, normalized)| (*raw, *normalized, mappings.cpu_range_for(raw.address())))
+        .collect();
+    if let Ok(mut ring) = PB_ANOMALY_RANGES.lock() {
+        if ring.len() >= PB_ANOMALY_RING_ENTRIES {
+            ring.pop_front();
+        }
+        ring.push_back(PbAnomalyRanges {
+            sequence,
+            total_entries: raw.len(),
+            enabled,
+            entries,
+        });
+    }
+}
+
+fn pb_frame_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_PB_FRAME_TRACE").is_some())
+}
+
 fn gpfifo_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_GPFIFO_TRACE").is_some())
@@ -483,6 +559,84 @@ pub(crate) mod kickprof {
     static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
     static KICKS: AtomicU64 = AtomicU64::new(0);
     static WINDOW_KICKS: AtomicU64 = AtomicU64::new(0);
+    static BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
+    static BLOCKED_CALLS: AtomicU64 = AtomicU64::new(0);
+    static RENDER_BUSY_NS: AtomicU64 = AtomicU64::new(0);
+    static RENDER_GROUPS: AtomicU64 = AtomicU64::new(0);
+    static RENDER_JOB_NS: AtomicU64 = AtomicU64::new(0);
+    static WINDOW_WALL_START_NS: AtomicU64 = AtomicU64::new(0);
+
+    fn process_epoch() -> Instant {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
+    }
+
+    fn now_ns() -> u64 {
+        process_epoch().elapsed().as_nanos() as u64
+    }
+
+    pub fn rate_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| enabled() || std::env::var_os("NEXIUM_KICK_RATE_PROFILE").is_some())
+    }
+
+    #[inline]
+    pub fn rate_start() -> Option<Instant> {
+        rate_enabled().then(Instant::now)
+    }
+
+    #[inline]
+    pub fn add_blocked(started: Option<Instant>) {
+        if let Some(started) = started {
+            BLOCKED_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            BLOCKED_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn add_render_busy(started: Option<Instant>, groups: u64) {
+        if let Some(started) = started {
+            RENDER_BUSY_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            RENDER_GROUPS.fetch_add(groups, Ordering::Relaxed);
+        }
+    }
+
+    static JOB_LABEL_NS: std::sync::Mutex<Vec<(&'static str, u64, u64)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[inline]
+    pub fn add_render_job(started: Option<Instant>, label: &'static str) {
+        if let Some(started) = started {
+            let ns = started.elapsed().as_nanos() as u64;
+            RENDER_JOB_NS.fetch_add(ns, Ordering::Relaxed);
+            let mut labels = JOB_LABEL_NS.lock().unwrap_or_else(|e| e.into_inner());
+            match labels.iter_mut().find(|entry| entry.0 == label) {
+                Some(entry) => {
+                    entry.1 += ns;
+                    entry.2 += 1;
+                }
+                None => labels.push((label, ns, 1)),
+            }
+        }
+    }
+
+    fn take_job_labels(kicks: f64) -> String {
+        let mut labels =
+            std::mem::take(&mut *JOB_LABEL_NS.lock().unwrap_or_else(|e| e.into_inner()));
+        labels.sort_by(|a, b| b.1.cmp(&a.1));
+        labels
+            .iter()
+            .take(6)
+            .map(|(label, ns, n)| {
+                format!(
+                    " {}={:.2}ms/n{:.1}",
+                    label,
+                    *ns as f64 / kicks / 1_000_000.0,
+                    *n as f64 / kicks
+                )
+            })
+            .collect()
+    }
 
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -518,9 +672,7 @@ pub(crate) mod kickprof {
 
     #[inline]
     pub fn kick_start() -> Option<Instant> {
-        static ON: OnceLock<bool> = OnceLock::new();
-        ON.get_or_init(|| enabled() || std::env::var_os("NEXIUM_KICK_RATE_PROFILE").is_some())
-            .then(Instant::now)
+        rate_start()
     }
 
     #[inline]
@@ -576,6 +728,15 @@ pub(crate) mod kickprof {
         WINDOW_KICKS.store(0, Ordering::Relaxed);
         let total = TOTAL_NS.swap(0, Ordering::Relaxed).max(1);
         let kicks = window as f64;
+        let wall_now = now_ns();
+        let wall_start = WINDOW_WALL_START_NS.swap(wall_now, Ordering::Relaxed);
+        let wall = wall_now.saturating_sub(wall_start);
+        let blocked = BLOCKED_NS.swap(0, Ordering::Relaxed);
+        let blocked_calls = BLOCKED_CALLS.swap(0, Ordering::Relaxed);
+        let render_busy = RENDER_BUSY_NS.swap(0, Ordering::Relaxed);
+        let render_groups = RENDER_GROUPS.swap(0, Ordering::Relaxed);
+        let render_job = RENDER_JOB_NS.swap(0, Ordering::Relaxed);
+        let job_labels = take_job_labels(kicks);
         let mut accounted = 0u64;
         let mut parts = String::new();
         let mut raw_texture_snapshots = 0u64;
@@ -625,6 +786,19 @@ pub(crate) mod kickprof {
             other as f64 * 100.0 / total as f64,
             parts
         );
+        log::warn!(
+            "[kickwall] kicks={} wall_ms/kick={:.2} pusher_duty={:.0}% blocked_ms/kick={:.2} blocked_calls/kick={:.1} render_draw_ms/kick={:.2} render_groups/kick={:.1} render_job_ms/kick={:.2} render_share={:.0}%",
+            total_kicks,
+            wall as f64 / kicks / 1_000_000.0,
+            total as f64 * 100.0 / wall.max(1) as f64,
+            blocked as f64 / kicks / 1_000_000.0,
+            blocked_calls as f64 / kicks,
+            render_busy as f64 / kicks / 1_000_000.0,
+            render_groups as f64 / kicks,
+            render_job as f64 / kicks / 1_000_000.0,
+            (render_busy + render_job) as f64 * 100.0 / wall.max(1) as f64,
+        );
+        log::warn!("[kickjobs] kicks={} per-kick |{}", total_kicks, job_labels);
     }
 }
 
@@ -856,6 +1030,11 @@ pub struct Pusher {
     engine_event_batch: Option<(u32, Vec<(u32, u32, bool)>)>,
     live_macro_scratch: Vec<u8>,
     live_macro_values: Vec<u32>,
+    entry_bytes_scratch: Vec<u8>,
+    anomaly_ring: std::collections::VecDeque<PbAnomalyEntry>,
+    anomaly_dumped: bool,
+    gpu_profile_on: bool,
+    entry_words_scratch: Vec<u32>,
     #[cfg(test)]
     passive_bulk_override: Option<bool>,
     #[cfg(test)]
@@ -888,6 +1067,11 @@ impl Pusher {
             engine_event_batch: None,
             live_macro_scratch: Vec::new(),
             live_macro_values: Vec::new(),
+            entry_bytes_scratch: Vec::new(),
+            anomaly_ring: std::collections::VecDeque::new(),
+            anomaly_dumped: false,
+            gpu_profile_on: gpu_profile_enabled(),
+            entry_words_scratch: Vec::new(),
             #[cfg(test)]
             passive_bulk_override: None,
             #[cfg(test)]
@@ -1219,7 +1403,7 @@ impl Pusher {
         read_gpu_scattered(mappings, address, &mut buf, mem_read);
 
         let decoded = decode_command_list_headers(&buf);
-        let decoded = repair_endform_entries(&decoded, mappings);
+        record_gpfifo_entries(&decoded, mappings);
         kickprof::add(kickprof::ELIST, kp_elist);
 
         if direct_forensics() && decoded.iter().any(|e| e.entry_count() > 4096) {
@@ -1289,6 +1473,7 @@ impl Pusher {
         self.prep_entry_begin();
         let address = entry.address();
         let word_count = entry.entry_count();
+        super::watchdog::phase(super::watchdog::Phase::Entry, address);
         let profile = gpu_profile_enabled();
         let started = profile.then(std::time::Instant::now);
         let methods_before = profile.then(|| stats.methods_dispatched.load(Ordering::Relaxed));
@@ -1307,8 +1492,7 @@ impl Pusher {
             self.entries_logged += 1;
         }
 
-        if word_count == 0 || word_count > 0x100000 {
-            self.state.method_count = self.state.method_count.saturating_sub(word_count);
+        if word_count == 0 {
             return;
         }
 
@@ -1359,15 +1543,20 @@ impl Pusher {
         }
         let _ = cpu_addr;
         let kp_pb = kickprof::start();
-        let mut buf = vec![0u8; bytes_needed];
+        let mut buf = std::mem::take(&mut self.entry_bytes_scratch);
+        buf.clear();
+        buf.resize(bytes_needed, 0);
         read_gpu_scattered(mappings, address, &mut buf, mem_read);
 
-        let mut words: Vec<u32> = Vec::with_capacity(word_count as usize);
+        let mut words = std::mem::take(&mut self.entry_words_scratch);
+        words.clear();
+        words.reserve(word_count as usize);
         for i in 0..word_count as usize {
             let off = i * 4;
             let w = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
             words.push(if w == POISON_SENTINEL { 0 } else { w });
         }
+        self.entry_bytes_scratch = buf;
         kickprof::add(kickprof::PBREAD, kp_pb);
 
         self.active_entry_gpu_va = address;
@@ -1379,7 +1568,18 @@ impl Pusher {
             self.state.non_incrementing,
             self.state.increment_once,
         );
-        let frame_trace = std::env::var_os("NEXIUM_PB_FRAME_TRACE").is_some();
+        if pb_anomaly_dump_enabled() {
+            if self.anomaly_ring.len() >= PB_ANOMALY_RING_ENTRIES {
+                self.anomaly_ring.pop_front();
+            }
+            self.anomaly_ring.push_back(PbAnomalyEntry {
+                gpu_va: address,
+                state_in: entry_state_in,
+                total_words: words.len(),
+                words: words[..words.len().min(PB_ANOMALY_RING_WORDS)].to_vec(),
+            });
+        }
+        let frame_trace = pb_frame_trace_enabled();
         if frame_trace {
             log::warn!(
                 "[pb-frame-in] gpu_va={:#x} words={} state_in={:?} w={:08x?}",
@@ -1486,6 +1686,7 @@ impl Pusher {
                 );
             }
         }
+        self.entry_words_scratch = words;
     }
 
     fn process_commands(
@@ -1519,11 +1720,17 @@ impl Pusher {
             && !mme_param_trace()
             && !mme_dispatch_trace();
         let mut live_macro_scratch = std::mem::take(&mut self.live_macro_scratch);
+        let direct_forensics_on = direct_forensics();
         let mut live_macro_values = std::mem::take(&mut self.live_macro_values);
         let mut live_macro_start = 0usize;
         let mut live_macro_end = 0usize;
         let mut live_macro_valid = false;
+        let anomaly_dump_on = pb_anomaly_dump_enabled();
         while i < commands.len() {
+            if anomaly_dump_on && !self.anomaly_dumped && PB_ANOMALY_PENDING.load(Ordering::Acquire)
+            {
+                self.dump_pb_anomaly(commands, i);
+            }
             let header = commands[i];
 
             if self.state.method_count > 0 {
@@ -1531,7 +1738,7 @@ impl Pusher {
                 let cls = self.bound_classes[self.state.subchannel as usize & 7];
                 let passive_run = (cls == 0xB197
                     && (!gpu_profile_active || passive_bulk_active)
-                    && !direct_forensics()
+                    && !direct_forensics_on
                     && !self.state.increment_once)
                     .then(|| {
                         let available = (commands.len() - i).min(self.state.method_count as usize);
@@ -1749,6 +1956,11 @@ impl Pusher {
                 continue;
             }
 
+            if header == 0 {
+                i += 1;
+                continue;
+            }
+
             let method = header & 0x1FFF;
             let subchannel = (header >> 13) & 0x7;
             let arg_count = (header >> 16) & 0x1FFF;
@@ -1756,11 +1968,21 @@ impl Pusher {
             self.active_word_index = i;
             self.active_header = header;
             let Some(mode) = Mode::from_bits(mode_bits) else {
-                log::trace!(
-                    "pusher: unknown mode {} in header {:#010x}",
-                    mode_bits,
-                    header
-                );
+                static UNKNOWN_MODES: AtomicU64 = AtomicU64::new(0);
+                if UNKNOWN_MODES.fetch_add(1, Ordering::Relaxed) < 64 {
+                    log::warn!(
+                        "[pb-unknown-secop] mode={} header={:#010x} entry_gpu={:#x} word={} of {} state_in_method={:#x} subch={} lo={:08x?}",
+                        mode_bits,
+                        header,
+                        self.active_entry_gpu_va,
+                        i,
+                        commands.len(),
+                        self.state.method,
+                        self.state.subchannel,
+                        &commands[i.saturating_sub(8)..(i + 8).min(commands.len())]
+                    );
+                }
+                note_pb_anomaly("unknown-secop");
                 i += 1;
                 continue;
             };
@@ -1769,7 +1991,7 @@ impl Pusher {
             self.state.subchannel = subchannel;
             self.state.method_count = arg_count;
 
-            if direct_forensics() && arg_count > 512 && mode != Mode::Inline {
+            if direct_forensics_on && arg_count > 512 && mode != Mode::Inline {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static N: AtomicU32 = AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 64 {
@@ -1840,6 +2062,88 @@ impl Pusher {
         self.live_macro_values = live_macro_values;
     }
 
+    fn dump_pb_anomaly(&mut self, commands: &[u32], i: usize) {
+        self.anomaly_dumped = true;
+        let reason = PB_ANOMALY_REASON
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default();
+        log::error!(
+            "[pb-anomaly] reason={} entry_gpu={:#x} word={} of {} state=(method={:#x} subch={} count={} noninc={} once={}) active_header={:#010x} ring_entries={}",
+            reason,
+            self.active_entry_gpu_va,
+            i,
+            commands.len(),
+            self.state.method,
+            self.state.subchannel,
+            self.state.method_count,
+            self.state.non_incrementing,
+            self.state.increment_once,
+            self.active_header,
+            self.anomaly_ring.len()
+        );
+        let lo = i.saturating_sub(24);
+        let hi = (i + 24).min(commands.len());
+        log::error!(
+            "[pb-anomaly] window[{}..{}]={:08x?}",
+            lo,
+            hi,
+            &commands[lo..hi]
+        );
+        if let Ok(ranges) = PB_ANOMALY_RANGES.lock() {
+            for submission in ranges.iter() {
+                log::error!(
+                    "[pb-anomaly-ranges] submit={} endform_enabled={} entries={} captured={}",
+                    submission.sequence,
+                    submission.enabled,
+                    submission.total_entries,
+                    submission.entries.len()
+                );
+                for (index, (raw, normalized, cpu_range)) in submission.entries.iter().enumerate() {
+                    log::error!(
+                        "[pb-anomaly-ranges] submit={} entry={} raw={:08x}:{:08x} gpu={:#x} words={} cpu_range={:#x?} normalized={:08x}:{:08x} gpu={:#x} words={} changed={}",
+                        submission.sequence,
+                        index,
+                        raw.address_lo,
+                        raw.address_hi_and_count,
+                        raw.address(),
+                        raw.entry_count(),
+                        cpu_range,
+                        normalized.address_lo,
+                        normalized.address_hi_and_count,
+                        normalized.address(),
+                        normalized.entry_count(),
+                        raw.address_lo != normalized.address_lo
+                            || raw.address_hi_and_count != normalized.address_hi_and_count
+                    );
+                }
+            }
+        }
+        for (index, entry) in self.anomaly_ring.iter().enumerate() {
+            log::error!(
+                "[pb-anomaly] ring[{}] gpu_va={:#x} state_in=(method={:#x} subch={} count={} noninc={} once={}) words={}",
+                index,
+                entry.gpu_va,
+                entry.state_in.0,
+                entry.state_in.1,
+                entry.state_in.2,
+                entry.state_in.3,
+                entry.state_in.4,
+                entry.total_words
+            );
+            for (line, chunk) in entry.words.chunks(16).enumerate() {
+                let text: Vec<String> = chunk.iter().map(|w| format!("{:08x}", w)).collect();
+                log::error!(
+                    "[pb-anomaly] ring[{}] +{:04x}: {}",
+                    index,
+                    line * 16,
+                    text.join(" ")
+                );
+            }
+        }
+    }
+
     fn dispatch_method(
         &mut self,
         arg: u32,
@@ -1860,7 +2164,7 @@ impl Pusher {
         let method = self.state.method;
         let subchannel = self.state.subchannel as usize;
         let bound_class = self.bound_classes[subchannel & 7];
-        let profile_started = gpu_profile_enabled().then(std::time::Instant::now);
+        let profile_started = self.gpu_profile_on.then(std::time::Instant::now);
 
         if method < NON_PULLER_METHODS {
             if puller_method_requires_hard_boundary(method) {
@@ -2015,6 +2319,10 @@ impl Pusher {
             } else {
                 if constbuf_write_count != 0 {
                     let writes = std::mem::take(&mut maxwell.regs.pending_constbuf_writes);
+                    maxwell
+                        .regs
+                        .pending_constbuf_writes
+                        .reserve(constbuf_write_count);
                     let mut engines = super::prep::PrepEngines {
                         maxwell_dma,
                         fermi_2d,
@@ -2123,7 +2431,11 @@ impl Pusher {
             }
             if !maxwell.pending_draws.is_empty() {
                 let gs_debug = gs_dump_enabled().then(|| maxwell.gs_debug_regs());
-                let draws = std::mem::take(&mut maxwell.pending_draws);
+                let draw_capacity = maxwell.pending_draws.len();
+                let draws = std::mem::replace(
+                    &mut maxwell.pending_draws,
+                    Vec::with_capacity(draw_capacity),
+                );
                 if let super::prep::PrepLane::Threaded(handle) = &self.prep {
                     if let Some(recycled) = handle.try_take_recycled_draw_vec() {
                         maxwell.pending_draws = recycled;
@@ -2454,131 +2766,8 @@ fn passive_maxwell_run_len(method: u32, available: usize, non_incrementing: bool
         .count()
 }
 
-const GPFIFO_LENGTH_MASK: u32 = 0x1F_FFFF;
-const RECOVERED_RANGE_WORD_LIMIT: u32 = 4096;
-
-fn with_entry_range(entry: CommandListHeader, start: u64, words: u32) -> CommandListHeader {
-    debug_assert!(words <= GPFIFO_LENGTH_MASK);
-    CommandListHeader {
-        address_lo: (start as u32 & !3) | (entry.address_lo & 3),
-        address_hi_and_count: (entry.address_hi_and_count & 0x8000_0300)
-            | ((start >> 32) as u32 & 0xFF)
-            | (words << 10),
-    }
-}
-
-fn recover_gpu_end_range(
-    entries: &[CommandListHeader],
-    index: usize,
-    mappings: &GpuMappings,
-) -> Option<(u64, u32)> {
-    let entry = entries[index];
-    if !entry.no_prefetch() || !entry.not_main() {
-        return None;
-    }
-    let start = entry.address();
-    let encoded_end = entry.entry_count();
-    entries
-        .iter()
-        .enumerate()
-        .filter_map(|(other_index, other)| {
-            if other_index == index
-                || (other.address() & GPFIFO_LENGTH_MASK as u64) as u32 != encoded_end
-            {
-                return None;
-            }
-            let bytes = other.address().checked_sub(start)?;
-            if bytes == 0 || bytes & 3 != 0 {
-                return None;
-            }
-            let start_cpu = mappings.cpu_address_for(start)?;
-            let end_cpu = mappings.cpu_address_for(other.address())?;
-            if start_cpu.checked_add(bytes) != Some(end_cpu) {
-                return None;
-            }
-            let words = u32::try_from(bytes / 4).ok()?;
-            (words <= RECOVERED_RANGE_WORD_LIMIT).then_some((start, words))
-        })
-        .min_by_key(|(_, words)| *words)
-}
-
-fn recover_cpu_start_range(entry: CommandListHeader, mappings: &GpuMappings) -> Option<(u64, u32)> {
-    if entry.no_prefetch() || !entry.not_main() {
-        return None;
-    }
-    let end = entry.address();
-    let end_cpu = mappings.cpu_address_for(end)?;
-    let encoded_start = entry.entry_count();
-    let bytes = ((end_cpu & GPFIFO_LENGTH_MASK as u64) as u32).checked_sub(encoded_start)?;
-    if bytes == 0 || bytes & 3 != 0 {
-        return None;
-    }
-    let words = bytes / 4;
-    if words > RECOVERED_RANGE_WORD_LIMIT {
-        return None;
-    }
-    let start = end.checked_sub(bytes as u64)?;
-    let start_cpu = mappings.cpu_address_for(start)?;
-    if start_cpu.checked_add(bytes as u64) != Some(end_cpu)
-        || (start_cpu & GPFIFO_LENGTH_MASK as u64) as u32 != encoded_start
-    {
-        return None;
-    }
-    Some((start, words))
-}
-
-fn endform_fix_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("NEXIUM_ENDFORM_FIX")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no"
-                )
-            })
-            .unwrap_or(true)
-    })
-}
-
-pub(crate) fn repair_endform_entries(
-    entries: &[CommandListHeader],
-    mappings: &GpuMappings,
-) -> Vec<CommandListHeader> {
-    if !endform_fix_enabled() {
-        return entries.to_vec();
-    }
-    entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let count = e.entry_count();
-            if count <= RECOVERED_RANGE_WORD_LIMIT {
-                return *e;
-            }
-            let recovered = recover_gpu_end_range(entries, i, mappings)
-                .map(|range| (range, "gpu-start/end"))
-                .or_else(|| {
-                    recover_cpu_start_range(*e, mappings).map(|range| (range, "cpu-start/gpu-end"))
-                });
-            if direct_forensics() {
-                let normalized = recovered.map(|((start, words), _)| (start, words));
-                log::warn!(
-                    "[pb-range] raw_va={:#x} raw_count={} normalized={:?} family={}",
-                    e.address(),
-                    count,
-                    normalized,
-                    recovered
-                        .map(|(_, family)| family)
-                        .unwrap_or("unrecognized")
-                );
-            }
-            let Some(((start, words), _)) = recovered else {
-                return *e;
-            };
-            with_entry_range(*e, start, words)
-        })
-        .collect()
+pub(crate) fn record_gpfifo_entries(entries: &[CommandListHeader], mappings: &GpuMappings) {
+    record_pb_anomaly_ranges(entries, entries, mappings, false);
 }
 
 pub(crate) fn read_gpu_scattered(
@@ -2995,71 +3184,116 @@ mod tests {
     }
 
     #[test]
-    fn repairs_gpu_start_end_intermediate_range_only_at_a_submitted_boundary() {
-        let mut mappings = GpuMappings::new();
-        mappings.add(0x5_64a5_0000, 0x180_0000, 0x3_1c25_d000, 27);
-        let range = gpfifo_entry(0x5_64a5_0560, 0x50_5ec, true);
-        let end = gpfifo_entry(0x5_64a5_05ec, 29, false);
+    fn zero_nop_headers_preserve_zero_method_payloads() {
+        let mut pusher = Pusher::new();
+        let mappings = GpuMappings::new();
+        let mut maxwell = Maxwell3D::new();
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
 
-        let repaired = repair_endform_entries(&[range, end], &mappings);
-
-        assert_eq!(repaired.len(), 2);
-        assert_eq!(repaired[0].address(), 0x5_64a5_0560);
-        assert_eq!(repaired[0].entry_count(), 35);
-        assert_eq!(repaired[1].address(), end.address());
-        assert_eq!(repaired[1].entry_count(), end.entry_count());
-    }
-
-    #[test]
-    fn repairs_cpu_start_gpu_end_intermediate_range_through_the_mapping() {
-        let mut mappings = GpuMappings::new();
-        mappings.add(0x5_64a5_0000, 0x180_0000, 0x3_1c25_d000, 27);
-        let long_range = gpfifo_entry(0x5_64a5_05ec, 0x5_d578, false);
-        let short_range = gpfifo_entry(0x5_64a5_055c, 0x5_d548, false);
-
-        let repaired = repair_endform_entries(&[long_range, short_range], &mappings);
-
-        assert_eq!(repaired.len(), 2);
-        assert_eq!(repaired[0].address(), 0x5_64a5_0578);
-        assert_eq!(repaired[0].entry_count(), 29);
-        assert_eq!(repaired[1].address(), 0x5_64a5_0548);
-        assert_eq!(repaired[1].entry_count(), 5);
-    }
-
-    #[test]
-    fn range_repair_preserves_repeated_entries_and_unmatched_large_counts() {
-        let mut mappings = GpuMappings::new();
-        mappings.add(0x5_64a5_0000, 0x180_0000, 0x3_1c25_d000, 27);
-        let range = gpfifo_entry(0x5_64a5_0560, 0x50_5ec, true);
-        let end = gpfifo_entry(0x5_64a5_05ec, 29, false);
-        let unmatched = gpfifo_entry(0x5_64a5_1000, 0x1100, true);
-
-        let repaired = repair_endform_entries(&[range, end, range, end, unmatched], &mappings);
-
-        assert_eq!(repaired.len(), 5);
-        assert_eq!(repaired[0].address_lo, repaired[2].address_lo);
-        assert_eq!(
-            repaired[0].address_hi_and_count,
-            repaired[2].address_hi_and_count
+        pusher.process_commands(
+            &[0, 0x2002_0200, 0, 0x3344, 0, 0x2001_0202, 0x5566, 0],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &|_, _| true,
+            &|_, _| true,
+            &|_, _, _| false,
         );
-        assert_eq!(repaired[4].address(), unmatched.address());
-        assert_eq!(repaired[4].entry_count(), 0x1100);
+
+        assert_eq!(&maxwell.reg_file[0x200..0x203], &[0, 0x3344, 0x5566]);
+        assert_eq!(pusher.state.method, 0x203);
+        assert_eq!(pusher.state.method_count, 0);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 3);
+    }
+
+    fn execute_gpfifo_length_case(entries: &[CommandListHeader], inline: bool) {
+        let gpu = super::super::GpuContext::new();
+        let gpu_base = entries[0].address() - 0x2000;
+        let cpu_base = 0x20_0000;
+        let end = entries[0].address() + u64::from(entries[0].entry_count()) * 4;
+        let mut memory = vec![0u8; (end - gpu_base) as usize];
+        memory[0x2000..0x2008].copy_from_slice(&words_bytes(&[0x2001_0200, 0x12]));
+        let tail = memory.len() - 8;
+        memory[tail..].copy_from_slice(&words_bytes(&[0x2001_0201, 0x5566_7788]));
+        if entries.len() > 1 {
+            let second = (entries[1].address() - gpu_base) as usize;
+            memory[second..second + 8].copy_from_slice(&words_bytes(&[0x2001_0202, 0x99aa_bbcc]));
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            memory[index * 8..index * 8 + 8].copy_from_slice(&words_bytes(&[
+                entry.address_lo,
+                entry.address_hi_and_count,
+            ]));
+        }
+        gpu.mappings
+            .write()
+            .add(gpu_base, memory.len() as u64, cpu_base, 1);
+        let mem_read = |cpu: u64, output: &mut [u8]| {
+            let start = cpu.checked_sub(cpu_base).unwrap() as usize;
+            output.copy_from_slice(&memory[start..start + output.len()]);
+            true
+        };
+        let completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let completion_count = Arc::clone(&completions);
+        let on_complete = Some(Box::new(move || {
+            completion_count.fetch_add(1, Ordering::Relaxed);
+        }) as Box<dyn FnOnce() + Send>);
+        if inline {
+            gpu.process_inline_gpfifo(entries, mem_read, |_, _| true, |_, _, _| false, on_complete);
+        } else {
+            gpu.submit_gpfifo(
+                gpu_base,
+                entries.len() as u32,
+                mem_read,
+                |_, _| true,
+                |_, _, _| false,
+                on_complete,
+            );
+        }
+        let maxwell = gpu.maxwell3d.lock();
+        assert_eq!(&maxwell.reg_file[0x200..0x202], &[0x12, 0x5566_7788]);
+        if entries.len() > 1 {
+            assert_eq!(maxwell.reg_file[0x202], 0x99aa_bbcc);
+        }
+        assert_eq!(completions.load(Ordering::Relaxed), 1);
+        assert_eq!(gpu.pusher.lock().state.method_count, 0);
     }
 
     #[test]
-    fn range_repair_rejects_unmapped_or_geometrically_invalid_records() {
-        let mut mappings = GpuMappings::new();
-        mappings.add(0x5_64a5_0000, 0x180_0000, 0x3_1c25_d000, 27);
-        let reverse_underflow = gpfifo_entry(0x5_64a5_03f8, 0x5_e128, false);
-        let mut main_level = gpfifo_entry(0x5_64a5_05ec, 0x5_d578, false);
-        main_level.address_hi_and_count &= !0x200;
+    fn gpfifo_length_is_preserved_when_it_matches_cpu_address_bits() {
+        for inline in [false, true] {
+            execute_gpfifo_length_case(&[gpfifo_entry(0x10_2000, 0x1800, false)], inline);
+        }
+    }
 
-        let repaired = repair_endform_entries(&[reverse_underflow, main_level], &mappings);
+    #[test]
+    fn gpfifo_length_is_preserved_when_it_matches_another_entry_address() {
+        for inline in [false, true] {
+            execute_gpfifo_length_case(
+                &[
+                    gpfifo_entry(0x40_2000, 0x2040, true),
+                    gpfifo_entry(0x40_2040, 2, false),
+                ],
+                inline,
+            );
+        }
+    }
 
-        assert_eq!(repaired[0].address(), reverse_underflow.address());
-        assert_eq!(repaired[0].entry_count(), reverse_underflow.entry_count());
-        assert_eq!(repaired[1].address(), main_level.address());
-        assert_eq!(repaired[1].entry_count(), main_level.entry_count());
+    #[test]
+    fn gpfifo_length_executes_the_upper_half_of_the_21_bit_range() {
+        for (words, no_prefetch) in [(0x10_0001, false), (0x1f_ffff, true)] {
+            for inline in [false, true] {
+                execute_gpfifo_length_case(&[gpfifo_entry(0x10_2000, words, no_prefetch)], inline);
+            }
+        }
     }
 
     #[test]
