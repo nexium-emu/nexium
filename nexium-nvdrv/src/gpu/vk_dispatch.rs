@@ -1,5 +1,6 @@
 use ash::vk;
-use std::collections::{HashMap, HashSet, VecDeque};
+use nexium_common::fast_hash::{FastMap, FastSet};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const MAX_RT_DIMENSION: u32 = 32768;
@@ -34,7 +35,8 @@ const INPUT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 65536;
 const INPUT_CBUF_COVER_PAGE_SIZE: u64 = 4096;
 const INPUT_CBUF_COVER_MAX_PAGES: u64 = 64;
 const INPUT_CBUF_COVER_CANDIDATES_PER_PAGE: usize = 8;
-const INPUT_INVALIDATION_PAGE_SHIFT: u32 = 12;
+const INPUT_INVALIDATION_PAGE_SHIFT: u32 = 16;
+const INPUT_INVALIDATION_SUPERPAGE_SHIFT: u32 = 4;
 const INPUT_INVALIDATION_MAX_QUERY_PAGES: u64 = 4096;
 const INPUT_INVALIDATION_MAX_CANDIDATES: usize = 1024;
 const RECENT_CBUF_REQUEST_CAPACITY: usize = 64;
@@ -69,6 +71,33 @@ fn explicit_env_switch_value_enabled(value: Option<&str>) -> bool {
 
 fn draw_derived_cache_value_enabled(enable: Option<&str>, disable: Option<&str>) -> bool {
     explicit_env_switch_value_enabled(enable) && !explicit_env_switch_value_enabled(disable)
+}
+
+fn input_idle_kicks() -> Option<u64> {
+    static VALUE: OnceLock<Option<u64>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("NEXIUM_INPUT_IDLE_KICKS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|kicks| *kicks != 0)
+    })
+}
+
+fn cbuf_recheck_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_CBUF_RECHECK").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn input_sweep_all_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        explicit_env_switch_value_enabled(std::env::var("NEXIUM_INPUT_SWEEP_ALL").ok().as_deref())
+    })
 }
 
 fn draw_derived_cache_enabled() -> bool {
@@ -633,6 +662,7 @@ struct InputRangeEntry {
     data: Arc<Vec<u8>>,
     watch_range: HostWatchRange,
     serial: u64,
+    last_used_kick: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -914,8 +944,9 @@ impl PendingDrawBatch {
     }
 
     fn take_parts(&mut self) -> (Vec<Maxwell3dDrawCall>, ResidentCbufArenaBuilder) {
+        let capacity = self.calls.len();
         (
-            std::mem::take(&mut self.calls),
+            std::mem::replace(&mut self.calls, Vec::with_capacity(capacity)),
             std::mem::take(&mut self.resident_cbuf_arena),
         )
     }
@@ -1263,36 +1294,42 @@ pub(crate) struct SsboSnapshotCache {
     input_mutation_epoch: u64,
     resource_mutation_epoch: u64,
     last_packed_cbuf: Option<(CbufPackKey, nexium_gpu::draw::GraphicsCbufPayload)>,
-    entries: std::collections::HashMap<SsboSnapshotCacheKey, Arc<Vec<u8>>>,
-    full_watch_ranges: std::collections::HashMap<SsboSnapshotCacheKey, HostWatchRange>,
-    input_entries: HashMap<InputRangeKey, InputRangeEntry>,
-    input_sources: HashMap<InputSourceKey, InputRangeKey>,
-    input_cbuf_covering: HashMap<(u64, u64), Vec<InputRangeKey>>,
-    input_gpu_pages: HashMap<u64, Vec<InputRangeKey>>,
-    input_cpu_pages: HashMap<u64, Vec<InputRangeKey>>,
+    entries: FastMap<SsboSnapshotCacheKey, Arc<Vec<u8>>>,
+    full_watch_ranges: FastMap<SsboSnapshotCacheKey, HostWatchRange>,
+    input_entries: FastMap<InputRangeKey, InputRangeEntry>,
+    input_sources: FastMap<InputSourceKey, InputRangeKey>,
+    input_cbuf_covering: FastMap<(u64, u64), Vec<InputRangeKey>>,
+    input_gpu_pages: FastMap<u64, Vec<InputRangeKey>>,
+    input_cpu_pages: FastMap<u64, Vec<InputRangeKey>>,
+    input_gpu_superpages: FastMap<u64, u32>,
+    input_cpu_superpages: FastMap<u64, u32>,
+    ssbo_entry_cpu: FastMap<SsboSnapshotCacheKey, (u64, Option<u64>)>,
     input_invalidation_candidates: Vec<InputRangeKey>,
-    input_invalidation_seen: HashSet<InputRangeKey>,
+    input_invalidation_seen: FastSet<InputRangeKey>,
     input_order: VecDeque<(InputRangeKey, u64)>,
     input_bytes: usize,
     input_next_serial: u64,
     last_input: Option<InputSnapshotIdentity>,
     recent_cbuf_requests: [Option<RecentCbufRequest>; RECENT_CBUF_REQUEST_CAPACITY],
-    recent_cbuf_request_index: HashMap<RecentCbufRequestKey, usize>,
+    recent_cbuf_request_index: FastMap<RecentCbufRequestKey, usize>,
     recent_cbuf_cursor: usize,
     deferred_gpu_writes: Vec<(u64, usize)>,
     deferred_patched_writes: Vec<(u64, u64, usize)>,
     input_max_bytes: usize,
     input_max_entries: usize,
-    prepared_index_entries: HashMap<PreparedIndexCacheKey, PreparedIndexCacheEntry>,
+    prepared_index_entries: FastMap<PreparedIndexCacheKey, PreparedIndexCacheEntry>,
     prepared_index_order: VecDeque<(PreparedIndexCacheKey, u64)>,
     prepared_index_bytes: usize,
     prepared_index_next_serial: u64,
     prepared_index_max_bytes: usize,
     prepared_index_max_entries: usize,
     prepared_texture_snapshots: PreparedTextureSnapshotMemo,
-    prepared_tic_plans: HashMap<u64, PreparedTicPlan>,
+    prepared_texture_bounds: Option<(u64, u64, u64, u64)>,
+    prepared_tic_plans: FastMap<u64, PreparedTicPlan>,
     input_profile: bool,
     watch_query_ranges: Vec<HostWatchRange>,
+    input_sweep_kick: u64,
+    idle_input_scratch: Vec<InputRangeKey>,
     input_gpu_bounds: (u64, u64),
     input_cpu_bounds: (u64, u64),
     ssbo_gpu_bounds: (u64, u64),
@@ -1508,7 +1545,7 @@ struct MirrorChunk {
 }
 
 struct MirrorPageCache {
-    chunks: HashMap<u64, MirrorChunk>,
+    chunks: FastMap<u64, MirrorChunk>,
     kick_epoch: u64,
     sweep_gen: u64,
     commit_gen_seen: u64,
@@ -1523,7 +1560,7 @@ struct MirrorPageCache {
 impl MirrorPageCache {
     fn new() -> Self {
         Self {
-            chunks: HashMap::new(),
+            chunks: FastMap::default(),
             kick_epoch: 0,
             sweep_gen: 1,
             commit_gen_seen: nexium_memory::fastmem::commit_generation(),
@@ -1557,6 +1594,20 @@ impl MirrorPageCache {
             chunk.dirty |= mask;
             chunk.cbuf_dirty |= mask;
         }
+    }
+
+    fn cbuf_chunk_unchanged_since_observation(chunk: &mut MirrorChunk, chunk_base: u64) -> bool {
+        let observed_write_serial = nexium_memory::fastmem::observed_write_serial();
+        if chunk.cbuf_observed_write_serial == observed_write_serial {
+            return true;
+        }
+        let (serial, generation) =
+            nexium_memory::fastmem::observed_write_snapshot_range(chunk_base, MIRROR_CHUNK_SIZE);
+        if generation != chunk.cbuf_observed_write_generation {
+            return false;
+        }
+        chunk.cbuf_observed_write_serial = serial;
+        true
     }
 
     fn sync_cbuf_write_watch(
@@ -1739,33 +1790,75 @@ fn input_entry_overlaps_span(
         })
 }
 
+fn adjust_input_superpages(superpages: &mut FastMap<u64, u32>, addr: u64, len: usize, delta: i32) {
+    let Some((first_page, last_page)) = input_invalidation_pages(addr, len) else {
+        return;
+    };
+    let first = first_page >> INPUT_INVALIDATION_SUPERPAGE_SHIFT;
+    let last = last_page >> INPUT_INVALIDATION_SUPERPAGE_SHIFT;
+    for superpage in first..=last {
+        if delta > 0 {
+            *superpages.entry(superpage).or_insert(0) += delta as u32;
+        } else if let Some(count) = superpages.get_mut(&superpage) {
+            *count = count.saturating_sub((-delta) as u32);
+            if *count == 0 {
+                superpages.remove(&superpage);
+            }
+        }
+    }
+}
+
+fn span_hits_superpages(superpages: &FastMap<u64, u32>, addr: u64, len: usize) -> bool {
+    let Some((first_page, last_page)) = input_invalidation_pages(addr, len) else {
+        return false;
+    };
+    let first = first_page >> INPUT_INVALIDATION_SUPERPAGE_SHIFT;
+    let last = last_page >> INPUT_INVALIDATION_SUPERPAGE_SHIFT;
+    if last.saturating_sub(first) > 4096 {
+        return true;
+    }
+    (first..=last).any(|superpage| superpages.contains_key(&superpage))
+}
+
 fn collect_input_page_candidates(
-    index: &HashMap<u64, Vec<InputRangeKey>>,
+    index: &FastMap<u64, Vec<InputRangeKey>>,
+    superpages: &FastMap<u64, u32>,
     addr: u64,
     len: usize,
     queried_pages: &mut u64,
     query_page_limit: u64,
     candidates: &mut Vec<InputRangeKey>,
-    seen: &mut HashSet<InputRangeKey>,
+    seen: &mut FastSet<InputRangeKey>,
 ) -> bool {
     let Some((first_page, last_page)) = input_invalidation_pages(addr, len) else {
         return true;
     };
-    let page_count = last_page.saturating_sub(first_page).saturating_add(1);
-    *queried_pages = queried_pages.saturating_add(page_count);
-    if *queried_pages > query_page_limit {
-        return false;
-    }
-    for page in first_page..=last_page {
-        let Some(keys) = index.get(&page) else {
+    let first_super = first_page >> INPUT_INVALIDATION_SUPERPAGE_SHIFT;
+    let last_super = last_page >> INPUT_INVALIDATION_SUPERPAGE_SHIFT;
+    for superpage in first_super..=last_super {
+        if !superpages.contains_key(&superpage) {
             continue;
-        };
-        for &key in keys {
-            if seen.insert(key) {
-                if candidates.len() >= INPUT_INVALIDATION_MAX_CANDIDATES {
-                    return false;
+        }
+        let span_first = (superpage << INPUT_INVALIDATION_SUPERPAGE_SHIFT).max(first_page);
+        let span_last = ((superpage << INPUT_INVALIDATION_SUPERPAGE_SHIFT)
+            | ((1u64 << INPUT_INVALIDATION_SUPERPAGE_SHIFT) - 1))
+            .min(last_page);
+        let page_count = span_last.saturating_sub(span_first).saturating_add(1);
+        *queried_pages = queried_pages.saturating_add(page_count);
+        if *queried_pages > query_page_limit {
+            return false;
+        }
+        for page in span_first..=span_last {
+            let Some(keys) = index.get(&page) else {
+                continue;
+            };
+            for &key in keys {
+                if seen.insert(key) {
+                    if candidates.len() >= INPUT_INVALIDATION_MAX_CANDIDATES {
+                        return false;
+                    }
+                    candidates.push(key);
                 }
-                candidates.push(key);
             }
         }
     }
@@ -1784,36 +1877,42 @@ impl SsboSnapshotCache {
             input_mutation_epoch: 0,
             resource_mutation_epoch: 0,
             last_packed_cbuf: None,
-            entries: HashMap::new(),
-            full_watch_ranges: HashMap::new(),
-            input_entries: HashMap::new(),
-            input_sources: HashMap::new(),
-            input_cbuf_covering: HashMap::new(),
-            input_gpu_pages: HashMap::new(),
-            input_cpu_pages: HashMap::new(),
+            entries: FastMap::default(),
+            full_watch_ranges: FastMap::default(),
+            input_entries: FastMap::default(),
+            input_sources: FastMap::default(),
+            input_cbuf_covering: FastMap::default(),
+            input_gpu_pages: FastMap::default(),
+            input_cpu_pages: FastMap::default(),
+            input_gpu_superpages: FastMap::default(),
+            input_cpu_superpages: FastMap::default(),
+            ssbo_entry_cpu: FastMap::default(),
             input_invalidation_candidates: Vec::new(),
-            input_invalidation_seen: HashSet::new(),
+            input_invalidation_seen: FastSet::default(),
             input_order: VecDeque::new(),
             input_bytes: 0,
             input_next_serial: 0,
             last_input: None,
             recent_cbuf_requests: [None; RECENT_CBUF_REQUEST_CAPACITY],
-            recent_cbuf_request_index: HashMap::new(),
+            recent_cbuf_request_index: FastMap::default(),
             recent_cbuf_cursor: 0,
             deferred_gpu_writes: Vec::new(),
             deferred_patched_writes: Vec::new(),
             input_max_bytes,
             input_max_entries,
-            prepared_index_entries: HashMap::new(),
+            prepared_index_entries: FastMap::default(),
             prepared_index_order: VecDeque::new(),
             prepared_index_bytes: 0,
             prepared_index_next_serial: 0,
             prepared_index_max_bytes: PREPARED_INDEX_CACHE_MAX_BYTES,
             prepared_index_max_entries: PREPARED_INDEX_CACHE_MAX_ENTRIES,
             prepared_texture_snapshots: PreparedTextureSnapshotMemo::new(),
-            prepared_tic_plans: HashMap::new(),
+            prepared_texture_bounds: None,
+            prepared_tic_plans: FastMap::default(),
             input_profile: input_cache_profile_enabled(),
             watch_query_ranges: Vec::new(),
+            input_sweep_kick: 0,
+            idle_input_scratch: Vec::new(),
             input_gpu_bounds: (u64::MAX, 0),
             input_cpu_bounds: (u64::MAX, 0),
             ssbo_gpu_bounds: (u64::MAX, 0),
@@ -2071,6 +2170,7 @@ impl SsboSnapshotCache {
             }
             super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_ENTRY, 1);
             self.last_input = Some(identity);
+            self.touch_input_entry(identity.range);
             return Some(data);
         }
         if self.input_profile {
@@ -2213,6 +2313,7 @@ impl SsboSnapshotCache {
             }
             super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_ENTRY, 1);
             self.last_input = Some(identity);
+            self.touch_input_entry(identity.range);
             self.index_cbuf_covering_range(key);
             self.remember_recent_cbuf_request(gpu_addr, len, mapping_epoch, identity, 0);
             return Some(InputSnapshot {
@@ -2240,6 +2341,7 @@ impl SsboSnapshotCache {
                     }
                     super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_COVER, 1);
                     self.last_input = Some(identity);
+                    self.touch_input_entry(identity.range);
                     self.index_cbuf_covering_range(covering_key);
                     self.remember_recent_cbuf_request(gpu_addr, len, mapping_epoch, identity, 0);
                     return Some(InputSnapshot {
@@ -2255,6 +2357,7 @@ impl SsboSnapshotCache {
             }
             super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_COVER, 1);
             self.last_input = Some(identity);
+            self.touch_input_entry(identity.range);
             self.remember_recent_cbuf_request(
                 gpu_addr,
                 len,
@@ -2365,6 +2468,7 @@ impl SsboSnapshotCache {
         let entry = self.input_entries.get(&range).unwrap();
         let data = entry.data.clone();
         self.last_input = Some(recent.identity);
+        self.touch_input_entry(recent.identity.range);
         Some((
             InputSnapshot {
                 data,
@@ -2510,7 +2614,7 @@ impl SsboSnapshotCache {
     }
 
     fn index_input_page_range(
-        index: &mut HashMap<u64, Vec<InputRangeKey>>,
+        index: &mut FastMap<u64, Vec<InputRangeKey>>,
         addr: u64,
         len: usize,
         key: InputRangeKey,
@@ -2524,7 +2628,7 @@ impl SsboSnapshotCache {
     }
 
     fn remove_input_page_range(
-        index: &mut HashMap<u64, Vec<InputRangeKey>>,
+        index: &mut FastMap<u64, Vec<InputRangeKey>>,
         addr: u64,
         len: usize,
         key: InputRangeKey,
@@ -2551,12 +2655,26 @@ impl SsboSnapshotCache {
             watch_range.len,
             key,
         );
+        adjust_input_superpages(&mut self.input_gpu_superpages, key.gpu_addr, key.len, 1);
+        adjust_input_superpages(
+            &mut self.input_cpu_superpages,
+            watch_range.cpu_addr,
+            watch_range.len,
+            1,
+        );
     }
 
     fn remove_input_entry(&mut self, key: InputRangeKey) -> Option<InputRangeEntry> {
         self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
         let entry = self.input_entries.remove(&key)?;
         self.input_bytes = self.input_bytes.saturating_sub(entry.data.len());
+        adjust_input_superpages(&mut self.input_gpu_superpages, key.gpu_addr, key.len, -1);
+        adjust_input_superpages(
+            &mut self.input_cpu_superpages,
+            entry.watch_range.cpu_addr,
+            entry.watch_range.len,
+            -1,
+        );
         Self::remove_input_page_range(&mut self.input_gpu_pages, key.gpu_addr, key.len, key);
         Self::remove_input_page_range(
             &mut self.input_cpu_pages,
@@ -2598,6 +2716,7 @@ impl SsboSnapshotCache {
             let gpu_complete = span.gpu_addr.is_none_or(|addr| {
                 collect_input_page_candidates(
                     &self.input_gpu_pages,
+                    &self.input_gpu_superpages,
                     addr,
                     span.len,
                     &mut queried_pages,
@@ -2614,6 +2733,7 @@ impl SsboSnapshotCache {
             let cpu_complete = span.cpu_addr.is_none_or(|addr| {
                 collect_input_page_candidates(
                     &self.input_cpu_pages,
+                    &self.input_cpu_superpages,
                     addr,
                     span.len,
                     &mut queried_pages,
@@ -3041,6 +3161,7 @@ impl SsboSnapshotCache {
                 data,
                 watch_range,
                 serial,
+                last_used_kick: self.input_sweep_kick,
             },
         );
         self.index_input_entry(key, watch_range);
@@ -3190,13 +3311,59 @@ impl SsboSnapshotCache {
         self.watch_query_ranges = ranges;
     }
 
+    fn touch_input_entry(&mut self, key: InputRangeKey) {
+        let kick = self.input_sweep_kick;
+        if let Some(entry) = self.input_entries.get_mut(&key) {
+            entry.last_used_kick = kick;
+        }
+    }
+
+    fn evict_idle_input_entries(&mut self, kick: u64, window: u64) -> usize {
+        let mut idle = std::mem::take(&mut self.idle_input_scratch);
+        idle.clear();
+        idle.extend(
+            self.input_entries
+                .iter()
+                .filter(|(_, entry)| kick.wrapping_sub(entry.last_used_kick) > window)
+                .map(|(key, _)| *key),
+        );
+        let evicted = idle.len();
+        for key in idle.drain(..) {
+            self.remove_input_entry(key);
+        }
+        self.idle_input_scratch = idle;
+        evicted
+    }
+
     pub(crate) fn refresh_input_guest_writes(&mut self) {
         let kp = super::pusher::kickprof::start();
         let before = self.input_entries.len();
+        self.input_sweep_kick = self.input_sweep_kick.wrapping_add(1);
+        let kick = self.input_sweep_kick;
+        let evicted = match input_idle_kicks() {
+            Some(window) if !input_sweep_all_enabled() => {
+                self.evict_idle_input_entries(kick, window)
+            }
+            _ => 0,
+        };
         let mut ranges = std::mem::take(&mut self.watch_query_ranges);
         ranges.clear();
         ranges.extend(self.input_entries.values().map(|entry| entry.watch_range));
         coalesce_host_watch_ranges(&mut ranges);
+        if super::pusher::kickprof::rate_enabled() && kick % 1024 == 0 {
+            let pages: usize = ranges
+                .iter()
+                .map(|range| range.len.div_ceil(MIRROR_PAGE_SIZE))
+                .sum();
+            log::warn!(
+                "[input-sweep] kick={} entries={} evicted_idle={} ranges={} pages={}",
+                kick,
+                self.input_entries.len(),
+                evicted,
+                ranges.len(),
+                pages
+            );
+        }
         let mut dirty_spans: Vec<(u64, usize)> = Vec::new();
         for range in ranges.iter().copied() {
             match nexium_memory::fastmem::take_write_watch_spans(
@@ -3437,6 +3604,7 @@ impl SsboSnapshotCache {
 
     pub(crate) fn mirror_cbuf_barrier_bump(&mut self) {
         self.mirror.cbuf_barrier_gen = self.mirror.cbuf_barrier_gen.wrapping_add(1);
+        self.mirror.bump_sweep();
     }
 
     fn mirror_cbuf_barrier_resync(&mut self, forward_spans: &mut Vec<(u64, usize)>) {
@@ -3528,9 +3696,8 @@ impl SsboSnapshotCache {
             let current = if barrier_mode {
                 chunk.cbuf_barrier_seen == barrier_gen
             } else {
-                let observed_write_serial = nexium_memory::fastmem::observed_write_serial();
                 chunk.cbuf_swept_gen == sweep_gen
-                    && chunk.cbuf_observed_write_serial == observed_write_serial
+                    && MirrorPageCache::cbuf_chunk_unchanged_since_observation(chunk, chunk_base)
             };
             if !current && !MirrorPageCache::sync_cbuf_write_watch(chunk, chunk_base, forward_spans)
             {
@@ -3550,8 +3717,7 @@ impl SsboSnapshotCache {
                     if barrier_mode {
                         break;
                     }
-                    let observed_write_serial = nexium_memory::fastmem::observed_write_serial();
-                    if chunk.cbuf_observed_write_serial == observed_write_serial {
+                    if MirrorPageCache::cbuf_chunk_unchanged_since_observation(chunk, chunk_base) {
                         break;
                     }
                     if !MirrorPageCache::sync_cbuf_write_watch(chunk, chunk_base, forward_spans) {
@@ -3613,11 +3779,20 @@ impl SsboSnapshotCache {
                 let recheck_base = chunk_base + (first_page * MIRROR_PAGE_SIZE) as u64;
                 let recheck_len = (last_page - first_page + 1) * MIRROR_PAGE_SIZE;
                 let pre_spans = forward_spans.len();
-                let observation = nexium_memory::fastmem::take_write_watch_spans_observed(
-                    recheck_base,
-                    recheck_len,
-                    forward_spans,
-                );
+                let observation = if cbuf_recheck_enabled() {
+                    nexium_memory::fastmem::take_write_watch_spans_observed(
+                        recheck_base,
+                        recheck_len,
+                        forward_spans,
+                    )
+                } else {
+                    nexium_memory::fastmem::WriteWatchObservation {
+                        result: nexium_memory::fastmem::WriteWatchResult::Clean,
+                        serial_after: serial_before,
+                        generation_before,
+                        generation_after: generation_before,
+                    }
+                };
                 match observation.result {
                     nexium_memory::fastmem::WriteWatchResult::Clean => {
                         if observation.generation_before != generation_before
@@ -4213,11 +4388,50 @@ impl SsboSnapshotCache {
         self.invalidate_cpu_spans_inner(spans);
     }
 
+    fn refresh_prepared_texture_bounds(&mut self) {
+        let mut bounds: Option<(u64, u64, u64, u64)> = None;
+        for key in self.prepared_texture_snapshots.keys() {
+            let cpu_hi = key.cpu_va.saturating_add(key.len as u64);
+            let gpu_hi = key.gpu_va.saturating_add(key.len as u64);
+            bounds = Some(match bounds {
+                None => (key.cpu_va, cpu_hi, key.gpu_va, gpu_hi),
+                Some((clo, chi, glo, ghi)) => (
+                    clo.min(key.cpu_va),
+                    chi.max(cpu_hi),
+                    glo.min(key.gpu_va),
+                    ghi.max(gpu_hi),
+                ),
+            });
+        }
+        self.prepared_texture_bounds = bounds;
+    }
+
+    fn prepared_texture_spans_may_overlap(
+        &self,
+        gpu_spans: &[(u64, usize)],
+        cpu_spans: &[(u64, usize)],
+    ) -> bool {
+        let Some((cpu_lo, cpu_hi, gpu_lo, gpu_hi)) = self.prepared_texture_bounds else {
+            return !self.prepared_texture_snapshots.is_empty();
+        };
+        gpu_spans
+            .iter()
+            .any(|&(addr, len)| addr < gpu_hi && addr.saturating_add(len as u64) > gpu_lo)
+            || cpu_spans
+                .iter()
+                .any(|&(addr, len)| addr < cpu_hi && addr.saturating_add(len as u64) > cpu_lo)
+    }
+
     fn invalidate_prepared_texture_spans(
         &mut self,
         gpu_spans: &[(u64, usize)],
         cpu_spans: &[(u64, usize)],
     ) {
+        if self.prepared_texture_snapshots.is_empty()
+            || !self.prepared_texture_spans_may_overlap(gpu_spans, cpu_spans)
+        {
+            return;
+        }
         self.prepared_texture_snapshots.retain(|key, _| {
             !gpu_spans
                 .iter()
@@ -4319,6 +4533,8 @@ impl SsboSnapshotCache {
         self.input_cbuf_covering.clear();
         self.input_gpu_pages.clear();
         self.input_cpu_pages.clear();
+        self.input_gpu_superpages.clear();
+        self.input_cpu_superpages.clear();
         self.input_invalidation_candidates.clear();
         self.input_invalidation_seen.clear();
         self.input_order.clear();
@@ -4347,6 +4563,43 @@ impl SsboSnapshotCache {
     }
 
     pub(crate) fn clear_prepared_texture_snapshots(&mut self) {
+        if super::pusher::kickprof::rate_enabled() && self.input_sweep_kick % 1024 == 512 {
+            let mut ranges: Vec<HostWatchRange> = self
+                .prepared_texture_snapshots
+                .keys()
+                .filter_map(|key| HostWatchRange::write_watch(key.cpu_va, key.len))
+                .collect();
+            let keys = ranges.len();
+            coalesce_host_watch_ranges(&mut ranges);
+            let pages: usize = ranges
+                .iter()
+                .map(|range| range.len.div_ceil(MIRROR_PAGE_SIZE))
+                .sum();
+            log::warn!(
+                "[texture-fetch] kick={} keys={} ranges={} pages={} fetch_hit={} miss={} stale={} stale_avoided={} stale_own={}/{}MiB stale_neighbour={}/{}MiB",
+                self.input_sweep_kick,
+                keys,
+                ranges.len(),
+                pages,
+                TEX_FETCH_HIT.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_FETCH_MISS.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_FETCH_STALE.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_STALE_AVOIDED.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_STALE_OWN.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_STALE_OWN_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+                TEX_STALE_NEIGHBOUR.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_STALE_NEIGHBOUR_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20
+            );
+            log::warn!(
+                "[texture-stale-top] gpu={} gpu_avoided={} commit={} host_changed_pages={} of {} | {}",
+                TEX_STALE_GPU.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_STALE_GPU_AVOIDED.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_STALE_COMMIT.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_STALE_CHANGED_PAGES.load(std::sync::atomic::Ordering::Relaxed),
+                TEX_STALE_TOTAL_PAGES.load(std::sync::atomic::Ordering::Relaxed),
+                stale_texture_report()
+            );
+        }
         self.prepared_texture_snapshots.clear();
     }
 
@@ -4447,30 +4700,60 @@ impl SsboSnapshotCache {
                     span_hits_bounds(self.ssbo_cpu_bounds, cpu_addr, len)
                 }));
         let input_possible = !self.input_entries.is_empty()
-            && (writes
-                .iter()
-                .any(|&(gpu_addr, len)| span_hits_bounds(self.input_gpu_bounds, gpu_addr, len))
-                || mapped_writes.iter().any(|&(_, cpu_addr, len)| {
-                    span_hits_bounds(self.input_cpu_bounds, cpu_addr, len)
-                }));
+            && (writes.iter().any(|&(gpu_addr, len)| {
+                span_hits_bounds(self.input_gpu_bounds, gpu_addr, len)
+                    && span_hits_superpages(&self.input_gpu_superpages, gpu_addr, len)
+            }) || mapped_writes.iter().any(|&(_, cpu_addr, len)| {
+                span_hits_bounds(self.input_cpu_bounds, cpu_addr, len)
+                    && span_hits_superpages(&self.input_cpu_superpages, cpu_addr, len)
+            }));
         if ssbo_possible {
+            let mapping_generation = mappings.generation();
+            let has_mapped_writes = !mapped_writes.is_empty();
+            let entry_cpu_cache = &mut self.ssbo_entry_cpu;
+            let mut removed = false;
             self.entries.retain(|key, _| {
                 let entry_gpu = key.guest_addr.saturating_add(key.data_offset as u64);
-                let entry_cpu = mappings.cpu_address_for(entry_gpu).or_else(|| {
-                    mappings
-                        .cpu_address_for_any32(entry_gpu)
-                        .map(|(_, cpu, _)| cpu)
-                });
-                !writes.iter().any(|&(gpu_addr, len)| {
+                if writes.iter().any(|&(gpu_addr, len)| {
                     byte_ranges_overlap(entry_gpu, key.read_len, gpu_addr, len)
-                }) && !entry_cpu.is_some_and(|entry_cpu| {
+                }) {
+                    removed = true;
+                    return false;
+                }
+                if !has_mapped_writes {
+                    return true;
+                }
+                let entry_cpu = match entry_cpu_cache.get(key) {
+                    Some((generation, cpu)) if *generation == mapping_generation => *cpu,
+                    _ => {
+                        let cpu = mappings.cpu_address_for(entry_gpu).or_else(|| {
+                            mappings
+                                .cpu_address_for_any32(entry_gpu)
+                                .map(|(_, cpu, _)| cpu)
+                        });
+                        entry_cpu_cache.insert(*key, (mapping_generation, cpu));
+                        cpu
+                    }
+                };
+                let keep = !entry_cpu.is_some_and(|entry_cpu| {
                     mapped_writes.iter().any(|&(_, write_cpu, len)| {
                         byte_ranges_overlap(entry_cpu, key.read_len, write_cpu, len)
                     })
-                })
+                });
+                if !keep {
+                    removed = true;
+                }
+                keep
             });
-            self.full_watch_ranges
-                .retain(|key, _| self.entries.contains_key(key));
+            if removed {
+                self.full_watch_ranges
+                    .retain(|key, _| self.entries.contains_key(key));
+                if self.ssbo_entry_cpu.len() > self.entries.len().saturating_mul(2).max(64) {
+                    let entries = &self.entries;
+                    self.ssbo_entry_cpu
+                        .retain(|key, _| entries.contains_key(key));
+                }
+            }
         }
         if input_possible {
             let mut input_spans = Vec::with_capacity(writes.len() + mapped_writes.len());
@@ -4767,7 +5050,7 @@ fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
     )
 }
 
-fn tic_can_alias_render_target_view(tic: &nexium_gpu::texture::TicEntry) -> bool {
+pub(crate) fn tic_can_alias_render_target_view(tic: &nexium_gpu::texture::TicEntry) -> bool {
     let supported_shape = match tic.texture_type {
         0 => tic.height == 1 && tic.depth == 1,
         1 | 4 | 5 | 7 => tic.depth == 1,
@@ -4791,7 +5074,7 @@ fn tic_can_alias_render_target_view(tic: &nexium_gpu::texture::TicEntry) -> bool
         && tic_can_alias_render_target(tic.format)
 }
 
-fn with_tic_rt_alias_layout(key: RtKey, tic: &nexium_gpu::texture::TicEntry) -> RtKey {
+pub(crate) fn with_tic_rt_alias_layout(key: RtKey, tic: &nexium_gpu::texture::TicEntry) -> RtKey {
     if tic.is_block_linear {
         key.with_block_linear_layout(
             tic.block_width_log2,
@@ -5129,6 +5412,7 @@ pub(crate) fn enqueue_draws(
     let mut rt_signature_memo: Option<(RtBindingSignature, u64)> = None;
     let mut derived_state_cache = DrawDerivedStateCache::new(draw_derived_cache_enabled());
     for draw in draws {
+        trace_depth_target_request(draw, mappings);
         if let Some(probe) = compute_probe.as_deref_mut() {
             probe.record_request(draw);
         }
@@ -5594,6 +5878,60 @@ fn strict_cond_render() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_STRICT_COND_RENDER").is_some())
 }
 
+fn trace_depth_target_request(draw: &DrawCall, mappings: &GpuMappings) {
+    static CONFIG: OnceLock<(Option<u64>, u64)> = OnceLock::new();
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (target, limit) = CONFIG.get_or_init(|| {
+        (
+            std::env::var("NEXIUM_DEPTH_TARGET_TRACE")
+                .ok()
+                .and_then(|value| parse_env_u64(&value)),
+            std::env::var("NEXIUM_DEPTH_TARGET_TRACE_LIMIT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(256),
+        )
+    });
+    let Some(target) = *target else {
+        return;
+    };
+    let zeta_va = (u64::from(draw.zeta.address_hi) << 32) | u64::from(draw.zeta.address_lo);
+    if zeta_va != target || (!draw.zeta_enable && !(draw.is_clear && draw.clear_mask & 0x3 != 0)) {
+        return;
+    }
+    let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count >= *limit {
+        return;
+    }
+    let rt_slot = if draw.is_clear {
+        ((draw.clear_mask >> 6) & 0xf).min(7) as usize
+    } else {
+        draw_color_rt_slot(draw)
+    };
+    let rt = &draw.rt[rt_slot];
+    let rt_va = (u64::from(rt.address_hi) << 32) | u64::from(rt.address_lo);
+    let fs = &draw.shader_programs[5];
+    let vs = &draw.shader_programs[1];
+    log::warn!(
+        "[depth-request] op={} #{} clear={} drawtex={} mask={:#x} rtctl={:#x} rt{}={}x{}@{:#x}/fmt{:#x}/mapped{} zeta={}x{}@{:#x}/fmt{:#x}/tile{:#x}/enabled{}/mapped{} depth={}/{}/func{:#x}/mode{} clear_depth={} fs={:#x}/enabled{} vs={:#x}/enabled{} v={} i={} indexed={} vp_en={} vp={:?} scissor={}:({},{})->({},{}) clip=({},{} {}x{}) render_enable={}/override{} cull={}/{:#x}/front{:#x}",
+        next_gpu_op_seq(), count, draw.is_clear, draw.draw_texture.is_some(), draw.clear_mask,
+        draw.rt_control, rt_slot, rt.width, rt.height, rt_va, rt.format,
+        mappings.nvmap_id_for(rt_va).is_some(),
+        draw.zeta.width, draw.zeta.height, zeta_va, draw.zeta.format, draw.zeta.block_size,
+        draw.zeta_enable, mappings.nvmap_id_for(zeta_va).is_some(),
+        draw.depth_test_enable, draw.depth_write_enable, draw.depth_func, draw.depth_mode,
+        draw.clear_depth, draw.program_region_gpu_va.wrapping_add(u64::from(fs.address_lo)),
+        fs.enabled, draw.program_region_gpu_va.wrapping_add(u64::from(vs.address_lo)),
+        vs.enabled, draw.vertex_count, draw.index_count, draw.indexed,
+        draw.viewport_transform_en, draw.viewport,
+        draw.scissor.enabled, draw.scissor.min_x, draw.scissor.min_y,
+        draw.scissor.max_x, draw.scissor.max_y,
+        draw.surface_clip.x, draw.surface_clip.y, draw.surface_clip.width, draw.surface_clip.height,
+        draw.render_enable_mode, draw.render_enable_override,
+        draw.cull_test_enable, draw.cull_face, draw.front_face,
+    );
+}
+
 fn bump_draw_drop(kind: usize, detail: &str) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTS: [AtomicU64; 4] = [
@@ -5857,7 +6195,7 @@ fn flush_accum_with_boundary(
     let mut prepared_tic_plans = if persist_tic_plans {
         std::mem::take(&mut snapshot_cache.prepared_tic_plans)
     } else {
-        HashMap::new()
+        FastMap::default()
     };
     let writeback = writeback_cube_sample_dependencies(
         batch,
@@ -6304,6 +6642,7 @@ fn flush_batch(
         }
     }
     snapshot_cache.prepared_texture_snapshots = prepared_texture_snapshots;
+    snapshot_cache.refresh_prepared_texture_bounds();
     (n, completed)
 }
 
@@ -6691,7 +7030,7 @@ fn derive_prepared_tic_texture_plan(
 }
 
 fn memoized_prepared_tic_plan(
-    plans: &mut HashMap<u64, PreparedTicPlan>,
+    plans: &mut FastMap<u64, PreparedTicPlan>,
     tic_addr: u64,
     raw: [u8; 32],
     mappings: &GpuMappings,
@@ -6720,7 +7059,9 @@ fn memoized_prepared_tic_plan(
 
 struct TextureSnapshotCacheEntry {
     gpu_generation: u64,
+    gpu_bump_serial: u64,
     host_generation: u64,
+    host_generation_precise: u64,
     commit_generation: u64,
     trusted_identity: u64,
     serial: u64,
@@ -6785,16 +7126,58 @@ impl TextureSnapshotCache {
         host_generation: u64,
         commit_generation: u64,
     ) -> TextureSnapshotCacheLookup {
-        match self.entries.get(&key) {
-            Some(entry)
-                if entry.gpu_generation == gpu_generation
-                    && entry.host_generation == host_generation
-                    && entry.commit_generation == commit_generation =>
-            {
-                return TextureSnapshotCacheLookup::Hit(entry.data.clone(), entry.trusted_identity);
+        let hit = match self.entries.get_mut(&key) {
+            Some(entry) if entry.commit_generation == commit_generation => {
+                let gpu_current = entry.gpu_generation == gpu_generation
+                    || if nexium_gpu::tex_invalidate::region_bumped_since(
+                        key.gpu_va,
+                        key.len as u64,
+                        entry.gpu_bump_serial,
+                    ) {
+                        TEX_STALE_GPU.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        false
+                    } else {
+                        entry.gpu_generation = gpu_generation;
+                        entry.gpu_bump_serial = nexium_gpu::tex_invalidate::bump_serial();
+                        TEX_STALE_GPU_AVOIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        true
+                    };
+                if !gpu_current {
+                    None
+                } else if entry.host_generation == host_generation {
+                    Some((entry.data.clone(), entry.trusted_identity))
+                } else {
+                    let precise = nexium_memory::fastmem::observed_write_generation_pages(
+                        key.cpu_va, key.len,
+                    );
+                    if precise == entry.host_generation_precise {
+                        entry.host_generation = host_generation;
+                        TEX_STALE_AVOIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Some((entry.data.clone(), entry.trusted_identity))
+                    } else {
+                        let changed = nexium_memory::fastmem::observed_write_pages_changed_since(
+                            key.cpu_va,
+                            key.len,
+                            entry.host_generation_precise,
+                        );
+                        TEX_STALE_CHANGED_PAGES
+                            .fetch_add(changed as u64, std::sync::atomic::Ordering::Relaxed);
+                        TEX_STALE_TOTAL_PAGES.fetch_add(
+                            key.len.div_ceil(4096) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        None
+                    }
+                }
             }
-            Some(_) => {}
+            Some(_) => {
+                TEX_STALE_COMMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
             None => return TextureSnapshotCacheLookup::Miss,
+        };
+        if let Some((data, trusted_identity)) = hit {
+            return TextureSnapshotCacheLookup::Hit(data, trusted_identity);
         }
         self.remove(key);
         TextureSnapshotCacheLookup::Stale
@@ -6822,7 +7205,11 @@ impl TextureSnapshotCache {
             key,
             TextureSnapshotCacheEntry {
                 gpu_generation,
+                gpu_bump_serial: nexium_gpu::tex_invalidate::bump_serial(),
                 host_generation,
+                host_generation_precise: nexium_memory::fastmem::observed_write_generation_pages(
+                    key.cpu_va, key.len,
+                ),
                 commit_generation,
                 trusted_identity,
                 serial,
@@ -6862,8 +7249,80 @@ fn next_texture_snapshot_identity() -> u64 {
         .max(1)
 }
 
+fn observed_texture_host_generation(key: TextureSnapshotCacheKey) -> u64 {
+    nexium_memory::fastmem::observed_write_generation_range(key.cpu_va, key.len)
+}
+
+static TEX_FETCH_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_FETCH_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_FETCH_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static TEX_STALE_AVOIDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_GPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_GPU_AVOIDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_COMMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_CHANGED_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_TOTAL_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_KEYS: OnceLock<Mutex<HashMap<(u64, usize, u32), (u64, u64)>>> = OnceLock::new();
+
+fn note_stale_texture(key: TextureSnapshotCacheKey, own: bool) {
+    let mut keys = TEX_STALE_KEYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    let entry = keys
+        .entry((key.cpu_va, key.len, key.nvmap_id))
+        .or_insert((0, 0));
+    if own {
+        entry.0 += 1;
+    } else {
+        entry.1 += 1;
+    }
+}
+
+fn stale_texture_report() -> String {
+    let keys = TEX_STALE_KEYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    let mut top: Vec<_> = keys.iter().map(|(k, v)| (*k, *v)).collect();
+    top.sort_by_key(|((_, len, _), (own, neighbour))| {
+        std::cmp::Reverse((own + neighbour) * *len as u64)
+    });
+    top.iter()
+        .take(6)
+        .map(|((cpu_va, len, nvmap), (own, neighbour))| {
+            format!("{cpu_va:#x}+{len:#x}@{nvmap}:own{own}/nb{neighbour}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+static TEX_STALE_OWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_OWN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_NEIGHBOUR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_STALE_NEIGHBOUR_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static TEXTURE_QUERY_SPANS: std::cell::RefCell<Vec<(u64, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static TEXTURE_QUERY_OWN_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn take_texture_host_generation(key: TextureSnapshotCacheKey) -> Option<u64> {
-    match nexium_memory::fastmem::take_write_watch(key.cpu_va, key.len) {
+    let result = TEXTURE_QUERY_SPANS.with(|spans| {
+        let mut spans = spans.borrow_mut();
+        spans.clear();
+        let result =
+            nexium_memory::fastmem::take_write_watch_spans(key.cpu_va, key.len, &mut spans);
+        let end = key.cpu_va.saturating_add(key.len as u64);
+        let own_dirty = spans
+            .iter()
+            .any(|&(addr, len)| addr < end && addr.saturating_add(len as u64) > key.cpu_va);
+        TEXTURE_QUERY_OWN_DIRTY.with(|flag| flag.set(own_dirty));
+        result
+    });
+    match result {
         nexium_memory::fastmem::WriteWatchResult::Clean
         | nexium_memory::fastmem::WriteWatchResult::Dirty => Some(
             nexium_memory::fastmem::observed_write_generation_range(key.cpu_va, key.len),
@@ -7506,13 +7965,14 @@ fn fetch_texture_snapshot(
             };
             match data {
                 TextureSnapshotCacheLookup::Hit(data, trusted_identity) => {
+                    TEX_FETCH_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let after_gpu_generation =
                         nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
                     let after_commit_generation = nexium_memory::fastmem::commit_generation();
-                    let after_host_generation = take_texture_host_generation(cache_key);
+                    let after_host_generation = observed_texture_host_generation(cache_key);
                     if after_gpu_generation == initial_gpu_generation
                         && after_commit_generation == initial_commit_generation
-                        && after_host_generation == Some(initial_host_generation)
+                        && after_host_generation == initial_host_generation
                     {
                         super::pusher::kickprof::count_sized(
                             super::pusher::kickprof::PREP_TEX_CACHE_HIT,
@@ -7531,16 +7991,33 @@ fn fetch_texture_snapshot(
                     cache.set_owner(cache_owner);
                     cache.remove(cache_key);
                 }
-                TextureSnapshotCacheLookup::Miss => super::pusher::kickprof::count_sized(
-                    super::pusher::kickprof::PREP_TEX_CACHE_MISS,
-                    1,
-                    len,
-                ),
-                TextureSnapshotCacheLookup::Stale => super::pusher::kickprof::count_sized(
-                    super::pusher::kickprof::PREP_TEX_CACHE_STALE,
-                    1,
-                    len,
-                ),
+                TextureSnapshotCacheLookup::Miss => {
+                    TEX_FETCH_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    super::pusher::kickprof::count_sized(
+                        super::pusher::kickprof::PREP_TEX_CACHE_MISS,
+                        1,
+                        len,
+                    )
+                }
+                TextureSnapshotCacheLookup::Stale => {
+                    TEX_FETCH_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let own = TEXTURE_QUERY_OWN_DIRTY.with(|flag| flag.get());
+                    note_stale_texture(cache_key, own);
+                    if own {
+                        TEX_STALE_OWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        TEX_STALE_OWN_BYTES
+                            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        TEX_STALE_NEIGHBOUR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        TEX_STALE_NEIGHBOUR_BYTES
+                            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    super::pusher::kickprof::count_sized(
+                        super::pusher::kickprof::PREP_TEX_CACHE_STALE,
+                        1,
+                        len,
+                    )
+                }
             }
         } else {
             super::pusher::kickprof::count_sized(
@@ -8248,6 +8725,7 @@ pub(crate) struct PreparedDrawBatch {
     hard_after: Arc<std::sync::atomic::AtomicBool>,
     fermi_exact_snapshot_leases: Vec<u64>,
     fermi_exact_snapshot_leases_transferred: bool,
+    retained_bytes: std::cell::OnceCell<usize>,
 }
 
 impl PreparedDrawBatch {
@@ -8260,8 +8738,14 @@ impl PreparedDrawBatch {
     }
 
     pub(crate) fn snapshot_retained_bytes_upper_bound(&self) -> usize {
-        let mut seen = HashSet::<*const Vec<u8>>::new();
-        let mut seen_arenas = HashSet::<*const nexium_gpu::draw::ResidentCbufArena>::new();
+        *self
+            .retained_bytes
+            .get_or_init(|| self.compute_snapshot_retained_bytes_upper_bound())
+    }
+
+    fn compute_snapshot_retained_bytes_upper_bound(&self) -> usize {
+        let mut seen = FastSet::<*const Vec<u8>>::default();
+        let mut seen_arenas = FastSet::<*const nexium_gpu::draw::ResidentCbufArena>::default();
         let mut bytes = 0usize;
         let mut arena_bytes = 0usize;
         let mut charge = |data: &Arc<Vec<u8>>| {
@@ -8684,7 +9168,7 @@ fn prepare_draw_batch_async(
     let mut prepared_tic_plans = if persist_tic_plans {
         std::mem::take(&mut snapshot_cache.prepared_tic_plans)
     } else {
-        HashMap::new()
+        FastMap::default()
     };
     let mut fermi_exact_snapshot_lease_by_token = HashMap::new();
     let mut fermi_exact_snapshot_leases = Vec::new();
@@ -9266,6 +9750,7 @@ fn prepare_draw_batch_async(
         hard_after: Arc::new(std::sync::atomic::AtomicBool::new(hard_after)),
         fermi_exact_snapshot_leases,
         fermi_exact_snapshot_leases_transferred: false,
+        retained_bytes: std::cell::OnceCell::new(),
     }
 }
 
@@ -9288,6 +9773,7 @@ fn prepare_clear_batch(
         hard_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fermi_exact_snapshot_leases: Vec::new(),
         fermi_exact_snapshot_leases_transferred: false,
+        retained_bytes: std::cell::OnceCell::new(),
     }
 }
 
@@ -9546,6 +10032,10 @@ fn y_direction_key(lower_left: bool) -> u32 {
     (lower_left as u32) << 31
 }
 
+fn fragment_depth_key(writes_depth: bool) -> u32 {
+    (writes_depth as u32) << 30
+}
+
 fn layer_output_shader_key(slot: Option<u32>) -> u32 {
     slot.map_or(0, |slot| ((slot & 0xff) + 1) << 18)
 }
@@ -9580,6 +10070,7 @@ struct FragmentTextureNumericMetadata {
     texture_ids: Vec<u32>,
     descriptor_ids: Vec<u32>,
     sampled_ids: Vec<u32>,
+    sampled_only_ids: Vec<u32>,
     buffer_candidates: Vec<u32>,
     image_kinds: Vec<(u32, GraphicsTextureImageKind)>,
     sampler_arrayed: bool,
@@ -9599,6 +10090,7 @@ struct GraphicsTextureLayout {
     vs_tex_base: u32,
     vs_tex_count: u32,
     manifest: Vec<TextureNumericBinding>,
+    texture_sampled_only_mask: u32,
     fs_texel_buffer_mask: u32,
     vs_texel_buffer_mask: u32,
     fs_sampler_arrayed: bool,
@@ -10139,6 +10631,9 @@ fn texture_view_metadata_fingerprint(layout: &GraphicsTextureLayout) -> u64 {
         ^ (unnormalized_coords_mask as u64)
             .wrapping_mul(0x1656_67b1)
             .rotate_left(37)
+        ^ (layout.texture_sampled_only_mask as u64)
+            .wrapping_mul(0x9e37_79b1)
+            .rotate_left(53)
 }
 
 fn fragment_sprite_batch_mirror(layout: &GraphicsTextureLayout) -> bool {
@@ -10750,7 +11245,7 @@ fn collect_cube_sample_ranges_from_tic_addresses(
     tic_addresses: impl IntoIterator<Item = u64>,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-    prepared_tic_plans: &mut HashMap<u64, PreparedTicPlan>,
+    prepared_tic_plans: &mut FastMap<u64, PreparedTicPlan>,
 ) -> CubeSampleDependencies {
     let mut ranges = Vec::new();
     let mut texture_bases = Vec::new();
@@ -10958,7 +11453,7 @@ fn writeback_cube_sample_dependencies(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
-    prepared_tic_plans: &mut HashMap<u64, PreparedTicPlan>,
+    prepared_tic_plans: &mut FastMap<u64, PreparedTicPlan>,
     before_readback: impl FnOnce() -> bool,
 ) -> SmallRtWritebackResult {
     if small_rt_registry().lock().unwrap().entries.is_empty() {
@@ -11833,6 +12328,7 @@ fn execute_one_inner(
             super::pusher::kickprof::count(super::pusher::kickprof::CENSUS_SPH_STABLE, 1);
         }
     }
+    let fs_writes_depth = fs_sph.is_some_and(ps_writes_depth);
     trace_raw_rt_target(draw, mappings, vs_addr, fs_addr, fs_output_map);
     let color_targets =
         PreparedColorTargets::new(draw, mappings, rt_slot, rt_key, rt_format, fs_output_map);
@@ -12131,6 +12627,7 @@ fn execute_one_inner(
     let initial_numeric_key =
         shader_numeric_key(fragment_uint_output_mask, fragment_sint_output_mask)
             | (if texture_metadata_cached { 0 } else { 3 << 16 })
+            | fragment_depth_key(fs_writes_depth)
             | y_direction_key(draw.window_origin.lower_left())
             | layer_output_shader_key(layer_output_slot);
     let initial_manifest_fingerprint = texlay_hit
@@ -12434,6 +12931,7 @@ fn execute_one_inner(
             texture_layout = Some(Arc::new(resolved_texture_layout));
             shader_key.10 =
                 shader_numeric_key(fragment_uint_output_mask, fragment_sint_output_mask)
+                    | fragment_depth_key(fs_writes_depth)
                     | y_direction_key(draw.window_origin.lower_left())
                     | layer_output_shader_key(layer_output_slot);
             shader_key.11.resource_fingerprint = shader_resource_fingerprint(
@@ -12479,6 +12977,7 @@ fn execute_one_inner(
                 sint_attr_mask,
                 color_output_count,
                 fs_output_map,
+                fs_writes_depth as u32,
                 fs_debug_active_key as u32,
                 alpha_test_key,
                 draw.alpha_test_ref,
@@ -12654,6 +13153,7 @@ fn execute_one_inner(
                                     fs_texture_numeric_metadata.texture_ids.len() as u32,
                                 ),
                                 texel_buffer_mask: active_texture_layout.fs_texel_buffer_mask,
+                                writes_depth: fs_writes_depth,
                                 y_negate: draw.window_origin.lower_left(),
                                 varying_map,
                             },
@@ -12936,6 +13436,7 @@ fn execute_one_inner(
         ));
     }
     let texture_numeric_manifest = bundle.texture_numeric_manifest.clone();
+    let texture_sampled_only_mask = active_texture_layout.texture_sampled_only_mask;
     let texel_buffer_mask = active_texture_layout.texel_buffer_mask();
 
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX_A, enq_tex_sub);
@@ -13219,6 +13720,26 @@ fn execute_one_inner(
             let Some(tic) = tic_raw.and_then(|raw| tic_entry_for_alias(cached_tic, raw)) else {
                 continue;
             };
+            let sampled_only =
+                slot < u32::BITS as usize && texture_sampled_only_mask & (1 << slot) != 0;
+            let sampler = if sampled_only && tic.view_mip_levels() > 1 {
+                fs_sampler_ids.get(slot).and_then(|sampler_id| {
+                    if draw.tsc_pool_gpu_va == 0 || *sampler_id > draw.tsc_pool_limit {
+                        return None;
+                    }
+                    let address = draw
+                        .tsc_pool_gpu_va
+                        .checked_add(u64::from(*sampler_id).checked_mul(32)?)?;
+                    read_tic_raw(address, mappings, mem_read)
+                        .and_then(|raw| nexium_gpu::texture::TscEntry::parse(&raw))
+                })
+            } else {
+                None
+            };
+            let alias_tic =
+                nexium_gpu::texture::effective_rt_alias_view(tic, sampler.as_ref(), sampled_only);
+            let base_only_alias = tic.view_mip_levels() > 1 && alias_tic.view_mip_levels() == 1;
+            let tic = alias_tic;
             if mask_mrt_for_fs_texture(fs_addr, tic.gpu_va) {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static MASKED: AtomicU64 = AtomicU64::new(0);
@@ -13256,42 +13777,56 @@ fn execute_one_inner(
                     );
                 }
             }
-            let alias_key = if tic_can_alias_render_target_view(&tic) {
-                tic.sample_grid().and_then(|samples| {
-                    mappings
-                        .nvmap_id_for(tic.gpu_va)
-                        .zip(mappings.mapping_epoch_for(tic.gpu_va))
-                        .map(|(nv, mapping_epoch)| {
-                            let layers = if tic.texture_type == 2 {
-                                tic.depth.max(1)
-                            } else {
-                                1
-                            };
-                            let key = RtKey::with_cpu(
-                                nv,
-                                tic.width,
-                                tic.height,
-                                tic.gpu_va,
-                                mappings.cpu_address_for(tic.gpu_va).unwrap_or(0),
-                            )
-                            .with_mapping_epoch(mapping_epoch)
-                            .with_sample_grid(samples.width, samples.height)
-                            .with_volume_depth(layers);
-                            with_tic_rt_alias_layout(key, &tic).with_guest_size_bytes(
-                                nexium_gpu::texture::texture_guest_size_bytes(&tic, layers)
-                                    .and_then(|size| u64::try_from(size).ok())
-                                    .unwrap_or(0),
-                            )
-                        })
-                })
-            } else {
-                None
-            };
+            let direct_alias = tic_can_alias_render_target_view(&tic);
+            let alias_key =
+                if direct_alias || nexium_gpu::texture_mips::texture_rt_mip_candidate(&tic) {
+                    tic.sample_grid().and_then(|samples| {
+                        mappings
+                            .nvmap_id_for(tic.gpu_va)
+                            .zip(mappings.mapping_epoch_for(tic.gpu_va))
+                            .map(|(nv, mapping_epoch)| {
+                                let layers = if tic.texture_type == 2 {
+                                    tic.depth.max(1)
+                                } else {
+                                    1
+                                };
+                                let key = RtKey::with_cpu(
+                                    nv,
+                                    tic.width,
+                                    tic.height,
+                                    tic.gpu_va,
+                                    mappings.cpu_address_for(tic.gpu_va).unwrap_or(0),
+                                )
+                                .with_mapping_epoch(mapping_epoch)
+                                .with_sample_grid(samples.width, samples.height)
+                                .with_volume_depth(layers);
+                                let key = with_tic_rt_alias_layout(key, &tic);
+                                let guest_size = if base_only_alias {
+                                    nexium_gpu::texture::native_render_target_source_size(
+                                        key.width.saturating_mul(u32::from(key.sample_width)),
+                                        key.height.saturating_mul(u32::from(key.sample_height)),
+                                        layers,
+                                        tic.format.src_bpp(),
+                                        key.layout_signature,
+                                    )
+                                } else {
+                                    nexium_gpu::texture::texture_guest_size_bytes(&tic, layers)
+                                };
+                                key.with_guest_size_bytes(
+                                    guest_size
+                                        .and_then(|size| u64::try_from(size).ok())
+                                        .unwrap_or(0),
+                                )
+                            })
+                    })
+                } else {
+                    None
+                };
             let Some(key) = alias_key else {
                 continue;
             };
             sampled_rt_slots[slot] = Some(key);
-            if fermi_provenance_profile {
+            if fermi_provenance_profile && direct_alias {
                 record_fermi_provenance(
                     &tic,
                     key,
@@ -13690,7 +14225,7 @@ fn execute_one_inner(
                 & shader_mask,
         }
     });
-    if mask_all_mrt_outputs {
+    if mask_all_mrt_outputs || (fs_writes_depth && fs_output_map == 0) {
         for attachment in &mut attachments {
             attachment.color_write_mask = vk::ColorComponentFlags::empty();
         }
@@ -13775,6 +14310,8 @@ fn execute_one_inner(
         ),
         &blend_state,
         fs_output_map,
+        fs_writes_depth,
+        depth_key,
         &draw.color_blend.color_masks,
         draw.color_blend.color_mask_common,
         vs_cbuf_mask,
@@ -14050,6 +14587,7 @@ fn execute_one_inner(
             fold.u32(binding.image_kind as u32);
         }
         fold.u32(texel_buffer_mask);
+        fold.u32(texture_sampled_only_mask);
         fold.u32(depth_compare_2d_mask);
         fold.u32(depth_compare_cube_mask);
         fold.u32(depth_compare_cube_array_mask);
@@ -14130,6 +14668,7 @@ fn execute_one_inner(
             .as_ref()
             .is_some_and(|layout| fragment_sprite_batch_mirror(layout.as_ref())),
         texture_numeric_manifest,
+        texture_sampled_only_mask,
         texel_buffer_mask,
         vs_tex_base,
         vs_tex_count,
@@ -16789,6 +17328,8 @@ fn trace_draw(
     blend_raw: (bool, bool, u32, u32, u32, u32, u32, u32),
     blend: &BlendState,
     fs_output_map: u32,
+    fs_writes_depth: bool,
+    depth_key: Option<RtKey>,
     color_masks: &[u32; 8],
     color_mask_common: bool,
     vs_cbuf_mask: u64,
@@ -16950,7 +17491,7 @@ fn trace_draw(
     log::warn!(
         "[drawtrace] op={} #{} rt={} va={:#x} keys=[{}] {}x{} topo={} first={} v={} i={} indexed={} pos={} \
          vp_en={} vp={:?} scale=({:.3},{:.3},{:.3}) trans=({:.3},{:.3},{:.3}) clip=({},{} {}x{}) scissor={}:({},{})->({},{}) origin={:#x} ll={} fy={} sw={:#x}/{} \
-         depth={}/{} clamp={} vclip={:#x}/{} func={:#x} zeta={} zraw={:#x}/{}x{}/{:#x} progs=[{}] cull={} ff={:#x} \
+         depth={}/{} mode={} export={} zkey={:?} clamp={} vclip={:#x}/{} func={:#x} zeta={} zraw={:#x}/{}x{}/{:#x} progs=[{}] cull={} ff={:#x} \
          tex={:?} tics=[{}] sampled={:?} \
          blend={} per={} rgb=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
          a=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
@@ -16992,6 +17533,9 @@ fn trace_draw(
         draw.viewport.y_swizzle(),
         depth_test,
         depth_write,
+        draw.depth_mode,
+        fs_writes_depth,
+        depth_key,
         draw.viewport_clip_control.depth_clamp_enabled(),
         draw.viewport_clip_control.raw,
         draw.viewport_clip_control.geometry_clip(),
@@ -17153,13 +17697,14 @@ fn trace_clear(
     use std::sync::OnceLock;
     static TARGETS: OnceLock<Vec<u64>> = OnceLock::new();
     let targets = TARGETS.get_or_init(|| parse_env_u64_list("NEXIUM_CLEAR_TRACE_RT_VA"));
-    if !targets.is_empty() && !targets.contains(&rt_gpu_va) {
+    let zeta_va = (u64::from(draw.zeta.address_hi) << 32) | u64::from(draw.zeta.address_lo);
+    if !targets.is_empty() && !targets.contains(&rt_gpu_va) && !targets.contains(&zeta_va) {
         return;
     }
     let clip = draw.surface_clip.effective(rt.width, rt.height);
     log::warn!(
         "[cleartrace] op={} rt={} va={:#x} {}x{} mask={:#x} color={} depth={} stencil={} clear_depth={:.6} clear_stencil={:#x} \
-         ctrl={:#x} scissor_en={} rect={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} zeta={}",
+         ctrl={:#x} scissor_en={} rect={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} zeta={} zeta_va={:#x}",
         op_seq,
         nvmap_id,
         rt_gpu_va,
@@ -17182,6 +17727,7 @@ fn trace_clear(
         draw.window_origin.lower_left(),
         draw.window_origin.triangle_rast_flip(),
         draw.zeta_enable,
+        zeta_va,
     );
     log::warn!(
         "[cleartrace] op={} rgba=({:.3},{:.3},{:.3},{:.3}) scissor=({},{})->({},{})",
@@ -17298,7 +17844,7 @@ fn cbuf_sample(
         let mut vals = Vec::new();
         for (i, c) in slot_data[..dump_bytes].chunks_exact(4).enumerate() {
             vals.push(format!(
-                "{:#x}:{:.3}",
+                "{:#x}:{:.9e}",
                 i * 4,
                 f32::from_le_bytes([c[0], c[1], c[2], c[3]])
             ));
@@ -17578,6 +18124,60 @@ fn cfg_uses_texture_descriptors(cfg: &nexium_shader::Cfg) -> bool {
     })
 }
 
+fn sampled_only_texture_ids(cfg: &nexium_shader::Cfg) -> Vec<u32> {
+    if cfg.unimplemented != 0 {
+        return Vec::new();
+    }
+    let mut sampled = std::collections::BTreeSet::new();
+    let mut excluded = std::collections::BTreeSet::new();
+    for block in &cfg.blocks {
+        for inst in &block.program.instructions {
+            match &inst.op {
+                nexium_shader::IrOp::SampleTex { tex_id, .. }
+                | nexium_shader::IrOp::GatherTex { tex_id, .. } => {
+                    sampled.insert(*tex_id);
+                }
+                nexium_shader::IrOp::TexelFetch {
+                    cbuf_binding,
+                    cbuf_word_offset,
+                    cbuf_secondary_word_offset,
+                    ..
+                } => {
+                    excluded.insert(nexium_shader::bindless_texture_id_pair(
+                        *cbuf_binding,
+                        *cbuf_word_offset,
+                        *cbuf_secondary_word_offset,
+                    ));
+                }
+                nexium_shader::IrOp::SampleTexHandle { handle, .. }
+                | nexium_shader::IrOp::TexelFetchHandle { handle, .. }
+                | nexium_shader::IrOp::TextureQueryDimension { handle, .. }
+                | nexium_shader::IrOp::TextureQueryLod { handle, .. }
+                | nexium_shader::IrOp::ImageWrite { handle, .. }
+                | nexium_shader::IrOp::ImageAtomic { handle, .. } => {
+                    let shader_id = match handle {
+                        nexium_shader::TextureHandleOrigin::Bound { cbuf_word_offset } => {
+                            *cbuf_word_offset
+                        }
+                        nexium_shader::TextureHandleOrigin::Bindless {
+                            cbuf_binding,
+                            cbuf_word_offset,
+                            cbuf_secondary_word_offset,
+                        } => nexium_shader::bindless_texture_id_pair(
+                            *cbuf_binding,
+                            *cbuf_word_offset,
+                            *cbuf_secondary_word_offset,
+                        ),
+                    };
+                    excluded.insert(shader_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    sampled.difference(&excluded).copied().collect()
+}
+
 fn fragment_texture_numeric_metadata(
     cfg: &nexium_shader::Cfg,
 ) -> Result<FragmentTextureNumericMetadata, String> {
@@ -17711,11 +18311,13 @@ fn fragment_texture_numeric_metadata(
         }
     }
     let texture_ids = nexium_shader::texture_ids(cfg);
+    let sampled_only_ids = sampled_only_texture_ids(cfg);
     Ok(FragmentTextureNumericMetadata {
         texel_fetches: (!texel_fetches.is_empty()).then(|| texel_fetches.into_iter().collect()),
         descriptor_ids: texture_ids.clone(),
         texture_ids,
         sampled_ids: sampled_ids.into_iter().collect(),
+        sampled_only_ids,
         buffer_candidates: buffer_candidates.into_iter().collect(),
         image_kinds: image_kinds.into_iter().collect(),
         sampler_arrayed,
@@ -18168,6 +18770,9 @@ fn graphics_texture_layout_from_metadata(
                 vs_tex_base,
                 &vs_metadata.depth_compare_cube_array_ids,
             );
+    let texture_sampled_only_mask =
+        texture_descriptor_mask(fs_metadata, 0, &fs_metadata.sampled_only_ids)
+            | texture_descriptor_mask(vs_metadata, vs_tex_base, &vs_metadata.sampled_only_ids);
     Ok(GraphicsTextureLayout {
         fs_ids,
         fs_tic_ids,
@@ -18177,6 +18782,7 @@ fn graphics_texture_layout_from_metadata(
         vs_tex_base,
         vs_tex_count,
         manifest,
+        texture_sampled_only_mask,
         fs_texel_buffer_mask,
         vs_texel_buffer_mask,
         fs_sampler_arrayed: fs_metadata.sampler_arrayed,
@@ -18498,6 +19104,17 @@ fn trace_vs_tex_remap(
     tic_pool_limit: u32,
 ) {
     if vs_tex_count == 0 || !vs_tex_bind_fs_trace(fs_addr) {
+        return;
+    }
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_VS_TEX_BIND_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024)
+    });
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= limit {
         return;
     }
     log::warn!(
@@ -18995,6 +19612,10 @@ fn ps_output_map(sph: [u8; SPH_SIZE]) -> u32 {
     u32::from_le_bytes([sph[0x48], sph[0x49], sph[0x4A], sph[0x4B]])
 }
 
+fn ps_writes_depth(sph: [u8; SPH_SIZE]) -> bool {
+    sph[0x4c] & 2 != 0
+}
+
 fn fs_solid_probe_matches(fs_addr: u64) -> bool {
     use std::sync::OnceLock;
     static CFG: OnceLock<(bool, bool, Vec<u64>)> = OnceLock::new();
@@ -19099,9 +19720,9 @@ fn solid_red_fs_spirv() -> Vec<u32> {
 }
 
 fn build_vertex_layout(draw: &DrawCall, used_locations: &[u32]) -> Result<VertexLayout, String> {
-    let mut bindings: Vec<VertexBinding> = Vec::new();
-    let mut attrs: Vec<VertexAttr> = Vec::new();
-    let mut seen_bindings: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut bindings: Vec<VertexBinding> = Vec::with_capacity(8);
+    let mut attrs: Vec<VertexAttr> = Vec::with_capacity(used_locations.len());
+    let mut seen_bindings: FastSet<u32> = FastSet::default();
 
     if probe_shade_enabled() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -20184,6 +20805,7 @@ fn vertex_buffer_bindings(
 
 #[cfg(test)]
 mod tests {
+    use nexium_common::fast_hash::{FastMap, FastSet};
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -20307,6 +20929,7 @@ mod tests {
                 vs_tex_base: 0,
                 vs_tex_count: 0,
                 manifest: Vec::new(),
+                texture_sampled_only_mask: 0,
                 fs_texel_buffer_mask: 0,
                 vs_texel_buffer_mask: 0,
                 fs_sampler_arrayed: false,
@@ -20606,6 +21229,26 @@ mod tests {
             };
             assert_eq!(exact_color_source_from_clear(&clear, source), Err(()));
         }
+    }
+
+    #[test]
+    fn fragment_depth_header_uses_depth_bit_independently_of_sample_mask() {
+        for mask in 0..4 {
+            let mut header = [0; super::SPH_SIZE];
+            header[0x4c] = mask;
+            assert_eq!(super::ps_writes_depth(header), mask & 2 != 0);
+        }
+    }
+
+    #[test]
+    fn fragment_depth_cache_key_does_not_overlap_other_shader_flags() {
+        let depth = super::fragment_depth_key(true);
+        assert_ne!(depth, super::fragment_depth_key(false));
+        let other = super::shader_numeric_key(u32::MAX, u32::MAX)
+            | (3 << 16)
+            | super::y_direction_key(true)
+            | super::layer_output_shader_key(Some(255));
+        assert_eq!(depth & other, 0);
     }
 
     #[test]
@@ -22879,7 +23522,7 @@ mod tests {
     fn full_scan_input_invalidations(
         cache: &SsboSnapshotCache,
         spans: &[InputInvalidationSpan],
-    ) -> HashSet<InputRangeKey> {
+    ) -> FastSet<InputRangeKey> {
         cache
             .input_entries
             .iter()
@@ -22907,10 +23550,10 @@ mod tests {
         cache: &mut SsboSnapshotCache,
         spans: &[InputInvalidationSpan],
     ) {
-        let before: HashSet<InputRangeKey> = cache.input_entries.keys().copied().collect();
+        let before: FastSet<InputRangeKey> = cache.input_entries.keys().copied().collect();
         let expected = full_scan_input_invalidations(cache, spans);
         cache.invalidate_input_spans(spans);
-        let actual: HashSet<InputRangeKey> = before
+        let actual: FastSet<InputRangeKey> = before
             .into_iter()
             .filter(|key| !cache.input_entries.contains_key(key))
             .collect();
@@ -25756,7 +26399,7 @@ mod tests {
     fn tic_derived_plan_exact_raw_hits_without_derivation() {
         let mappings = crate::gpu::GpuMappings::new();
         let raw = prepared_tic_plan_raw_with_view(0x4000, 3, 0);
-        let mut plans = std::collections::HashMap::new();
+        let mut plans = FastMap::default();
 
         let first = memoized_prepared_tic_plan(&mut plans, 0x1000, raw, &mappings, |raw| {
             derive_prepared_tic_texture_plan(raw, &mappings)
@@ -25786,7 +26429,7 @@ mod tests {
         let mappings = crate::gpu::GpuMappings::new();
         let first_raw = prepared_tic_plan_raw(0x4000);
         let second_raw = prepared_tic_plan_raw(0x8000);
-        let mut plans = std::collections::HashMap::new();
+        let mut plans = FastMap::default();
 
         memoized_prepared_tic_plan(&mut plans, 0x1000, first_raw, &mappings, |raw| {
             derive_prepared_tic_texture_plan(raw, &mappings)
@@ -25816,7 +26459,7 @@ mod tests {
         mappings.add(TIC_GPU_VA, 0x1000, TIC_CPU_VA, 1);
         mappings.add(BASE_GPU_VA, 0x1000, CPU_VA, 2);
         let raw = prepared_tic_plan_raw_with_view(BASE_GPU_VA, 3, 0);
-        let mut plans = std::collections::HashMap::new();
+        let mut plans = FastMap::default();
         let mem_read = |cpu_va: u64, out: &mut [u8]| {
             if cpu_va != TIC_CPU_VA || out.len() != raw.len() {
                 return false;
@@ -25885,7 +26528,7 @@ mod tests {
             out.copy_from_slice(raw.borrow().as_slice());
             true
         };
-        let mut plans = std::collections::HashMap::new();
+        let mut plans = FastMap::default();
 
         let first = collect_cube_sample_ranges_from_tic_addresses(
             [TIC_GPU_VA],
@@ -25932,7 +26575,7 @@ mod tests {
             out.copy_from_slice(&raw);
             true
         };
-        let mut cached_plans = std::collections::HashMap::new();
+        let mut cached_plans = FastMap::default();
 
         let first = collect_cube_sample_ranges_from_tic_addresses(
             [TIC_GPU_VA],
@@ -25951,7 +26594,7 @@ mod tests {
             &mem_read,
             &mut cached_plans,
         );
-        let mut uncached_plans = std::collections::HashMap::new();
+        let mut uncached_plans = FastMap::default();
         let uncached = collect_cube_sample_ranges_from_tic_addresses(
             [TIC_GPU_VA],
             &mappings,
@@ -25978,7 +26621,7 @@ mod tests {
         let mappings = crate::gpu::GpuMappings::new();
         let invalid_raw = [0u8; 32];
         let valid_raw = prepared_tic_plan_raw(0x4000);
-        let mut plans = std::collections::HashMap::new();
+        let mut plans = FastMap::default();
 
         let invalid =
             memoized_prepared_tic_plan(&mut plans, 0x1000, invalid_raw, &mappings, |raw| {
@@ -26002,8 +26645,7 @@ mod tests {
     #[test]
     fn tic_derived_plan_capacity_does_not_admit_new_addresses() {
         let mappings = crate::gpu::GpuMappings::new();
-        let mut plans: std::collections::HashMap<u64, PreparedTicPlan> =
-            std::collections::HashMap::new();
+        let mut plans: FastMap<u64, PreparedTicPlan> = FastMap::default();
         for tic_addr in 0..PREPARED_TIC_PLAN_CAPACITY as u64 {
             let raw = [tic_addr as u8; 32];
             memoized_prepared_tic_plan(&mut plans, tic_addr, raw, &mappings, |_| None);
@@ -26059,7 +26701,7 @@ mod tests {
     #[test]
     fn tic_derived_plan_short_raw_bypasses_memo() {
         let mappings = crate::gpu::GpuMappings::new();
-        let mut plans = std::collections::HashMap::new();
+        let mut plans = FastMap::default();
         let derivations = std::cell::Cell::new(0usize);
         let prepared = tic_raw_descriptor(&[0x5a; 31]).map(|raw| {
             memoized_prepared_tic_plan(&mut plans, 0x1000, raw, &mappings, |_| {
@@ -26280,7 +26922,7 @@ mod tests {
     fn texture_snapshot_cache_reuses_all_generations_and_separates_backings() {
         let key = TextureSnapshotCacheKey {
             mapping_epoch: 1,
-            gpu_va: 0x4000,
+            gpu_va: 0x7e00_1234_4000,
             len: 4,
             cpu_va: 0x8000,
             nvmap_id: 2,
@@ -26304,13 +26946,27 @@ mod tests {
         ));
         assert!(matches!(
             cache.get(key, 8, 11, 13),
+            TextureSnapshotCacheLookup::Hit(..)
+        ));
+        assert!(matches!(
+            cache.get(key, 8, 11, 13),
+            TextureSnapshotCacheLookup::Hit(..)
+        ));
+        nexium_gpu::tex_invalidate::bump_region(key.gpu_va + 0x1000, 4);
+        assert!(matches!(
+            cache.get(key, 9, 11, 13),
+            TextureSnapshotCacheLookup::Hit(..)
+        ));
+        nexium_gpu::tex_invalidate::bump_region(key.gpu_va, 4);
+        assert!(matches!(
+            cache.get(key, 10, 11, 13),
             TextureSnapshotCacheLookup::Stale
         ));
 
         cache.insert(key, 7, 11, 13, 19, data.clone());
         assert!(matches!(
             cache.get(key, 7, 12, 13),
-            TextureSnapshotCacheLookup::Stale
+            TextureSnapshotCacheLookup::Hit(..)
         ));
         cache.insert(key, 7, 12, 13, 23, data.clone());
         assert!(matches!(
@@ -26837,6 +27493,113 @@ mod tests {
                 nexium_gpu::texture_manifest::GraphicsTextureImageKind::D2Array
             )]
         );
+    }
+
+    #[test]
+    fn sampled_only_texture_metadata_excludes_mixed_access_and_preserves_stage_slots() {
+        use nexium_shader::{IrOp, IrValue, TextureHandleOrigin};
+        let mixed_id = nexium_shader::bindless_texture_id_pair(2, 0x40, Some(0x44));
+        let sample = |tex_id| IrOp::SampleTex {
+            sample_site: None,
+            tex_id,
+            u: IrValue::Zero,
+            v: IrValue::Zero,
+            array: None,
+            volume: None,
+            cube: None,
+            implicit_lod: true,
+            lod_bias: None,
+            explicit_lod: None,
+            texel_offset: None,
+            dref: None,
+            component: 0,
+        };
+        let cfg = |ops: Vec<IrOp>| {
+            let blocks = ops
+                .into_iter()
+                .enumerate()
+                .map(|(id, op)| {
+                    let mut program = nexium_shader::IrProgram::new();
+                    program.emit(op, None);
+                    nexium_shader::BasicBlock {
+                        id: id as u32,
+                        start_offset: id * 8,
+                        end_offset: (id + 1) * 8,
+                        branch: nexium_shader::BranchKind::Exit,
+                        program,
+                        reg_exit: Default::default(),
+                        pred_phis: Vec::new(),
+                        pred_exit: Default::default(),
+                    }
+                })
+                .collect();
+            nexium_shader::Cfg {
+                blocks,
+                unimplemented: 0,
+                bindless_or_partners: Default::default(),
+            }
+        };
+        let fs = fragment_texture_numeric_metadata(&cfg(vec![sample(10)])).unwrap();
+        let blockers = [
+            IrOp::TexelFetch {
+                cbuf_binding: 2,
+                cbuf_word_offset: 0x40,
+                cbuf_secondary_word_offset: Some(0x44),
+                x: IrValue::Zero,
+                y: Some(IrValue::Zero),
+                z: None,
+                component: 0,
+            },
+            IrOp::TextureQueryDimension {
+                handle: TextureHandleOrigin::Bindless {
+                    cbuf_binding: 2,
+                    cbuf_word_offset: 0x40,
+                    cbuf_secondary_word_offset: Some(0x44),
+                },
+                lod: IrValue::Zero,
+                component: 3,
+            },
+            IrOp::TextureQueryLod {
+                handle: TextureHandleOrigin::Bound {
+                    cbuf_word_offset: mixed_id,
+                },
+                u: IrValue::Zero,
+                v: IrValue::Zero,
+                arrayed: false,
+                component: 0,
+            },
+        ];
+        for blocker in blockers {
+            let mut mixed = cfg(vec![sample(mixed_id), sample(10), blocker]);
+            let vs = fragment_texture_numeric_metadata(&mixed).unwrap();
+            assert_eq!(vs.sampled_only_ids, vec![10]);
+            let layout = graphics_texture_layout_from_metadata(
+                &fs,
+                &vs,
+                &[[(0, 0); GRAPHICS_CBUF_SLOTS]; 5],
+                0,
+                4,
+                0,
+                0,
+                0,
+                false,
+                &crate::gpu::GpuMappings::new(),
+                &|_, _| false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(layout.vs_tex_base, 1);
+            assert_eq!(layout.texture_sampled_only_mask, 0b11);
+            let fingerprint = texture_view_metadata_fingerprint(&layout);
+            let mut unsafe_layout = layout.clone();
+            unsafe_layout.texture_sampled_only_mask |= 1 << 2;
+            assert_ne!(
+                fingerprint,
+                texture_view_metadata_fingerprint(&unsafe_layout)
+            );
+            mixed.unimplemented = 1;
+            assert!(super::sampled_only_texture_ids(&mixed).is_empty());
+        }
     }
 
     #[test]

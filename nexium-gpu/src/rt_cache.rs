@@ -1,5 +1,5 @@
 use ash::vk;
-use std::collections::{HashMap, HashSet};
+use nexium_common::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -192,14 +192,15 @@ impl Eq for RtKey {}
 
 impl Hash for RtKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.nvmap_id.hash(state);
-        self.width.hash(state);
-        self.height.hash(state);
-        self.depth.hash(state);
-        self.is_3d.hash(state);
-        self.sample_width.hash(state);
-        self.sample_height.hash(state);
-        self.gpu_va.hash(state);
+        let mut folded = self.gpu_va ^ (u64::from(self.nvmap_id) << 40);
+        folded = folded.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (u64::from(self.width) | (u64::from(self.height) << 32));
+        folded = folded.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (u64::from(self.depth)
+                | (u64::from(self.is_3d) << 32)
+                | (u64::from(self.sample_width) << 40)
+                | (u64::from(self.sample_height) << 48));
+        state.write_u64(folded);
     }
 }
 
@@ -344,7 +345,7 @@ impl RtKey {
 pub struct GpuImage {
     pub image: vk::Image,
     pub view: vk::ImageView,
-    pub views: HashMap<vk::Format, vk::ImageView>,
+    pub views: std::collections::HashMap<vk::Format, vk::ImageView>,
     sample_views: HashMap<RtSampleViewKey, vk::ImageView>,
     pub memory: vk::DeviceMemory,
     pub format: vk::Format,
@@ -495,6 +496,7 @@ pub struct RtCache {
     color_gpu_base_index: HashMap<u64, Vec<RtKey>>,
     color_cpu_base_index: HashMap<u64, Vec<RtKey>>,
     color_gpu_page_index: HashMap<u64, Vec<RtKey>>,
+    color_nvmap_index: HashMap<u32, Vec<RtKey>>,
     depth_cache: HashMap<RtKey, GpuImage>,
     snapshots: HashMap<RtKey, GpuImage>,
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
@@ -506,6 +508,7 @@ pub struct RtCache {
     drawn_counter: u64,
     frame_draws: HashMap<RtKey, u32>,
     frame_real_draws: HashMap<RtKey, u32>,
+    depth_frame_draws: HashMap<RtKey, u32>,
     depth_generation_counter: u64,
     depth_generations: HashMap<RtKey, u64>,
     depth_shadow_generations: HashMap<RtKey, (RtKey, u64)>,
@@ -517,9 +520,22 @@ pub struct RtCache {
     color_guest_range_index: HashMap<RtKey, usize>,
     depth_guest_ranges: Vec<GuestRangeEntry>,
     depth_guest_range_index: HashMap<RtKey, usize>,
+    guest_range_epoch: u64,
+    guest_hit_memo: Vec<GuestHitMemoEntry>,
 }
 
-#[derive(Clone, Copy)]
+const GUEST_HIT_MEMO_SIZE: usize = 64;
+
+struct GuestHitMemoEntry {
+    epoch: u64,
+    cpu_addr: u64,
+    cpu_end: u64,
+    gpu_ranges: Vec<(u64, u64)>,
+    color: Vec<RtKey>,
+    depth: Vec<RtKey>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct GuestRangeEntry {
     key: RtKey,
     cpu_lo: u64,
@@ -574,29 +590,35 @@ fn insert_guest_range(
     index: &mut HashMap<RtKey, usize>,
     key: RtKey,
     base_format: vk::Format,
-) {
+) -> bool {
     let Some(entry) = guest_range_entry(key, base_format) else {
-        return;
+        return false;
     };
     if let Some(&pos) = index.get(&key) {
+        if ranges[pos] == entry {
+            return false;
+        }
         ranges[pos] = entry;
     } else {
         index.insert(key, ranges.len());
         ranges.push(entry);
     }
+    true
 }
 
 fn remove_guest_range(
     ranges: &mut Vec<GuestRangeEntry>,
     index: &mut HashMap<RtKey, usize>,
     key: RtKey,
-) {
-    if let Some(pos) = index.remove(&key) {
-        ranges.swap_remove(pos);
-        if pos < ranges.len() {
-            index.insert(ranges[pos].key, pos);
-        }
+) -> bool {
+    let Some(pos) = index.remove(&key) else {
+        return false;
+    };
+    ranges.swap_remove(pos);
+    if pos < ranges.len() {
+        index.insert(ranges[pos].key, pos);
     }
+    true
 }
 
 fn guest_range_hits(
@@ -671,33 +693,72 @@ fn rekey_hash_set(set: &mut HashSet<RtKey>, old: RtKey, new: RtKey) {
 impl RtCache {
     pub fn new() -> Self {
         Self {
-            cache: HashMap::new(),
-            color_gpu_base_index: HashMap::new(),
-            color_cpu_base_index: HashMap::new(),
-            color_gpu_page_index: HashMap::new(),
-            depth_cache: HashMap::new(),
-            snapshots: HashMap::new(),
+            cache: HashMap::default(),
+            color_gpu_base_index: HashMap::default(),
+            color_cpu_base_index: HashMap::default(),
+            color_nvmap_index: HashMap::default(),
+            color_gpu_page_index: HashMap::default(),
+            depth_cache: HashMap::default(),
+            snapshots: HashMap::default(),
             mem_properties: None,
-            drawn_stamp: HashMap::new(),
-            guest_stale_color: HashSet::new(),
-            guest_stale_depth: HashSet::new(),
-            present_excluded: HashSet::new(),
-            present_flip_y: HashMap::new(),
+            drawn_stamp: HashMap::default(),
+            guest_stale_color: HashSet::default(),
+            guest_stale_depth: HashSet::default(),
+            present_excluded: HashSet::default(),
+            present_flip_y: HashMap::default(),
             drawn_counter: 0,
-            frame_draws: HashMap::new(),
-            frame_real_draws: HashMap::new(),
+            frame_draws: HashMap::default(),
+            frame_real_draws: HashMap::default(),
+            depth_frame_draws: HashMap::default(),
             depth_generation_counter: 0,
-            depth_generations: HashMap::new(),
-            depth_shadow_generations: HashMap::new(),
+            depth_generations: HashMap::default(),
+            depth_shadow_generations: HashMap::default(),
             guest_cpu_lo: u64::MAX,
             guest_cpu_hi: 0,
             guest_gpu_lo: u64::MAX,
             guest_gpu_hi: 0,
             color_guest_ranges: Vec::new(),
-            color_guest_range_index: HashMap::new(),
+            color_guest_range_index: HashMap::default(),
             depth_guest_ranges: Vec::new(),
-            depth_guest_range_index: HashMap::new(),
+            depth_guest_range_index: HashMap::default(),
+            guest_range_epoch: 0,
+            guest_hit_memo: Vec::new(),
         }
+    }
+
+    fn note_guest_ranges_changed(&mut self) {
+        self.guest_range_epoch = self.guest_range_epoch.wrapping_add(1);
+    }
+
+    fn guest_range_hits_memoized(
+        &mut self,
+        cpu_addr: u64,
+        cpu_end: u64,
+        gpu_ranges: &[(u64, u64)],
+    ) -> (Vec<RtKey>, Vec<RtKey>) {
+        let epoch = self.guest_range_epoch;
+        if let Some(memo) = self.guest_hit_memo.iter().find(|memo| {
+            memo.epoch == epoch
+                && memo.cpu_addr == cpu_addr
+                && memo.cpu_end == cpu_end
+                && memo.gpu_ranges == gpu_ranges
+        }) {
+            return (memo.color.clone(), memo.depth.clone());
+        }
+        let color = guest_range_hits(&self.color_guest_ranges, cpu_addr, cpu_end, gpu_ranges);
+        let depth = guest_range_hits(&self.depth_guest_ranges, cpu_addr, cpu_end, gpu_ranges);
+        if self.guest_hit_memo.len() >= GUEST_HIT_MEMO_SIZE {
+            self.guest_hit_memo.remove(0);
+        }
+        self.guest_hit_memo.push(GuestHitMemoEntry {
+            epoch,
+            cpu_addr,
+            cpu_end,
+            gpu_ranges: gpu_ranges.to_vec(),
+            color: color.clone(),
+            depth: depth.clone(),
+        });
+        (color, depth)
     }
 
     fn index_color_lookup(&mut self, key: RtKey, format: vk::Format) {
@@ -713,6 +774,10 @@ impl RtCache {
             if !base.contains(&key) {
                 base.push(key);
             }
+        }
+        let by_nvmap = self.color_nvmap_index.entry(key.nvmap_id).or_default();
+        if !by_nvmap.contains(&key) {
+            by_nvmap.push(key);
         }
         let Some((first_page, last_page)) = rt_color_gpu_page_span(key, format) else {
             return;
@@ -733,6 +798,7 @@ impl RtCache {
         if key.cpu_addr != 0 {
             remove_lookup_key(&mut self.color_cpu_base_index, key.cpu_addr, key);
         }
+        remove_lookup_key(&mut self.color_nvmap_index, key.nvmap_id, key);
         let Some((first_page, last_page)) = rt_color_gpu_page_span(key, format) else {
             return;
         };
@@ -760,16 +826,50 @@ impl RtCache {
         }
     }
 
+    pub fn adopt_external_color(
+        &mut self,
+        key: RtKey,
+        image: vk::Image,
+        view: vk::ImageView,
+        memory: vk::DeviceMemory,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        layout: vk::ImageLayout,
+    ) -> bool {
+        if is_synthetic_copy_key(key) || self.cache.contains_key(&key) {
+            return false;
+        }
+        let mut views = std::collections::HashMap::new();
+        views.insert(format, view);
+        let adopted = GpuImage {
+            image,
+            view,
+            views,
+            sample_views: HashMap::default(),
+            memory,
+            format,
+            base_format: format,
+            aspects: vk::ImageAspectFlags::COLOR,
+            extent,
+            layout,
+        };
+        self.insert_color_image(key, adopted);
+        self.mark_drawn(key);
+        true
+    }
+
     fn insert_color_image(&mut self, key: RtKey, image: GpuImage) {
         let format = image.format;
         debug_assert!(!self.cache.contains_key(&key));
         self.extend_guest_bounds(key, image.base_format);
-        insert_guest_range(
+        if insert_guest_range(
             &mut self.color_guest_ranges,
             &mut self.color_guest_range_index,
             key,
             image.base_format,
-        );
+        ) {
+            self.note_guest_ranges_changed();
+        }
         self.cache.insert(key, image);
         let canonical = self
             .cache
@@ -793,11 +893,13 @@ impl RtCache {
             return false;
         };
         self.unindex_color_lookup(indexed_key, image.format);
-        remove_guest_range(
+        if remove_guest_range(
             &mut self.color_guest_ranges,
             &mut self.color_guest_range_index,
             canonical,
-        );
+        ) {
+            self.note_guest_ranges_changed();
+        }
         rekey_hash_map_value(&mut self.snapshots, canonical, key);
         rekey_hash_map_value(&mut self.drawn_stamp, canonical, key);
         rekey_hash_set(&mut self.guest_stale_color, canonical, key);
@@ -809,12 +911,14 @@ impl RtCache {
         let base_format = image.base_format;
         self.cache.insert(key, image);
         self.extend_guest_bounds(key, base_format);
-        insert_guest_range(
+        if insert_guest_range(
             &mut self.color_guest_ranges,
             &mut self.color_guest_range_index,
             key,
             base_format,
-        );
+        ) {
+            self.note_guest_ranges_changed();
+        }
         self.index_color_lookup(key, format);
         true
     }
@@ -826,11 +930,13 @@ impl RtCache {
         let Some((canonical, image)) = self.depth_cache.remove_entry(&stored) else {
             return false;
         };
-        remove_guest_range(
+        if remove_guest_range(
             &mut self.depth_guest_ranges,
             &mut self.depth_guest_range_index,
             canonical,
-        );
+        ) {
+            self.note_guest_ranges_changed();
+        }
         rekey_hash_set(&mut self.guest_stale_depth, canonical, key);
         rekey_hash_map_value(&mut self.depth_generations, canonical, key);
         let shadow_generations = std::mem::take(&mut self.depth_shadow_generations);
@@ -847,12 +953,14 @@ impl RtCache {
         let base_format = image.base_format;
         self.depth_cache.insert(key, image);
         self.extend_guest_bounds(key, base_format);
-        insert_guest_range(
+        if insert_guest_range(
             &mut self.depth_guest_ranges,
             &mut self.depth_guest_range_index,
             key,
             base_format,
-        );
+        ) {
+            self.note_guest_ranges_changed();
+        }
         true
     }
 
@@ -916,11 +1024,13 @@ impl RtCache {
             .map(|entry| entry.key);
         let (canonical, image) = self.cache.remove_entry(&key)?;
         self.unindex_color_lookup(indexed_key.unwrap_or(canonical), image.format);
-        remove_guest_range(
+        if remove_guest_range(
             &mut self.color_guest_ranges,
             &mut self.color_guest_range_index,
             canonical,
-        );
+        ) {
+            self.note_guest_ranges_changed();
+        }
         Some((canonical, image))
     }
 
@@ -928,6 +1038,7 @@ impl RtCache {
         self.color_gpu_base_index.clear();
         self.color_cpu_base_index.clear();
         self.color_gpu_page_index.clear();
+        self.color_nvmap_index.clear();
     }
 
     fn canonical_depth_key(&self, key: RtKey) -> RtKey {
@@ -960,6 +1071,7 @@ impl RtCache {
     pub(crate) fn mark_depth_written(&mut self, key: RtKey) -> u64 {
         let canonical = self.canonical_depth_key(key);
         self.guest_stale_depth.remove(&canonical);
+        *self.depth_frame_draws.entry(canonical).or_insert(0) += 1;
         let generation = self.next_depth_generation();
         self.depth_generations.insert(canonical, generation);
         generation
@@ -1205,7 +1317,8 @@ impl RtCache {
         } else {
             0
         };
-        let stale_color = guest_range_hits(&self.color_guest_ranges, cpu_addr, cpu_end, gpu_ranges);
+        let (stale_color, stale_depth) =
+            self.guest_range_hits_memoized(cpu_addr, cpu_end, gpu_ranges);
         for stale_key in stale_color {
             self.drawn_stamp.remove(&stale_key);
             self.guest_stale_color.insert(stale_key);
@@ -1213,7 +1326,6 @@ impl RtCache {
             self.frame_draws.remove(&stale_key);
             self.frame_real_draws.remove(&stale_key);
         }
-        let stale_depth = guest_range_hits(&self.depth_guest_ranges, cpu_addr, cpu_end, gpu_ranges);
         for stale_key in stale_depth {
             self.mark_depth_written(stale_key);
             self.guest_stale_depth.insert(stale_key);
@@ -1231,6 +1343,81 @@ impl RtCache {
     pub fn reset_frame_draws(&mut self) {
         self.frame_draws.clear();
         self.frame_real_draws.clear();
+        self.depth_frame_draws.clear();
+    }
+
+    pub fn present_depth_key(
+        &self,
+        color: RtKey,
+    ) -> Option<(RtKey, u32, u32, vk::Format, vk::ImageAspectFlags, u32)> {
+        let min_w = color.width / 2;
+        let min_h = color.height / 2;
+        let max_w = color.width.saturating_mul(2);
+        let max_h = color.height.saturating_mul(2);
+        let mut best: Option<(bool, u32, u64, RtKey, u32, u32, vk::Format, vk::ImageAspectFlags)> =
+            None;
+        for (key, draws) in &self.depth_frame_draws {
+            if *draws == 0
+                || key.depth != 1
+                || key.is_3d
+                || key.sample_width > 1
+                || key.sample_height > 1
+            {
+                continue;
+            }
+            let Some(img) = self.depth_cache.get(key) else {
+                continue;
+            };
+            if !img.aspects.contains(vk::ImageAspectFlags::DEPTH)
+                || img.layout == vk::ImageLayout::UNDEFINED
+            {
+                continue;
+            }
+            let (w, h) = (img.extent.width, img.extent.height);
+            if w == 0 || h == 0 || w < min_w || h < min_h || w > max_w || h > max_h {
+                continue;
+            }
+            let exact = w == color.width && h == color.height;
+            let area = u64::from(w) * u64::from(h);
+            let better = best
+                .as_ref()
+                .map_or(true, |b| (exact, *draws, area) > (b.0, b.1, b.2));
+            if better {
+                best = Some((exact, *draws, area, *key, w, h, img.format, img.aspects));
+            }
+        }
+        best.map(|(_, draws, _, key, w, h, format, aspects)| (key, w, h, format, aspects, draws))
+    }
+
+    pub fn depth_share_summary(&self) -> String {
+        let mut entries: Vec<String> = self
+            .depth_frame_draws
+            .iter()
+            .map(|(key, draws)| {
+                let img = self.depth_cache.get(key);
+                format!(
+                    "{}x{} draws={} samples={}x{} depth={} 3d={} cached={} fmt={:?} layout={:?}",
+                    key.width,
+                    key.height,
+                    draws,
+                    key.sample_width,
+                    key.sample_height,
+                    key.depth,
+                    key.is_3d,
+                    img.is_some(),
+                    img.map(|i| i.format),
+                    img.map(|i| i.layout)
+                )
+            })
+            .collect();
+        entries.sort();
+        entries.truncate(6);
+        format!(
+            "{} depth targets drawn this frame, {} cached: [{}]",
+            self.depth_frame_draws.len(),
+            self.depth_cache.len(),
+            entries.join("; ")
+        )
     }
 
     pub fn mark_cleared(&mut self, key: RtKey, full_target: bool) {
@@ -1718,10 +1905,17 @@ impl RtCache {
         self.drawn_stamp.get(&key).copied()
     }
 
+    fn color_entries_for_nvmap(&self, nvmap_id: u32) -> impl Iterator<Item = (&RtKey, &GpuImage)> {
+        self.color_nvmap_index
+            .get(&nvmap_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.cache.get_key_value(key))
+    }
+
     pub fn color_keys_for_nvmap(&self, nvmap_id: u32) -> Vec<(RtKey, vk::Format, u64, u32)> {
-        self.cache
-            .iter()
-            .filter(|(k, _)| !is_synthetic_copy_key(**k) && k.nvmap_id == nvmap_id)
+        self.color_entries_for_nvmap(nvmap_id)
+            .filter(|(k, _)| !is_synthetic_copy_key(**k))
             .map(|(k, img)| {
                 (
                     *k,
@@ -1731,6 +1925,12 @@ impl RtCache {
                 )
             })
             .collect()
+    }
+
+    pub fn has_color_for_nvmap(&self, nvmap_id: u32) -> bool {
+        self.color_nvmap_index
+            .get(&nvmap_id)
+            .is_some_and(|keys| !keys.is_empty())
     }
 
     pub fn color_exact_with_format(
@@ -2086,11 +2286,13 @@ impl RtCache {
         if recreate {
             self.forget_depth_tracking(cache_key);
             if let Some(image) = self.depth_cache.remove(&cache_key) {
-                remove_guest_range(
+                if remove_guest_range(
                     &mut self.depth_guest_ranges,
                     &mut self.depth_guest_range_index,
                     cache_key,
-                );
+                ) {
+                    self.note_guest_ranges_changed();
+                }
                 if let Some(retired) = retired.as_mut() {
                     retired.push(image);
                 } else {
@@ -2114,12 +2316,14 @@ impl RtCache {
             let depth_base_format = image.base_format;
             self.depth_cache.insert(insert_key, image);
             self.extend_guest_bounds(insert_key, depth_base_format);
-            insert_guest_range(
+            if insert_guest_range(
                 &mut self.depth_guest_ranges,
                 &mut self.depth_guest_range_index,
                 insert_key,
                 depth_base_format,
-            );
+            ) {
+                self.note_guest_ranges_changed();
+            }
             self.mark_depth_written(insert_key);
         }
         let result_key = if created {
@@ -2955,8 +3159,8 @@ impl RtCache {
             return None;
         }
         let mut best: Option<(RtKey, &GpuImage, u64, u32, u32, bool)> = None;
-        for (k, img) in &self.cache {
-            if is_synthetic_copy_key(*k) || k.nvmap_id != nvmap_id {
+        for (k, img) in self.color_entries_for_nvmap(nvmap_id) {
+            if is_synthetic_copy_key(*k) {
                 continue;
             }
             let Some((src_x, src_y, exact)) =
@@ -3000,6 +3204,10 @@ impl RtCache {
 
     pub fn color_layout(&self, key: RtKey) -> Option<vk::ImageLayout> {
         self.cache.get(&key).map(|img| img.layout)
+    }
+
+    pub fn color_extent(&self, key: RtKey) -> Option<vk::Extent2D> {
+        self.cache.get(&key).map(|img| img.extent)
     }
 
     pub fn set_depth_layout(&mut self, key: RtKey, layout: vk::ImageLayout) {
@@ -3135,14 +3343,14 @@ impl RtCache {
         }
 
         let view = create_image_view(device, image, format, aspect, key)?;
-        let mut views = HashMap::new();
+        let mut views = std::collections::HashMap::default();
         views.insert(format, view);
 
         Ok(GpuImage {
             image,
             view,
             views,
-            sample_views: HashMap::new(),
+            sample_views: HashMap::default(),
             memory,
             format,
             base_format: format,
@@ -3154,6 +3362,8 @@ impl RtCache {
 
     pub fn clear(&mut self, device: &ash::Device) {
         self.clear_color_lookup_index();
+        self.note_guest_ranges_changed();
+        self.guest_hit_memo.clear();
         self.color_guest_ranges.clear();
         self.color_guest_range_index.clear();
         self.depth_guest_ranges.clear();
@@ -3318,7 +3528,11 @@ fn rt_color_gpu_page_span(key: RtKey, format: vk::Format) -> Option<(u64, u64)> 
     ))
 }
 
-fn remove_lookup_key(index: &mut HashMap<u64, Vec<RtKey>>, bucket: u64, key: RtKey) {
+fn remove_lookup_key<K: std::hash::Hash + Eq>(
+    index: &mut HashMap<K, Vec<RtKey>>,
+    bucket: K,
+    key: RtKey,
+) {
     let remove_bucket = if let Some(keys) = index.get_mut(&bucket) {
         keys.retain(|candidate| *candidate != key);
         keys.is_empty()
@@ -3526,8 +3740,8 @@ mod tests {
         GpuImage {
             image: vk::Image::null(),
             view: vk::ImageView::null(),
-            views: HashMap::new(),
-            sample_views: HashMap::new(),
+            views: HashMap::default(),
+            sample_views: HashMap::default(),
             memory: vk::DeviceMemory::null(),
             format: vk::Format::D24_UNORM_S8_UINT,
             base_format: vk::Format::D24_UNORM_S8_UINT,
@@ -3544,8 +3758,8 @@ mod tests {
         GpuImage {
             image: vk::Image::null(),
             view: vk::ImageView::null(),
-            views: HashMap::new(),
-            sample_views: HashMap::new(),
+            views: HashMap::default(),
+            sample_views: HashMap::default(),
             memory: vk::DeviceMemory::null(),
             format,
             base_format,

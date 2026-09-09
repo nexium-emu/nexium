@@ -246,6 +246,7 @@ mod bufferqueue_present_tests {
                     height: 1,
                     pixels: vec![1, 2, 3, 255],
                     flip_y: Some(false),
+                    depth: None,
                 })),
                 submission: PipelinedPresentSubmission::SourceUnavailable,
             },
@@ -9438,6 +9439,7 @@ fn igbp_handle_transact(
                                 height: frame_h,
                                 pixels: frame_pixels,
                                 present_at: pace_until,
+                                depth: None,
                             });
                     } else {
                         log::warn!(
@@ -9841,12 +9843,15 @@ fn submit_present_frame(
     read_w: u32,
     read_h: u32,
     bytes: Vec<u8>,
+    depth: Option<nexium_nvdrv::PresentDepth>,
     flip_y: Option<bool>,
     metadata: PresentMetadata,
     frame_queue: &nexium_nvdrv::FrameQueue,
     stats: &std::sync::Arc<nexium_nvdrv::PipelineStats>,
 ) {
+    let mut depth = depth;
     let (present_w, present_h, bytes) = if legacy_present_enabled() {
+        depth = None;
         let (w, h, mut b) =
             prepare_vulkan_present_frame(bytes, read_w, read_h, metadata.transform, flip_y);
         make_present_opaque(&mut b);
@@ -9860,23 +9865,35 @@ fn submit_present_frame(
         } else {
             maybe_crop_present_subwindow(bytes, read_w, read_h)
         };
-        if flip_y.unwrap_or_else(|| should_flip_vulkan_present(w, h)) {
+        if w != read_w || h != read_h {
+            depth = None;
+        }
+        let vflip = flip_y.unwrap_or_else(|| should_flip_vulkan_present(w, h));
+        if vflip {
             flip_present_v(&mut b, w, h);
         }
         apply_present_transform(&mut b, w, h, metadata.transform);
         make_present_opaque(&mut b);
+        if let Some(d) = depth.as_mut() {
+            if vflip {
+                flip_present_v(&mut d.texels, d.width, d.height);
+            }
+            apply_present_transform(&mut d.texels, d.width, d.height, metadata.transform);
+        }
         (w, h, b)
     };
-    let (present_w, present_h, bytes) = match metadata.queue_crop {
+    let (present_w, present_h, bytes, depth) = match metadata.queue_crop {
         Some((cx, cy, cw, ch))
             if cx + cw <= present_w
                 && cy + ch <= present_h
                 && (cw < present_w || ch < present_h) =>
         {
             let cropped = crop_and_upscale(&bytes, present_w, cx, cy, cw, ch, cw, ch);
-            (cw, ch, cropped)
+            let depth =
+                depth.and_then(|d| crop_present_depth(d, present_w, present_h, cx, cy, cw, ch));
+            (cw, ch, cropped, depth)
         }
-        _ => (present_w, present_h, bytes),
+        _ => (present_w, present_h, bytes, depth),
     };
     dump_present_frame(&bytes, present_w, present_h);
     if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
@@ -9890,8 +9907,55 @@ fn submit_present_frame(
             height: present_h,
             pixels: bytes,
             present_at: metadata.present_at,
+            depth,
         },
     );
+}
+
+fn crop_present_depth(
+    depth: nexium_nvdrv::PresentDepth,
+    color_w: u32,
+    color_h: u32,
+    cx: u32,
+    cy: u32,
+    cw: u32,
+    ch: u32,
+) -> Option<nexium_nvdrv::PresentDepth> {
+    if color_w == 0 || color_h == 0 || cw == 0 || ch == 0 || depth.width == 0 || depth.height == 0 {
+        return None;
+    }
+    let scale =
+        |v: u32, from: u32, to: u32| ((u64::from(v) * u64::from(to)) / u64::from(from)) as u32;
+    let (dx, dy, dw, dh) = if depth.width == color_w && depth.height == color_h {
+        (cx, cy, cw, ch)
+    } else {
+        (
+            scale(cx, color_w, depth.width),
+            scale(cy, color_h, depth.height),
+            scale(cw, color_w, depth.width).max(1),
+            scale(ch, color_h, depth.height).max(1),
+        )
+    };
+    if dx.checked_add(dw)? > depth.width || dy.checked_add(dh)? > depth.height {
+        return None;
+    }
+    let src_row = depth.width as usize * 4;
+    if depth.texels.len() < src_row * depth.height as usize {
+        return None;
+    }
+    let dst_row = dw as usize * 4;
+    let mut texels = vec![0u8; dst_row * dh as usize];
+    for row in 0..dh as usize {
+        let src = (dy as usize + row) * src_row + dx as usize * 4;
+        let dst = row * dst_row;
+        texels[dst..dst + dst_row].copy_from_slice(&depth.texels[src..src + dst_row]);
+    }
+    Some(nexium_nvdrv::PresentDepth {
+        width: dw,
+        height: dh,
+        encoding: depth.encoding,
+        texels,
+    })
 }
 
 fn submit_ordered_cpu_present<F>(
@@ -9920,6 +9984,7 @@ fn submit_ordered_cpu_present<F>(
         read_w,
         read_h,
         bytes,
+        None,
         flip_y,
         metadata,
         &frame_queue,
@@ -9975,6 +10040,7 @@ where
                             frame.width,
                             frame.height,
                             frame.pixels,
+                            frame.depth,
                             frame.flip_y,
                             metadata,
                             &frame_queue,

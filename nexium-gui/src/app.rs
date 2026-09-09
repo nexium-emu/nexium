@@ -191,6 +191,7 @@ mod frame_receive_tests {
             width: 1,
             height: 1,
             pixels: vec![marker, 0, 0, 0],
+            depth: None,
         }
     }
 
@@ -214,6 +215,7 @@ mod frame_receive_tests {
             width: 0,
             height: 1,
             pixels: vec![0; 4],
+            depth: None,
         })
         .unwrap();
         tx.send(frame(7)).unwrap();

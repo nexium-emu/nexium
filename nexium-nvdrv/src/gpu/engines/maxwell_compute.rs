@@ -466,14 +466,62 @@ impl PendingComputeId {
     }
 }
 
+fn compute_alias_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_COMPUTE_ALIAS").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+fn compute_output_rt_alias(
+    target: &OutputTarget,
+    mappings: &GpuMappings,
+) -> Option<nexium_gpu::compute::ComputeOutputRtAlias> {
+    let tic = &target.tic;
+    if !crate::gpu::vk_dispatch::tic_can_alias_render_target_view(tic) {
+        return None;
+    }
+    let samples = tic.sample_grid()?;
+    let nvmap_id = mappings.nvmap_id_for(tic.gpu_va)?;
+    let mapping_epoch = mappings.mapping_epoch_for(tic.gpu_va)?;
+    let layers = if tic.texture_type == 2 {
+        tic.depth.max(1)
+    } else {
+        1
+    };
+    let key = nexium_gpu::rt_cache::RtKey::with_cpu(
+        nvmap_id,
+        tic.width,
+        tic.height,
+        tic.gpu_va,
+        mappings.cpu_address_for(tic.gpu_va).unwrap_or(0),
+    )
+    .with_mapping_epoch(mapping_epoch)
+    .with_sample_grid(samples.width, samples.height)
+    .with_volume_depth(layers);
+    let key = crate::gpu::vk_dispatch::with_tic_rt_alias_layout(key, tic).with_guest_size_bytes(
+        nexium_gpu::texture::texture_guest_size_bytes(tic, layers)
+            .and_then(|size| u64::try_from(size).ok())
+            .unwrap_or(0),
+    );
+    Some(nexium_gpu::compute::ComputeOutputRtAlias {
+        binding: target.binding,
+        key,
+    })
+}
+
 fn compute_offload_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        crate::gpu::gpu_pipeline_enabled()
-            && !matches!(
-                std::env::var("NEXIUM_COMPUTE_OFFLOAD").ok().as_deref(),
-                Some("0") | Some("false") | Some("off") | Some("no")
-            )
+        let value = std::env::var("NEXIUM_COMPUTE_OFFLOAD").ok();
+        match value.as_deref() {
+            Some("0") | Some("false") | Some("off") | Some("no") => false,
+            Some("1") | Some("true") | Some("on") | Some("yes") => true,
+            _ => true,
+        }
     })
 }
 
@@ -636,6 +684,13 @@ fn pending_writeback_target_spans(
         );
     }
     spans
+}
+
+pub(crate) fn pending_writeback_spans_snapshot() -> Vec<PendingComputeWritebackSpan> {
+    let pending = pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending_writeback_target_spans(&pending)
 }
 
 pub(crate) fn resolve_pending_writebacks_report(
@@ -993,7 +1048,10 @@ fn prepare_and_execute(
     let renderer_arc = renderer.ok_or_else(|| "the Vulkan renderer is unavailable".to_string())?;
     let renderer: &nexium_gpu::Renderer = renderer_arc;
     let kp_sync = crate::gpu::pusher::kickprof::start();
-    let drained = vk_dispatch::sync_render_thread();
+    let offload = lazy_compute_enabled()
+        && compute_offload_enabled()
+        && crate::render_thread::maybe_render_thread().is_some();
+    let drained = offload || vk_dispatch::sync_render_thread();
     crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_SYNC, kp_sync);
     if !drained {
         return Err("could not drain the render thread for Maxwell compute"
@@ -1571,6 +1629,14 @@ fn prepare_and_execute(
         sampled_images,
         outputs,
         image_aliases,
+        output_rt_aliases: if compute_alias_enabled() {
+            output_targets
+                .iter()
+                .filter_map(|target| compute_output_rt_alias(target, mappings))
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
 
     static RESOURCE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

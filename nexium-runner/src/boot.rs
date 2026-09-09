@@ -552,6 +552,7 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub depth: Option<nexium_nvdrv::PresentDepth>,
 }
 
 impl From<FrameOut> for Frame {
@@ -560,6 +561,7 @@ impl From<FrameOut> for Frame {
             width: f.width,
             height: f.height,
             pixels: f.pixels,
+            depth: f.depth,
         }
     }
 }
@@ -674,6 +676,7 @@ impl FrameDeliveryGuard {
                             width: frame.width,
                             height: frame.height,
                             pixels: frame.pixels,
+                            depth: frame.depth,
                         });
                     }
                     if !try_deliver_pending_frame(&frame_tx, &mut pending_frame, repaint.as_ref()) {
@@ -2310,12 +2313,14 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![1, 0, 0, 255],
+            depth: None,
         })
         .unwrap();
         let mut pending = Some(Frame {
             width: 1,
             height: 1,
             pixels: vec![2, 0, 0, 255],
+            depth: None,
         });
 
         let repaint_count = Arc::new(AtomicU64::new(0));
@@ -2344,6 +2349,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![0, 0, 0, 255],
+            depth: None,
         })
         .unwrap();
         let worker = FrameDeliveryGuard::start(
@@ -2364,6 +2370,7 @@ mod tests {
                     height: 1,
                     pixels: vec![value, 0, 0, 255],
                     present_at: None,
+                    depth: None,
                 },
             );
         }
@@ -2413,6 +2420,7 @@ mod tests {
                 height: 1,
                 pixels: vec![9, 0, 0, 255],
                 present_at: Some(deadline),
+                depth: None,
             },
         );
 

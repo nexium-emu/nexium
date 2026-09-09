@@ -1226,6 +1226,7 @@ impl Fermi2D {
             height: h as u32,
             pixels: rgba,
             present_at: None,
+            depth: None,
         });
     }
 }

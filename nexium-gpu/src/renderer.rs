@@ -22,6 +22,8 @@ use crate::texture_manifest::{
 
 pub struct Renderer {
     inner: Mutex<RendererInner>,
+    raw_storage_resident:
+        Arc<Mutex<nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>>>,
     device: ash::Device,
     submit_timeline: vk::Semaphore,
     submit_state: Arc<SubmitState>,
@@ -1440,6 +1442,8 @@ struct RendererInner {
     compute_guest_image_pool: VecDeque<CachedComputeGuestImage>,
     compute_raw_storage_cache:
         HashMap<crate::compute::ComputeRawStorageKey, CachedComputeRawStorage>,
+    raw_storage_resident:
+        Arc<Mutex<nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>>>,
     frame_slots: Vec<FrameSlot>,
     frame_index: usize,
     utility_slot: FrameSlot,
@@ -2387,6 +2391,51 @@ struct CachedTexture {
     hash: u64,
     gen: u64,
     trusted_source_identity: Option<u64>,
+    gpu_mip_overlay: bool,
+    raw_cpu_hash: Option<u64>,
+    gpu_mip_mask: u32,
+    profile_cpu_snapshot_identity: Option<u64>,
+}
+
+fn texture_rt_mip_mask(mips: &[crate::texture_mips::TextureRtMip]) -> u32 {
+    mips.iter().fold(0, |mask, mip| {
+        mask | 1u32.checked_shl(mip.level).unwrap_or(0)
+    })
+}
+
+fn texture_rt_mips_can_refresh(
+    cached: &CachedTexture,
+    key: &TexCacheKey,
+    raw_cpu_hash: Option<u64>,
+    mips: &[crate::texture_mips::TextureRtMip],
+) -> bool {
+    raw_cpu_hash.is_some()
+        && raw_cpu_hash == cached.raw_cpu_hash
+        && !mips.is_empty()
+        && cached.gpu_mip_mask & !texture_rt_mip_mask(mips) == 0
+        && cached.image != vk::Image::null()
+        && cached.layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        && key.layers == 1
+        && !key.volume
+        && !key.arrayed
+        && !key.cube
+        && !key.cube_array
+        && mips.iter().all(|mip| {
+            mip.level < key.mip_levels
+                && mip.level < 32
+                && mip.width == (key.width >> mip.level).max(1)
+                && mip.height == (key.height >> mip.level).max(1)
+                && mip.image != cached.image
+                && mip.image != vk::Image::null()
+                && mip.layout != vk::ImageLayout::UNDEFINED
+        })
+}
+
+fn texture_mip_overlay_needs_validation(
+    cached: Option<&CachedTexture>,
+    mips: &[crate::texture_mips::TextureRtMip],
+) -> bool {
+    !mips.is_empty() || cached.is_some_and(|texture| texture.gpu_mip_overlay)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -2519,6 +2568,80 @@ fn memoized_texture_snapshot_hash(
 ) -> u64 {
     debug_assert_eq!(range.1, snapshot.len());
     *hashes.entry(range).or_insert_with(|| fnv_chunked(snapshot))
+}
+
+#[derive(Clone, Copy, Default)]
+struct TextureHashProfile {
+    snapshots: u64,
+    snapshot_bytes: u64,
+    trusted: u64,
+    repeated: u64,
+    repeated_bytes: u64,
+    hashes: u64,
+    hash_bytes: u64,
+    hash_repeated_bytes: u64,
+    hash_time: std::time::Duration,
+    memo_hits: u64,
+    memo_bytes: u64,
+}
+
+impl TextureHashProfile {
+    fn observe(&mut self, snapshot: &SharedGuestSnapshot, previous: Option<u64>) -> bool {
+        self.snapshots += 1;
+        self.snapshot_bytes += snapshot.len() as u64;
+        let identity = snapshot.trusted_identity();
+        self.trusted += u64::from(identity.is_some());
+        let repeated = identity.is_some() && identity == previous;
+        if repeated {
+            self.repeated += 1;
+            self.repeated_bytes += snapshot.len() as u64;
+        }
+        repeated
+    }
+
+    fn add(&mut self, other: Self) {
+        self.snapshots += other.snapshots;
+        self.snapshot_bytes += other.snapshot_bytes;
+        self.trusted += other.trusted;
+        self.repeated += other.repeated;
+        self.repeated_bytes += other.repeated_bytes;
+        self.hashes += other.hashes;
+        self.hash_bytes += other.hash_bytes;
+        self.hash_repeated_bytes += other.hash_repeated_bytes;
+        self.hash_time += other.hash_time;
+        self.memo_hits += other.memo_hits;
+        self.memo_bytes += other.memo_bytes;
+    }
+}
+
+fn profiled_texture_snapshot_hash(
+    hashes: &mut HashMap<(u64, usize), u64>,
+    range: (u64, usize),
+    snapshot: &[u8],
+    repeated_identity: bool,
+    profile: &mut TextureHashProfile,
+) -> u64 {
+    use std::collections::hash_map::Entry;
+
+    match hashes.entry(range) {
+        Entry::Occupied(entry) => {
+            profile.memo_hits += 1;
+            profile.memo_bytes += snapshot.len() as u64;
+            *entry.get()
+        }
+        Entry::Vacant(entry) => {
+            let started = std::time::Instant::now();
+            let hash = fnv_chunked(snapshot);
+            profile.hash_time += started.elapsed();
+            profile.hashes += 1;
+            profile.hash_bytes += snapshot.len() as u64;
+            if repeated_identity {
+                profile.hash_repeated_bytes += snapshot.len() as u64;
+            }
+            entry.insert(hash);
+            hash
+        }
+    }
 }
 
 fn trusted_texture_snapshot_matches(
@@ -3131,12 +3254,21 @@ struct RtCopySlot {
 }
 
 #[derive(Clone, Debug)]
+pub struct PresentDepth {
+    pub width: u32,
+    pub height: u32,
+    pub encoding: u32,
+    pub texels: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
 pub struct PipelinedPresentFrame {
     pub present_id: u64,
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
     pub flip_y: Option<bool>,
+    pub depth: Option<PresentDepth>,
 }
 
 #[derive(Clone, Debug)]
@@ -3159,6 +3291,27 @@ pub struct PipelinedPresentReadback {
     pub submission: PipelinedPresentSubmission,
 }
 
+#[derive(Clone, Copy)]
+struct PendingDepth {
+    offset: u64,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+}
+
+struct DepthCopyPlan {
+    key: RtKey,
+    format: vk::Format,
+    aspects: vk::ImageAspectFlags,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    offset: u64,
+    len: u64,
+    draws: u32,
+}
+
 struct PendingReadback {
     stream: u32,
     present_id: u64,
@@ -3168,12 +3321,20 @@ struct PendingReadback {
     height: u32,
     format: vk::Format,
     flip_y: Option<bool>,
+    depth: Option<PendingDepth>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingReadbackRef {
     key: RtKey,
     sequence: u64,
+}
+
+struct PresentDepthRaw {
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    bytes: Vec<u8>,
 }
 
 struct PipelinedPresentRawFrame {
@@ -3183,6 +3344,7 @@ struct PipelinedPresentRawFrame {
     pixels: Vec<u8>,
     format: vk::Format,
     flip_y: Option<bool>,
+    depth: Option<PresentDepthRaw>,
 }
 
 enum PipelinedPresentRawCompletion {
@@ -3330,6 +3492,99 @@ fn readback_byte_len(width: u32, height: u32, format: vk::Format) -> Option<usiz
         .checked_mul(exact_rt_copy_format_bpp(format)?)
 }
 
+fn depth_copy_bpp(format: vk::Format) -> Option<usize> {
+    match format {
+        vk::Format::D32_SFLOAT
+        | vk::Format::D32_SFLOAT_S8_UINT
+        | vk::Format::D24_UNORM_S8_UINT
+        | vk::Format::X8_D24_UNORM_PACK32 => Some(4),
+        vk::Format::D16_UNORM | vk::Format::D16_UNORM_S8_UINT => Some(2),
+        _ => None,
+    }
+}
+
+fn depth_encoding(format: vk::Format) -> u32 {
+    match format {
+        vk::Format::D24_UNORM_S8_UINT | vk::Format::X8_D24_UNORM_PACK32 => 1,
+        vk::Format::D16_UNORM | vk::Format::D16_UNORM_S8_UINT => 2,
+        _ => 0,
+    }
+}
+
+fn depth_copy_byte_len(width: u32, height: u32, format: vk::Format) -> Option<usize> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(depth_copy_bpp(format)?)
+}
+
+fn readout_present_depth(raw: PresentDepthRaw, vflip: bool) -> Option<PresentDepth> {
+    let bpp = depth_copy_bpp(raw.format)?;
+    let count = (raw.width as usize).checked_mul(raw.height as usize)?;
+    if raw.bytes.len() < count.checked_mul(bpp)? {
+        return None;
+    }
+    let mut texels = if bpp == 4 {
+        let mut texels = raw.bytes;
+        texels.truncate(count * 4);
+        texels
+    } else {
+        let mut texels = vec![0u8; count * 4];
+        for (dst, src) in texels
+            .chunks_exact_mut(4)
+            .zip(raw.bytes.chunks_exact(2))
+        {
+            dst[0] = src[0];
+            dst[1] = src[1];
+        }
+        texels
+    };
+    if vflip {
+        flip_rows_v(&mut texels, raw.width, raw.height);
+    }
+    Some(PresentDepth {
+        width: raw.width,
+        height: raw.height,
+        encoding: depth_encoding(raw.format),
+        texels,
+    })
+}
+
+fn note_depth_share_miss(color: RtKey, summary: String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n == 0 || n % 600 == 0 {
+        log::info!(
+            "[depth-share] no depth candidate for present {}x{} (#{}): {}",
+            color.width,
+            color.height,
+            n,
+            summary
+        );
+    }
+}
+
+fn note_depth_share_source(key: RtKey, format: vk::Format, width: u32, height: u32, draws: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let signature = (u64::from(width) << 48)
+        ^ (u64::from(height) << 32)
+        ^ u64::from(format.as_raw() as u32);
+    if LAST.swap(signature, Ordering::Relaxed) != signature {
+        log::info!(
+            "[depth-share] source {} {}x{} {:?} draws={}",
+            key.label(),
+            width,
+            height,
+            format,
+            draws
+        );
+    }
+}
+
 fn materialize_completed_readback(
     device: &ash::Device,
     readback_slots: &mut [ReadbackSlot],
@@ -3343,29 +3598,54 @@ fn materialize_completed_readback(
     };
     let raw = (|| {
         let total = readback_byte_len(completed.width, completed.height, completed.format)?;
+        let depth_len = completed
+            .depth
+            .and_then(|d| depth_copy_byte_len(d.width, d.height, d.format))
+            .unwrap_or(0);
+        let depth_end = completed
+            .depth
+            .map_or(0usize, |d| d.offset as usize)
+            .checked_add(depth_len)?;
+        let map_len = total.max(depth_end);
         let stage = slot.stage.as_ref()?;
-        if stage.size < total as u64 {
+        if stage.size < map_len as u64 {
             return None;
         }
         let mut raw = vec![0u8; total];
+        let mut depth = None;
         unsafe {
             let ptr = device
-                .map_memory(stage.memory, 0, total as u64, vk::MemoryMapFlags::empty())
+                .map_memory(stage.memory, 0, map_len as u64, vk::MemoryMapFlags::empty())
                 .ok()?;
             std::ptr::copy_nonoverlapping(ptr as *const u8, raw.as_mut_ptr(), total);
+            if let Some(d) = completed.depth.filter(|_| depth_len > 0) {
+                let mut bytes = vec![0u8; depth_len];
+                std::ptr::copy_nonoverlapping(
+                    (ptr as *const u8).add(d.offset as usize),
+                    bytes.as_mut_ptr(),
+                    depth_len,
+                );
+                depth = Some(PresentDepthRaw {
+                    width: d.width,
+                    height: d.height,
+                    format: d.format,
+                    bytes,
+                });
+            }
             device.unmap_memory(stage.memory);
         }
-        Some(raw)
+        Some((raw, depth))
     })();
     slot.in_flight = false;
     Some(match raw {
-        Some(pixels) => PipelinedPresentRawCompletion::Ready(PipelinedPresentRawFrame {
+        Some((pixels, depth)) => PipelinedPresentRawCompletion::Ready(PipelinedPresentRawFrame {
             present_id: completed.present_id,
             width: completed.width,
             height: completed.height,
             pixels,
             format: completed.format,
             flip_y: completed.flip_y,
+            depth,
         }),
         None => PipelinedPresentRawCompletion::Dropped {
             present_id: completed.present_id,
@@ -3561,6 +3841,7 @@ struct PendingComputeOutput {
     depth: u32,
     format: crate::compute::ComputeStorageFormat,
     byte_len: usize,
+    rt_alias: Option<RtKey>,
 }
 
 struct PendingComputeTexel {
@@ -3651,11 +3932,7 @@ impl Renderer {
         &self,
         key: crate::compute::ComputeRawStorageKey,
     ) -> bool {
-        self.inner
-            .lock()
-            .compute_raw_storage_cache
-            .get(&key)
-            .is_some_and(|entry| entry.ready && entry.valid)
+        self.raw_storage_resident.lock().contains(&key)
     }
 
     pub fn release_unreferenced_compute_raw_storage(&self) {
@@ -4851,7 +5128,10 @@ impl Renderer {
         log::info!("nexium-gpu Renderer init OK: {} (Vulkan via Ash)", name);
 
         let device_handle = device.clone();
+        let raw_storage_resident =
+            Arc::new(Mutex::new(nexium_common::fast_hash::FastSet::default()));
         let renderer = Arc::new(Self {
+            raw_storage_resident: Arc::clone(&raw_storage_resident),
             inner: Mutex::new(RendererInner {
                 entry,
                 instance,
@@ -4884,6 +5164,7 @@ impl Renderer {
                 compute_volume_cache: Vec::new(),
                 compute_guest_image_pool: VecDeque::new(),
                 compute_raw_storage_cache: HashMap::new(),
+                raw_storage_resident,
                 frame_slots,
                 frame_index: 0,
                 utility_slot,
@@ -7269,12 +7550,19 @@ impl Renderer {
         let completion = match raw_result.completion {
             Some(PipelinedPresentRawCompletion::Ready(frame)) => {
                 let pp_t1 = std::time::Instant::now();
+                let vflip = frame
+                    .flip_y
+                    .unwrap_or(!(frame.width == 1600 && frame.height == 900));
+                let depth = if legacy_present_enabled() {
+                    None
+                } else {
+                    frame
+                        .depth
+                        .and_then(|raw| readout_present_depth(raw, vflip))
+                };
                 let out = if legacy_present_enabled() {
                     readback_to_rgba8(&frame.pixels, frame.format, frame.width, frame.height)
                 } else {
-                    let vflip = frame
-                        .flip_y
-                        .unwrap_or(!(frame.width == 1600 && frame.height == 900));
                     readout_present_rgba8(
                         frame.pixels,
                         frame.format,
@@ -7290,6 +7578,7 @@ impl Renderer {
                     height: frame.height,
                     pixels: out,
                     flip_y: frame.flip_y,
+                    depth,
                 }))
             }
             Some(PipelinedPresentRawCompletion::Dropped { present_id }) => {
@@ -7437,6 +7726,15 @@ impl Renderer {
             requested_key,
             key,
         );
+        let depth_pick = if nexium_common::depth_share::enabled() {
+            let pick = rt_cache.present_depth_key(key);
+            if pick.is_none() {
+                note_depth_share_miss(key, rt_cache.depth_share_summary());
+            }
+            pick
+        } else {
+            None
+        };
         rt_cache.reset_frame_draws();
 
         let completion = take_pipelined_readback_completion(
@@ -7492,12 +7790,39 @@ impl Renderer {
             };
         };
         let total = total as u64;
+        let depth_plan = if nexium_common::depth_share::enabled() {
+            depth_pick.and_then(|(dkey, dw, dh, dformat, daspects, draws)| {
+                    let (dx, dy, dcw, dch) = if dw == key.width && dh == key.height {
+                        (copy_x, copy_y, copy_w, copy_h)
+                    } else {
+                        (0, 0, dw, dh)
+                    };
+                    let len = depth_copy_byte_len(dcw, dch, dformat)? as u64;
+                    Some(DepthCopyPlan {
+                        key: dkey,
+                        format: dformat,
+                        aspects: daspects,
+                        x: dx,
+                        y: dy,
+                        width: dcw,
+                        height: dch,
+                        offset: (total + 15) & !15,
+                        len,
+                        draws,
+                    })
+                })
+        } else {
+            None
+        };
+        let stage_len = depth_plan
+            .as_ref()
+            .map_or(total, |plan| plan.offset + plan.len);
         {
             let slot = &mut readback_slots[slot_idx];
             let needs_stage = slot
                 .stage
                 .as_ref()
-                .map(|stage| stage.size < total)
+                .map(|stage| stage.size < stage_len)
                 .unwrap_or(true);
             if needs_stage {
                 if let Some(old) = slot.stage.take() {
@@ -7506,7 +7831,7 @@ impl Renderer {
                         device.free_memory(old.memory, None);
                     }
                 }
-                match create_staging_owned(device, mem_props, total) {
+                match create_staging_owned(device, mem_props, stage_len) {
                     Ok(stage) => {
                         slot.stage = Some(stage);
                     }
@@ -7593,6 +7918,79 @@ impl Renderer {
             );
         }
         let previous_layout = img.layout;
+        let mut pending_depth = None;
+        if let Some(plan) = depth_plan {
+            if let Some(depth_img) = rt_cache.get_existing_depth(plan.key) {
+                if depth_img.layout != vk::ImageLayout::UNDEFINED
+                    && depth_img.format == plan.format
+                    && depth_img.extent.width >= plan.x + plan.width
+                    && depth_img.extent.height >= plan.y + plan.height
+                {
+                    let depth_prev = depth_img.layout;
+                    transition_image_aspect(
+                        device,
+                        cmd,
+                        depth_img.image,
+                        depth_prev,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        plan.aspects,
+                    );
+                    let depth_copy = vk::BufferImageCopy {
+                        buffer_offset: plan.offset,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::DEPTH,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D {
+                            x: plan.x as i32,
+                            y: plan.y as i32,
+                            z: 0,
+                        },
+                        image_extent: vk::Extent3D {
+                            width: plan.width,
+                            height: plan.height,
+                            depth: 1,
+                        },
+                    };
+                    unsafe {
+                        device.cmd_copy_image_to_buffer(
+                            cmd,
+                            depth_img.image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            stage_buffer,
+                            &[depth_copy],
+                        );
+                    }
+                    if depth_prev != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+                        transition_image_aspect(
+                            device,
+                            cmd,
+                            depth_img.image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            depth_prev,
+                            plan.aspects,
+                        );
+                    }
+                    note_depth_share_source(
+                        plan.key,
+                        plan.format,
+                        plan.width,
+                        plan.height,
+                        plan.draws,
+                    );
+                    pending_depth = Some(PendingDepth {
+                        offset: plan.offset,
+                        width: plan.width,
+                        height: plan.height,
+                        format: plan.format,
+                    });
+                }
+            }
+        }
         let end_res = end_one_time(device, cmd);
         let sub_res = if end_res.is_ok() {
             submit_with_fence(submit_state, *submit_timeline, device, *queue, cmd, fence)
@@ -7620,7 +8018,9 @@ impl Renderer {
                 submission: PipelinedPresentSubmission::Failed,
             };
         }
-        img.layout = readback_layout_after_submit(previous_layout, true);
+        if let Some(img) = rt_cache.get_existing(key) {
+            img.layout = readback_layout_after_submit(previous_layout, true);
+        }
         readback_slots[slot_idx].in_flight = true;
         let sequence = *next_readback_sequence;
         *next_readback_sequence = sequence.wrapping_add(1).max(1);
@@ -7636,6 +8036,7 @@ impl Renderer {
                 height: copy_h,
                 format: readback_format,
                 flip_y: resolved_flip_y,
+                depth: pending_depth,
             });
         pending_readback_order
             .entry(binder_id)
@@ -8167,7 +8568,16 @@ impl Renderer {
                 let tic = tex_pendings
                     .get(slot)
                     .and_then(|pending| pending.as_ref().map(|(_, tic, _, _)| tic));
-                rt_alias_for_slot(rt_cache, None, call, slot, call.rt_key, false, tic)
+                rt_alias_for_slot(
+                    rt_cache,
+                    None,
+                    call,
+                    slot,
+                    call.rt_key,
+                    false,
+                    tic,
+                    tsc_entries.get(slot).and_then(Option::as_ref),
+                )
             })
             .map(|alias| alias.filter(|alias| alias.depth || !color_keys.contains(&alias.key)))
             .collect();
@@ -8300,7 +8710,15 @@ impl Renderer {
             let direct_volume_rt = pending.map_or(false, |(key, _, _, _)| key.volume)
                 && sampled_rt_key_for_slot(call, slot).is_some_and(|key| key.is_3d);
             let pending_special = pending.map_or(false, |(key, tic, _, _)| {
-                texture_key_blocks_2d_rt_alias(key, &tic)
+                texture_key_blocks_2d_rt_alias(
+                    key,
+                    &rt_alias_tic_for_slot(
+                        call,
+                        slot,
+                        tic,
+                        tsc_entries.get(slot).and_then(Option::as_ref),
+                    ),
+                )
             }) && !direct_volume_rt;
             if !pending_special {
                 if let Some(alias) = rt_aliases.get(slot).copied().flatten().filter(|alias| {
@@ -8466,6 +8884,14 @@ impl Renderer {
             let numeric_family = texture_numeric_index(numeric_type);
             let mut binding_failure_reason = None;
             let identity_volume = key.volume && volume_identity_enabled();
+            let rt_mips = sampled_rt_key_for_slot(call, slot)
+                .zip(texture_image_format_for_tic(&tic, numeric_type).ok())
+                .map(|(base_key, format)| {
+                    crate::texture_mips::find_texture_rt_mips(rt_cache, &tic, base_key, format)
+                })
+                .unwrap_or_default();
+            let mip_overlay_needs_validation =
+                texture_mip_overlay_needs_validation(tex_cache.get(&key), &rt_mips);
             let volume_slices = if key.volume
                 && !identity_volume
                 && numeric_type == nexium_spirv::TextureNumericType::Float
@@ -8490,6 +8916,7 @@ impl Renderer {
             }
             let force_refresh_early = force_refresh_texture(key.gpu_va);
             let cache_fresh = generation_gating
+                && !mip_overlay_needs_validation
                 && !force_refresh_early
                 && volume_slices.is_none()
                 && !identity_volume
@@ -8507,6 +8934,7 @@ impl Renderer {
                 if let Some(slices) = volume_slices.as_ref() {
                     tex_hash = volume_rt_slice_hash(tex_hash, slices);
                 }
+                tex_hash = crate::texture_mips::texture_rt_mip_hash(tex_hash, &rt_mips);
                 let force_refresh = force_refresh_early;
                 let content_hash_authoritative =
                     raw_hash.is_some() && volume_slices.is_none() && !identity_volume;
@@ -8650,9 +9078,11 @@ impl Renderer {
                         texels,
                         &upload.copies,
                         volume_slices.as_deref(),
+                        &rt_mips,
                         texture_view_swizzle(tic.format, numeric_type, tic.swizzle),
                         image_format,
                         tex_hash,
+                        raw_hash,
                         cur_gen,
                     ) {
                         Ok(tex) => {
@@ -9736,6 +10166,7 @@ impl Renderer {
         let texture_generation_gating = tex_gen_gating_enabled();
         let hot_generic_texture_binding_cache = hot_generic_texture_bindings_enabled();
         let mut rp_texture_memo = RecordTextureMemoProfile::default();
+        let mut rp_texture_hash = [TextureHashProfile::default(); 2];
 
         struct Prep<'a> {
             pipeline: vk::Pipeline,
@@ -10497,6 +10928,7 @@ impl Renderer {
                             rt_key,
                             true,
                             tic,
+                            prep.tsc_entries.get(slot).and_then(Option::as_ref),
                         )
                     });
                 let feedback_loop = color_keys.iter().copied().any(|key| {
@@ -10540,6 +10972,7 @@ impl Renderer {
                             rt_key,
                             true,
                             tic,
+                            prep.tsc_entries.get(slot).and_then(Option::as_ref),
                         );
                     }
                 }
@@ -10801,7 +11234,15 @@ impl Renderer {
                     let direct_volume_rt = pending.map_or(false, |(key, _, _, _)| key.volume)
                         && sampled_rt_key_for_slot(call, slot).is_some_and(|key| key.is_3d);
                     let pending_special = pending.map_or(false, |(key, tic, _, _)| {
-                        texture_key_blocks_2d_rt_alias(key, &tic)
+                        texture_key_blocks_2d_rt_alias(
+                            key,
+                            &rt_alias_tic_for_slot(
+                                call,
+                                slot,
+                                tic,
+                                prep.tsc_entries.get(slot).and_then(Option::as_ref),
+                            ),
+                        )
                     }) && !direct_volume_rt;
                     let frozen_rt_alias = rt_aliases
                         .get(slot)
@@ -10920,6 +11361,7 @@ impl Renderer {
                                         rt_key,
                                         true,
                                         tic,
+                                        prep.tsc_entries.get(slot).and_then(Option::as_ref),
                                     );
                                 }
                             }
@@ -11244,6 +11686,56 @@ impl Renderer {
                     let numeric_type = texture_numeric_types[slot];
                     let numeric_family = texture_numeric_index(numeric_type);
                     let mut binding_failure_reason = None;
+                    let mip_overlay_candidate = crate::texture_mips::texture_rt_mip_candidate(&tic);
+                    let mip_source_in_pass = mip_overlay_candidate
+                        && sampled_rt_key_for_slot(call, slot).is_none_or(|source| {
+                            color_bind.iter().any(|(target, _, _, _, _)| {
+                                source.guest_size_bytes == 0
+                                    || target.guest_size_bytes == 0
+                                    || gpu_ranges_overlap(
+                                        source.gpu_va,
+                                        source.guest_size_bytes,
+                                        target.gpu_va,
+                                        target.guest_size_bytes,
+                                    )
+                                    || (source.cpu_addr != 0
+                                        && target.cpu_addr != 0
+                                        && gpu_ranges_overlap(
+                                            source.cpu_addr,
+                                            source.guest_size_bytes,
+                                            target.cpu_addr,
+                                            target.guest_size_bytes,
+                                        ))
+                            })
+                        });
+                    if mip_source_in_pass && pass_open {
+                        unsafe {
+                            device.cmd_end_rendering(cmd);
+                        }
+                        finish_color_pass(
+                            device,
+                            cmd,
+                            rt_cache,
+                            &color_bind,
+                            &mut color_layouts,
+                            pass_rt_layout,
+                            &mut pass_dirty,
+                            &pass_trace_calls,
+                        );
+                        pass_open = false;
+                        pass_trace_calls.clear();
+                        color_sync_checked.clear();
+                    }
+                    let rt_mips = sampled_rt_key_for_slot(call, slot)
+                        .zip(texture_image_format_for_tic(&tic, numeric_type).ok())
+                        .map(|(base_key, format)| {
+                            crate::texture_mips::find_texture_rt_mips(
+                                rt_cache, &tic, base_key, format,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let mip_overlay_needs_validation =
+                        texture_mip_overlay_needs_validation(tex_cache.get(&key), &rt_mips);
                     let identity_volume = key.volume && volume_identity_enabled();
                     let volume_slices = if key.volume
                         && !identity_volume
@@ -11300,6 +11792,7 @@ impl Renderer {
                         .flatten();
                     let generation_gating = texture_generation_gating;
                     let group_binding_eligible = group_route.is_some()
+                        && !mip_overlay_needs_validation
                         && group_texture_binding_memo_eligible(
                             key,
                             tic,
@@ -11329,6 +11822,7 @@ impl Renderer {
                         generation_gating && group_binding.is_none(),
                     );
                     let hot_binding_eligible = hot_generic_texture_binding_cache
+                        && !mip_overlay_needs_validation
                         && group_binding.is_none()
                         && generation_gating
                         && !force_refresh_early
@@ -11344,6 +11838,7 @@ impl Renderer {
                         });
                     let hot_binding = group_binding.or(slot_hot_binding);
                     let cache_fresh = !force_refresh_early
+                        && !mip_overlay_needs_validation
                         && volume_slices.is_none()
                         && !identity_volume
                         && (group_binding.is_some()
@@ -11369,7 +11864,18 @@ impl Renderer {
                             texstat_event(1, raw_entry.as_ref().map_or(0, |raw| raw.len()));
                         }
                         let raw_snapshot = raw_entry.as_ref();
+                        let hash_profile_index = usize::from(mip_overlay_needs_validation);
+                        let repeated_identity = record_stage_profile
+                            && raw_snapshot.is_some_and(|raw| {
+                                rp_texture_hash[hash_profile_index].observe(
+                                    raw,
+                                    tex_cache
+                                        .get(&key)
+                                        .and_then(|texture| texture.profile_cpu_snapshot_identity),
+                                )
+                            });
                         let trusted_match = volume_slices.is_none()
+                            && !mip_overlay_needs_validation
                             && !identity_volume
                             && trusted_texture_snapshot_matches(
                                 tex_cache
@@ -11383,17 +11889,28 @@ impl Renderer {
                             (!trusted_match)
                                 .then(|| {
                                     raw_snapshot.map(|raw| {
-                                        memoized_texture_snapshot_hash(
-                                            &mut tex_raw_hash_cache,
-                                            (key.gpu_va, read_size),
-                                            raw.as_slice(),
-                                        )
+                                        if record_stage_profile {
+                                            profiled_texture_snapshot_hash(
+                                                &mut tex_raw_hash_cache,
+                                                (key.gpu_va, read_size),
+                                                raw.as_slice(),
+                                                repeated_identity,
+                                                &mut rp_texture_hash[hash_profile_index],
+                                            )
+                                        } else {
+                                            memoized_texture_snapshot_hash(
+                                                &mut tex_raw_hash_cache,
+                                                (key.gpu_va, read_size),
+                                                raw.as_slice(),
+                                            )
+                                        }
                                     })
                                 })
                                 .flatten(),
                         )
                     };
                     let trusted_snapshot_match = raw_snapshot.is_some()
+                        && !mip_overlay_needs_validation
                         && volume_slices.is_none()
                         && !identity_volume
                         && trusted_texture_snapshot_matches(
@@ -11404,7 +11921,9 @@ impl Renderer {
                         );
                     let trusted_source_identity = raw_snapshot
                         .and_then(SharedGuestSnapshot::trusted_identity)
-                        .filter(|_| volume_slices.is_none() && !identity_volume);
+                        .filter(|_| {
+                            volume_slices.is_none() && !identity_volume && rt_mips.is_empty()
+                        });
                     let upload_decision_available =
                         raw.is_some() || volume_slices.is_some() || identity_volume;
                     let content_hash_authoritative =
@@ -11427,6 +11946,7 @@ impl Renderer {
                         if let Some(slices) = volume_slices.as_ref() {
                             tex_hash = volume_rt_slice_hash(tex_hash, slices);
                         }
+                        tex_hash = crate::texture_mips::texture_rt_mip_hash(tex_hash, &rt_mips);
                         let force_refresh = force_refresh_early;
                         let need_upload = sampled_texture_needs_upload(
                             force_refresh,
@@ -11471,127 +11991,192 @@ impl Renderer {
                                 }
                             }
                             rp_tex_uploads += 1;
-                            if tic.is_srgb && tic_srgb_log_enabled() {
-                                log::warn!(
-                                    "[tic-srgb] batch {}x{} fmt={:?} bl={} va={:#x}",
-                                    tic.width,
-                                    tic.height,
-                                    tic.format,
-                                    tic.is_block_linear,
-                                    tic.gpu_va
-                                );
-                            }
-                            let force_pitch = force_pitch_enabled();
-                            let image_format = if identity_volume {
-                                Ok(texture_image_format(
-                                    crate::texture::TicFormat::R8G8B8A8,
-                                    false,
-                                    false,
-                                    numeric_type,
-                                ))
-                            } else if let Some(slice) =
-                                volume_slices.as_ref().and_then(|slices| slices.first())
-                            {
-                                Ok(slice.format)
-                            } else {
-                                texture_image_format_for_tic(&tic, numeric_type)
-                            };
-                            let image_format = match image_format {
-                                Ok(format) => format,
-                                Err(error) => {
-                                    log_graphics_texture_rejection(
-                                        call,
-                                        slot,
-                                        *pending,
-                                        numeric_type,
-                                        "format",
-                                        &error,
-                                    );
-                                    continue;
-                                }
-                            };
-                            let upload = if volume_slices.is_some() {
-                                Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
-                            } else if identity_volume {
-                                Ok(TextureUploadData::base(
-                                    identity_volume_rgba8(key.width, key.height, key.layers),
-                                    key.width,
-                                    key.height,
-                                ))
-                            } else if let Some(raw) = raw {
-                                texture_upload_data(
-                                    raw,
-                                    &tic,
-                                    key.layers,
-                                    pitch_size,
-                                    force_pitch,
-                                    image_format,
-                                )
-                            } else {
-                                Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
-                            };
-                            let upload = match upload {
-                                Ok(upload) => upload,
-                                Err(error) => {
-                                    log_graphics_texture_rejection(
-                                        call,
-                                        slot,
-                                        *pending,
-                                        numeric_type,
-                                        "decode",
-                                        &error,
-                                    );
-                                    continue;
-                                }
-                            };
-                            let texels = &upload.bytes;
-                            texstat_event(2, texels.len());
-                            let dump_target = texdump_target_enabled(tic.gpu_va);
-                            let dump_stats = texdump_stats_enabled() && dump_target;
-                            let dump_img = texdump_image_enabled() && dump_target;
-                            let dump_rgba8 = if dump_stats || dump_img {
-                                Some(
-                                    if image_format == vk::Format::R8G8B8A8_UNORM
-                                        && volume_slices.is_none()
-                                    {
-                                        upload.bytes.clone()
-                                    } else if identity_volume {
-                                        identity_volume_rgba8(key.width, key.height, key.layers)
-                                    } else if let Some(raw) = raw {
-                                        decode_texture_rgba8_layers(
-                                            raw,
-                                            &tic,
-                                            key.layers,
-                                            pitch_size,
-                                            force_pitch,
-                                        )
-                                    } else {
-                                        Vec::new()
-                                    },
-                                )
-                            } else {
-                                None
-                            };
-                            if dump_stats {
-                                use std::sync::{Mutex, OnceLock};
-                                static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> =
-                                    OnceLock::new();
-                                let s = SEEN
-                                    .get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-                                if s.lock().unwrap().insert(tic.gpu_va) {
-                                    let rgba8 = dump_rgba8.as_deref().unwrap_or(&[]);
-                                    let (mut sr, mut sg, mut sb, mut sa) = (0u64, 0u64, 0u64, 0u64);
-                                    let (mut amin, mut amax) = (255u8, 0u8);
-                                    for c in rgba8.chunks_exact(4) {
-                                        sr += c[0] as u64;
-                                        sg += c[1] as u64;
-                                        sb += c[2] as u64;
-                                        sa += c[3] as u64;
-                                        amin = amin.min(c[3]);
-                                        amax = amax.max(c[3]);
+                            let gpu_refresh = !force_refresh
+                                && texture_rt_mip_update_enabled()
+                                && tex_cache.get(&key).is_some_and(|texture| {
+                                    texture_rt_mips_can_refresh(texture, &key, raw_hash, &rt_mips)
+                                });
+                            if gpu_refresh {
+                                if pass_open {
+                                    unsafe {
+                                        device.cmd_end_rendering(cmd);
                                     }
-                                    let n = (rgba8.len() / 4).max(1) as u64;
+                                    finish_color_pass(
+                                        device,
+                                        cmd,
+                                        rt_cache,
+                                        &color_bind,
+                                        &mut color_layouts,
+                                        pass_rt_layout,
+                                        &mut pass_dirty,
+                                        &pass_trace_calls,
+                                    );
+                                    pass_open = false;
+                                    pass_trace_calls.clear();
+                                    color_sync_checked.clear();
+                                }
+                                if let Some(texture) = tex_cache.get_mut(&key) {
+                                    update_texture_rt_mips_only(
+                                        device,
+                                        cmd,
+                                        texture.image,
+                                        key.mip_levels,
+                                        &rt_mips,
+                                    );
+                                    texture.hash = tex_hash;
+                                    texture.gen = cur_gen;
+                                    texture.trusted_source_identity = None;
+                                    texture.raw_cpu_hash = raw_hash;
+                                    texture.gpu_mip_mask = texture_rt_mip_mask(&rt_mips);
+                                    texture.gpu_mip_overlay = true;
+                                }
+                            } else {
+                                if tic.is_srgb && tic_srgb_log_enabled() {
                                     log::warn!(
+                                        "[tic-srgb] batch {}x{} fmt={:?} bl={} va={:#x}",
+                                        tic.width,
+                                        tic.height,
+                                        tic.format,
+                                        tic.is_block_linear,
+                                        tic.gpu_va
+                                    );
+                                }
+                                let force_pitch = force_pitch_enabled();
+                                let image_format = if identity_volume {
+                                    Ok(texture_image_format(
+                                        crate::texture::TicFormat::R8G8B8A8,
+                                        false,
+                                        false,
+                                        numeric_type,
+                                    ))
+                                } else if let Some(slice) =
+                                    volume_slices.as_ref().and_then(|slices| slices.first())
+                                {
+                                    Ok(slice.format)
+                                } else {
+                                    texture_image_format_for_tic(&tic, numeric_type)
+                                };
+                                let image_format = match image_format {
+                                    Ok(format) => format,
+                                    Err(error) => {
+                                        log_graphics_texture_rejection(
+                                            call,
+                                            slot,
+                                            *pending,
+                                            numeric_type,
+                                            "format",
+                                            &error,
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let upload = if volume_slices.is_some() {
+                                    Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
+                                } else if identity_volume {
+                                    Ok(TextureUploadData::base(
+                                        identity_volume_rgba8(key.width, key.height, key.layers),
+                                        key.width,
+                                        key.height,
+                                    ))
+                                } else if let Some(raw) = raw {
+                                    texture_upload_data(
+                                        raw,
+                                        &tic,
+                                        key.layers,
+                                        pitch_size,
+                                        force_pitch,
+                                        image_format,
+                                    )
+                                } else {
+                                    Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
+                                };
+                                let upload = match upload {
+                                    Ok(upload) => upload,
+                                    Err(error) => {
+                                        log_graphics_texture_rejection(
+                                            call,
+                                            slot,
+                                            *pending,
+                                            numeric_type,
+                                            "decode",
+                                            &error,
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let texels = &upload.bytes;
+                                texstat_event(2, texels.len());
+                                let dump_target = texdump_target_enabled(tic.gpu_va);
+                                let dump_stats = texdump_stats_enabled() && dump_target;
+                                let dump_img = texdump_image_enabled() && dump_target;
+                                let dump_rgba8 = if dump_stats || dump_img {
+                                    Some(
+                                        if image_format == vk::Format::R8G8B8A8_UNORM
+                                            && volume_slices.is_none()
+                                        {
+                                            upload.bytes.clone()
+                                        } else if identity_volume {
+                                            identity_volume_rgba8(key.width, key.height, key.layers)
+                                        } else if let Some(raw) = raw {
+                                            decode_texture_rgba8_layers(
+                                                raw,
+                                                &tic,
+                                                key.layers,
+                                                pitch_size,
+                                                force_pitch,
+                                            )
+                                        } else {
+                                            Vec::new()
+                                        },
+                                    )
+                                } else {
+                                    None
+                                };
+                                if dump_stats {
+                                    use std::sync::{Mutex, OnceLock};
+                                    static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> =
+                                        OnceLock::new();
+                                    let s = SEEN.get_or_init(|| {
+                                        Mutex::new(std::collections::HashSet::new())
+                                    });
+                                    if s.lock().unwrap().insert(tic.gpu_va) {
+                                        if let Some(directory) =
+                                            std::env::var_os("NEXIUM_RT_STATS_RAW_DIR")
+                                        {
+                                            let directory = std::path::PathBuf::from(directory);
+                                            if std::fs::create_dir_all(&directory).is_ok() {
+                                                let path = directory.join(format!(
+                                                    "tex_{:x}_{}x{}_{}.bin",
+                                                    tic.gpu_va,
+                                                    tic.width,
+                                                    tic.height,
+                                                    image_format.as_raw()
+                                                ));
+                                                if let Err(error) =
+                                                    std::fs::write(&path, &upload.bytes)
+                                                {
+                                                    log::warn!(
+                                                        "[tex-stats-raw] {}: {}",
+                                                        path.display(),
+                                                        error
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        let rgba8 = dump_rgba8.as_deref().unwrap_or(&[]);
+                                        let (mut sr, mut sg, mut sb, mut sa) =
+                                            (0u64, 0u64, 0u64, 0u64);
+                                        let (mut amin, mut amax) = (255u8, 0u8);
+                                        for c in rgba8.chunks_exact(4) {
+                                            sr += c[0] as u64;
+                                            sg += c[1] as u64;
+                                            sb += c[2] as u64;
+                                            sa += c[3] as u64;
+                                            amin = amin.min(c[3]);
+                                            amax = amax.max(c[3]);
+                                        }
+                                        let n = (rgba8.len() / 4).max(1) as u64;
+                                        log::warn!(
                                     "TEXDUMP va={:#x} {}x{} fmt={:?} bl={} bh_log2={} read_size={} pitch_size={} pitchdst={} avg=({},{},{},{}) a=[{}..{}] raw16={:02x?}",
                                     tic.gpu_va, tic.width, tic.height, tic.format,
                                     tic.is_block_linear, tic.block_height_log2, read_size, pitch_size,
@@ -11599,48 +12184,49 @@ impl Renderer {
                                     sr / n, sg / n, sb / n, sa / n, amin, amax,
                                     raw.map(|raw| &raw[..16.min(raw.len())]).unwrap_or(&[]),
                                 );
+                                    }
                                 }
-                            }
-                            if dump_img {
-                                dump_texture_bmp_once(
-                                    tic.gpu_va,
-                                    tic.width,
-                                    tic.height,
-                                    key.layers,
-                                    dump_rgba8.as_deref().unwrap_or(&[]),
-                                    tic.swizzle,
-                                    "base",
-                                );
-                                if matches!(
-                                    image_format,
-                                    vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB
-                                ) {
-                                    for copy in &upload.copies {
-                                        let start = copy.buffer_offset as usize;
-                                        let len = copy.width as usize
-                                            * copy.height as usize
-                                            * key.layers.max(1) as usize
-                                            * 4;
-                                        let end = start.saturating_add(len).min(upload.bytes.len());
-                                        if start < end {
-                                            let mip = &upload.bytes[start..end];
-                                            let mut raw_hasher = DefaultHasher::new();
-                                            mip.hash(&mut raw_hasher);
-                                            let raw_hash = raw_hasher.finish();
-                                            let mut sums = [0u64; 4];
-                                            let mut mins = [u8::MAX; 4];
-                                            let mut maxs = [u8::MIN; 4];
-                                            for texel in mip.chunks_exact(4) {
-                                                for component in 0..4 {
-                                                    sums[component] += texel[component] as u64;
-                                                    mins[component] =
-                                                        mins[component].min(texel[component]);
-                                                    maxs[component] =
-                                                        maxs[component].max(texel[component]);
+                                if dump_img {
+                                    dump_texture_bmp_once(
+                                        tic.gpu_va,
+                                        tic.width,
+                                        tic.height,
+                                        key.layers,
+                                        dump_rgba8.as_deref().unwrap_or(&[]),
+                                        tic.swizzle,
+                                        "base",
+                                    );
+                                    if matches!(
+                                        image_format,
+                                        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB
+                                    ) {
+                                        for copy in &upload.copies {
+                                            let start = copy.buffer_offset as usize;
+                                            let len = copy.width as usize
+                                                * copy.height as usize
+                                                * key.layers.max(1) as usize
+                                                * 4;
+                                            let end =
+                                                start.saturating_add(len).min(upload.bytes.len());
+                                            if start < end {
+                                                let mip = &upload.bytes[start..end];
+                                                let mut raw_hasher = DefaultHasher::new();
+                                                mip.hash(&mut raw_hasher);
+                                                let raw_hash = raw_hasher.finish();
+                                                let mut sums = [0u64; 4];
+                                                let mut mins = [u8::MAX; 4];
+                                                let mut maxs = [u8::MIN; 4];
+                                                for texel in mip.chunks_exact(4) {
+                                                    for component in 0..4 {
+                                                        sums[component] += texel[component] as u64;
+                                                        mins[component] =
+                                                            mins[component].min(texel[component]);
+                                                        maxs[component] =
+                                                            maxs[component].max(texel[component]);
+                                                    }
                                                 }
-                                            }
-                                            let count = (mip.len() / 4).max(1) as u64;
-                                            log::warn!(
+                                                let count = (mip.len() / 4).max(1) as u64;
+                                                log::warn!(
                                                 "TEXDUMP-MIP va={:#x} level={} {}x{} hash={:#018x} avg=({},{},{},{}) min={:?} max={:?}",
                                                 tic.gpu_va,
                                                 copy.mip_level,
@@ -11654,130 +12240,144 @@ impl Renderer {
                                                 mins,
                                                 maxs,
                                             );
-                                            dump_texture_bmp_once(
-                                                tic.gpu_va,
-                                                copy.width,
-                                                copy.height,
-                                                key.layers,
-                                                mip,
-                                                tic.swizzle,
-                                                &format!("mip{}", copy.mip_level),
-                                            );
+                                                dump_texture_bmp_once(
+                                                    tic.gpu_va,
+                                                    copy.width,
+                                                    copy.height,
+                                                    key.layers,
+                                                    mip,
+                                                    tic.swizzle,
+                                                    &format!("mip{}", copy.mip_level),
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if pass_open {
-                                unsafe {
-                                    device.cmd_end_rendering(cmd);
-                                }
-                                finish_color_pass(
-                                    device,
-                                    cmd,
-                                    rt_cache,
-                                    &color_bind,
-                                    &mut color_layouts,
-                                    pass_rt_layout,
-                                    &mut pass_dirty,
-                                    &pass_trace_calls,
-                                );
-                                pass_open = false;
-                                pass_trace_calls.clear();
-                                color_sync_checked.clear();
-                            }
-                            let mut updated_in_place = false;
-                            if texture_update_in_place_enabled() && volume_slices.is_none() {
-                                let existing = tex_cache
-                                    .get(&key)
-                                    .map(|texture| (texture.image, texture.layout));
-                                if let Some((image, old_layout)) = existing {
-                                    match update_texture_image(
+                                if pass_open {
+                                    unsafe {
+                                        device.cmd_end_rendering(cmd);
+                                    }
+                                    finish_color_pass(
                                         device,
                                         cmd,
-                                        mem_props,
-                                        image,
-                                        old_layout,
-                                        key.layers,
-                                        key.volume,
-                                        key.mip_levels,
-                                        texels,
-                                        &upload.copies,
-                                        &mut frame_slots[cur_idx],
-                                    ) {
-                                        Ok(stage) => {
-                                            if let Some(stage) = stage {
-                                                frame_slots[cur_idx].upload_buffers.push(stage);
+                                        rt_cache,
+                                        &color_bind,
+                                        &mut color_layouts,
+                                        pass_rt_layout,
+                                        &mut pass_dirty,
+                                        &pass_trace_calls,
+                                    );
+                                    pass_open = false;
+                                    pass_trace_calls.clear();
+                                    color_sync_checked.clear();
+                                }
+                                let mut updated_in_place = false;
+                                if texture_update_in_place_enabled() && volume_slices.is_none() {
+                                    let existing = tex_cache
+                                        .get(&key)
+                                        .map(|texture| (texture.image, texture.layout));
+                                    if let Some((image, old_layout)) = existing {
+                                        match update_texture_image(
+                                            device,
+                                            cmd,
+                                            mem_props,
+                                            image,
+                                            old_layout,
+                                            key.layers,
+                                            key.volume,
+                                            key.mip_levels,
+                                            texels,
+                                            &upload.copies,
+                                            &rt_mips,
+                                            &mut frame_slots[cur_idx],
+                                        ) {
+                                            Ok(stage) => {
+                                                if let Some(stage) = stage {
+                                                    frame_slots[cur_idx].upload_buffers.push(stage);
+                                                }
+                                                if let Some(texture) = tex_cache.get_mut(&key) {
+                                                    texture.layout =
+                                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                                                    texture.hash = tex_hash;
+                                                    texture.gen = cur_gen;
+                                                    texture.trusted_source_identity =
+                                                        trusted_source_identity;
+                                                    texture.gpu_mip_overlay = !rt_mips.is_empty();
+                                                    texture.raw_cpu_hash = raw_hash;
+                                                    texture.gpu_mip_mask =
+                                                        texture_rt_mip_mask(&rt_mips);
+                                                }
+                                                updated_in_place = true;
                                             }
-                                            if let Some(texture) = tex_cache.get_mut(&key) {
-                                                texture.layout =
-                                                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-                                                texture.hash = tex_hash;
-                                                texture.gen = cur_gen;
-                                                texture.trusted_source_identity =
-                                                    trusted_source_identity;
-                                            }
-                                            updated_in_place = true;
-                                        }
-                                        Err(error) => {
-                                            log::debug!(
+                                            Err(error) => {
+                                                log::debug!(
                                                 "in-place texture update fell back to replacement: {}",
                                                 error
                                             );
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if !updated_in_place {
-                                match create_texture_image(
-                                    device,
-                                    cmd,
-                                    mem_props,
-                                    key.width,
-                                    key.height,
-                                    key.layers,
-                                    key.base_layer,
-                                    key.view_layers,
-                                    key.arrayed,
-                                    key.cube,
-                                    key.cube_array,
-                                    key.volume,
-                                    key.mip_levels,
-                                    key.base_mip,
-                                    key.view_mips,
-                                    texels,
-                                    &upload.copies,
-                                    volume_slices.as_deref(),
-                                    texture_view_swizzle(tic.format, numeric_type, tic.swizzle),
-                                    image_format,
-                                    tex_hash,
-                                    cur_gen,
-                                    Some(&mut frame_slots[cur_idx]),
-                                ) {
-                                    Ok((tex, stage)) => {
-                                        if let Some(old) = tex_cache.insert(key, tex) {
-                                            frame_slots[cur_idx].retired_textures.push(old);
-                                        } else {
-                                            retain_tex_cache_va(tex_cache_vas, key.gpu_va);
+                                if !updated_in_place {
+                                    match create_texture_image(
+                                        device,
+                                        cmd,
+                                        mem_props,
+                                        key.width,
+                                        key.height,
+                                        key.layers,
+                                        key.base_layer,
+                                        key.view_layers,
+                                        key.arrayed,
+                                        key.cube,
+                                        key.cube_array,
+                                        key.volume,
+                                        key.mip_levels,
+                                        key.base_mip,
+                                        key.view_mips,
+                                        texels,
+                                        &upload.copies,
+                                        volume_slices.as_deref(),
+                                        &rt_mips,
+                                        texture_view_swizzle(tic.format, numeric_type, tic.swizzle),
+                                        image_format,
+                                        tex_hash,
+                                        raw_hash,
+                                        cur_gen,
+                                        Some(&mut frame_slots[cur_idx]),
+                                    ) {
+                                        Ok((tex, stage)) => {
+                                            if let Some(old) = tex_cache.insert(key, tex) {
+                                                frame_slots[cur_idx].retired_textures.push(old);
+                                            } else {
+                                                retain_tex_cache_va(tex_cache_vas, key.gpu_va);
+                                            }
+                                            if let Some(texture) = tex_cache.get_mut(&key) {
+                                                texture.trusted_source_identity =
+                                                    trusted_source_identity;
+                                            }
+                                            if let Some(stage) = stage {
+                                                frame_slots[cur_idx].upload_buffers.push(stage);
+                                            }
                                         }
-                                        if let Some(texture) = tex_cache.get_mut(&key) {
-                                            texture.trusted_source_identity =
-                                                trusted_source_identity;
+                                        Err(error) => {
+                                            if !bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
+                                                log::warn!("texture upload failed: {}", error);
+                                            }
+                                            binding_failure_reason = Some(error);
                                         }
-                                        if let Some(stage) = stage {
-                                            frame_slots[cur_idx].upload_buffers.push(stage);
-                                        }
-                                    }
-                                    Err(error) => {
-                                        if !bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
-                                            log::warn!("texture upload failed: {}", error);
-                                        }
-                                        binding_failure_reason = Some(error);
                                     }
                                 }
                             }
                         }
                     }
                     rp_tex_upload += profile_elapsed(rp_upload_t0);
+                    if record_stage_profile {
+                        if let (Some(raw), Some(texture)) = (raw_snapshot, tex_cache.get_mut(&key))
+                        {
+                            texture.profile_cpu_snapshot_identity = raw.trusted_identity();
+                        }
+                    }
                     let rp_finish_t0 = record_detail_profile.then(std::time::Instant::now);
                     let cached_binding = hot_binding.or_else(|| {
                         tex_cache.get(&key).map(|texture| HotGenericTextureBinding {
@@ -12982,6 +13582,10 @@ impl Renderer {
             rp_dset_stages,
             rp_command_stages,
             rp_texture_memo,
+            rp_tex_sync,
+            rp_tex_gen,
+            rp_tex_upload,
+            rp_texture_hash,
         );
         let rp_t4 = std::time::Instant::now();
         let slot_fence = frame_slots[cur_idx].fence;
@@ -13123,6 +13727,10 @@ struct RecordStageProfileWindow {
     dset_stages: RecordDsetStageProfile,
     command_stages: RecordCommandStageProfile,
     texture_memo: RecordTextureMemoProfile,
+    texture_sync: std::time::Duration,
+    texture_gen: std::time::Duration,
+    texture_upload: std::time::Duration,
+    texture_hash: [TextureHashProfile; 2],
 }
 
 type ViewportRecordKey = [u32; 6];
@@ -13261,6 +13869,10 @@ fn record_stage_profile_record(
     dset_stages: RecordDsetStageProfile,
     command_stages: RecordCommandStageProfile,
     texture_memo: RecordTextureMemoProfile,
+    texture_sync: std::time::Duration,
+    texture_gen: std::time::Duration,
+    texture_upload: std::time::Duration,
+    texture_hash: [TextureHashProfile; 2],
 ) {
     if !record_stage_profile_enabled() {
         return;
@@ -13311,6 +13923,12 @@ fn record_stage_profile_record(
     window.texture_memo.binding_lookups += texture_memo.binding_lookups;
     window.texture_memo.binding_hits += texture_memo.binding_hits;
     window.texture_memo.binding_evictions += texture_memo.binding_evictions;
+    window.texture_sync += texture_sync;
+    window.texture_gen += texture_gen;
+    window.texture_upload += texture_upload;
+    for (total, current) in window.texture_hash.iter_mut().zip(texture_hash) {
+        total.add(current);
+    }
     if window.draws < 32_768 {
         return;
     }
@@ -13387,6 +14005,31 @@ fn record_stage_profile_record(
         count_per_draw(window.texture_memo.binding_lookups),
         window.texture_memo.binding_evictions,
     );
+    log::warn!(
+        "[texture-stage] draws={} us/draw sync={:.3} gen={:.3} upload={:.3}",
+        window.draws,
+        per_draw_us(window.texture_sync),
+        per_draw_us(window.texture_gen),
+        per_draw_us(window.texture_upload),
+    );
+    for (kind, profile) in ["ordinary", "overlay"].into_iter().zip(window.texture_hash) {
+        log::warn!(
+            "[texture-hash] kind={} draws={} snapshots={} snapshot_mib={:.2} trusted={} repeated={} repeated_mib={:.2} hashes={} hash_mib={:.2} hash_ms={:.3} hash_repeated_mib={:.2} memo_hits={} memo_mib={:.2}",
+            kind,
+            window.draws,
+            profile.snapshots,
+            profile.snapshot_bytes as f64 / 1048576.0,
+            profile.trusted,
+            profile.repeated,
+            profile.repeated_bytes as f64 / 1048576.0,
+            profile.hashes,
+            profile.hash_bytes as f64 / 1048576.0,
+            profile.hash_time.as_secs_f64() * 1000.0,
+            profile.hash_repeated_bytes as f64 / 1048576.0,
+            profile.memo_hits,
+            profile.memo_bytes as f64 / 1048576.0,
+        );
+    }
     *window = RecordStageProfileWindow::default();
 }
 
@@ -13888,6 +14531,13 @@ fn trace_rt_stats(
             if key.width < 256 || layout == vk::ImageLayout::UNDEFINED {
                 continue;
             }
+            if std::env::var("NEXIUM_RT_STATS_DEPTH_VA")
+                .ok()
+                .and_then(|value| parse_u64_value(&value))
+                .is_some_and(|address| address != key.gpu_va)
+            {
+                continue;
+            }
             match read_depth_image_stats(
                 submit_state,
                 submit_timeline,
@@ -13898,6 +14548,7 @@ fn trace_rt_stats(
                 key,
                 image,
                 layout,
+                format,
                 aspects,
             ) {
                 Some((nonzero, min, max, total)) => {
@@ -13935,14 +14586,20 @@ fn read_depth_image_stats(
     key: RtKey,
     image: vk::Image,
     prev_layout: vk::ImageLayout,
+    format: vk::Format,
     aspects: vk::ImageAspectFlags,
 ) -> Option<(usize, u32, u32, usize)> {
     if !aspects.contains(vk::ImageAspectFlags::DEPTH) {
         return None;
     }
+    let pixel_bytes = if format == vk::Format::D16_UNORM {
+        2
+    } else {
+        4
+    };
     let total = (key.width as u64)
         .checked_mul(key.height as u64)?
-        .checked_mul(4)?;
+        .checked_mul(pixel_bytes)?;
     let stage = create_staging_owned(device, mem_props, total).ok()?;
     let cleanup = |device: &ash::Device,
                    fence: Option<vk::Fence>,
@@ -14041,14 +14698,38 @@ fn read_depth_image_stats(
     unsafe {
         if let Ok(ptr) = device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
         {
-            let words = std::slice::from_raw_parts(ptr as *const u32, total as usize / 4);
-            for word in words {
-                let depth = *word & 0x00ff_ffff;
+            let data = std::slice::from_raw_parts(ptr as *const u8, total as usize);
+            if let Some(directory) = std::env::var_os("NEXIUM_RT_STATS_RAW_DIR") {
+                let directory = std::path::PathBuf::from(directory);
+                if std::fs::create_dir_all(&directory).is_ok() {
+                    let path = directory.join(format!(
+                        "depth_{:x}_{}x{}_{}.bin",
+                        key.gpu_va,
+                        key.width,
+                        key.height,
+                        format.as_raw()
+                    ));
+                    if let Err(error) = std::fs::write(&path, data) {
+                        log::warn!("[depth-stats-raw] {}: {}", path.display(), error);
+                    }
+                }
+            }
+            for pixel in data.chunks_exact(pixel_bytes as usize) {
+                let depth = if pixel_bytes == 2 {
+                    u32::from(u16::from_le_bytes([pixel[0], pixel[1]]))
+                } else {
+                    let word = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                    if format == vk::Format::D24_UNORM_S8_UINT {
+                        word & 0x00ff_ffff
+                    } else {
+                        word
+                    }
+                };
                 nonzero += usize::from(depth != 0);
                 min = min.min(depth);
                 max = max.max(depth);
             }
-            count = words.len();
+            count = data.len() / pixel_bytes as usize;
             device.unmap_memory(stage.memory);
         }
     }
@@ -14455,6 +15136,32 @@ struct DrawGroupAttachmentUse {
     sampled: Vec<RtKey>,
 }
 
+impl DrawGroupAttachmentUse {
+    fn add_color(&mut self, key: RtKey, format: vk::Format) {
+        if !self
+            .colors
+            .iter()
+            .any(|(seen, seen_format)| seen.same_live_identity(key) && *seen_format == format)
+        {
+            self.colors.push((key, format));
+        }
+    }
+
+    fn add_depth(&mut self, key: RtKey, format: vk::Format, aspects: vk::ImageAspectFlags) {
+        if !self.depths.iter().any(|(seen, seen_format, seen_aspects)| {
+            seen.same_live_identity(key) && *seen_format == format && *seen_aspects == aspects
+        }) {
+            self.depths.push((key, format, aspects));
+        }
+    }
+
+    fn add_sampled(&mut self, key: RtKey) {
+        if !self.sampled.iter().any(|seen| seen.same_live_identity(key)) {
+            self.sampled.push(key);
+        }
+    }
+}
+
 fn is_ordered_exact_sampled_color_transition(sampled: RtKey, attachment: RtKey) -> bool {
     sampled == attachment
         && sampled.gpu_va != 0
@@ -14473,22 +15180,18 @@ fn draw_group_attachment_uses(
             for call in *calls {
                 let color_keys = active_color_keys_for_call(call);
                 let color_formats = color_formats_for_call(call, color_keys.len());
-                usage
-                    .colors
-                    .extend(color_keys.into_iter().enumerate().map(|(index, key)| {
-                        (
-                            key,
-                            color_formats.get(index).copied().unwrap_or(call.rt_format),
-                        )
-                    }));
-                if let Some(key) = call.depth_key {
-                    usage
-                        .depths
-                        .push((key, call.depth_format, call.depth_aspects));
+                for (index, key) in color_keys.into_iter().enumerate() {
+                    usage.add_color(
+                        key,
+                        color_formats.get(index).copied().unwrap_or(call.rt_format),
+                    );
                 }
-                usage
-                    .sampled
-                    .extend(call.sampled_rt_slots.iter().flatten().copied());
+                if let Some(key) = call.depth_key {
+                    usage.add_depth(key, call.depth_format, call.depth_aspects);
+                }
+                for key in call.sampled_rt_slots.iter().flatten().copied() {
+                    usage.add_sampled(key);
+                }
             }
             usage
         })
@@ -14503,10 +15206,10 @@ fn draw_group_attachment_uses_with_clears(
     for (usage, clears) in uses.iter_mut().zip(clear_groups) {
         for clear in *clears {
             if let Some(color) = &clear.color {
-                usage.colors.push((color.key, color.format));
+                usage.add_color(color.key, color.format);
             }
             if let Some(depth) = &clear.depth_stencil {
-                usage.depths.push((depth.key, depth.format, depth.aspects));
+                usage.add_depth(depth.key, depth.format, depth.aspects);
             }
         }
     }
@@ -15997,6 +16700,9 @@ impl PreparedComputeResources {
         &self,
         dispatch: &crate::compute::ComputeDispatch,
         cache: &mut HashMap<crate::compute::ComputeRawStorageKey, CachedComputeRawStorage>,
+        resident: &Arc<
+            Mutex<nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>>,
+        >,
     ) {
         for (request, texel) in dispatch.texel_buffers.iter().zip(&self.texels) {
             let Some(key) = texel.resident_key else {
@@ -16006,6 +16712,9 @@ impl PreparedComputeResources {
                 continue;
             };
             entry.ready = true;
+            if entry.valid {
+                resident.lock().insert(key);
+            }
             if request.writable {
                 entry.dirty = true;
             }
@@ -16134,6 +16843,7 @@ fn acquire_compute_raw_storage(
             .ok_or_else(|| "generic Vulkan compute backend is unavailable".to_string())?
             .acquire_raw_storage_buffer(device, mem_props, seed)?
     };
+    inner.raw_storage_resident.lock().remove(&key);
     inner.compute_raw_storage_cache.insert(
         key,
         CachedComputeRawStorage {
@@ -16164,6 +16874,12 @@ fn release_unreferenced_compute_raw_storage(inner: &mut RendererInner) {
         .collect();
     if removable.is_empty() {
         return;
+    }
+    {
+        let mut resident = inner.raw_storage_resident.lock();
+        for key in &removable {
+            resident.remove(key);
+        }
     }
     let raw_storage: Vec<_> = removable
         .into_iter()
@@ -16609,6 +17325,38 @@ fn settle_pending_compute_record(
     let guest_images = std::mem::take(&mut resources.guest_images);
     let guest_image_keys = std::mem::take(&mut resources.guest_image_keys);
     let guest_image_contents = std::mem::take(&mut resources.guest_image_contents);
+    let mut adopted: Vec<(usize, RtKey)> = pending
+        .outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, meta)| meta.rt_alias.map(|key| (index, key)))
+        .filter(|(index, _)| *index < resources.outputs.len())
+        .collect();
+    adopted.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut adopted_count = 0usize;
+    for (index, key) in adopted {
+        let image = resources.outputs.remove(index);
+        let extent = vk::Extent2D {
+            width: image.width,
+            height: image.height,
+        };
+        if inner.rt_cache.adopt_external_color(
+            key,
+            image.image,
+            image.view,
+            image.memory,
+            image.format,
+            extent,
+            vk::ImageLayout::GENERAL,
+        ) {
+            adopted_count += 1;
+        } else {
+            image.destroy(&inner.device);
+        }
+    }
+    if adopted_count != 0 {
+        log::debug!("[compute-alias] adopted {} compute outputs", adopted_count);
+    }
     let outputs = std::mem::take(&mut resources.outputs);
     let readbacks = std::mem::take(&mut resources.readbacks);
     let recycle_counts = [
@@ -17678,10 +18426,15 @@ fn execute_compute_dispatch(
                 ..
             } = &mut *inner;
             let backend = compute_backend.as_mut().unwrap();
-            let sampled = dispatch
-                .image_aliases
+            let attachable = dispatch
+                .output_rt_aliases
                 .iter()
-                .any(|alias| alias.storage_binding == output.binding);
+                .any(|alias| alias.binding == output.binding);
+            let sampled = attachable
+                || dispatch
+                    .image_aliases
+                    .iter()
+                    .any(|alias| alias.storage_binding == output.binding);
             resources.outputs.push(backend.acquire_output_image(
                 device,
                 mem_props,
@@ -17691,6 +18444,7 @@ fn execute_compute_dispatch(
                 output.is_3d,
                 output.format.vk_format(),
                 sampled,
+                attachable,
             )?);
             resources.output_uploads.push(
                 output
@@ -18655,7 +19409,11 @@ fn execute_compute_dispatch(
         guest.needs_upload = false;
     }
     resources.commit_cached_volumes(&mut inner.compute_volume_cache);
-    resources.commit_resident_raw_storage(&dispatch, &mut inner.compute_raw_storage_cache);
+    resources.commit_resident_raw_storage(
+        &dispatch,
+        &mut inner.compute_raw_storage_cache,
+        &inner.raw_storage_resident,
+    );
 
     if lazy {
         let outputs = dispatch
@@ -18669,6 +19427,11 @@ fn execute_compute_dispatch(
                 depth: request.depth,
                 format: request.format,
                 byte_len: *output_len,
+                rt_alias: dispatch
+                    .output_rt_aliases
+                    .iter()
+                    .find(|alias| alias.binding == request.binding)
+                    .map(|alias| alias.key),
             })
             .collect();
         let texels = dispatch
@@ -19569,6 +20332,22 @@ fn read_image_mip_stats(
             }
         }
         let rgba = readback_to_rgba8(data, format, key.width, key.height);
+        if let Some(directory) = std::env::var_os("NEXIUM_RT_STATS_RAW_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            if std::fs::create_dir_all(&directory).is_ok() {
+                let path = directory.join(format!(
+                    "rt_{:x}_{}x{}_{}_m{}.bin",
+                    key.gpu_va,
+                    key.width,
+                    key.height,
+                    format.as_raw(),
+                    mip_level
+                ));
+                if let Err(error) = std::fs::write(&path, data) {
+                    log::warn!("[rt-stats-raw] {}: {}", path.display(), error);
+                }
+            }
+        }
         if std::env::var_os("NEXIUM_RT_DUMP").is_some() {
             dump_rt_bmp(key, &rgba);
         }
@@ -20219,6 +20998,7 @@ fn vs_tex_bind_trace(call: &crate::draw::Maxwell3dDrawCall) -> bool {
     struct Config {
         fragment_addresses: Option<Vec<u64>>,
         all: bool,
+        limit: u64,
     }
     static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
     let config = CONFIG.get_or_init(|| Config {
@@ -20228,11 +21008,17 @@ fn vs_tex_bind_trace(call: &crate::draw::Maxwell3dDrawCall) -> bool {
                 .collect()
         }),
         all: std::env::var_os("NEXIUM_VS_TEX_BIND").is_some(),
+        limit: std::env::var("NEXIUM_VS_TEX_BIND_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024),
     });
-    config
+    let matches = config
         .fragment_addresses
         .as_ref()
-        .map_or(config.all, |addresses| addresses.contains(&call.fs_gpu_va))
+        .map_or(config.all, |addresses| addresses.contains(&call.fs_gpu_va));
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    matches && COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < config.limit
 }
 
 fn rt_stamp(rt_cache: &RtCache, key: RtKey) -> u64 {
@@ -21926,6 +22712,19 @@ fn call_samples_only_frozen_rt_aliases(
     sampled
 }
 
+fn rt_alias_tic_for_slot(
+    call: &crate::draw::Maxwell3dDrawCall,
+    slot: usize,
+    tic: crate::texture::TicEntry,
+    tsc: Option<&crate::texture::TscEntry>,
+) -> crate::texture::TicEntry {
+    crate::texture::effective_rt_alias_view(
+        tic,
+        tsc,
+        slot < 32 && call.texture_sampled_only_mask & (1u32 << slot) != 0,
+    )
+}
+
 fn rt_alias_for_slot(
     rt_cache: &RtCache,
     fermi_exact_rt_snapshot_leases: Option<&HashMap<u64, FermiExactRtSnapshotLease>>,
@@ -21934,7 +22733,10 @@ fn rt_alias_for_slot(
     rt_key: RtKey,
     allow_self: bool,
     tic: Option<&crate::texture::TicEntry>,
+    tsc: Option<&crate::texture::TscEntry>,
 ) -> Option<RtAlias> {
+    let alias_tic = tic.map(|tic| rt_alias_tic_for_slot(call, slot, *tic, tsc));
+    let tic = alias_tic.as_ref();
     let sk = sampled_rt_key_for_slot(call, slot)?;
     if let (Some(leases), Some(id), Some(token), Some(tic)) = (
         fermi_exact_rt_snapshot_leases,
@@ -22413,6 +23215,7 @@ where
             1,
             &upload.bytes,
             &upload.copies,
+            &[],
             frame_slot,
         )
         .map_err(|error| format!("configured RT upload {}: {error}", key.label()))?;
@@ -24672,9 +25475,11 @@ fn upload_texture_oneshot(
     rgba8: &[u8],
     mip_copies: &[TextureMipCopy],
     volume_slices: Option<&[VolumeRtSlice]>,
+    rt_mips: &[crate::texture_mips::TextureRtMip],
     swizzle: [crate::texture::SwizzleSource; 4],
     format: vk::Format,
     hash: u64,
+    raw_cpu_hash: Option<u64>,
     gen: u64,
 ) -> Result<CachedTexture, String> {
     let cmd = alloc_one_time_cmd(device, cmd_pool)?;
@@ -24698,9 +25503,11 @@ fn upload_texture_oneshot(
         rgba8,
         mip_copies,
         volume_slices,
+        rt_mips,
         swizzle,
         format,
         hash,
+        raw_cpu_hash,
         gen,
         None,
     )?;
@@ -24901,6 +25708,105 @@ fn texture_view_layer_range(
     Ok((base_layer, 1))
 }
 
+fn copy_texture_rt_mips(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    mip_levels: u32,
+    rt_mips: &[crate::texture_mips::TextureRtMip],
+) {
+    if rt_mips.is_empty() {
+        return;
+    }
+    transition_image_range(
+        device,
+        cmd,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageAspectFlags::COLOR,
+        0,
+        mip_levels,
+        0,
+        1,
+    );
+    for mip in rt_mips {
+        if std::env::var_os("NEXIUM_RT_MIP_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) < 64 {
+                log::warn!(
+                    "[rt-mip-copy] source={} level={} extent={}x{} stamp={} format={:?}",
+                    mip.key.label(),
+                    mip.level,
+                    mip.width,
+                    mip.height,
+                    mip.stamp,
+                    mip.format,
+                );
+            }
+        }
+        transition_image(
+            device,
+            cmd,
+            mip.image,
+            mip.layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        unsafe {
+            device.cmd_copy_image(
+                cmd,
+                mip.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[mip.copy_region()],
+            );
+        }
+        transition_image(
+            device,
+            cmd,
+            mip.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            mip.layout,
+        );
+    }
+}
+
+fn update_texture_rt_mips_only(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    mip_levels: u32,
+    rt_mips: &[crate::texture_mips::TextureRtMip],
+) {
+    transition_image_range(
+        device,
+        cmd,
+        image,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageAspectFlags::COLOR,
+        0,
+        mip_levels,
+        0,
+        1,
+    );
+    copy_texture_rt_mips(device, cmd, image, mip_levels, rt_mips);
+    transition_image_range(
+        device,
+        cmd,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::ImageAspectFlags::COLOR,
+        0,
+        mip_levels,
+        0,
+        1,
+    );
+}
+
 fn create_texture_image(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -24920,9 +25826,11 @@ fn create_texture_image(
     rgba8: &[u8],
     mip_copies: &[TextureMipCopy],
     volume_slices: Option<&[VolumeRtSlice]>,
+    rt_mips: &[crate::texture_mips::TextureRtMip],
     swizzle: [crate::texture::SwizzleSource; 4],
     format: vk::Format,
     hash: u64,
+    raw_cpu_hash: Option<u64>,
     gen: u64,
     upload_slot: Option<&mut FrameSlot>,
 ) -> Result<(CachedTexture, Option<PersistentUploadBuffer>), String> {
@@ -25172,6 +26080,7 @@ fn create_texture_image(
             );
         }
     }
+    copy_texture_rt_mips(device, cmd, image, mip_levels, rt_mips);
     transition_image_range(
         device,
         cmd,
@@ -25226,6 +26135,10 @@ fn create_texture_image(
             hash,
             gen,
             trusted_source_identity: None,
+            gpu_mip_overlay: !rt_mips.is_empty(),
+            raw_cpu_hash,
+            gpu_mip_mask: texture_rt_mip_mask(rt_mips),
+            profile_cpu_snapshot_identity: None,
         },
         stage.and_then(|stage| stage.dedicated),
     ))
@@ -25242,6 +26155,7 @@ fn update_texture_image(
     mip_levels: u32,
     rgba8: &[u8],
     mip_copies: &[TextureMipCopy],
+    rt_mips: &[crate::texture_mips::TextureRtMip],
     upload_slot: &mut FrameSlot,
 ) -> Result<Option<PersistentUploadBuffer>, String> {
     if mip_copies.is_empty() {
@@ -25296,6 +26210,7 @@ fn update_texture_image(
             &copies,
         );
     }
+    copy_texture_rt_mips(device, cmd, image, mip_levels, rt_mips);
     transition_image_range(
         device,
         cmd,
@@ -25319,6 +26234,32 @@ fn texture_update_in_place_enabled() -> bool {
                 .ok()
                 .as_deref(),
             Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
+        )
+    })
+}
+
+fn texture_rt_mip_update_value_enabled(legacy: Option<&str>, mip: Option<&str>) -> bool {
+    let disabled = |value: Option<&str>| {
+        value.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+    };
+    !disabled(legacy) && !disabled(mip)
+}
+
+fn texture_rt_mip_update_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        texture_rt_mip_update_value_enabled(
+            std::env::var("NEXIUM_TEXTURE_UPDATE_IN_PLACE")
+                .ok()
+                .as_deref(),
+            std::env::var("NEXIUM_RT_MIP_UPDATE_IN_PLACE")
+                .ok()
+                .as_deref(),
         )
     })
 }
@@ -28009,6 +28950,7 @@ impl Drop for RendererInner {
             }
         }
         let cached_compute_raw_storage = std::mem::take(&mut self.compute_raw_storage_cache);
+        self.raw_storage_resident.lock().clear();
         if device_idle {
             for (_, entry) in cached_compute_raw_storage {
                 entry.resource.destroy(&self.device);
@@ -28391,6 +29333,53 @@ mod tests {
     }
 
     #[test]
+    fn texture_hash_profile_separates_actual_work_memo_hits_and_trusted_repeats() {
+        let snapshot =
+            SharedGuestSnapshot::new_trusted(std::sync::Arc::new(vec![1, 2, 3, 4]), 4, 17).unwrap();
+        let mut profile = super::TextureHashProfile::default();
+        let mut memo = HashMap::new();
+        let range = (0x1000, snapshot.len());
+        assert!(!profile.observe(&snapshot, None));
+        assert_eq!(
+            super::profiled_texture_snapshot_hash(
+                &mut memo,
+                range,
+                snapshot.as_slice(),
+                false,
+                &mut profile,
+            ),
+            fnv_chunked(snapshot.as_slice())
+        );
+        assert!(profile.observe(&snapshot, Some(17)));
+        super::profiled_texture_snapshot_hash(
+            &mut memo,
+            range,
+            snapshot.as_slice(),
+            true,
+            &mut profile,
+        );
+        assert_eq!((profile.hashes, profile.hash_bytes), (1, 4));
+        assert_eq!((profile.memo_hits, profile.memo_bytes), (1, 4));
+        assert_eq!(profile.hash_repeated_bytes, 0);
+        memo.clear();
+        super::profiled_texture_snapshot_hash(
+            &mut memo,
+            range,
+            snapshot.as_slice(),
+            true,
+            &mut profile,
+        );
+        assert_eq!((profile.hashes, profile.hash_bytes), (2, 8));
+        assert_eq!(profile.hash_repeated_bytes, 4);
+        assert!(!profile.observe(&SharedGuestSnapshot::from_vec(vec![1, 2, 3, 4]), None));
+        assert_eq!((profile.snapshots, profile.snapshot_bytes), (3, 12));
+        assert_eq!(
+            (profile.trusted, profile.repeated, profile.repeated_bytes),
+            (2, 1, 4)
+        );
+    }
+
+    #[test]
     fn texture_generation_query_is_skipped_until_required() {
         let calls = std::cell::Cell::new(0);
         let mut generation = None;
@@ -28470,6 +29459,190 @@ mod tests {
             false,
             trusted_match,
         ));
+    }
+
+    #[test]
+    fn mip_overlays_validate_gpu_changes_and_restore_cpu_cache_after_disappearing() {
+        use crate::texture_mips::{texture_rt_mip_hash, TextureRtMip};
+
+        let snapshot =
+            SharedGuestSnapshot::new_trusted(std::sync::Arc::new(vec![1, 2, 3, 4]), 4, 17).unwrap();
+        let raw_hash = fnv_chunked(snapshot.as_slice());
+        let cpu_hash = texture_rt_mip_hash(raw_hash, &[]);
+        let mut cached = super::CachedTexture {
+            image: vk::Image::null(),
+            view: vk::ImageView::null(),
+            memory: vk::DeviceMemory::null(),
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            hash: cpu_hash,
+            gen: 41,
+            trusted_source_identity: Some(17),
+            gpu_mip_overlay: false,
+            raw_cpu_hash: Some(raw_hash),
+            gpu_mip_mask: 0,
+            profile_cpu_snapshot_identity: None,
+        };
+        let mip = TextureRtMip {
+            level: 0,
+            width: 512,
+            height: 512,
+            key: RtKey::new(642, 512, 512, 0x5a4970000),
+            image: vk::Image::from_raw(101),
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            format: vk::Format::R16_SFLOAT,
+            stamp: 7,
+        };
+        let decide = |texture: &super::CachedTexture, mips: &[TextureRtMip]| {
+            let validate = super::texture_mip_overlay_needs_validation(Some(texture), mips);
+            let trusted = !validate
+                && trusted_texture_snapshot_matches(
+                    texture.trusted_source_identity,
+                    Some(&snapshot),
+                );
+            (
+                validate,
+                sampled_texture_needs_upload(
+                    false,
+                    Some((texture.gen, texture.hash)),
+                    41,
+                    texture_rt_mip_hash(raw_hash, mips),
+                    true,
+                    trusted,
+                ),
+            )
+        };
+        assert_eq!(decide(&cached, &[]), (false, false));
+        assert_eq!(decide(&cached, &[mip]), (true, true));
+        cached.gpu_mip_overlay = true;
+        cached.hash = texture_rt_mip_hash(raw_hash, &[mip]);
+        assert_eq!(decide(&cached, &[mip]), (true, false));
+        assert_eq!(
+            decide(&cached, &[TextureRtMip { stamp: 8, ..mip }]),
+            (true, true)
+        );
+        assert_eq!(decide(&cached, &[]), (true, true));
+        cached.gpu_mip_overlay = false;
+        cached.hash = cpu_hash;
+        assert_eq!(decide(&cached, &[]), (false, false));
+        assert_eq!(decide(&cached, &[mip]), (true, true));
+    }
+
+    #[test]
+    fn gpu_mip_refresh_requires_unchanged_cpu_backing_and_preserved_coverage() {
+        use crate::texture_mips::{texture_rt_mip_hash, TextureRtMip};
+
+        let key = TexCacheKey {
+            width: 512,
+            height: 512,
+            mip_levels: 8,
+            view_mips: 8,
+            ..group_memo_test_key(0x5a4970000)
+        };
+        let raw_hash = fnv_chunked(&[0; 64]);
+        let mut cached = super::CachedTexture {
+            image: vk::Image::from_raw(100),
+            view: vk::ImageView::from_raw(101),
+            memory: vk::DeviceMemory::from_raw(102),
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            hash: texture_rt_mip_hash(raw_hash, &[]),
+            gen: 1,
+            trusted_source_identity: Some(17),
+            gpu_mip_overlay: false,
+            raw_cpu_hash: Some(raw_hash),
+            gpu_mip_mask: 0,
+            profile_cpu_snapshot_identity: None,
+        };
+        let base = TextureRtMip {
+            level: 0,
+            width: 512,
+            height: 512,
+            key: RtKey::new(642, 512, 512, 0x5a4970000),
+            image: vk::Image::from_raw(201),
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            format: vk::Format::R16_SFLOAT,
+            stamp: 7,
+        };
+        let lower = TextureRtMip {
+            level: 1,
+            width: 256,
+            height: 256,
+            key: RtKey::new(642, 256, 256, 0x5a49f0000),
+            image: vk::Image::from_raw(202),
+            ..base
+        };
+        let eligible = |texture: &super::CachedTexture, cpu_hash, mips: &[TextureRtMip]| {
+            super::texture_rt_mips_can_refresh(texture, &key, cpu_hash, mips)
+        };
+        assert!(eligible(&cached, Some(raw_hash), &[base]));
+        assert!(!eligible(&cached, None, &[base]));
+        assert!(!eligible(&cached, Some(fnv_chunked(&[1; 64])), &[base]));
+        cached.gpu_mip_overlay = true;
+        cached.gpu_mip_mask = super::texture_rt_mip_mask(&[base]);
+        cached.hash = texture_rt_mip_hash(raw_hash, &[base]);
+        assert!(!sampled_texture_needs_upload(
+            false,
+            Some((cached.gen, cached.hash)),
+            cached.gen,
+            texture_rt_mip_hash(raw_hash, &[base]),
+            true,
+            false,
+        ));
+        let changed = TextureRtMip { stamp: 8, ..base };
+        assert!(sampled_texture_needs_upload(
+            false,
+            Some((cached.gen, cached.hash)),
+            cached.gen,
+            texture_rt_mip_hash(raw_hash, &[changed]),
+            true,
+            false,
+        ));
+        assert!(eligible(&cached, Some(raw_hash), &[changed]));
+        assert!(eligible(&cached, Some(raw_hash), &[changed, lower]));
+        cached.gpu_mip_mask = super::texture_rt_mip_mask(&[changed, lower]);
+        assert!(!eligible(&cached, Some(raw_hash), &[changed]));
+        assert!(!eligible(&cached, Some(raw_hash), &[lower]));
+        assert!(!eligible(&cached, Some(raw_hash), &[]));
+        cached.gpu_mip_overlay = false;
+        cached.gpu_mip_mask = 0;
+        cached.hash = texture_rt_mip_hash(raw_hash, &[]);
+        assert!(eligible(&cached, Some(raw_hash), &[base]));
+        for invalid in [
+            TextureRtMip {
+                image: cached.image,
+                ..base
+            },
+            TextureRtMip {
+                image: vk::Image::null(),
+                ..base
+            },
+            TextureRtMip { width: 256, ..base },
+            TextureRtMip { level: 32, ..base },
+            TextureRtMip {
+                layout: vk::ImageLayout::UNDEFINED,
+                ..base
+            },
+        ] {
+            assert!(!eligible(&cached, Some(raw_hash), &[invalid]));
+        }
+        cached.layout = vk::ImageLayout::UNDEFINED;
+        assert!(!eligible(&cached, Some(raw_hash), &[base]));
+        cached.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        cached.raw_cpu_hash = None;
+        assert!(!eligible(&cached, Some(raw_hash), &[base]));
+    }
+
+    #[test]
+    fn gpu_mip_refresh_defaults_on_and_respects_explicit_update_opt_out() {
+        let enabled = super::texture_rt_mip_update_value_enabled;
+        assert!(enabled(None, None));
+        assert!(enabled(Some("1"), None));
+        assert!(enabled(None, Some("true")));
+        for disabled in ["0", "false", "OFF", " no "] {
+            assert!(!enabled(Some(disabled), None));
+            assert!(!enabled(None, Some(disabled)));
+            assert!(!enabled(Some(disabled), Some("1")));
+            assert!(!enabled(Some("1"), Some(disabled)));
+        }
     }
 
     #[test]
@@ -29611,6 +30784,76 @@ mod tests {
     }
 
     #[test]
+    fn attachment_usage_deduplicates_only_complete_live_identities() {
+        let key = RtKey::with_cpu(7, 128, 128, 0x20000, 0x40000)
+            .with_mapping_epoch(9)
+            .with_guest_size_bytes(65536)
+            .with_block_linear_layout(0, 2, 0, 0);
+        let identities = [
+            key,
+            RtKey {
+                cpu_addr: key.cpu_addr + 4096,
+                ..key
+            },
+            RtKey {
+                mapping_epoch: 10,
+                ..key
+            },
+            RtKey {
+                guest_size_bytes: key.guest_size_bytes + 512,
+                ..key
+            },
+            key.with_block_linear_layout(0, 3, 0, 0),
+            key.with_base_layer(1),
+            RtKey {
+                gpu_va: key.gpu_va + 4096,
+                ..key
+            },
+        ];
+        let mut usage = DrawGroupAttachmentUse::default();
+        for _ in 0..128 {
+            for identity in identities {
+                usage.add_color(identity, vk::Format::R8G8B8A8_UNORM);
+                usage.add_depth(
+                    identity,
+                    vk::Format::D32_SFLOAT,
+                    vk::ImageAspectFlags::DEPTH,
+                );
+                usage.add_sampled(identity);
+            }
+            usage.add_color(key, vk::Format::R16G16B16A16_SFLOAT);
+            usage.add_depth(
+                key,
+                vk::Format::D32_SFLOAT,
+                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            );
+            usage.add_depth(key, vk::Format::D16_UNORM, vk::ImageAspectFlags::DEPTH);
+        }
+        assert_eq!(usage.colors.len(), identities.len() + 1);
+        assert_eq!(usage.depths.len(), identities.len() + 2);
+        assert_eq!(usage.sampled.len(), identities.len());
+        for (index, identity) in identities.iter().enumerate() {
+            assert!(usage.colors[index].0.same_live_identity(*identity));
+            assert!(usage.depths[index].0.same_live_identity(*identity));
+            assert!(usage.sampled[index].same_live_identity(*identity));
+        }
+        assert_eq!(
+            usage.colors.last().unwrap().1,
+            vk::Format::R16G16B16A16_SFLOAT
+        );
+        assert_eq!(
+            usage.depths[identities.len()].2,
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
+        assert_eq!(usage.depths.last().unwrap().1, vk::Format::D16_UNORM);
+        let later = DrawGroupAttachmentUse {
+            colors: vec![(key, vk::Format::R8G8B8A8_UNORM)],
+            ..Default::default()
+        };
+        assert!(preflight_draw_group_attachment_uses(&[usage, later]).is_err());
+    }
+
+    #[test]
     fn graphics_clear_data_validates_matching_distinct_2d_attachments() {
         let color_key = RtKey::new(1, 1600, 900, 0x1000);
         let depth_key = RtKey::new(2, 1600, 900, 0x2000);
@@ -29708,7 +30951,8 @@ mod tests {
             depth_stencil: None,
         };
         let draw_groups: [&[crate::draw::Maxwell3dDrawCall]; 1] = [&[]];
-        let clear_groups: [&[GraphicsClearOp]; 1] = [std::slice::from_ref(&clear)];
+        let repeated = [clear.clone(), clear.clone(), clear];
+        let clear_groups: [&[GraphicsClearOp]; 1] = [&repeated];
         let uses = draw_group_attachment_uses_with_clears(&draw_groups, &clear_groups);
 
         assert_eq!(uses.len(), 1);
@@ -30114,6 +31358,7 @@ mod tests {
                 height: 1,
                 format: vk::Format::R8G8B8A8_UNORM,
                 flip_y: None,
+                depth: None,
             }
         }
 
@@ -30191,6 +31436,7 @@ mod tests {
                 height: 1,
                 format: vk::Format::R8G8B8A8_UNORM,
                 flip_y: None,
+                depth: None,
             }
         }
 

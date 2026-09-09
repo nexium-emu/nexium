@@ -1,0 +1,507 @@
+use ash::vk::{self, Handle};
+
+use crate::rt_cache::{RtCache, RtKey};
+use crate::texture::{block_linear_mip_layout, TicEntry, TicFormat};
+
+#[derive(Clone, Copy, Debug)]
+pub struct TextureRtMip {
+    pub level: u32,
+    pub width: u32,
+    pub height: u32,
+    pub key: RtKey,
+    pub image: vk::Image,
+    pub layout: vk::ImageLayout,
+    pub format: vk::Format,
+    pub stamp: u64,
+}
+
+impl TextureRtMip {
+    pub fn copy_region(&self) -> vk::ImageCopy {
+        vk::ImageCopy {
+            src_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            dst_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: self.level,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            extent: vk::Extent3D {
+                width: self.width,
+                height: self.height,
+                depth: 1,
+            },
+            ..Default::default()
+        }
+    }
+}
+
+pub fn texture_rt_mip_candidate(tic: &TicEntry) -> bool {
+    tic.texture_type == 1
+        && tic.depth == 1
+        && tic.base_layer == 0
+        && tic.view_base_mip() == 0
+        && tic.view_mip_levels() > 1
+        && tic.is_block_linear
+        && !tic.is_sparse
+        && tic.pitch_bytes == 0
+        && tic.block_width_log2 == 0
+        && tic.block_depth_log2 == 0
+        && tic.tile_width_spacing == 0
+        && tic.sample_count() == Some(1)
+        && tic.format.block_extent() == (1, 1)
+        && !matches!(
+            tic.format,
+            TicFormat::Unknown(_)
+                | TicFormat::G24R8
+                | TicFormat::Z24S8
+                | TicFormat::X8Z24
+                | TicFormat::S8Z24
+                | TicFormat::Z32
+        )
+}
+
+pub fn find_texture_rt_mips(
+    rt_cache: &RtCache,
+    tic: &TicEntry,
+    base_key: RtKey,
+    format: vk::Format,
+) -> Vec<TextureRtMip> {
+    if !texture_rt_mip_candidate(tic)
+        || !rt_cache.has_color_for_nvmap(base_key.nvmap_id)
+        || base_key.gpu_va != tic.gpu_va
+        || base_key.width != tic.width
+        || base_key.height != tic.height
+        || base_key.cpu_addr == 0
+        || base_key.mapping_epoch == 0
+        || base_key.is_3d
+        || base_key.depth != 1
+        || base_key.base_layer != 0
+        || base_key.sample_grid() != (1, 1)
+        || crate::renderer::exact_rt_copy_format_bpp(format) != Some(tic.format.src_bpp())
+    {
+        return Vec::new();
+    }
+    let Some(layout) = block_linear_mip_layout(tic) else {
+        return Vec::new();
+    };
+    if base_key.guest_size_bytes < layout.layer_size as u64 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for mip in layout.levels.iter().take(tic.view_mip_levels() as usize) {
+        let Some(gpu_va) = tic.gpu_va.checked_add(mip.guest_offset as u64) else {
+            continue;
+        };
+        let Some(cpu_addr) = base_key.cpu_addr.checked_add(mip.guest_offset as u64) else {
+            continue;
+        };
+        let want = RtKey::with_cpu(base_key.nvmap_id, mip.width, mip.height, gpu_va, cpu_addr)
+            .with_mapping_epoch(base_key.mapping_epoch)
+            .with_guest_size_bytes(mip.guest_size as u64)
+            .with_block_linear_layout(0, mip.block_height_log2, 0, 0);
+        let padded_width =
+            ((mip.width as usize * tic.format.src_bpp() + 63) & !63) / tic.format.src_bpp();
+        let padded = RtKey {
+            width: padded_width as u32,
+            ..want
+        };
+        let source = rt_cache
+            .find_drawn_color_for_exact_alias(want)
+            .or_else(|| rt_cache.find_drawn_color_for_exact_alias(padded));
+        let Some((key, image, image_layout, source_format, stamp)) = source else {
+            continue;
+        };
+        if source_format != format
+            || stamp == 0
+            || image == vk::Image::null()
+            || image_layout == vk::ImageLayout::UNDEFINED
+            || rt_cache.color_extent(key)
+                != Some(vk::Extent2D {
+                    width: key.width,
+                    height: key.height,
+                })
+        {
+            continue;
+        }
+        out.push(TextureRtMip {
+            level: mip.level,
+            width: mip.width,
+            height: mip.height,
+            key,
+            image,
+            layout: image_layout,
+            format,
+            stamp,
+        });
+    }
+    out
+}
+
+pub fn texture_rt_mip_hash(mut hash: u64, mips: &[TextureRtMip]) -> u64 {
+    for value in std::iter::once(mips.len() as u64).chain(mips.iter().flat_map(|mip| {
+        [
+            u64::from(mip.level),
+            u64::from(mip.width),
+            u64::from(mip.height),
+            mip.image.as_raw(),
+            mip.stamp,
+            mip.format.as_raw() as u64,
+            u64::from(mip.key.nvmap_id),
+            mip.key.gpu_va,
+            mip.key.cpu_addr,
+            mip.key.mapping_epoch,
+            mip.key.guest_size_bytes,
+            mip.key.layout_signature,
+            u64::from(mip.key.width),
+            u64::from(mip.key.height),
+        ]
+    })) {
+        hash ^= value;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn height_texture() -> (TicEntry, RtKey) {
+        let words = [
+            0x1bu32,
+            0xa4970000,
+            5 | (3 << 21),
+            (4 << 3) | (7 << 28),
+            511 | (1 << 23),
+            511 | (1 << 31),
+            0,
+            0x70,
+        ];
+        let raw = words
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let tic = TicEntry::parse(&raw).unwrap();
+        let layout = block_linear_mip_layout(&tic).unwrap();
+        let key = RtKey::with_cpu(642, 512, 512, tic.gpu_va, 0x1122330000)
+            .with_mapping_epoch(26)
+            .with_guest_size_bytes(layout.layer_size as u64)
+            .with_block_linear_layout(0, 4, 0, 0);
+        (tic, key)
+    }
+
+    fn mip_key(tic: &TicEntry, base: RtKey, level: usize) -> RtKey {
+        let mip = block_linear_mip_layout(tic).unwrap().levels[level];
+        RtKey::with_cpu(
+            base.nvmap_id,
+            mip.width,
+            mip.height,
+            base.gpu_va + mip.guest_offset as u64,
+            base.cpu_addr + mip.guest_offset as u64,
+        )
+        .with_mapping_epoch(base.mapping_epoch)
+        .with_guest_size_bytes(mip.guest_size as u64)
+        .with_block_linear_layout(0, mip.block_height_log2, 0, 0)
+    }
+
+    fn insert_source(cache: &mut RtCache, key: RtKey, format: vk::Format, extent: vk::Extent2D) {
+        assert!(cache.adopt_external_color(
+            key,
+            vk::Image::from_raw(key.gpu_va),
+            vk::ImageView::null(),
+            vk::DeviceMemory::null(),
+            format,
+            extent,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        ));
+    }
+
+    #[test]
+    fn gathers_each_live_mip_with_guest_offsets_and_padded_small_rows() {
+        let (tic, base) = height_texture();
+        let mut cache = RtCache::new();
+        for level in 0..8 {
+            let mut key = mip_key(&tic, base, level);
+            key.width = key.width.max(32);
+            insert_source(
+                &mut cache,
+                key,
+                vk::Format::R16_SFLOAT,
+                vk::Extent2D {
+                    width: key.width,
+                    height: key.height,
+                },
+            );
+        }
+        let mips = find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT);
+        assert_eq!(mips.len(), 8);
+        let expected = [
+            0, 0x80000, 0xa0000, 0xa8000, 0xaa000, 0xaa800, 0xaac00, 0xaae00,
+        ];
+        for (level, mip) in mips.iter().enumerate() {
+            assert_eq!(mip.level, level as u32);
+            assert_eq!(mip.key.gpu_va, tic.gpu_va + expected[level]);
+            assert_eq!(mip.key.cpu_addr, base.cpu_addr + expected[level]);
+            assert_eq!(mip.width, 512 >> level);
+            assert_eq!(mip.height, 512 >> level);
+            let copy = mip.copy_region();
+            assert_eq!(copy.src_subresource.mip_level, 0);
+            assert_eq!(copy.dst_subresource.mip_level, level as u32);
+            assert_eq!(copy.extent.width, 512 >> level);
+            assert_eq!(copy.extent.height, 512 >> level);
+            assert_eq!(copy.extent.depth, 1);
+        }
+        assert_eq!(mips[7].key.width, 32);
+        assert_eq!(mips[7].copy_region().extent.width, 4);
+    }
+
+    #[test]
+    fn rejects_wrong_mapping_layout_format_extent_and_multisample_sources() {
+        let (tic, base) = height_texture();
+        let key = mip_key(&tic, base, 0);
+        let extent = vk::Extent2D {
+            width: 512,
+            height: 512,
+        };
+        for (candidate, format, image_extent) in [
+            (
+                RtKey {
+                    mapping_epoch: 27,
+                    ..key
+                },
+                vk::Format::R16_SFLOAT,
+                extent,
+            ),
+            (
+                RtKey {
+                    cpu_addr: key.cpu_addr + 4096,
+                    ..key
+                },
+                vk::Format::R16_SFLOAT,
+                extent,
+            ),
+            (
+                RtKey {
+                    nvmap_id: 643,
+                    ..key
+                },
+                vk::Format::R16_SFLOAT,
+                extent,
+            ),
+            (
+                RtKey {
+                    layout_signature: 1,
+                    ..key
+                },
+                vk::Format::R16_SFLOAT,
+                extent,
+            ),
+            (key.with_sample_grid(2, 1), vk::Format::R16_SFLOAT, extent),
+            (key, vk::Format::R16_UNORM, extent),
+            (
+                key,
+                vk::Format::R16_SFLOAT,
+                vk::Extent2D {
+                    width: 1024,
+                    height: 1024,
+                },
+            ),
+            (
+                RtKey { width: 1024, ..key },
+                vk::Format::R16_SFLOAT,
+                vk::Extent2D {
+                    width: 1024,
+                    height: 512,
+                },
+            ),
+        ] {
+            let mut cache = RtCache::new();
+            insert_source(&mut cache, candidate, format, image_extent);
+            assert!(find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT).is_empty());
+        }
+    }
+
+    #[test]
+    fn excludes_stale_or_undefined_sources_and_changes_hash_after_gpu_writes() {
+        let (tic, base) = height_texture();
+        let key = mip_key(&tic, base, 0);
+        let mut cache = RtCache::new();
+        insert_source(
+            &mut cache,
+            key,
+            vk::Format::R16_SFLOAT,
+            vk::Extent2D {
+                width: 512,
+                height: 512,
+            },
+        );
+        let initial = find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT);
+        assert_eq!(initial.len(), 1);
+        let initial_hash = texture_rt_mip_hash(123, &initial);
+        cache.mark_drawn(key);
+        let rewritten = find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT);
+        assert_ne!(initial_hash, texture_rt_mip_hash(123, &rewritten));
+        cache.set_color_layout(key, vk::ImageLayout::UNDEFINED);
+        assert!(find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT).is_empty());
+        cache.set_color_layout(key, vk::ImageLayout::GENERAL);
+        cache.mark_guest_written_range(key.cpu_addr, 2, &[]);
+        let stale = find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT);
+        assert!(stale.is_empty());
+        assert_ne!(initial_hash, texture_rt_mip_hash(123, &stale));
+    }
+
+    #[test]
+    fn content_hash_tracks_image_mapping_and_mip_identity() {
+        let (tic, base) = height_texture();
+        let mut cache = RtCache::new();
+        let key = mip_key(&tic, base, 0);
+        insert_source(
+            &mut cache,
+            key,
+            vk::Format::R16_SFLOAT,
+            vk::Extent2D {
+                width: 512,
+                height: 512,
+            },
+        );
+        let mip = find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT)[0];
+        let original = texture_rt_mip_hash(123, &[mip]);
+        for changed in [
+            TextureRtMip {
+                image: vk::Image::from_raw(999),
+                ..mip
+            },
+            TextureRtMip { level: 1, ..mip },
+            TextureRtMip {
+                key: RtKey {
+                    mapping_epoch: 27,
+                    ..mip.key
+                },
+                ..mip
+            },
+            TextureRtMip {
+                key: RtKey {
+                    cpu_addr: 0x55667700,
+                    ..mip.key
+                },
+                ..mip
+            },
+        ] {
+            assert_ne!(original, texture_rt_mip_hash(123, &[changed]));
+        }
+    }
+
+    #[test]
+    fn skips_absent_allocations_but_preserves_higher_mip_only_sources() {
+        let (tic, base) = height_texture();
+        let mut cache = RtCache::new();
+        assert!(!cache.has_color_for_nvmap(base.nvmap_id));
+        assert!(find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT).is_empty());
+        let source = mip_key(&tic, base, 1);
+        let extent = vk::Extent2D {
+            width: source.width,
+            height: source.height,
+        };
+        insert_source(
+            &mut cache,
+            RtKey {
+                nvmap_id: base.nvmap_id + 1,
+                ..source
+            },
+            vk::Format::R16_SFLOAT,
+            extent,
+        );
+        assert!(!cache.has_color_for_nvmap(base.nvmap_id));
+        assert!(cache.has_color_for_nvmap(base.nvmap_id + 1));
+        assert!(find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT).is_empty());
+        insert_source(&mut cache, source, vk::Format::R16_SFLOAT, extent);
+        assert!(cache.has_color_for_nvmap(base.nvmap_id));
+        let mips = find_texture_rt_mips(&cache, &tic, base, vk::Format::R16_SFLOAT);
+        assert_eq!(mips.len(), 1);
+        assert_eq!(mips[0].level, 1);
+        assert_eq!(mips[0].key.nvmap_id, base.nvmap_id);
+        assert_eq!(mips[0].key.gpu_va, tic.gpu_va + 0x80000);
+    }
+
+    #[test]
+    fn only_accepts_native_uncompressed_two_dimensional_mip_views() {
+        let (tic, base) = height_texture();
+        assert!(texture_rt_mip_candidate(&tic));
+        for rejected in [
+            TicEntry {
+                texture_type: 5,
+                ..tic
+            },
+            TicEntry { depth: 2, ..tic },
+            TicEntry {
+                base_layer: 1,
+                ..tic
+            },
+            TicEntry {
+                res_min_mip_level: 1,
+                ..tic
+            },
+            TicEntry {
+                res_max_mip_level: 0,
+                ..tic
+            },
+            TicEntry {
+                msaa_mode: 2,
+                ..tic
+            },
+            TicEntry {
+                is_sparse: true,
+                ..tic
+            },
+            TicEntry {
+                is_block_linear: false,
+                ..tic
+            },
+            TicEntry {
+                block_depth_log2: 1,
+                ..tic
+            },
+            TicEntry {
+                tile_width_spacing: 1,
+                ..tic
+            },
+            TicEntry {
+                format: TicFormat::BC1,
+                ..tic
+            },
+            TicEntry {
+                format: TicFormat::Z32,
+                ..tic
+            },
+        ] {
+            assert!(!texture_rt_mip_candidate(&rejected));
+        }
+        let mut cache = RtCache::new();
+        let key = mip_key(&tic, base, 0);
+        insert_source(
+            &mut cache,
+            key,
+            vk::Format::R16_SFLOAT,
+            vk::Extent2D {
+                width: 512,
+                height: 512,
+            },
+        );
+        assert!(find_texture_rt_mips(
+            &cache,
+            &tic,
+            RtKey {
+                guest_size_bytes: 1,
+                ..base
+            },
+            vk::Format::R16_SFLOAT
+        )
+        .is_empty());
+        assert!(find_texture_rt_mips(&cache, &tic, base, vk::Format::R32_SFLOAT).is_empty());
+    }
+}

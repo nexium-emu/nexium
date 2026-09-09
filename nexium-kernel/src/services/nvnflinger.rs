@@ -122,6 +122,7 @@ impl BufferQueueService {
                 width: w,
                 height: h,
                 pixels: px,
+                depth: None,
             };
         }
         let pixel_count = (self.width * self.height) as usize;
@@ -129,6 +130,7 @@ impl BufferQueueService {
             width: self.width,
             height: self.height,
             pixels: vec![0x10u8; pixel_count * 4],
+            depth: None,
         }
     }
 }

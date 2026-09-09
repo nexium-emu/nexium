@@ -39,6 +39,7 @@ pub struct QueuedFrame {
     pub height: u32,
     pub pixels: Vec<u8>,
     pub present_at: Option<std::time::Instant>,
+    pub depth: Option<nexium_gpu::PresentDepth>,
 }
 
 pub struct BufferQueue {

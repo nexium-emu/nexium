@@ -14,8 +14,9 @@ pub mod shader;
 pub mod tex_invalidate;
 pub mod texture;
 pub mod texture_manifest;
+pub mod texture_mips;
 
 pub use renderer::{
     PipelinedPresentCompletion, PipelinedPresentFrame, PipelinedPresentReadback,
-    PipelinedPresentSubmission, Renderer,
+    PipelinedPresentSubmission, PresentDepth, Renderer,
 };

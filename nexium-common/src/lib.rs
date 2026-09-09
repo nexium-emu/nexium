@@ -1,5 +1,6 @@
 pub mod async_compile;
 pub mod constants;
+pub mod depth_share;
 pub mod dumps;
 pub mod error;
 pub mod fast_hash;

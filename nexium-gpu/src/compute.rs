@@ -268,6 +268,12 @@ pub struct ComputeImageAlias {
     pub storage_binding: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ComputeOutputRtAlias {
+    pub binding: u32,
+    pub key: crate::rt_cache::RtKey,
+}
+
 #[derive(Clone, Debug)]
 pub struct ComputeDispatch {
     pub program_key: u64,
@@ -285,6 +291,7 @@ pub struct ComputeDispatch {
     pub sampled_images: Vec<ComputeSampledImage>,
     pub outputs: Vec<ComputeStorageImage>,
     pub image_aliases: Vec<ComputeImageAlias>,
+    pub output_rt_aliases: Vec<ComputeOutputRtAlias>,
 }
 
 #[derive(Clone, Debug)]
@@ -553,6 +560,7 @@ struct ComputeOutputPoolKey {
     is_3d: bool,
     format: vk::Format,
     sampled: bool,
+    attachable: bool,
 }
 
 struct ComputeResourcePool {
@@ -1040,6 +1048,7 @@ impl ComputeBackend {
         is_3d: bool,
         format: vk::Format,
         sampled: bool,
+        attachable: bool,
     ) -> Result<ComputeImageResource, String> {
         let key = ComputeOutputPoolKey {
             width,
@@ -1048,6 +1057,7 @@ impl ComputeBackend {
             is_3d,
             format,
             sampled,
+            attachable,
         };
         if let Some(resource) = self.resource_pool.outputs.take(&key) {
             self.resource_pool.stats.output_hits =
@@ -1057,7 +1067,7 @@ impl ComputeBackend {
         self.resource_pool.stats.output_misses =
             self.resource_pool.stats.output_misses.saturating_add(1);
         create_compute_output_image(
-            device, mem_props, width, height, depth, is_3d, format, sampled,
+            device, mem_props, width, height, depth, is_3d, format, sampled, attachable,
         )
     }
 
@@ -1106,6 +1116,7 @@ impl ComputeBackend {
                 height: resource.height,
                 depth: resource.depth,
                 is_3d: resource.is_3d,
+                attachable: resource.attachable,
                 format: resource.format,
                 sampled: resource.sampled,
             };
@@ -1429,6 +1440,7 @@ pub(crate) struct ComputeImageResource {
     pub is_3d: bool,
     pub format: vk::Format,
     pub sampled: bool,
+    pub attachable: bool,
 }
 
 impl ComputeImageResource {
@@ -1450,6 +1462,7 @@ pub(crate) fn create_compute_output_image(
     is_3d: bool,
     format: vk::Format,
     sampled: bool,
+    attachable: bool,
 ) -> Result<ComputeImageResource, String> {
     let info = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
@@ -1473,6 +1486,11 @@ pub(crate) fn create_compute_output_image(
             | vk::ImageUsageFlags::TRANSFER_DST
             | if sampled {
                 vk::ImageUsageFlags::SAMPLED
+            } else {
+                vk::ImageUsageFlags::empty()
+            }
+            | if attachable {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
             } else {
                 vk::ImageUsageFlags::empty()
             },
@@ -1554,6 +1572,7 @@ pub(crate) fn create_compute_output_image(
         is_3d,
         format,
         sampled,
+        attachable,
     })
 }
 
@@ -1715,6 +1734,7 @@ pub(crate) fn create_compute_sampled_image(
         is_3d,
         format,
         sampled: true,
+        attachable: false,
     })
 }
 
@@ -1914,6 +1934,7 @@ pub(crate) fn create_compute_guest_image(
             is_3d,
             format,
             sampled: true,
+            attachable: false,
         },
         upload,
         needs_upload: true,
@@ -2044,6 +2065,7 @@ mod tests {
             depth: 1,
             is_3d: false,
             format: vk::Format::R16_SFLOAT,
+            attachable: false,
             sampled: false,
         };
         assert_eq!(base, base);

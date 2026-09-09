@@ -303,7 +303,7 @@ pub use bufferqueue::{BufferQueue, GraphicBuffer, QueuedFrame};
 pub use gpu::GpuContext;
 pub use nexium_gpu::{
     PipelinedPresentCompletion, PipelinedPresentFrame, PipelinedPresentReadback,
-    PipelinedPresentSubmission,
+    PipelinedPresentSubmission, PresentDepth,
 };
 
 pub const FRAME_QUEUE_CAPACITY: usize = 4;
@@ -5835,6 +5835,7 @@ impl Nvdrv {
                 height: h,
                 pixels,
                 present_at: None,
+                depth: None,
             })
         } else {
             None
@@ -5915,6 +5916,7 @@ impl Nvdrv {
             height: dst_h,
             pixels: out,
             present_at: None,
+            depth: None,
         })
     }
 
@@ -6002,6 +6004,7 @@ mod tests {
             height: 1,
             pixels: vec![value, 0, 0, 255],
             present_at: None,
+            depth: None,
         }
     }
 

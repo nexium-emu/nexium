@@ -991,6 +991,8 @@ pub struct Emitter {
     no_kil_shader: bool,
     fragment_color_outputs: u32,
     fragment_output_map: u32,
+    fragment_writes_depth: bool,
+    fragment_depth_var: Option<Word>,
     fragment_uint_output_mask: u32,
     fragment_sint_output_mask: u32,
     texel_buffer_mask: u32,
@@ -1402,6 +1404,8 @@ impl Emitter {
             no_kil_shader: false,
             fragment_color_outputs: 1,
             fragment_output_map: 0,
+            fragment_writes_depth: false,
+            fragment_depth_var: None,
             fragment_uint_output_mask: 0,
             fragment_sint_output_mask: 0,
             texel_buffer_mask: 0,
@@ -2010,6 +2014,39 @@ impl Emitter {
         v
     }
 
+    fn fragment_depth_var(&mut self) -> Word {
+        if let Some(var) = self.fragment_depth_var {
+            return var;
+        }
+        let var = self
+            .b
+            .variable(self.ptr_output_f32, None, StorageClass::Output, None);
+        self.b.decorate(
+            var,
+            Decoration::BuiltIn,
+            [Operand::BuiltIn(BuiltIn::FragDepth)],
+        );
+        self.interface.push(var);
+        self.fragment_depth_var = Some(var);
+        var
+    }
+
+    fn store_fragment_depth(&mut self, state: Option<&HashMap<u8, nexium_shader::ir::Value>>) {
+        if !self.fragment_writes_depth {
+            return;
+        }
+        let targets = (0..8)
+            .filter(|index| (self.fragment_output_map >> (index * 4)) & 0xf != 0)
+            .count();
+        let register = (targets * 4 + 1) as u8;
+        let value = state
+            .and_then(|registers| registers.get(&register))
+            .map(|value| self.lower_value(value))
+            .unwrap_or(self.f32_zero);
+        let var = self.fragment_depth_var();
+        self.b.store(var, value, None, []).unwrap();
+    }
+
     fn fragment_output_numeric_type(&self, location: u32) -> TextureNumericType {
         let bit = 1u32.checked_shl(location).unwrap_or(0);
         if self.fragment_uint_output_mask & bit != 0 {
@@ -2050,6 +2087,9 @@ impl Emitter {
     fn fragment_output_locations(&self) -> Vec<u32> {
         let count = self.fragment_color_outputs.max(1).min(8);
         if self.fragment_output_map == 0 {
+            if self.fragment_writes_depth {
+                return Vec::new();
+            }
             return (0..count).collect();
         }
         (0..8)
@@ -8536,6 +8576,7 @@ impl Emitter {
                         for (loc, v) in outputs {
                             self.store_fragment_output_vec(loc, v);
                         }
+                        self.store_fragment_depth(es);
                     }
                     let virtual_merge = self.block_labels.len() as BlockId;
                     let target = if self.shared_merge_headers.contains_key(&virtual_merge) {
@@ -9071,6 +9112,9 @@ impl Emitter {
                 for loc in self.fragment_output_locations() {
                     self.frag_color_var_at(loc);
                 }
+                if self.fragment_writes_depth {
+                    self.fragment_depth_var();
+                }
             }
             Stage::Compute => {}
         }
@@ -9548,6 +9592,7 @@ impl Emitter {
                     for (loc, v) in outputs {
                         self.store_fragment_output_vec(loc, v);
                     }
+                    self.store_fragment_depth(exit_state);
                 }
             }
             Stage::Compute => {}
@@ -9586,6 +9631,10 @@ impl Emitter {
         if self.stage == Stage::Fragment {
             self.b
                 .execution_mode(main_id, rspirv::spirv::ExecutionMode::OriginUpperLeft, []);
+            if self.fragment_writes_depth {
+                self.b
+                    .execution_mode(main_id, rspirv::spirv::ExecutionMode::DepthReplacing, []);
+            }
         } else if self.stage == Stage::Compute {
             let local_size = self
                 .compute_options
@@ -11050,6 +11099,7 @@ pub struct FragmentOptions {
     pub sint_output_mask: u32,
     pub texture_numeric_manifest: Vec<GraphicsTextureResource>,
     pub texel_buffer_mask: u32,
+    pub writes_depth: bool,
     pub y_negate: bool,
     pub varying_map: GraphicsVaryingMap,
 }
@@ -11193,6 +11243,7 @@ pub fn emit_fragment_full_with_options(
     let mut emitter = Emitter::new_sized(Stage::Fragment, vec4s);
     emitter.varying_map = options.varying_map;
     emitter.fragment_debug_active = debug_active;
+    emitter.fragment_writes_depth = options.writes_depth;
     emitter.texture_numeric_manifest = normalize_graphics_texture_manifest(
         options.texture_numeric_manifest,
     )

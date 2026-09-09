@@ -862,6 +862,20 @@ impl TscEntry {
     }
 }
 
+pub fn effective_rt_alias_view(
+    mut tic: TicEntry,
+    tsc: Option<&TscEntry>,
+    sampled_only: bool,
+) -> TicEntry {
+    if sampled_only
+        && tsc.is_some_and(|sampler| sampler.mip_filter == TexFilter::None)
+        && tic.view_base_mip() == 0
+    {
+        tic.res_max_mip_level = 0;
+    }
+    tic
+}
+
 const GOB_W: usize = 64;
 const GOB_H: usize = 8;
 const GOB_SIZE: usize = 512;
@@ -2206,6 +2220,55 @@ mod tests {
         let block = [0x81, 0x80, 0x1f, 0, 0, 0, 0, 0];
         let signed = decode_to_rgba8_typed(&block, 4, 4, TicFormat::BC4, ComponentType::Snorm);
         assert_eq!(&signed[..8], &[0x81, 0, 0, 0x7f, 0x81, 0, 0, 0x7f]);
+    }
+
+    #[test]
+    fn rt_alias_view_clamps_only_proven_base_mip_sampling() {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&0x1bu32.to_le_bytes());
+        raw[4..8].copy_from_slice(&0xa4970000u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&(5u32 | (3 << 21)).to_le_bytes());
+        raw[12..16].copy_from_slice(&((4u32 << 3) | (7 << 28)).to_le_bytes());
+        raw[16..20].copy_from_slice(&(511u32 | (1 << 23)).to_le_bytes());
+        raw[20..24].copy_from_slice(&(511u32 | (1 << 31)).to_le_bytes());
+        raw[28..32].copy_from_slice(&0x70u32.to_le_bytes());
+        let tic = TicEntry::parse(&raw).unwrap();
+        let original_layout = block_linear_mip_layout(&tic).unwrap();
+        let mut sampler_raw = [0u8; 32];
+        sampler_raw[4..8].copy_from_slice(&0x362u32.to_le_bytes());
+        let sampler = super::TscEntry::parse(&sampler_raw).unwrap();
+        let effective = super::effective_rt_alias_view(tic, Some(&sampler), true);
+        assert_eq!(tic.view_mip_levels(), 8);
+        assert_eq!(effective.view_mip_levels(), 1);
+        assert_eq!(effective.max_mip_level, 7);
+        assert_eq!(effective.gpu_va, 0x5a4970000);
+        assert_eq!(
+            block_linear_mip_layout(&effective).unwrap(),
+            original_layout
+        );
+        assert_eq!(super::effective_rt_alias_view(tic, None, true), tic);
+        assert_eq!(
+            super::effective_rt_alias_view(tic, Some(&sampler), false),
+            tic
+        );
+        for filter in [super::TexFilter::Nearest, super::TexFilter::Linear] {
+            let filtered = super::TscEntry {
+                mip_filter: filter,
+                ..sampler
+            };
+            assert_eq!(
+                super::effective_rt_alias_view(tic, Some(&filtered), true),
+                tic
+            );
+        }
+        let nonzero_base = TicEntry {
+            res_min_mip_level: 1,
+            ..tic
+        };
+        assert_eq!(
+            super::effective_rt_alias_view(nonzero_base, Some(&sampler), true),
+            nonzero_base
+        );
     }
 
     #[test]

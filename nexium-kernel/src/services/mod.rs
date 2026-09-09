@@ -91,6 +91,7 @@ pub struct FrameOut {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub depth: Option<nexium_nvdrv::PresentDepth>,
 }
 
 pub struct IpcCtx<'a> {

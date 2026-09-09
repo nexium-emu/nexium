@@ -75,6 +75,75 @@ pub(crate) enum PrepEvent {
     SetGuestMemory(Option<super::GuestMemoryAccess>),
 }
 
+fn eager_clear_resolve_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_EAGER_CLEAR_RESOLVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+fn clear_target_ranges(draw: &super::engines::maxwell3d::DrawCall) -> Vec<(u64, u64)> {
+    const CONSERVATIVE_BYTES_PER_PIXEL: u64 = 16;
+    let mut ranges = Vec::with_capacity(9);
+    for rt in &draw.rt {
+        let base = (u64::from(rt.address_hi) << 32) | u64::from(rt.address_lo);
+        if base == 0 {
+            continue;
+        }
+        let size = u64::from(rt.width)
+            .saturating_mul(u64::from(rt.height))
+            .saturating_mul(u64::from(rt.depth.max(1)))
+            .saturating_mul(CONSERVATIVE_BYTES_PER_PIXEL)
+            .max(u64::from(rt.layer_stride).saturating_mul(u64::from(rt.depth.max(1))));
+        ranges.push((base, size));
+    }
+    if draw.zeta_enable {
+        let base = (u64::from(draw.zeta.address_hi) << 32) | u64::from(draw.zeta.address_lo);
+        if base != 0 {
+            let size = u64::from(draw.zeta.width)
+                .saturating_mul(u64::from(draw.zeta.height))
+                .saturating_mul(CONSERVATIVE_BYTES_PER_PIXEL)
+                .max(u64::from(draw.zeta.array_pitch));
+            ranges.push((base, size));
+        }
+    }
+    ranges
+}
+
+fn draws_need_pending_compute(draws: &[super::engines::maxwell3d::DrawCall]) -> bool {
+    if draws.iter().any(|draw| !draw.is_clear) {
+        return true;
+    }
+    let spans = super::engines::maxwell_compute::pending_writeback_spans_snapshot();
+    if spans.is_empty() {
+        return false;
+    }
+    draws.iter().any(|draw| {
+        clear_target_ranges(draw).into_iter().any(|(base, size)| {
+            let end = base.saturating_add(size);
+            spans.iter().any(|span| {
+                let span_end = span.gpu_va.saturating_add(span.len as u64);
+                span.gpu_va < end && base < span_end
+            })
+        })
+    })
+}
+
+fn mirror_sweep_per_entry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_MIRROR_SWEEP_PER_ENTRY")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
 fn engb_prof_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_PREP_PROFILE").is_some())
@@ -677,7 +746,14 @@ impl PrepState {
                 mut replay_constbuf_writes,
                 constbuf_trace,
             } => {
-                let compute_spans = self.resolve_pending_compute_report(mappings, mem_write);
+                let compute_spans = if eager_clear_resolve_enabled()
+                    || !super::engines::maxwell_compute::has_pending_writebacks()
+                    || draws_need_pending_compute(&draws)
+                {
+                    self.resolve_pending_compute_report(mappings, mem_write)
+                } else {
+                    super::engines::maxwell_compute::pending_writeback_spans_snapshot()
+                };
                 let mut compute_probe =
                     super::vk_dispatch::ComputeGraphicsProbe::new(&compute_spans);
                 let mut committed_constbuf_writes = 0;
@@ -1191,6 +1267,7 @@ impl PrepState {
     }
 
     pub(crate) fn begin_ssbo_snapshot_epoch(&mut self) {
+        self.ssbo_snapshot_cache.mirror_bump_sweep();
         self.ssbo_snapshot_cache.mirror_begin_kick();
         self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
         self.ssbo_snapshot_cache.reset_epoch();
@@ -1280,7 +1357,9 @@ impl PrepState {
 
     pub(crate) fn begin_ssbo_snapshot_entry(&mut self) {
         let watch_started = super::pusher::kickprof::start();
-        self.ssbo_snapshot_cache.mirror_bump_sweep();
+        if mirror_sweep_per_entry_enabled() {
+            self.ssbo_snapshot_cache.mirror_bump_sweep();
+        }
         self.ssbo_snapshot_cache.refresh_ssbo_guest_writes();
         super::pusher::kickprof::add(super::pusher::kickprof::ENQ_WATCH, watch_started);
         let retain_started = super::pusher::kickprof::start();
@@ -2285,13 +2364,22 @@ mod tests {
     }
 
     #[test]
-    fn entry_boundary_advances_resident_mirror_sweep() {
+    fn kick_and_barrier_boundaries_advance_resident_mirror_sweep_but_entries_do_not() {
         let mut state = PrepState::new();
         let before = state.ssbo_snapshot_cache.mirror_sweep_generation();
 
         state.begin_ssbo_snapshot_entry();
+        assert_eq!(state.ssbo_snapshot_cache.mirror_sweep_generation(), before);
 
-        assert_ne!(state.ssbo_snapshot_cache.mirror_sweep_generation(), before);
+        state.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
+        let after_barrier = state.ssbo_snapshot_cache.mirror_sweep_generation();
+        assert_ne!(after_barrier, before);
+
+        state.begin_ssbo_snapshot_epoch();
+        assert_ne!(
+            state.ssbo_snapshot_cache.mirror_sweep_generation(),
+            after_barrier
+        );
     }
 
     #[test]

@@ -1419,6 +1419,7 @@ impl Kernel {
                 width: qf.width,
                 height: qf.height,
                 pixels: qf.pixels,
+                depth: qf.depth,
             });
         }
 
@@ -1440,6 +1441,7 @@ impl Kernel {
                     width: qf.width,
                     height: qf.height,
                     pixels: qf.pixels,
+                    depth: None,
                 });
             }
         }
@@ -1503,6 +1505,7 @@ impl Kernel {
             width: w,
             height: h,
             pixels,
+            depth: None,
         }
     }
 
