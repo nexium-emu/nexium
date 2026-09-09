@@ -237,6 +237,8 @@ pub struct HorizonApp {
     egui_ctx: egui::Context,
     wgpu_state: Option<eframe::egui_wgpu::RenderState>,
     game_texture_native: Option<NativeGameTexture>,
+    game_depth: Option<std::sync::Arc<nexium_gpu::PresentDepth>>,
+    game_depth_seq: u64,
     last_game_rect: Option<egui::Rect>,
     mouse_wheel_accum: egui::Vec2,
     show_settings: bool,
@@ -502,6 +504,8 @@ impl HorizonApp {
             egui_ctx: cc.egui_ctx.clone(),
             wgpu_state: cc.wgpu_render_state.clone(),
             game_texture_native: None,
+            game_depth: None,
+            game_depth_seq: 0,
             last_game_rect: None,
             mouse_wheel_accum: egui::Vec2::ZERO,
             show_settings: false,
@@ -1098,7 +1102,7 @@ impl HorizonApp {
             crate::app_settings::FilterMode::Linear => egui::TextureOptions::LINEAR,
             crate::app_settings::FilterMode::Nearest => egui::TextureOptions::NEAREST,
         };
-        if let Some(frame) = take_next_game_frame(&handle.frame_rx) {
+        if let Some(mut frame) = take_next_game_frame(&handle.frame_rx) {
             gui_rate_stats(1);
             self.performance.record_frame();
             self.last_frame_res = (frame.width, frame.height);
@@ -1109,7 +1113,7 @@ impl HorizonApp {
                 frame.pixels.len()
             );
             if self.wgpu_state.is_some() && !legacy_gui_upload() {
-                self.upload_frame_native(&frame);
+                self.upload_frame_native(&mut frame);
                 return;
             }
             let image_size = [frame.width as usize, frame.height as usize];
@@ -1127,7 +1131,7 @@ impl HorizonApp {
         }
     }
 
-    fn upload_frame_native(&mut self, frame: &crate::boot::Frame) {
+    fn upload_frame_native(&mut self, frame: &mut crate::boot::Frame) {
         let Some(rs) = self.wgpu_state.clone() else {
             return;
         };
@@ -1199,9 +1203,14 @@ impl HorizonApp {
                 depth_or_array_layers: 1,
             },
         );
+        if let Some(depth) = frame.depth.take() {
+            self.game_depth = Some(std::sync::Arc::new(depth));
+            self.game_depth_seq = self.game_depth_seq.wrapping_add(1);
+        }
     }
 
     fn free_native_texture(&mut self) {
+        self.game_depth = None;
         if let Some(t) = self.game_texture_native.take() {
             if let Some(rs) = &self.wgpu_state {
                 rs.renderer.write().free_texture(&t.id);
@@ -4140,7 +4149,7 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 6] = [
+            let rows: [(&str, String); 7] = [
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
                 ("Output Scale", format!("{}x", scale)),
                 (
@@ -4150,6 +4159,7 @@ impl HorizonApp {
                 ("High-DPI Aware", on(self.app_settings.dpi_aware)),
                 ("V-Sync", on(self.app_settings.vsync)),
                 ("Async Shaders", on(self.app_settings.async_shaders)),
+                ("Depth Share", on(self.app_settings.depth_share)),
             ];
             let n = rows.len();
             if !self.prefs_focus {
@@ -8937,6 +8947,16 @@ impl eframe::App for HorizonApp {
                         ui.centered_and_justified(|ui| {
                             ui.image((tid, draw_size));
                         });
+                        if let Some(depth) = self.game_depth.clone() {
+                            ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
+                                draw_rect,
+                                crate::depth_emit::DepthEmit {
+                                    depth,
+                                    seq: self.game_depth_seq,
+                                    rect: draw_rect,
+                                },
+                            ));
+                        }
                     } else {
                         self.library_view(ui, ctx);
                     }
@@ -9853,6 +9873,17 @@ fn graphics_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_need
         *save_needed = true;
     }
     ui.label(egui::RichText::new("Builds new pipelines on a background thread so the game never stalls to compile. New effects pop in a frame or two the first time they appear. Off = compile on demand (brief hitch on first sight, no pop-in). Disk cache makes later launches stutter-free either way.").size(10.5).color(MUTED));
+    ui.add_space(6.0);
+    let mut depth_share = cfg.depth_share;
+    if ui
+        .checkbox(&mut depth_share, "Share game depth with ReShade add-ons")
+        .changed()
+    {
+        cfg.depth_share = depth_share;
+        nexium_common::depth_share::set_enabled(depth_share);
+        *save_needed = true;
+    }
+    ui.label(egui::RichText::new("Copies the guest's main depth buffer with every frame and replays it into a depth attachment on the host device, so ReShade's Generic Depth and add-ons such as DLSS 5 Feed see real depth. Costs one extra readback per frame; leave off unless an overlay needs it.").size(10.5).color(MUTED));
 }
 
 fn audio_settings_content(

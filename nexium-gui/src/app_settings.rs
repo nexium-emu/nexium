@@ -492,6 +492,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub async_shaders: bool,
     #[serde(default)]
+    pub depth_share: bool,
+    #[serde(default)]
     pub library_folders: Vec<PathBuf>,
     #[serde(default)]
     pub view_mode: ViewMode,
@@ -658,6 +660,7 @@ impl Default for AppSettings {
             multicore: default_multicore(),
             docked: default_docked(),
             async_shaders: false,
+            depth_share: false,
             library_folders: Vec::new(),
             view_mode: ViewMode::Carousel,
             carousel_theme: CarouselTheme::default(),

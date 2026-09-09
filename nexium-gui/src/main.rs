@@ -8,6 +8,7 @@ mod carousel;
 mod controller_art;
 mod controller_config;
 mod debugger;
+mod depth_emit;
 mod homebrew;
 mod input;
 mod library;
@@ -42,6 +43,13 @@ fn host_surface_config(vsync: bool) -> eframe::SurfaceConfig {
         },
         desired_maximum_frame_latency: Some(2),
     }
+}
+
+fn host_wgpu_setup() -> eframe::egui_wgpu::WgpuSetupCreateNew {
+    let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.instance_descriptor.backends =
+        eframe::wgpu::Backends::from_env().unwrap_or(eframe::wgpu::Backends::VULKAN);
+    setup
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -106,6 +114,17 @@ fn main() -> Result<(), eframe::Error> {
     fault_logger::install();
 
     nexium_common::async_compile::set_enabled(settings.async_shaders);
+    nexium_common::depth_share::set_enabled(
+        std::env::var("NEXIUM_DEPTH_SHARE").map_or(settings.depth_share, |v| v != "0"),
+    );
+    log::info!(
+        "depth share for ReShade add-ons: {}",
+        if nexium_common::depth_share::enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     #[cfg(windows)]
     {
@@ -151,7 +170,11 @@ fn main() -> Result<(), eframe::Error> {
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
         renderer: eframe::Renderer::Wgpu,
-        wgpu_options: eframe::WgpuConfiguration::default().with_surface_config(surface_config),
+        wgpu_options: eframe::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(host_wgpu_setup()),
+            ..Default::default()
+        }
+        .with_surface_config(surface_config),
         ..Default::default()
     };
 
@@ -196,7 +219,17 @@ mod fast_exit {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_surface_config, host_vsync_enabled};
+    use super::{host_surface_config, host_vsync_enabled, host_wgpu_setup};
+
+    #[test]
+    fn host_wgpu_setup_defaults_to_vulkan_only() {
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            assert_eq!(
+                host_wgpu_setup().instance_descriptor.backends,
+                eframe::wgpu::Backends::VULKAN
+            );
+        }
+    }
 
     #[test]
     fn host_vsync_override_only_accepts_known_values() {
