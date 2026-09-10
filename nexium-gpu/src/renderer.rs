@@ -4348,21 +4348,34 @@ impl Renderer {
         }
         let mut layer_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
         let mut ext_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
+        let mut present_fences_supported = false;
         if presentation_target.is_some() {
-            let required = [ash::khr::surface::NAME, ash::khr::get_surface_capabilities2::NAME,
-                ash::ext::surface_maintenance1::NAME];
-            let available = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
-            if !required.iter().all(|required| available.iter().any(|extension| unsafe {
-                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == *required
-            })) {
+            let required = [
+                ash::khr::surface::NAME,
+                #[cfg(windows)]
+                ash::khr::win32_surface::NAME,
+            ];
+            let available =
+                unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+            let has_extension = |name| {
+                available.iter().any(|extension| unsafe {
+                    std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == name
+                })
+            };
+            if !required.iter().copied().all(has_extension) {
                 log::warn!("[vulkan-present] native surface extensions unavailable; using GUI frame delivery");
                 presentation_target = None;
+            } else {
+                present_fences_supported = has_extension(ash::khr::get_surface_capabilities2::NAME)
+                    && has_extension(ash::ext::surface_maintenance1::NAME);
             }
         }
         if presentation_target.is_some() {
             ext_ptrs.push(ash::khr::surface::NAME.as_ptr());
-            ext_ptrs.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
-            ext_ptrs.push(ash::ext::surface_maintenance1::NAME.as_ptr());
+            if present_fences_supported {
+                ext_ptrs.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
+                ext_ptrs.push(ash::ext::surface_maintenance1::NAME.as_ptr());
+            }
             #[cfg(windows)]
             ext_ptrs.push(ash::khr::win32_surface::NAME.as_ptr());
         }
@@ -4706,20 +4719,31 @@ impl Renderer {
         let mut enabled_ext_names: Vec<*const std::os::raw::c_char> = Vec::new();
         let mut present_features = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
         if presentation_target.is_some() {
-            let supported = device_extensions.iter().any(|extension| unsafe {
-                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr())
-                    == ash::ext::swapchain_maintenance1::NAME
-            });
-            if supported {
-                let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut present_features);
-                unsafe { instance.get_physical_device_features2(physical_device, &mut features); }
+            let has_extension = |name| {
+                device_extensions.iter().any(|extension| unsafe {
+                    std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == name
+                })
+            };
+            present_fences_supported &= has_extension(ash::ext::swapchain_maintenance1::NAME);
+            if present_fences_supported {
+                let mut features =
+                    vk::PhysicalDeviceFeatures2::default().push_next(&mut present_features);
+                unsafe {
+                    instance.get_physical_device_features2(physical_device, &mut features);
+                }
+                present_fences_supported = present_features.swapchain_maintenance1 == vk::TRUE;
             }
-            if !supported || present_features.swapchain_maintenance1 != vk::TRUE {
-                log::warn!("[vulkan-present] swapchain maintenance unavailable; using GUI frame delivery");
+            if !has_extension(ash::khr::swapchain::NAME) {
+                log::warn!("[vulkan-present] swapchain unavailable; using GUI frame delivery");
                 presentation_target = None;
+                present_fences_supported = false;
             } else {
                 enabled_ext_names.push(ash::khr::swapchain::NAME.as_ptr());
-                enabled_ext_names.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
+                if present_fences_supported {
+                    enabled_ext_names.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
+                } else {
+                    log::info!("[vulkan-present] using image acquisition to retire presentation resources");
+                }
             }
         }
         if enable_depth_clip_control {
@@ -4759,7 +4783,7 @@ impl Renderer {
         } else {
             compute_feature_chain
         };
-        if presentation_target.is_some() {
+        if present_fences_supported {
             present_features.p_next = p_next_chain;
             p_next_chain = &mut present_features as *mut _ as *mut std::ffi::c_void;
         }
@@ -5210,7 +5234,7 @@ impl Renderer {
             let present_queue = unsafe { device.get_device_queue(queue_family, queue_count - 1) };
             match crate::presentation::Presenter::new(
                 &entry, &instance, &device, physical_device, queue_family, present_queue,
-                submit_timeline, submit_state.clone(), target,
+                submit_timeline, submit_state.clone(), target, present_fences_supported,
             ) {
                 Ok(presenter) => Some(presenter),
                 Err(error) => {

@@ -337,6 +337,7 @@ impl Presenter {
         timeline: vk::Semaphore,
         submit: Arc<SubmitState>,
         target: Arc<PresentationTarget>,
+        present_fences: bool,
     ) -> Result<Self, String> {
         if timeline == vk::Semaphore::null() {
             return Err("native presentation requires timeline semaphores".into());
@@ -358,6 +359,7 @@ impl Presenter {
             timeline,
             submit,
             target.clone(),
+            present_fences,
         )?;
         let stop = worker.stop.clone();
         let thread_target = target.clone();
@@ -436,6 +438,11 @@ struct SwapImage {
     pending_present: bool,
 }
 
+struct RetiredSwapchain {
+    handle: vk::SwapchainKHR,
+    images: Vec<SwapImage>,
+}
+
 struct Worker {
     device: ash::Device,
     surface_api: ash::khr::surface::Instance,
@@ -445,6 +452,8 @@ struct Worker {
     surface: vk::SurfaceKHR,
     swapchain: vk::SwapchainKHR,
     images: Vec<SwapImage>,
+    retired: Vec<RetiredSwapchain>,
+    present_fences: bool,
     extent: vk::Extent2D,
     vsync: bool,
     queue: vk::Queue,
@@ -478,6 +487,7 @@ impl Worker {
         timeline: vk::Semaphore,
         submit: Arc<SubmitState>,
         target: Arc<PresentationTarget>,
+        present_fences: bool,
     ) -> Result<Self, String> {
         let mut worker = Self {
             device: device.clone(),
@@ -488,6 +498,8 @@ impl Worker {
             surface: vk::SurfaceKHR::null(),
             swapchain: vk::SwapchainKHR::null(),
             images: Vec::new(),
+            retired: Vec::new(),
+            present_fences,
             extent: vk::Extent2D::default(),
             vsync: true,
             queue,
@@ -664,6 +676,8 @@ impl Worker {
                 (self.target.repaint)();
                 if state.visible && state.width != 0 && state.height != 0 {
                     self.present(state)?;
+                } else {
+                    self.wait_present_time(self.last.as_ref().unwrap().parameters.present_at);
                 }
             } else if self.last.is_some()
                 && state.visible
@@ -698,6 +712,15 @@ impl Worker {
         mutex.lock().unwrap_or_else(|error| error.into_inner())
     }
 
+    fn wait_present_time(&self, deadline: Instant) {
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            if self.target.stopped.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
+        }
+    }
+
     fn wait_submission(&mut self) -> Result<(), String> {
         if self.fence_pending {
             unsafe {
@@ -712,6 +735,27 @@ impl Worker {
 
     fn drain(&mut self) {
         let _ = self.wait_submission();
+        if !self.present_fences {
+            if self.images.iter().any(|image| image.pending_present)
+                || self
+                    .retired
+                    .iter()
+                    .any(|swapchain| swapchain.images.iter().any(|image| image.pending_present))
+            {
+                let _sequence = self.queue_lock();
+                unsafe {
+                    let _ = self.device.queue_wait_idle(self.queue);
+                }
+            }
+            for image in self.images.iter_mut().chain(
+                self.retired
+                    .iter_mut()
+                    .flat_map(|swapchain| &mut swapchain.images),
+            ) {
+                image.pending_present = false;
+            }
+            return;
+        }
         for image in &mut self.images {
             if image.pending_present {
                 unsafe {
@@ -724,23 +768,47 @@ impl Worker {
         }
     }
 
-    fn destroy_swapchain(&mut self) {
-        self.drain();
+    fn retire_swapchain(&mut self) {
+        let _ = self.wait_submission();
+        if self.present_fences {
+            self.drain();
+        }
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
             self.pipeline = vk::Pipeline::null();
-            for image in self.images.drain(..) {
+        }
+        if self.swapchain != vk::SwapchainKHR::null() {
+            let swapchain = RetiredSwapchain {
+                handle: std::mem::replace(&mut self.swapchain, vk::SwapchainKHR::null()),
+                images: std::mem::take(&mut self.images),
+            };
+            if self.present_fences {
+                self.release_swapchain(swapchain);
+            } else {
+                self.retired.push(swapchain);
+            }
+        }
+    }
+
+    fn release_swapchain(&self, swapchain: RetiredSwapchain) {
+        unsafe {
+            for image in swapchain.images {
                 self.device.destroy_image_view(image.view, None);
                 self.device.destroy_semaphore(image.complete, None);
                 self.device.destroy_fence(image.present_fence, None);
             }
-            self.swap_api.destroy_swapchain(self.swapchain, None);
-            self.swapchain = vk::SwapchainKHR::null();
+            self.swap_api.destroy_swapchain(swapchain.handle, None);
+        }
+    }
+
+    fn release_retired(&mut self) {
+        for swapchain in std::mem::take(&mut self.retired) {
+            self.release_swapchain(swapchain);
         }
     }
 
     fn recreate(&mut self, state: SurfaceState) -> Result<(), String> {
-        self.destroy_swapchain();
+        self.retire_swapchain();
         unsafe {
             let caps = self
                 .surface_api
@@ -823,7 +891,12 @@ impl Worker {
                         .pre_transform(caps.current_transform)
                         .composite_alpha(alpha)
                         .present_mode(mode)
-                        .clipped(true),
+                        .clipped(true)
+                        .old_swapchain(
+                            self.retired
+                                .last()
+                                .map_or(vk::SwapchainKHR::null(), |swapchain| swapchain.handle),
+                        ),
                     None,
                 )
                 .map_err(err)?;
@@ -855,10 +928,12 @@ impl Worker {
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                     .map_err(err)?;
-                out.present_fence = self
-                    .device
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
-                    .map_err(err)?;
+                if self.present_fences {
+                    out.present_fence = self
+                        .device
+                        .create_fence(&vk::FenceCreateInfo::default(), None)
+                        .map_err(err)?;
+                }
             }
             self.pipeline = create_pipeline(&self.device, self.pipeline_layout, format.format)?;
             log::info!(
@@ -906,23 +981,27 @@ impl Worker {
             } {
                 Ok(value) => break value,
                 Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => {}
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.destroy_swapchain(),
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.retire_swapchain(),
                 Err(error) => return Err(err(error)),
             }
             state = *self.target.state.lock();
         };
         let image = &mut self.images[index as usize];
+        let release_retired = !self.present_fences && image.pending_present;
         let present_fence = image.present_fence;
         unsafe {
-            if image.pending_present {
+            if self.present_fences {
+                if image.pending_present {
+                    self.device
+                        .wait_for_fences(&[image.present_fence], true, u64::MAX)
+                        .map_err(err)?;
+                }
                 self.device
-                    .wait_for_fences(&[image.present_fence], true, u64::MAX)
+                    .reset_fences(&[image.present_fence])
                     .map_err(err)?;
-                image.pending_present = false;
             }
-            self.device
-                .reset_fences(&[image.present_fence, self.fence])
-                .map_err(err)?;
+            image.pending_present = false;
+            self.device.reset_fences(&[self.fence]).map_err(err)?;
             self.device
                 .reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
                 .map_err(err)?;
@@ -1052,25 +1131,18 @@ impl Worker {
             }
         }
         self.fence_pending = true;
-        while let Some(remaining) = slot
-            .parameters
-            .present_at
-            .checked_duration_since(Instant::now())
-        {
-            if self.target.stopped.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
-                break;
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(2)));
-        }
+        self.wait_present_time(slot.parameters.present_at);
         let swaps = [self.swapchain];
         let indices = [index];
         let fences = [present_fence];
         let mut completion = vk::SwapchainPresentFenceInfoEXT::default().fences(&fences);
-        let present = vk::PresentInfoKHR::default()
+        let mut present = vk::PresentInfoKHR::default()
             .wait_semaphores(&signals)
             .swapchains(&swaps)
-            .image_indices(&indices)
-            .push_next(&mut completion);
+            .image_indices(&indices);
+        if self.present_fences {
+            present = present.push_next(&mut completion);
+        }
         let result = {
             let _sequence = self.queue_lock();
             unsafe { self.swap_api.queue_present(self.queue, &present) }
@@ -1089,10 +1161,13 @@ impl Worker {
             }
         }
         self.wait_submission()?;
+        if release_retired {
+            self.release_retired();
+        }
         match result {
-            Ok(changed) if changed || suboptimal => self.destroy_swapchain(),
+            Ok(changed) if changed || suboptimal => self.retire_swapchain(),
             Ok(_) => {}
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.destroy_swapchain(),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.retire_swapchain(),
             Err(error) => return Err(err(error)),
         }
         Ok(())
@@ -1247,7 +1322,9 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.destroy_swapchain();
+        self.drain();
+        self.retire_swapchain();
+        self.release_retired();
         self.last.take();
         unsafe {
             for sampler in self.samplers {

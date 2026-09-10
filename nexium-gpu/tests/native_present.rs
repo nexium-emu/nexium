@@ -50,12 +50,20 @@ fn pump_until(event_loop: &mut EventLoop<()>, mut done: impl FnMut() -> bool) {
 fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
     let _ = log::set_logger(&Logger);
     log::set_max_level(log::LevelFilter::Info);
+    if let Ok(name) = std::env::var("NEXIUM_TEST_GPU") {
+        let device = nexium_gpu::adapter::available_devices()
+            .iter()
+            .find(|device| device.name == name)
+            .expect("requested test GPU is available");
+        nexium_gpu::adapter::set_preferred_device(Some(device.id.clone()));
+    }
     let mut event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
     #[allow(deprecated)]
     let window = event_loop
         .create_window(
             Window::default_attributes()
                 .with_title("NeXium presentation test")
+                .with_visible(false)
                 .with_inner_size(winit::dpi::PhysicalSize::new(320, 180)),
         )
         .unwrap();
@@ -72,7 +80,7 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
     target.configure(SurfaceState {
         width: 320,
         height: 180,
-        visible: true,
+        visible: false,
         vsync: true,
         nearest: true,
     });
@@ -129,6 +137,44 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         .unwrap());
     pump_until(&mut event_loop, || target.progress().0 >= 1);
     assert_eq!(target.metrics().2, 0);
+    assert_eq!(target.metrics().1, 0);
+    let hidden_started = Instant::now();
+    let producer = {
+        let renderer = renderer.clone();
+        std::thread::spawn(move || {
+            for n in 1..=12 {
+                assert!(renderer
+                    .present_image(
+                        key,
+                        stamp,
+                        false,
+                        PresentParameters {
+                            present_at: hidden_started + Duration::from_nanos(n * 16_666_667),
+                            ..parameters
+                        },
+                    )
+                    .unwrap());
+            }
+        })
+    };
+    pump_until(&mut event_loop, || {
+        producer.is_finished() && target.progress().0 >= 13
+    });
+    producer.join().unwrap();
+    assert!(
+        hidden_started.elapsed() >= Duration::from_millis(150),
+        "hidden presentation advanced ahead of guest deadlines: {:?}",
+        hidden_started.elapsed()
+    );
+    window.set_visible(true);
+    target.configure(SurfaceState {
+        width: 320,
+        height: 180,
+        visible: true,
+        vsync: true,
+        nearest: true,
+    });
+    pump_until(&mut event_loop, || target.metrics().1 >= 1);
     target.request_snapshot();
     let mut snapshot = None;
     pump_until(&mut event_loop, || {
@@ -147,6 +193,7 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         vsync: false,
         nearest: false,
     });
+    let initial_frames = target.progress().0;
     let producer = {
         let renderer = renderer.clone();
         std::thread::spawn(move || {
@@ -166,7 +213,7 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         })
     };
     pump_until(&mut event_loop, || {
-        producer.is_finished() && target.progress().0 >= 25
+        producer.is_finished() && target.progress().0 >= initial_frames + 24
     });
     producer.join().unwrap();
     target.configure(SurfaceState {
@@ -219,6 +266,35 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         "60 fps producer was throttled: {:?}",
         started.elapsed()
     );
+    for n in 0..12 {
+        let width = 320 + (n % 3) * 80;
+        let height = width * 9 / 16;
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+        event_loop.pump_app_events(Some(Duration::from_millis(2)), &mut Events);
+        target.configure(SurfaceState {
+            width,
+            height,
+            visible: true,
+            vsync: n % 2 == 0,
+            nearest: true,
+        });
+        let before = target.metrics().1;
+        let frames = if n < 6 { 1 } else { 6 };
+        let producer = {
+            let renderer = renderer.clone();
+            std::thread::spawn(move || {
+                for _ in 0..frames {
+                    assert!(renderer
+                        .present_image(key, stamp, false, parameters)
+                        .unwrap());
+                }
+            })
+        };
+        pump_until(&mut event_loop, || {
+            producer.is_finished() && target.metrics().1 >= before + frames
+        });
+        producer.join().unwrap();
+    }
     let worker = std::thread::spawn(move || {
         target.stop();
         drop(renderer);
