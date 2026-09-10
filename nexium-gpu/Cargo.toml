@@ -16,9 +16,14 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 texture2ddecoder = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [build-dependencies]
 naga = { version = "30.0", features = ["wgsl-in", "spv-out"] }
 
 [dev-dependencies]
 winit = "0.30"
+
+[[bench]]
+name = "texture_hash"
+harness = false

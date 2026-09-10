@@ -2557,19 +2557,8 @@ struct ComputeGuestImageContent {
     copies: Arc<[TextureMipCopy]>,
 }
 
-fn fnv_chunked(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325 ^ bytes.len() as u64;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        h ^= u64::from_le_bytes(chunk.try_into().unwrap());
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    let mut tail = 0u64;
-    for (index, &byte) in chunks.remainder().iter().enumerate() {
-        tail |= (byte as u64) << (index * 8);
-    }
-    h ^= tail;
-    h.wrapping_mul(0x100000001b3)
+fn texture_content_hash(bytes: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(bytes)
 }
 
 fn memoized_texture_snapshot_hash(
@@ -2578,7 +2567,9 @@ fn memoized_texture_snapshot_hash(
     snapshot: &[u8],
 ) -> u64 {
     debug_assert_eq!(range.1, snapshot.len());
-    *hashes.entry(range).or_insert_with(|| fnv_chunked(snapshot))
+    *hashes
+        .entry(range)
+        .or_insert_with(|| texture_content_hash(snapshot))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2642,7 +2633,7 @@ fn profiled_texture_snapshot_hash(
         }
         Entry::Vacant(entry) => {
             let started = std::time::Instant::now();
-            let hash = fnv_chunked(snapshot);
+            let hash = texture_content_hash(snapshot);
             profile.hash_time += started.elapsed();
             profile.hashes += 1;
             profile.hash_bytes += snapshot.len() as u64;
@@ -9111,7 +9102,7 @@ impl Renderer {
                 read_guest(key.gpu_va, read_size)
             };
             if raw.is_some() || volume_slices.is_some() || identity_volume {
-                let raw_hash = raw.as_ref().map(|raw| fnv_chunked(raw));
+                let raw_hash = raw.as_ref().map(|raw| texture_content_hash(raw));
                 let mut tex_hash = raw_hash.unwrap_or_else(|| texture_seed_hash(&key));
                 if let Some(slices) = volume_slices.as_ref() {
                     tex_hash = volume_rt_slice_hash(tex_hash, slices);
@@ -16257,7 +16248,7 @@ fn prepare_compute_guest_image_content(
             }
         }
     }
-    let source_hash = fnv_chunked(raw);
+    let source_hash = texture_content_hash(raw);
     if let Some(content) = pool.iter().rev().find_map(|entry| {
         entry
             .content
@@ -24978,7 +24969,7 @@ where
             read_size
         ));
     }
-    let hash = fnv_chunked(bytes.as_ref());
+    let hash = texture_content_hash(bytes.as_ref());
     if !force_refresh && cache.get(&key).is_some_and(|cached| cached.hash == hash) {
         let cached = cache.get_mut(&key).unwrap();
         cached.gen = generation;
@@ -29505,7 +29496,7 @@ mod tests {
         depth_stencil_component_mapping, depth_stencil_sample_aspect,
         descriptor_slot_uses_arrayed_2d, draw_group_attachment_uses_with_clears,
         dummy_image_format_and_aspect, env_switch_value_default_enabled, env_switch_value_enabled,
-        exact_rt_copy_format_bpp, fnv_chunked, format_graphics_texture_bind_trace,
+        exact_rt_copy_format_bpp, format_graphics_texture_bind_trace,
         g24r8_scalar_upload, graphics_cbuf_allocation_size,
         graphics_texture_descriptor_binding_mask, graphics_texture_descriptor_target,
         group_texture_binding_epoch_changed, group_texture_binding_evict_range,
@@ -29524,7 +29515,7 @@ mod tests {
         shared_aurora_ssbo_key, sparse_texture_manifest_eligible,
         take_backlogged_readback_completion, take_stream_head_completed_readback,
         tex_gen_gating_value_enabled, texel_buffer_format,
-        texture_cache_invalidate_clear_value_enabled, texture_image_format_for_tic,
+        texture_cache_invalidate_clear_value_enabled, texture_content_hash, texture_image_format_for_tic,
         texture_key_blocks_2d_rt_alias, texture_key_has_special_view,
         texture_key_overlaps_gpu_range, texture_level_upload, texture_numeric_cache_key,
         texture_numeric_type_matches_format, texture_requires_integer_sampler, texture_upload_data,
@@ -29583,8 +29574,8 @@ mod tests {
         let first = [1, 2, 3, 4];
         let changed = [9, 2, 3, 4];
         let longer = [1, 2, 3, 4, 5];
-        let first_hash = fnv_chunked(&first);
-        let changed_hash = fnv_chunked(&changed);
+        let first_hash = texture_content_hash(&first);
+        let changed_hash = texture_content_hash(&changed);
         let mut hashes = HashMap::new();
 
         assert_eq!(
@@ -29601,7 +29592,7 @@ mod tests {
         );
         assert_eq!(
             memoized_texture_snapshot_hash(&mut hashes, (0x4000, longer.len()), &longer),
-            fnv_chunked(&longer)
+            texture_content_hash(&longer)
         );
         assert_eq!(hashes.len(), 3);
 
@@ -29646,7 +29637,7 @@ mod tests {
                 false,
                 &mut profile,
             ),
-            fnv_chunked(snapshot.as_slice())
+            texture_content_hash(snapshot.as_slice())
         );
         assert!(profile.observe(&snapshot, Some(17)));
         super::profiled_texture_snapshot_hash(
@@ -29734,9 +29725,9 @@ mod tests {
         assert!(!trusted_match);
         assert!(sampled_texture_needs_upload(
             false,
-            Some((generation, fnv_chunked(&cached_bytes))),
+            Some((generation, texture_content_hash(&cached_bytes))),
             generation,
-            fnv_chunked(changed.as_slice()),
+            texture_content_hash(changed.as_slice()),
             true,
             trusted_match,
         ));
@@ -29751,7 +29742,7 @@ mod tests {
         assert!(trusted_match);
         assert!(!sampled_texture_needs_upload(
             false,
-            Some((40, fnv_chunked(unchanged.as_slice()))),
+            Some((40, texture_content_hash(unchanged.as_slice()))),
             41,
             0,
             false,
@@ -29765,7 +29756,7 @@ mod tests {
 
         let snapshot =
             SharedGuestSnapshot::new_trusted(std::sync::Arc::new(vec![1, 2, 3, 4]), 4, 17).unwrap();
-        let raw_hash = fnv_chunked(snapshot.as_slice());
+        let raw_hash = texture_content_hash(snapshot.as_slice());
         let cpu_hash = texture_rt_mip_hash(raw_hash, &[]);
         let mut cached = super::CachedTexture {
             image: vk::Image::null(),
@@ -29836,7 +29827,7 @@ mod tests {
             view_mips: 8,
             ..group_memo_test_key(0x5a4970000)
         };
-        let raw_hash = fnv_chunked(&[0; 64]);
+        let raw_hash = texture_content_hash(&[0; 64]);
         let mut cached = super::CachedTexture {
             image: vk::Image::from_raw(100),
             view: vk::ImageView::from_raw(101),
@@ -29873,7 +29864,7 @@ mod tests {
         };
         assert!(eligible(&cached, Some(raw_hash), &[base]));
         assert!(!eligible(&cached, None, &[base]));
-        assert!(!eligible(&cached, Some(fnv_chunked(&[1; 64])), &[base]));
+        assert!(!eligible(&cached, Some(texture_content_hash(&[1; 64])), &[base]));
         cached.gpu_mip_overlay = true;
         cached.gpu_mip_mask = super::texture_rt_mip_mask(&[base]);
         cached.hash = texture_rt_mip_hash(raw_hash, &[base]);
@@ -31482,14 +31473,14 @@ mod tests {
             compute_guest_upload_spec(match_tic, 1, 256, false, vk::Format::R8G8B8A8_UNORM);
         let match_content = ComputeGuestImageContent {
             spec: match_spec.clone(),
-            source_hash: fnv_chunked(&[1, 2, 3]),
+            source_hash: texture_content_hash(&[1, 2, 3]),
             source: std::sync::Arc::from([1, 2, 3]),
             upload: std::sync::Arc::from([1, 2, 3]),
             copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
         };
         let other_content = ComputeGuestImageContent {
             spec: match_spec.clone(),
-            source_hash: fnv_chunked(&[1, 2, 4]),
+            source_hash: texture_content_hash(&[1, 2, 4]),
             source: std::sync::Arc::from([1, 2, 4]),
             upload: std::sync::Arc::from([1, 2, 4]),
             copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
@@ -31538,7 +31529,7 @@ mod tests {
         let spec = compute_guest_upload_spec(tic, 1, 256, false, vk::Format::R8G8B8A8_UNORM);
         let content = ComputeGuestImageContent {
             spec: spec.clone(),
-            source_hash: fnv_chunked(&[1, 2, 3, 4]),
+            source_hash: texture_content_hash(&[1, 2, 3, 4]),
             source: std::sync::Arc::from([1, 2, 3, 4]),
             upload: std::sync::Arc::from([5, 6, 7, 8]),
             copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
@@ -31547,19 +31538,19 @@ mod tests {
         assert!(compute_guest_source_matches(
             &content,
             &spec,
-            fnv_chunked(&[1, 2, 3, 4]),
+            texture_content_hash(&[1, 2, 3, 4]),
             4
         ));
         assert!(!compute_guest_source_matches(
             &content,
             &spec,
-            fnv_chunked(&[1, 2, 3, 5]),
+            texture_content_hash(&[1, 2, 3, 5]),
             4
         ));
         assert!(!compute_guest_source_matches(
             &content,
             &compute_guest_upload_spec(tic, 2, 256, false, vk::Format::R8G8B8A8_UNORM),
-            fnv_chunked(&[1, 2, 3, 4]),
+            texture_content_hash(&[1, 2, 3, 4]),
             4,
         ));
 
@@ -31568,7 +31559,7 @@ mod tests {
         assert!(!compute_guest_source_matches(
             &content,
             &compute_guest_upload_spec(changed_tic, 1, 256, false, vk::Format::R8G8B8A8_UNORM,),
-            fnv_chunked(&[1, 2, 3, 4]),
+            texture_content_hash(&[1, 2, 3, 4]),
             4,
         ));
     }
