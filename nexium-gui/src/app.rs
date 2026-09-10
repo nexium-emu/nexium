@@ -159,6 +159,10 @@ fn gui_rate_stats(kind: usize) {
     }
 }
 
+fn request_game_frame_repaint(ctx: &egui::Context) {
+    ctx.request_repaint_after(std::time::Duration::from_nanos(1));
+}
+
 fn request_idle_repaint(ctx: &egui::Context, idle_for: std::time::Duration) {
     let predicted_dt = ctx.input(|input| {
         std::time::Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default()
@@ -183,8 +187,23 @@ fn take_next_game_frame(
 
 #[cfg(test)]
 mod frame_receive_tests {
-    use super::take_next_game_frame;
+    use super::{request_game_frame_repaint, take_next_game_frame};
     use crate::boot::Frame;
+
+    #[test]
+    fn game_frame_notification_does_not_schedule_a_second_repaint() {
+        let ctx = egui::Context::default();
+        for _ in 0..4 {
+            ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+        }
+        request_game_frame_repaint(&ctx);
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        assert_eq!(
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+            std::time::Duration::MAX
+        );
+    }
 
     fn frame(marker: u8) -> Frame {
         Frame {
@@ -636,7 +655,9 @@ impl HorizonApp {
             if let Ok(handle) = EmulationHandle::new(
                 &nro_path,
                 backend,
-                Some(std::sync::Arc::new(move || repaint_ctx.request_repaint())),
+                Some(std::sync::Arc::new(move || {
+                    request_game_frame_repaint(&repaint_ctx)
+                })),
             ) {
                 app.emulation_handle = Some(handle);
                 let launched = std::path::PathBuf::from(&nro_path);
@@ -6417,7 +6438,9 @@ impl HorizonApp {
         match EmulationHandle::new(
             &self.nro_path,
             backend,
-            Some(std::sync::Arc::new(move || repaint_ctx.request_repaint())),
+            Some(std::sync::Arc::new(move || {
+                request_game_frame_repaint(&repaint_ctx)
+            })),
         ) {
             Ok(h) => {
                 crate::ui_audio::play(crate::ui_audio::Sfx::GameBoot);
@@ -7766,6 +7789,17 @@ impl eframe::App for HorizonApp {
             return;
         }
         gui_rate_stats(0);
+        let frame_driven_game = self
+            .emulation_handle
+            .as_ref()
+            .is_some_and(|h| h.is_running() && !h.is_paused())
+            && self.game_display().is_some()
+            && !self.modal_active()
+            && !self.show_settings
+            && !self.show_profile
+            && self.profile_anim == 0.0
+            && self.pause_anim.is_none()
+            && self.resume_anim.is_none();
         if self.splash.active() {
             if self.emulation_handle.is_some() {
                 self.splash = crate::splash::Splash::finished();
@@ -7814,7 +7848,7 @@ impl eframe::App for HorizonApp {
                 self.app_settings.left_deadzone,
                 self.app_settings.right_deadzone,
             );
-            if self.last_input.connected {
+            if self.last_input.connected && !frame_driven_game {
                 request_idle_repaint(ctx, std::time::Duration::from_millis(8));
             }
             if let Some(btn) = self.rebinding_pad {
@@ -8070,7 +8104,6 @@ impl eframe::App for HorizonApp {
                 if elapsed >= 0.0 && elapsed % 8.0 < 0.25 {
                     buttons |= SwitchButton::A.npad_bit();
                 }
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
             if diagnostics_enabled()
                 && (buttons != self.last_buttons_logged || sticks != self.last_sticks_logged)
@@ -9281,7 +9314,10 @@ impl eframe::App for HorizonApp {
             &mut self.app_settings,
         );
 
-        request_idle_repaint(ctx, std::time::Duration::from_millis(16));
+        request_idle_repaint(
+            ctx,
+            std::time::Duration::from_millis(if frame_driven_game { 100 } else { 16 }),
+        );
     }
 }
 
