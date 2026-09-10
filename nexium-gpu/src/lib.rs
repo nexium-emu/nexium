@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod bundle_cache;
 pub mod commands;
 pub mod compute;
+mod depth;
 pub mod descriptor;
 pub mod deswizzle;
 pub mod draw;

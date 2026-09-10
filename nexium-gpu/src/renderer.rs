@@ -4899,6 +4899,7 @@ impl Renderer {
 
         let mut rt_cache = RtCache::new();
         rt_cache.set_mem_properties(mem_props);
+        rt_cache.set_depth_formats(crate::depth::DepthFormats::query(&instance, physical_device)?);
 
         let descriptor_layout =
             DescriptorSetLayout::new(&device, descriptor_binding_partially_bound_supported)?;
@@ -7476,7 +7477,7 @@ impl Renderer {
         let (key, _, _, layout, format, aspects) = rt_cache
             .find_depth(requested)
             .or_else(|| rt_cache.find_d24_depth_covering(requested))?;
-        if format != vk::Format::D24_UNORM_S8_UINT
+        if rt_cache.get_existing_depth(key)?.base_format != vk::Format::D24_UNORM_S8_UINT
             || !aspects.contains(vk::ImageAspectFlags::DEPTH)
             || layout == vk::ImageLayout::UNDEFINED
             || width == 0
@@ -7615,6 +7616,9 @@ impl Renderer {
             }
         }
         cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+        if format == vk::Format::D32_SFLOAT_S8_UINT {
+            crate::depth::pack_d32_readback(&mut raw);
+        }
         Some((width, height, bpp, raw))
     }
 
@@ -8281,6 +8285,7 @@ impl Renderer {
         }
         let mut inner = self.inner.lock();
         let mut blend_signature: u64 = 0xcbf29ce484222325;
+        let depth_format = inner.rt_cache.host_depth_format(depth_format);
         for att in &blend.attachments {
             let packed = (att.enabled as u64)
                 | ((att.src_factor.as_raw() as u64 & 0xFF) << 8)
@@ -11591,6 +11596,7 @@ impl Renderer {
                                     cmd,
                                     rt_cache,
                                     mem_props,
+                                    descriptor_pool.pool,
                                     &mut frame_slots[cur_idx],
                                     sk,
                                 )? {
@@ -24094,11 +24100,12 @@ fn sync_sampled_depth_self(
         return Ok(None);
     }
     let shadow_key = depth_self_shadow_key(src_key);
+    let guest_format = rt_cache.get_existing_depth(src_key).unwrap().base_format;
     let (shadow_image, shadow_view, shadow_layout) = {
         let (img, _) = rt_cache.get_or_create_depth_retiring(
             shadow_key,
             device,
-            src_format,
+            guest_format,
             src_aspects,
             retired_rt_images,
         )?;
@@ -24220,6 +24227,7 @@ fn sync_sampled_depth_as_color(
     cmd: vk::CommandBuffer,
     rt_cache: &mut RtCache,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
+    descriptor_pool: vk::DescriptorPool,
     frame_slot: &mut FrameSlot,
     sk: RtKey,
 ) -> Result<Option<RtAlias>, String> {
@@ -24234,7 +24242,9 @@ fn sync_sampled_depth_as_color(
     if src_layout == vk::ImageLayout::UNDEFINED {
         return Ok(None);
     }
-    if src_format != vk::Format::D24_UNORM_S8_UINT && src_format != vk::Format::X8_D24_UNORM_PACK32
+    let guest_format = rt_cache.get_existing_depth(src_key).unwrap().base_format;
+    if guest_format != vk::Format::D24_UNORM_S8_UINT
+        && guest_format != vk::Format::X8_D24_UNORM_PACK32
     {
         return Ok(None);
     }
@@ -24263,7 +24273,20 @@ fn sync_sampled_depth_as_color(
         (img.image, img.view, img.layout)
     };
     let bytes = src_key.width as u64 * src_key.height as u64 * 4;
-    let transfer = create_transfer_buffer_owned(device, mem_props, bytes)?;
+    let needs_pack = src_format != guest_format;
+    let transfer = create_transfer_buffer_with_usage(
+        device,
+        mem_props,
+        bytes,
+        if needs_pack {
+            vk::BufferUsageFlags::STORAGE_BUFFER
+        } else {
+            vk::BufferUsageFlags::empty()
+        },
+    )?;
+    frame_slot
+        .retired_buffers
+        .push((transfer.buffer, transfer.memory));
     transition_image_aspect(
         device,
         cmd,
@@ -24324,15 +24347,24 @@ fn sync_sampled_depth_as_color(
             transfer.buffer,
             &[depth_copy],
         );
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[buffer_barrier],
-            &[],
-        );
+    }
+    if needs_pack {
+        let set = rt_cache.pack_depth_buffer(device, cmd, descriptor_pool, transfer.buffer, bytes)?;
+        frame_slot.retired_dsets.push(set);
+    } else {
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[buffer_barrier],
+                &[],
+            );
+        }
+    }
+    unsafe {
         device.cmd_copy_buffer_to_image(
             cmd,
             transfer.buffer,
@@ -24357,9 +24389,6 @@ fn sync_sampled_depth_as_color(
         src_aspects,
     );
     rt_cache.set_color_layout(shadow_key, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    frame_slot
-        .retired_buffers
-        .push((transfer.buffer, transfer.memory));
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -29168,10 +29197,21 @@ fn create_transfer_buffer_owned(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     size: u64,
 ) -> Result<StagingBuffer, String> {
+    create_transfer_buffer_with_usage(device, mem_props, size, vk::BufferUsageFlags::empty())
+}
+
+fn create_transfer_buffer_with_usage(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    extra_usage: vk::BufferUsageFlags,
+) -> Result<StagingBuffer, String> {
     let buf_info = vk::BufferCreateInfo {
         s_type: vk::StructureType::BUFFER_CREATE_INFO,
         size: size.max(16),
-        usage: vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+        usage: vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | extra_usage,
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         queue_family_index_count: 0,
         p_queue_family_indices: std::ptr::null(),
@@ -29346,6 +29386,12 @@ impl Drop for RendererInner {
         }
         for slot in self.frame_slots.iter_mut() {
             slot.retired_dsets.clear();
+            for (buffer, memory) in slot.retired_buffers.drain(..) {
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+            }
             destroy_descriptor_pools(&self.device, &mut slot.retired_dset_pools);
             destroy_descriptor_pools(&self.device, &mut slot.available_dset_pools);
             for view in slot.retired_views.drain(..) {
@@ -29386,6 +29432,12 @@ impl Drop for RendererInner {
             slot.fence = vk::Fence::null();
         }
         self.utility_slot.retired_dsets.clear();
+        for (buffer, memory) in self.utility_slot.retired_buffers.drain(..) {
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+        }
         destroy_descriptor_pools(&self.device, &mut self.utility_slot.retired_dset_pools);
         destroy_descriptor_pools(&self.device, &mut self.utility_slot.available_dset_pools);
         for view in self.utility_slot.retired_views.drain(..) {
@@ -29498,6 +29550,10 @@ impl Drop for RendererInner {
 
 unsafe impl Send for Renderer {}
 unsafe impl Sync for Renderer {}
+
+#[cfg(test)]
+#[path = "renderer_depth_tests.rs"]
+mod depth_tests;
 
 #[cfg(test)]
 mod tests {

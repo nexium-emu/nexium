@@ -498,6 +498,8 @@ pub struct RtCache {
     color_gpu_page_index: HashMap<u64, Vec<RtKey>>,
     color_nvmap_index: HashMap<u32, Vec<RtKey>>,
     depth_cache: HashMap<RtKey, GpuImage>,
+    depth_formats: crate::depth::DepthFormats,
+    depth_pack_pipeline: Option<crate::depth::DepthPackPipeline>,
     snapshots: HashMap<RtKey, GpuImage>,
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     drawn_stamp: HashMap<RtKey, u64>,
@@ -699,6 +701,8 @@ impl RtCache {
             color_nvmap_index: HashMap::default(),
             color_gpu_page_index: HashMap::default(),
             depth_cache: HashMap::default(),
+            depth_formats: crate::depth::DepthFormats::default(),
+            depth_pack_pipeline: None,
             snapshots: HashMap::default(),
             mem_properties: None,
             drawn_stamp: HashMap::default(),
@@ -1835,6 +1839,32 @@ impl RtCache {
         })
     }
 
+    pub(crate) fn set_depth_formats(&mut self, formats: crate::depth::DepthFormats) {
+        assert!(self.depth_cache.is_empty());
+        self.depth_formats = formats;
+    }
+
+    pub(crate) fn host_depth_format(&self, guest: vk::Format) -> vk::Format {
+        self.depth_formats.host(guest)
+    }
+
+    pub(crate) fn pack_depth_buffer(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        pool: vk::DescriptorPool,
+        buffer: vk::Buffer,
+        bytes: u64,
+    ) -> Result<vk::DescriptorSet, String> {
+        if self.depth_pack_pipeline.is_none() {
+            self.depth_pack_pipeline = Some(crate::depth::DepthPackPipeline::new(device)?);
+        }
+        self.depth_pack_pipeline
+            .as_ref()
+            .unwrap()
+            .record(device, cmd, pool, buffer, bytes)
+    }
+
     pub fn set_mem_properties(&mut self, props: vk::PhysicalDeviceMemoryProperties) {
         self.mem_properties = Some(props);
     }
@@ -2058,7 +2088,7 @@ impl RtCache {
         };
         self.depth_cache.get(&cache_key).is_some_and(|image| {
             render_target_backing_changed(cache_key, key)
-                || depth_image_requires_recreate(image.format, image.aspects, format, aspects)
+                || depth_image_requires_recreate(image.base_format, image.aspects, format, aspects)
         })
     }
 
@@ -2281,7 +2311,7 @@ impl RtCache {
         };
         let recreate = self.depth_cache.get(&cache_key).is_some_and(|image| {
             render_target_backing_changed(cache_key, key)
-                || depth_image_requires_recreate(image.format, image.aspects, format, aspects)
+                || depth_image_requires_recreate(image.base_format, image.aspects, format, aspects)
         });
         if recreate {
             self.forget_depth_tracking(cache_key);
@@ -2303,16 +2333,17 @@ impl RtCache {
         let insert_key = if recreate { key } else { cache_key };
         let created = !self.depth_cache.contains_key(&insert_key);
         if created {
-            let image = self.create_image_inner(
+            let mut image = self.create_image_inner(
                 device,
                 insert_key,
-                format,
+                self.host_depth_format(format),
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
                     | vk::ImageUsageFlags::TRANSFER_DST
                     | vk::ImageUsageFlags::TRANSFER_SRC
                     | vk::ImageUsageFlags::SAMPLED,
                 aspects,
             )?;
+            image.base_format = format;
             let depth_base_format = image.base_format;
             self.depth_cache.insert(insert_key, image);
             self.extend_guest_bounds(insert_key, depth_base_format);
@@ -2551,7 +2582,7 @@ impl RtCache {
             .depth_cache
             .iter()
             .filter(|(key, img)| {
-                img.format == vk::Format::D24_UNORM_S8_UINT
+                img.base_format == vk::Format::D24_UNORM_S8_UINT
                     && img.aspects.contains(vk::ImageAspectFlags::DEPTH)
                     && same_d24_depth_allocation_covering(**key, want)
             })
@@ -3361,6 +3392,9 @@ impl RtCache {
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
+        if let Some(pipeline) = self.depth_pack_pipeline.take() {
+            pipeline.destroy(device);
+        }
         self.clear_color_lookup_index();
         self.note_guest_ranges_changed();
         self.guest_hit_memo.clear();
@@ -3620,6 +3654,7 @@ fn rt_region_from_offset(
 
 pub fn rt_format_bytes(format: vk::Format) -> u64 {
     match format {
+        vk::Format::D32_SFLOAT_S8_UINT => 8,
         vk::Format::B5G5R5A1_UNORM_PACK16 | vk::Format::D16_UNORM => 2,
         vk::Format::A2R10G10B10_UNORM_PACK32
         | vk::Format::D24_UNORM_S8_UINT
