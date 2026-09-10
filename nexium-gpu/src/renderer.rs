@@ -1414,6 +1414,7 @@ struct RendererInner {
     instance: ash::Instance,
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
+    native_bc_formats: Vec<vk::Format>,
     queue: vk::Queue,
     queue_family: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
@@ -4533,6 +4534,21 @@ impl Renderer {
             ..Default::default()
         };
         unsafe { instance.get_physical_device_features2(physical_device, &mut supported_features) };
+        let native_bc_formats = NATIVE_BC_FORMATS
+            .iter()
+            .copied()
+            .filter(|&format| {
+                let properties = unsafe {
+                    instance.get_physical_device_format_properties(physical_device, format)
+                };
+                properties.optimal_tiling_features.contains(
+                    vk::FormatFeatureFlags::SAMPLED_IMAGE
+                        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                        | vk::FormatFeatureFlags::TRANSFER_SRC
+                        | vk::FormatFeatureFlags::TRANSFER_DST,
+                )
+            })
+            .collect();
         let shader_draw_parameters_supported =
             supported_features_11.shader_draw_parameters == vk::TRUE;
         let shader_output_layer_supported = supported_features_12.shader_output_layer == vk::TRUE;
@@ -5137,6 +5153,7 @@ impl Renderer {
                 instance,
                 device,
                 physical_device,
+                native_bc_formats,
                 queue,
                 queue_family,
                 mem_props,
@@ -8460,6 +8477,7 @@ impl Renderer {
             integer_sampler_cache,
             sampler_filter_minmax_supported,
             sampler_anisotropy_supported,
+            native_bc_formats,
             tex_cache,
             tex_cache_vas,
             texel_buffer_cache,
@@ -8885,7 +8903,7 @@ impl Renderer {
             let mut binding_failure_reason = None;
             let identity_volume = key.volume && volume_identity_enabled();
             let rt_mips = sampled_rt_key_for_slot(call, slot)
-                .zip(texture_image_format_for_tic(&tic, numeric_type).ok())
+                .zip(graphics_texture_image_format(&tic, numeric_type, native_bc_formats).ok())
                 .map(|(base_key, format)| {
                     crate::texture_mips::find_texture_rt_mips(rt_cache, &tic, base_key, format)
                 })
@@ -8980,7 +8998,7 @@ impl Renderer {
                     {
                         Ok(slice.format)
                     } else {
-                        texture_image_format_for_tic(&tic, numeric_type)
+                        graphics_texture_image_format(&tic, numeric_type, native_bc_formats)
                     };
                     let image_format = match image_format {
                         Ok(format) => format,
@@ -9161,7 +9179,7 @@ impl Renderer {
                 outcome,
                 source,
                 format!("{selected_view:?}"),
-                texture_image_format_for_tic(&tic, numeric_type)
+                graphics_texture_image_format(&tic, numeric_type, native_bc_formats)
                     .ok()
                     .map(|format| format!("{format:?}")),
                 reason,
@@ -10454,6 +10472,7 @@ impl Renderer {
             integer_sampler_cache,
             sampler_filter_minmax_supported,
             sampler_anisotropy_supported,
+            native_bc_formats,
             tex_cache,
             tex_cache_vas,
             texel_buffer_cache,
@@ -11727,7 +11746,10 @@ impl Renderer {
                         color_sync_checked.clear();
                     }
                     let rt_mips = sampled_rt_key_for_slot(call, slot)
-                        .zip(texture_image_format_for_tic(&tic, numeric_type).ok())
+                        .zip(
+                            graphics_texture_image_format(&tic, numeric_type, native_bc_formats)
+                                .ok(),
+                        )
                         .map(|(base_key, format)| {
                             crate::texture_mips::find_texture_rt_mips(
                                 rt_cache, &tic, base_key, format,
@@ -12054,7 +12076,11 @@ impl Renderer {
                                 {
                                     Ok(slice.format)
                                 } else {
-                                    texture_image_format_for_tic(&tic, numeric_type)
+                                    graphics_texture_image_format(
+                                        &tic,
+                                        numeric_type,
+                                        native_bc_formats,
+                                    )
                                 };
                                 let image_format = match image_format {
                                     Ok(format) => format,
@@ -12434,8 +12460,12 @@ impl Renderer {
                                 key: RtKey::new(0, key.width, key.height, key.gpu_va),
                                 image,
                                 layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                format: texture_image_format_for_tic(&tic, numeric_type)
-                                    .unwrap_or(vk::Format::UNDEFINED),
+                                format: graphics_texture_image_format(
+                                    &tic,
+                                    numeric_type,
+                                    native_bc_formats,
+                                )
+                                .unwrap_or(vk::Format::UNDEFINED),
                                 mip_levels: key.mip_levels,
                             });
                         }
@@ -12480,7 +12510,7 @@ impl Renderer {
                         outcome,
                         source,
                         format!("{selected_view:?}"),
-                        texture_image_format_for_tic(&tic, numeric_type)
+                        graphics_texture_image_format(&tic, numeric_type, native_bc_formats)
                             .ok()
                             .map(|format| format!("{format:?}")),
                         reason,
@@ -21895,7 +21925,22 @@ fn texture_level_upload(
             vk::Format::R32G32B32A32_SFLOAT
                 | vk::Format::R32G32B32A32_UINT
                 | vk::Format::R32G32B32A32_SINT
-        ) | (crate::texture::TicFormat::BC4, vk::Format::BC4_SNORM_BLOCK)
+        ) | (
+            crate::texture::TicFormat::BC1,
+            vk::Format::BC1_RGBA_UNORM_BLOCK | vk::Format::BC1_RGBA_SRGB_BLOCK
+        ) | (
+            crate::texture::TicFormat::BC2,
+            vk::Format::BC2_UNORM_BLOCK | vk::Format::BC2_SRGB_BLOCK
+        ) | (
+            crate::texture::TicFormat::BC3,
+            vk::Format::BC3_UNORM_BLOCK | vk::Format::BC3_SRGB_BLOCK
+        ) | (crate::texture::TicFormat::BC4, vk::Format::BC4_UNORM_BLOCK)
+            | (crate::texture::TicFormat::BC5, vk::Format::BC5_UNORM_BLOCK)
+            | (
+                crate::texture::TicFormat::BC7,
+                vk::Format::BC7_UNORM_BLOCK | vk::Format::BC7_SRGB_BLOCK
+            )
+            | (crate::texture::TicFormat::BC4, vk::Format::BC4_SNORM_BLOCK)
             | (crate::texture::TicFormat::BC5, vk::Format::BC5_SNORM_BLOCK)
             | (
                 crate::texture::TicFormat::BC6S,
@@ -26287,6 +26332,82 @@ fn texture_image_format(
     } else {
         vk::Format::R8G8B8A8_UNORM
     }
+}
+
+const NATIVE_BC_FORMATS: &[vk::Format] = &[
+    vk::Format::BC1_RGBA_UNORM_BLOCK,
+    vk::Format::BC1_RGBA_SRGB_BLOCK,
+    vk::Format::BC2_UNORM_BLOCK,
+    vk::Format::BC2_SRGB_BLOCK,
+    vk::Format::BC3_UNORM_BLOCK,
+    vk::Format::BC3_SRGB_BLOCK,
+    vk::Format::BC4_UNORM_BLOCK,
+    vk::Format::BC5_UNORM_BLOCK,
+    vk::Format::BC7_UNORM_BLOCK,
+    vk::Format::BC7_SRGB_BLOCK,
+];
+
+fn native_bc_texture_format(
+    tic: &crate::texture::TicEntry,
+    numeric_type: nexium_spirv::TextureNumericType,
+    srgb_enabled: bool,
+) -> Option<vk::Format> {
+    use crate::texture::{ComponentType, TicFormat};
+
+    if tic_is_volume(tic)
+        || tic.is_buffer()
+        || numeric_type != nexium_spirv::TextureNumericType::Float
+    {
+        return None;
+    }
+    let represented_components = match tic.format {
+        TicFormat::BC4 => 1,
+        TicFormat::BC5 => 2,
+        TicFormat::BC1 | TicFormat::BC2 | TicFormat::BC3 | TicFormat::BC7 => 4,
+        _ => return None,
+    };
+    if !tic.component_types[..represented_components]
+        .iter()
+        .all(|component| {
+            matches!(
+                component,
+                ComponentType::Unorm | ComponentType::UnormForceFp16
+            )
+        })
+    {
+        return None;
+    }
+    let srgb = tic.is_srgb && srgb_enabled;
+    Some(match (tic.format, srgb) {
+        (TicFormat::BC1, false) => vk::Format::BC1_RGBA_UNORM_BLOCK,
+        (TicFormat::BC1, true) => vk::Format::BC1_RGBA_SRGB_BLOCK,
+        (TicFormat::BC2, false) => vk::Format::BC2_UNORM_BLOCK,
+        (TicFormat::BC2, true) => vk::Format::BC2_SRGB_BLOCK,
+        (TicFormat::BC3, false) => vk::Format::BC3_UNORM_BLOCK,
+        (TicFormat::BC3, true) => vk::Format::BC3_SRGB_BLOCK,
+        (TicFormat::BC4, false) => vk::Format::BC4_UNORM_BLOCK,
+        (TicFormat::BC5, false) => vk::Format::BC5_UNORM_BLOCK,
+        (TicFormat::BC7, false) => vk::Format::BC7_UNORM_BLOCK,
+        (TicFormat::BC7, true) => vk::Format::BC7_SRGB_BLOCK,
+        _ => return None,
+    })
+}
+
+fn graphics_texture_image_format(
+    tic: &crate::texture::TicEntry,
+    numeric_type: nexium_spirv::TextureNumericType,
+    native_bc_formats: &[vk::Format],
+) -> Result<vk::Format, String> {
+    if let Some(format) = native_bc_texture_format(
+        tic,
+        numeric_type,
+        std::env::var_os("NEXIUM_NO_TEX_SRGB").is_none(),
+    )
+    .filter(|format| native_bc_formats.contains(format))
+    {
+        return Ok(format);
+    }
+    texture_image_format_for_tic(tic, numeric_type)
 }
 
 fn texture_image_format_for_tic(
@@ -33417,6 +33538,214 @@ mod tests {
         tic.component_types = [ComponentType::Snorm; 4];
         tic.is_srgb = true;
         assert!(texture_image_format_for_tic(&tic, TextureNumericType::Float).is_err());
+    }
+
+    #[test]
+    fn native_bc_selection_preserves_types_srgb_and_device_fallback() {
+        use crate::texture::{ComponentType, TicFormat};
+        use nexium_spirv::TextureNumericType::{Float, Uint};
+        let mut tic = group_memo_test_tic(0x7fff_f100_0000);
+        for (guest, linear, srgb) in [
+            (
+                TicFormat::BC1,
+                vk::Format::BC1_RGBA_UNORM_BLOCK,
+                vk::Format::BC1_RGBA_SRGB_BLOCK,
+            ),
+            (
+                TicFormat::BC2,
+                vk::Format::BC2_UNORM_BLOCK,
+                vk::Format::BC2_SRGB_BLOCK,
+            ),
+            (
+                TicFormat::BC3,
+                vk::Format::BC3_UNORM_BLOCK,
+                vk::Format::BC3_SRGB_BLOCK,
+            ),
+            (
+                TicFormat::BC7,
+                vk::Format::BC7_UNORM_BLOCK,
+                vk::Format::BC7_SRGB_BLOCK,
+            ),
+        ] {
+            tic.format = guest;
+            tic.is_srgb = false;
+            assert_eq!(
+                super::native_bc_texture_format(&tic, Float, true),
+                Some(linear)
+            );
+            assert_eq!(
+                super::graphics_texture_image_format(&tic, Float, &[linear]).unwrap(),
+                linear
+            );
+            assert_eq!(
+                super::graphics_texture_image_format(&tic, Float, &[]).unwrap(),
+                vk::Format::R8G8B8A8_UNORM
+            );
+            assert_eq!(
+                super::graphics_texture_image_format(&tic, Float, &[srgb]).unwrap(),
+                vk::Format::R8G8B8A8_UNORM
+            );
+            tic.is_srgb = true;
+            assert_eq!(
+                super::native_bc_texture_format(&tic, Float, true),
+                Some(srgb)
+            );
+            assert_eq!(
+                super::native_bc_texture_format(&tic, Float, false),
+                Some(linear)
+            );
+            assert_eq!(super::native_bc_texture_format(&tic, Uint, true), None);
+        }
+        for (guest, host) in [
+            (TicFormat::BC4, vk::Format::BC4_UNORM_BLOCK),
+            (TicFormat::BC5, vk::Format::BC5_UNORM_BLOCK),
+        ] {
+            tic.format = guest;
+            tic.is_srgb = false;
+            assert_eq!(
+                super::native_bc_texture_format(&tic, Float, true),
+                Some(host)
+            );
+            tic.is_srgb = true;
+            assert_eq!(super::native_bc_texture_format(&tic, Float, true), None);
+        }
+        tic.is_srgb = false;
+        tic.component_types[1] = ComponentType::Snorm;
+        assert_eq!(super::native_bc_texture_format(&tic, Float, true), None);
+        assert!(
+            super::graphics_texture_image_format(&tic, Float, super::NATIVE_BC_FORMATS).is_err()
+        );
+        tic.component_types = [ComponentType::Snorm; 4];
+        assert_eq!(
+            super::graphics_texture_image_format(&tic, Float, super::NATIVE_BC_FORMATS).unwrap(),
+            vk::Format::BC5_SNORM_BLOCK
+        );
+        tic.component_types = [ComponentType::Unorm; 4];
+        tic.texture_type = 2;
+        assert_eq!(super::native_bc_texture_format(&tic, Float, true), None);
+    }
+
+    #[test]
+    fn native_bc_upload_preserves_blocks_layers_and_partial_mips() {
+        use crate::texture::{block_linear_mip_layout, swizzle_block_linear_strided, TicFormat};
+        for (guest_format, host_format) in [
+            (TicFormat::BC1, vk::Format::BC1_RGBA_SRGB_BLOCK),
+            (TicFormat::BC2, vk::Format::BC2_UNORM_BLOCK),
+            (TicFormat::BC3, vk::Format::BC3_SRGB_BLOCK),
+            (TicFormat::BC4, vk::Format::BC4_UNORM_BLOCK),
+            (TicFormat::BC5, vk::Format::BC5_UNORM_BLOCK),
+            (TicFormat::BC7, vk::Format::BC7_SRGB_BLOCK),
+        ] {
+            let mut tic = group_memo_test_tic(0x7fff_f200_0000);
+            tic.format = guest_format;
+            tic.width = 37;
+            tic.height = 19;
+            tic.is_block_linear = true;
+            tic.block_height_log2 = 2;
+            tic.texture_type = 5;
+            tic.depth = 3;
+            tic.max_mip_level = 5;
+            tic.res_max_mip_level = 5;
+            let layers = 3;
+            let layout = block_linear_mip_layout(&tic).unwrap();
+            let mut guest = vec![0; layout.guest_size_bytes(layers)];
+            let mut expected = Vec::new();
+            let mut offsets = Vec::new();
+            for level in &layout.levels {
+                offsets.push(expected.len() as u64);
+                for layer in 0..layers as usize {
+                    let bytes: Vec<_> = (0..level.linear_size)
+                        .map(|i| {
+                            (i as u8)
+                                .wrapping_mul(37)
+                                .wrapping_add((layer * 17 + level.level as usize * 23) as u8)
+                        })
+                        .collect();
+                    let swizzled = swizzle_block_linear_strided(
+                        &bytes,
+                        level.storage_width,
+                        level.storage_height,
+                        tic.format.src_bpp(),
+                        level.block_height_log2,
+                        level.stride_alignment_log2,
+                    );
+                    let start = layer * layout.layer_stride + level.guest_offset;
+                    guest[start..start + swizzled.len()].copy_from_slice(&swizzled);
+                    expected.extend(bytes);
+                }
+            }
+            let upload = texture_upload_data_with_layout(
+                &guest,
+                &tic,
+                layers,
+                layout.layer_stride,
+                true,
+                false,
+                host_format,
+            )
+            .unwrap();
+            assert_eq!(upload.bytes, expected, "{guest_format:?}");
+            assert_eq!(upload.copies.len(), 6);
+            for ((copy, level), offset) in upload.copies.iter().zip(&layout.levels).zip(offsets) {
+                assert_eq!(copy.buffer_offset, offset);
+                assert_eq!(copy.buffer_offset % tic.format.src_bpp() as u64, 0);
+                assert_eq!((copy.width, copy.height), (level.width, level.height));
+                assert_eq!(copy.mip_level, level.level);
+            }
+            assert!(texture_upload_data_with_layout(
+                &guest[..guest.len() - 1],
+                &tic,
+                layers,
+                layout.layer_stride,
+                true,
+                false,
+                host_format
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn native_bc_cpu_fallback_preserves_transparent_bc1_and_two_channel_bc5() {
+        use crate::texture::{ComponentType, TicFormat};
+        let transparent = [0, 0, 0, 0, 255, 255, 255, 255];
+        assert_eq!(
+            texture_level_upload(
+                &transparent,
+                TicFormat::BC1,
+                4,
+                4,
+                1,
+                ComponentType::Unorm,
+                vk::Format::BC1_RGBA_UNORM_BLOCK
+            ),
+            transparent
+        );
+        assert_eq!(
+            texture_level_upload(
+                &transparent,
+                TicFormat::BC1,
+                4,
+                4,
+                1,
+                ComponentType::Unorm,
+                vk::Format::R8G8B8A8_UNORM
+            ),
+            vec![0; 64]
+        );
+        let two_channels = [32, 32, 0, 0, 0, 0, 0, 0, 192, 192, 0, 0, 0, 0, 0, 0];
+        let rgba = texture_level_upload(
+            &two_channels,
+            TicFormat::BC5,
+            4,
+            4,
+            1,
+            ComponentType::Unorm,
+            vk::Format::R8G8B8A8_UNORM,
+        );
+        for pixel in rgba.chunks_exact(4) {
+            assert_eq!(pixel, [32, 192, 0, 255]);
+        }
     }
 
     #[test]
