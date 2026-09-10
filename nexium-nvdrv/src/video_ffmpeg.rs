@@ -95,6 +95,10 @@ impl FfmpegDecoder {
                 "rawvideo",
                 "-pix_fmt",
                 "yuv420p",
+                "-threads:v",
+                "1",
+                "-fps_mode",
+                "passthrough",
                 "pipe:1",
             ])
             .stdin(Stdio::piped())
@@ -211,4 +215,88 @@ pub fn i420_frame(
         &raw[y_len + c_len..y_len + 2 * c_len],
     )
     .map_err(|error| format!("i420 copy: {}", error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const VP9_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/vp9_hidden_frames.ivf");
+
+    fn fixture_packets() -> Vec<&'static [u8]> {
+        assert_eq!(&VP9_FIXTURE[..4], b"DKIF");
+        let mut offset = 32;
+        let mut packets = Vec::new();
+        while offset < VP9_FIXTURE.len() {
+            let size =
+                u32::from_le_bytes(VP9_FIXTURE[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 12;
+            packets.push(&VP9_FIXTURE[offset..offset + size]);
+            offset += size;
+        }
+        assert_eq!(packets.len(), 24);
+        packets
+    }
+
+    fn assert_fixture_frame(frame: &[u8], packet_index: usize) {
+        assert_eq!(frame.len(), 16 * 16 * 3 / 2);
+        let luma = 16 + 8 * packet_index as u8;
+        assert!(
+            frame[..256].iter().all(|&value| value == luma),
+            "packet {packet_index}: expected luma {luma}, got {}",
+            frame[0]
+        );
+        assert!(frame[256..].iter().all(|&value| value == 128));
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg; set NEXIUM_FFMPEG and run with --ignored"]
+    fn vp9_shown_frames_arrive_without_later_input() {
+        let mut decoder = FfmpegDecoder::new(16, 16, FfmpegCodec::Vp9).unwrap();
+        for (index, packet) in fixture_packets().into_iter().enumerate() {
+            decoder.submit(packet).unwrap();
+            if index % 3 == 1 {
+                assert_eq!(
+                    decoder.frames.recv_timeout(Duration::from_millis(20)),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    "hidden packet {index} must not produce a picture"
+                );
+            } else {
+                let frame = decoder
+                    .frames
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or_else(|error| panic!("packet {index} needed later input: {error}"));
+                assert_fixture_frame(&frame, index);
+            }
+        }
+        decoder.stdin.take();
+        assert_eq!(
+            decoder.frames.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Disconnected),
+            "all shown frames must arrive before EOF, with no duplicates"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg; set NEXIUM_FFMPEG and run with --ignored"]
+    fn vp9_hidden_frames_do_not_duplicate_output() {
+        let mut decoder = FfmpegDecoder::new(16, 16, FfmpegCodec::Vp9).unwrap();
+        for packet in fixture_packets() {
+            decoder.submit(packet).unwrap();
+        }
+        decoder.stdin.take();
+        for index in (0..24).filter(|index| index % 3 != 1) {
+            let frame = decoder
+                .frames
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap_or_else(|error| panic!("missing shown packet {index}: {error}"));
+            assert_fixture_frame(&frame, index);
+        }
+        assert_eq!(
+            decoder.frames.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Disconnected),
+            "24 input packets contain exactly 16 shown pictures"
+        );
+    }
 }

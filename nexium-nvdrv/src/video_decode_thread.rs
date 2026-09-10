@@ -1,12 +1,14 @@
 use crate::video_decode::OwnedI420Frame;
 use crate::video_ffmpeg::{i420_frame, FfmpegCodec, FfmpegDecoder};
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 pub const FRAME_CACHE_CAPACITY: usize = 32;
-const MAX_PENDING_TARGETS: usize = 64;
+const PENDING_TARGET_WARNING_THRESHOLD: usize = 64;
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Default)]
 pub struct VideoFrameCacheState {
@@ -74,6 +76,29 @@ pub enum PacketDetail {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingFrameTarget {
+    luma_iova: u64,
+    packet_len: usize,
+    detail: PacketDetail,
+}
+
+fn queue_frame_target(
+    targets: &mut VecDeque<PendingFrameTarget>,
+    luma_iova: u64,
+    packet_len: usize,
+    detail: PacketDetail,
+) {
+    if matches!(detail, PacketDetail::Vp9 { show_frame: false }) {
+        return;
+    }
+    targets.push_back(PendingFrameTarget {
+        luma_iova,
+        packet_len,
+        detail,
+    });
+}
+
 pub enum DecodeWork {
     Configure {
         fd: u32,
@@ -101,7 +126,7 @@ enum Message {
 struct ChannelDecoder {
     decoder: FfmpegDecoder,
     failed: Arc<AtomicBool>,
-    targets: VecDeque<u64>,
+    targets: VecDeque<PendingFrameTarget>,
 }
 
 struct DecodeWorkerState {
@@ -198,6 +223,23 @@ impl DecodeWorkerState {
             }
         }
     }
+
+    fn has_pending_frames(&self) -> bool {
+        self.channels
+            .values()
+            .any(|channel| !channel.targets.is_empty())
+    }
+
+    fn drain_outputs(&mut self) {
+        let cache = &self.cache;
+        self.channels.retain(|fd, channel| {
+            let healthy = drain_channel_outputs(cache, *fd, channel);
+            if !healthy {
+                channel.failed.store(true, Ordering::Relaxed);
+            }
+            healthy
+        });
+    }
 }
 
 fn decode_into_cache(
@@ -208,19 +250,24 @@ fn decode_into_cache(
     target_luma_iova: u64,
     detail: PacketDetail,
 ) -> bool {
-    channel.targets.push_back(target_luma_iova);
-    while channel.targets.len() > MAX_PENDING_TARGETS {
-        channel.targets.pop_front();
+    let previous_count = channel.targets.len();
+    queue_frame_target(&mut channel.targets, target_luma_iova, packet.len(), detail);
+    if previous_count == PENDING_TARGET_WARNING_THRESHOLD && channel.targets.len() > previous_count
+    {
         log::warn!(
-            "[video-decode] fd={} decoder is more than {} packets behind; output surfaces will shift",
+            "[video-decode] fd={} decoder is more than {} visible frames behind",
             fd,
-            MAX_PENDING_TARGETS
+            PENDING_TARGET_WARNING_THRESHOLD
         );
     }
     if let Err(error) = channel.decoder.submit(packet) {
         log::warn!("[video-decode] fd={} ffmpeg submit failed: {}", fd, error);
         return false;
     }
+    drain_channel_outputs(cache, fd, channel)
+}
+
+fn drain_channel_outputs(cache: &VideoFrameCache, fd: u32, channel: &mut ChannelDecoder) -> bool {
     let width = channel.decoder.width();
     let height = channel.decoder.height();
     loop {
@@ -232,7 +279,7 @@ fn decode_into_cache(
                 return false;
             }
         };
-        let Some(luma_iova) = channel.targets.pop_front() else {
+        let Some(target) = channel.targets.pop_front() else {
             log::warn!(
                 "[video-decode] fd={} ffmpeg produced an unassociated frame",
                 fd
@@ -246,15 +293,15 @@ fn decode_into_cache(
                 return false;
             }
         };
-        lock_frame_cache(cache).insert(luma_iova, frame);
+        lock_frame_cache(cache).insert(target.luma_iova, frame);
         log_decoded_frame(
             fd,
             width,
             height,
-            packet.len(),
-            target_luma_iova,
-            luma_iova,
-            detail,
+            target.packet_len,
+            target.luma_iova,
+            target.luma_iova,
+            target.detail,
         );
     }
 }
@@ -304,11 +351,25 @@ fn log_decoded_frame(
 
 fn worker_loop(rx: Receiver<Message>, cache: VideoFrameCache) {
     let mut state = DecodeWorkerState::new(cache);
-    while let Ok(message) = rx.recv() {
+    loop {
+        let message = if state.has_pending_frames() {
+            match rx.recv_timeout(OUTPUT_POLL_INTERVAL) {
+                Ok(message) => Some(message),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            match rx.recv() {
+                Ok(message) => Some(message),
+                Err(_) => return,
+            }
+        };
         match message {
-            Message::Work(work) => state.handle(work),
-            Message::Shutdown => return,
+            Some(Message::Work(work)) => state.handle(work),
+            Some(Message::Shutdown) => return,
+            None => {}
         }
+        state.drain_outputs();
     }
 }
 
@@ -334,6 +395,12 @@ impl VideoDecoder {
     }
 
     pub fn cache(&self) -> &VideoFrameCache {
+        if let Some(Dispatch::Inline(state)) = self.dispatch.get() {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drain_outputs();
+        }
         &self.cache
     }
 
@@ -343,10 +410,11 @@ impl VideoDecoder {
                 let _ = tx.send(Message::Work(work));
             }
             Dispatch::Inline(state) => {
-                state
+                let mut state = state
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .handle(work);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.handle(work);
+                state.drain_outputs();
             }
         }
     }
@@ -422,6 +490,128 @@ mod tests {
             &c,
         )
         .expect("frame")
+    }
+
+    #[test]
+    fn invisible_vp9_packets_do_not_shift_visible_output_surfaces() {
+        let mut targets = VecDeque::new();
+        for (luma_iova, show_frame) in [
+            (0x1000, true),
+            (0x2000, false),
+            (0x3000, false),
+            (0x4000, true),
+            (0x5000, false),
+            (0x6000, true),
+        ] {
+            queue_frame_target(
+                &mut targets,
+                luma_iova,
+                luma_iova as usize / 256,
+                PacketDetail::Vp9 { show_frame },
+            );
+        }
+        for (expected_iova, expected_bytes) in [(0x1000, 16), (0x4000, 64), (0x6000, 96)] {
+            let target = targets.pop_front().expect("visible output target");
+            assert_eq!(target.luma_iova, expected_iova);
+            assert_eq!(target.packet_len, expected_bytes);
+            assert_eq!(target.detail, PacketDetail::Vp9 { show_frame: true });
+        }
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn delayed_output_keeps_all_surface_and_packet_associations() {
+        let mut targets = VecDeque::new();
+        let packet_count = PENDING_TARGET_WARNING_THRESHOLD * 2;
+        for index in 0..packet_count {
+            queue_frame_target(
+                &mut targets,
+                0x1000 + index as u64 * 0x100,
+                index + 1,
+                PacketDetail::H264 {
+                    picture_index: index as u32,
+                    guest_frame: index as u32 + 100,
+                },
+            );
+        }
+        assert_eq!(targets.len(), packet_count);
+        for index in 0..packet_count {
+            let target = targets.pop_front().expect("pending output target");
+            assert_eq!(target.luma_iova, 0x1000 + index as u64 * 0x100);
+            assert_eq!(target.packet_len, index + 1);
+            assert_eq!(
+                target.detail,
+                PacketDetail::H264 {
+                    picture_index: index as u32,
+                    guest_frame: index as u32 + 100,
+                }
+            );
+        }
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg; set NEXIUM_FFMPEG and run with --ignored"]
+    fn worker_publishes_visible_frames_without_later_packets() {
+        let fixture = include_bytes!("../tests/fixtures/vp9_hidden_frames.ivf");
+        let decoder = VideoDecoder::new();
+        let cache = decoder.cache().clone();
+        let worker_cache = cache.clone();
+        let (tx, rx) = unbounded();
+        let handle = std::thread::spawn(move || worker_loop(rx, worker_cache));
+        assert!(decoder
+            .dispatch
+            .set(Dispatch::Worker {
+                tx,
+                handle: Mutex::new(Some(handle)),
+            })
+            .is_ok());
+        let failed = Arc::new(AtomicBool::new(false));
+        decoder.submit(DecodeWork::Configure {
+            fd: 1,
+            codec: FfmpegCodec::Vp9,
+            width: 16,
+            height: 16,
+            failed: failed.clone(),
+        });
+        let mut offset = 32;
+        for index in 0..24 {
+            let size = u32::from_le_bytes(fixture[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 12;
+            let packet = fixture[offset..offset + size].to_vec();
+            offset += size;
+            let show_frame = index % 3 != 1;
+            let target_luma_iova = 0x1000 + index as u64 * 0x100;
+            decoder.submit(DecodeWork::Packet {
+                fd: 1,
+                packet,
+                target_luma_iova,
+                detail: PacketDetail::Vp9 { show_frame },
+            });
+            if !show_frame {
+                continue;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let frame = loop {
+                if let Some(frame) = lock_frame_cache(&cache).get_cloned(target_luma_iova) {
+                    break frame;
+                }
+                assert!(!failed.load(Ordering::Relaxed), "FFmpeg decoding failed");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "visible packet {index} was not published without later input"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let expected_luma = 16 + 8 * index as u8;
+            assert!(frame.y().iter().all(|&luma| luma == expected_luma));
+        }
+        assert_eq!(offset, fixture.len());
+        let cache = lock_frame_cache(&cache);
+        assert_eq!(cache.len(), 16);
+        for index in (0..24).filter(|index| index % 3 == 1) {
+            assert!(cache.get_cloned(0x1000 + index * 0x100).is_none());
+        }
     }
 
     #[test]
