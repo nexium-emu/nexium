@@ -58,6 +58,24 @@ fn try_select_ordered_present_source<R>(
     select(&maxwell_dma)
 }
 
+fn try_register_present_surface(
+    maxwell_dma: &parking_lot::Mutex<nexium_nvdrv::gpu::engines::MaxwellDma>,
+    nvmap_id: u32,
+    destination_vas: &[u64],
+    width: u32,
+    height: u32,
+    source_vas: &[u64],
+) -> bool {
+    if source_vas.is_empty() {
+        return false;
+    }
+    let Some(mut maxwell_dma) = maxwell_dma.try_lock() else {
+        return false;
+    };
+    maxwell_dma.register_present_surface(nvmap_id, destination_vas, width, height, source_vas);
+    true
+}
+
 struct AcquiredBufferSlotGuard {
     queues: std::sync::Arc<
         parking_lot::Mutex<std::collections::HashMap<u32, nexium_nvdrv::BufferQueue>>,
@@ -149,8 +167,8 @@ fn release_rejected_present_slot_after_fences(
 mod bufferqueue_present_tests {
     use super::{
         release_rejected_present_slot_after_fences, submit_ordered_gpu_present,
-        try_select_ordered_present_source, PresentDeliveryLanes, PresentMetadata,
-        PresentMetadataQueue,
+        try_register_present_surface, try_select_ordered_present_source, PresentDeliveryLanes,
+        PresentMetadata, PresentMetadataQueue,
     };
     use nexium_nvdrv::bufferqueue::SlotState;
     use nexium_nvdrv::gpu::engines::MaxwellDma;
@@ -220,6 +238,29 @@ mod bufferqueue_present_tests {
         drop(held);
         worker.join().unwrap();
         assert_eq!(selected.unwrap(), Some("fallback"));
+    }
+
+    #[test]
+    fn present_hint_registration_skips_contention_and_recovers() {
+        let maxwell_dma = Arc::new(Mutex::new(MaxwellDma::new()));
+        let held = maxwell_dma.lock();
+        let worker_dma = Arc::clone(&maxwell_dma);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let register =
+                || try_register_present_surface(&worker_dma, 7, &[0x2000], 1280, 720, &[0x1000]);
+            result_tx.send(register()).unwrap();
+            resume_rx.recv().unwrap();
+            register()
+        });
+
+        let contended = result_rx.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        resume_tx.send(()).unwrap();
+        let recovered = worker.join().unwrap();
+        assert!(!contended.unwrap());
+        assert!(recovered);
     }
 
     #[test]
@@ -8385,20 +8426,16 @@ fn igbp_handle_transact(
                         let (present_nvmap_id, present_width, present_height) =
                             (gb.nvmap_id, gb.width, gb.height);
                         let present_source_vas =
-                            renderer.present_alias_vas(gb.nvmap_id, gb.width, gb.height);
-                        if !present_source_vas.is_empty() {
-                            kernel
-                                .nvdrv
-                                .gpu
-                                .maxwell_dma
-                                .lock()
-                                .register_present_surface(
-                                    gb.nvmap_id,
-                                    &direct_gpu_vas,
-                                    gb.width,
-                                    gb.height,
-                                    &present_source_vas,
-                                );
+                            renderer.try_present_alias_vas(gb.nvmap_id, gb.width, gb.height);
+                        if let Some(present_source_vas) = present_source_vas {
+                            try_register_present_surface(
+                                &kernel.nvdrv.gpu.maxwell_dma,
+                                gb.nvmap_id,
+                                &direct_gpu_vas,
+                                gb.width,
+                                gb.height,
+                                &present_source_vas,
+                            );
                         }
                         let maxwell_dma_for_ordered =
                             std::sync::Arc::clone(&kernel.nvdrv.gpu.maxwell_dma);

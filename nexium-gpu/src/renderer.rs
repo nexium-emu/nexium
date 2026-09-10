@@ -6801,6 +6801,20 @@ impl Renderer {
             .present_alias_vas(RtKey::request(nvmap_id, width, height))
     }
 
+    pub fn try_present_alias_vas(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u64>> {
+        let inner = self.inner.try_lock()?;
+        Some(
+            inner
+                .rt_cache
+                .present_alias_vas(RtKey::request(nvmap_id, width, height)),
+        )
+    }
+
     pub fn present_rt_ready_at_va(
         &self,
         nvmap_id: u32,
