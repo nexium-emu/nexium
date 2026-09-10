@@ -4442,20 +4442,17 @@ impl Renderer {
             }
         } else { vk::DebugUtilsMessengerEXT::null() };
 
-        let phys_devices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|e| format!("enumerate_physical_devices: {:?}", e))?;
-        if phys_devices.is_empty() {
+        let phys_devices = crate::adapter::physical_devices(&instance)?;
+        let devices: Vec<_> = phys_devices.iter().map(|(_, info)| info.clone()).collect();
+        let preferred = crate::adapter::preferred_device();
+        let Some(index) = crate::adapter::select_index(&devices, preferred.as_deref()) else {
             unsafe { instance.destroy_instance(None) };
-            return Err("no Vulkan physical devices".to_string());
+            return Err("no Vulkan 1.3 graphics devices".to_string());
+        };
+        if preferred.as_ref().is_some_and(|id| *id != devices[index].id) {
+            log::warn!("Selected GPU unavailable; using {}", devices[index].label());
         }
-        let physical_device = phys_devices
-            .iter()
-            .copied()
-            .find(|d| {
-                let p = unsafe { instance.get_physical_device_properties(*d) };
-                p.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-            })
-            .unwrap_or(phys_devices[0]);
+        let physical_device = phys_devices[index].0;
 
         let qf = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let queue_family =

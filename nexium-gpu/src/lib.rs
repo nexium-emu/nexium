@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod adapter;
 pub mod bundle_cache;
 pub mod commands;
 pub mod compute;

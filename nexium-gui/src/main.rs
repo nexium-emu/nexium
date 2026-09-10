@@ -46,10 +46,42 @@ fn host_surface_config(vsync: bool) -> eframe::SurfaceConfig {
     }
 }
 
-fn host_wgpu_setup() -> eframe::egui_wgpu::WgpuSetupCreateNew {
+fn host_wgpu_setup(preferred: Option<&str>) -> eframe::egui_wgpu::WgpuSetupCreateNew {
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     setup.instance_descriptor.backends =
         eframe::wgpu::Backends::from_env().unwrap_or(eframe::wgpu::Backends::VULKAN);
+    if let Some(selected) = preferred
+        .and_then(|id| {
+            nexium_gpu::adapter::available_devices()
+                .iter()
+                .find(|device| device.id == id)
+        })
+        .cloned()
+    {
+        setup.native_adapter_selector = Some(std::sync::Arc::new(move |adapters, surface| {
+            let compatible = |adapter: &&eframe::wgpu::Adapter| {
+                surface.is_none_or(|surface| adapter.is_surface_supported(surface))
+            };
+            let selected_adapter = adapters.iter().filter(compatible).find(|adapter| {
+                let info = adapter.get_info();
+                info.vendor == selected.vendor_id && info.device == selected.device_id
+            });
+            let adapter = selected_adapter
+                .or_else(|| {
+                    log::warn!("Selected GPU unavailable for the window; using an available GPU");
+                    adapters
+                        .iter()
+                        .filter(compatible)
+                        .find(|adapter| {
+                            adapter.get_info().device_type == eframe::wgpu::DeviceType::DiscreteGpu
+                        })
+                        .or_else(|| adapters.iter().find(compatible))
+                })
+                .ok_or_else(|| "No GPU can present to the application window".to_string())?;
+            log::info!("Window GPU: {}", adapter.get_info().name);
+            Ok(adapter.clone())
+        }));
+    }
     setup
 }
 
@@ -103,6 +135,7 @@ fn main() -> Result<(), eframe::Error> {
     }
 
     log::info!("=== NeXium - Nintendo Switch Emulator ===");
+    nexium_gpu::adapter::set_preferred_device(settings.gpu_device.clone());
 
     let docked = std::env::var("NEXIUM_DOCKED").map_or(settings.docked, |value| value != "0");
     nexium_core::hid_state::set_docked(docked);
@@ -172,7 +205,9 @@ fn main() -> Result<(), eframe::Error> {
             .with_min_inner_size([640.0, 480.0]),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: eframe::WgpuConfiguration {
-            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(host_wgpu_setup()),
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(host_wgpu_setup(
+                settings.gpu_device.as_deref(),
+            )),
             ..Default::default()
         }
         .with_surface_config(surface_config),
@@ -226,7 +261,7 @@ mod tests {
     fn host_wgpu_setup_defaults_to_vulkan_only() {
         if std::env::var_os("WGPU_BACKEND").is_none() {
             assert_eq!(
-                host_wgpu_setup().instance_descriptor.backends,
+                host_wgpu_setup(None).instance_descriptor.backends,
                 eframe::wgpu::Backends::VULKAN
             );
         }

@@ -480,6 +480,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub gpu_backend: GpuBackend,
     #[serde(default)]
+    pub gpu_device: Option<String>,
+    #[serde(default)]
     pub resolution_preset: ResolutionPreset,
     #[serde(default)]
     pub audio_output_device: Option<String>,
@@ -654,6 +656,7 @@ impl Default for AppSettings {
             vsync: default_vsync(),
             cpu_backend: CpuBackend::default(),
             gpu_backend: GpuBackend::default(),
+            gpu_device: None,
             resolution_preset: ResolutionPreset::default(),
             audio_output_device: None,
             audio_volume: default_audio_volume(),
@@ -690,6 +693,27 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn gpu_device_label(&self) -> String {
+        match self.gpu_device.as_deref() {
+            None => "Auto".into(),
+            Some(id) => nexium_gpu::adapter::available_devices()
+                .iter()
+                .find(|device| device.id == id)
+                .map_or_else(|| "Unavailable GPU (Auto)".into(), |device| device.label()),
+        }
+    }
+
+    pub fn cycle_gpu_device(&mut self, direction: i32) {
+        let devices = nexium_gpu::adapter::available_devices();
+        let index = self
+            .gpu_device
+            .as_ref()
+            .and_then(|id| devices.iter().position(|device| device.id == *id))
+            .map_or(0, |index| index + 1);
+        let next = (index as i32 + direction).rem_euclid(devices.len() as i32 + 1) as usize;
+        self.gpu_device = next.checked_sub(1).map(|index| devices[index].id.clone());
+    }
+
     pub fn config_path() -> Option<PathBuf> {
         Some(nexium_common::paths::root().join("app.json"))
     }

@@ -303,6 +303,7 @@ pub struct HorizonApp {
     prefs_rebind_cool: bool,
     prefs_enter_held: bool,
     input_device: InputDevice,
+    startup_gpu_device: Option<String>,
     app_settings: AppSettings,
     last_buttons_logged: u64,
     last_sticks_logged: [i32; 4],
@@ -572,6 +573,7 @@ impl HorizonApp {
             prefs_rebind_cool: false,
             prefs_enter_held: false,
             input_device: InputDevice::Keyboard,
+            startup_gpu_device: app_settings.gpu_device.clone(),
             app_settings,
             last_buttons_logged: 0,
             last_sticks_logged: [0; 4],
@@ -4199,7 +4201,8 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 7] = [
+            let rows: [(&str, String); 8] = [
+                ("GPU", self.app_settings.gpu_device_label()),
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
                 ("Output Scale", format!("{}x", scale)),
                 (
@@ -4226,7 +4229,7 @@ impl HorizonApp {
                     crate::ui_audio::play_move();
                 }
             }
-            let row_h = 62.0 * s;
+            let row_h = ((content.height() - 52.0 * s) / n as f32).min(62.0 * s);
             let mut y = content.min.y + 4.0 * s;
             let mut dir = 0i32;
             for (i, (label, value)) in rows.iter().enumerate() {
@@ -4270,9 +4273,22 @@ impl HorizonApp {
                     text,
                 );
                 let val_col = if selrow { accent } else { muted };
-                let lx = base.max.x - 150.0 * s;
+                let lx = if i == 0 {
+                    base.min.x + 180.0 * s
+                } else {
+                    base.max.x - 150.0 * s
+                };
                 let rx = base.max.x - 22.0 * s;
-                p.text(
+                let value_clip = sr(egui::Rect::from_min_max(
+                    egui::pos2(lx + 20.0 * s, base.min.y),
+                    egui::pos2(rx - 20.0 * s, base.max.y),
+                ));
+                let value_painter = if i == 0 {
+                    p.with_clip_rect(value_clip)
+                } else {
+                    p.clone()
+                };
+                value_painter.text(
                     sp(egui::pos2((lx + rx) * 0.5, base.center().y)),
                     egui::Align2::CENTER_CENTER,
                     value,
@@ -4328,7 +4344,8 @@ impl HorizonApp {
             }
             if dir != 0 {
                 match self.prefs_row {
-                    0 => {
+                    0 => self.app_settings.cycle_gpu_device(dir),
+                    1 => {
                         let all = crate::app_settings::AspectMode::all();
                         let idx = all
                             .iter()
@@ -4337,11 +4354,11 @@ impl HorizonApp {
                         self.app_settings.aspect =
                             all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
                     }
-                    1 => {
+                    2 => {
                         self.app_settings.output_scale =
                             (((scale as i32 - 1 + dir).rem_euclid(3)) + 1) as u8;
                     }
-                    2 => {
+                    3 => {
                         let all = crate::app_settings::FilterMode::all();
                         let idx = all
                             .iter()
@@ -4350,17 +4367,33 @@ impl HorizonApp {
                         self.app_settings.filter =
                             all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
                     }
-                    3 => self.app_settings.dpi_aware = !self.app_settings.dpi_aware,
-                    4 => self.app_settings.vsync = !self.app_settings.vsync,
-                    5 => {
+                    4 => self.app_settings.dpi_aware = !self.app_settings.dpi_aware,
+                    5 => self.app_settings.vsync = !self.app_settings.vsync,
+                    6 => {
                         self.app_settings.async_shaders = !self.app_settings.async_shaders;
                         nexium_common::async_compile::set_enabled(self.app_settings.async_shaders);
+                    }
+                    7 => {
+                        self.app_settings.depth_share = !self.app_settings.depth_share;
+                        nexium_common::depth_share::set_enabled(self.app_settings.depth_share);
                     }
                     _ => {}
                 }
                 let _ = self.app_settings.save();
                 crate::ui_audio::play_move();
             }
+            let (gpu_status, restart_pending) = gpu_selection_status(
+                self.app_settings.gpu_device.as_deref(),
+                self.startup_gpu_device.as_deref(),
+                &self.active_gpu_name(),
+            );
+            p.text(
+                sp(egui::pos2(content.min.x + 2.0 * s, y + 2.0 * s)),
+                egui::Align2::LEFT_TOP,
+                gpu_status,
+                egui::FontId::proportional(13.0 * s * sf),
+                if restart_pending { AMBER } else { muted },
+            );
         } else if self.settings_tab == SettingsTab::Controller {
             let (nu, nd, nl, nr) = if nav_stick {
                 (false, false, false, false)
@@ -6420,6 +6453,12 @@ impl HorizonApp {
             self.nro_path = path;
             self.boot_nro(ctx);
         }
+    }
+
+    fn active_gpu_name(&self) -> String {
+        self.wgpu_state
+            .as_ref()
+            .map_or_else(|| "Unknown".into(), |state| state.adapter.get_info().name)
     }
 
     fn game_window_title(&self, path: &std::path::Path) -> String {
@@ -9111,6 +9150,7 @@ impl eframe::App for HorizonApp {
             let mut save_needed = false;
             let mut app_cfg = self.app_settings.clone();
             let mut app_save_needed = false;
+            let active_gpu = self.active_gpu_name();
             let mut test_key: Option<String> = None;
             let last_input = self.last_input;
             let gp_name = self.input.as_ref().and_then(|ib| ib.name());
@@ -9216,7 +9256,13 @@ impl eframe::App for HorizonApp {
                             );
                         }
                         SettingsTab::Graphics => {
-                            graphics_settings_content(ui, &mut app_cfg, &mut app_save_needed);
+                            graphics_settings_content(
+                                ui,
+                                &mut app_cfg,
+                                &mut app_save_needed,
+                                self.startup_gpu_device.as_deref(),
+                                &active_gpu,
+                            );
                         }
                         SettingsTab::Audio => {
                             audio_settings_content(
@@ -9855,7 +9901,48 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.end_row();
 }
 
-fn graphics_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_needed: &mut bool) {
+fn gpu_selection_status(
+    selected: Option<&str>,
+    startup: Option<&str>,
+    active: &str,
+) -> (String, bool) {
+    let restart_pending = selected != startup;
+    let message = if restart_pending {
+        "GPU change saved. Fully close and reopen NeXium to apply."
+    } else {
+        "Auto prefers a dGPU. GPU changes require restarting NeXium."
+    };
+    (format!("Active GPU: {active}\n{message}"), restart_pending)
+}
+
+fn graphics_settings_content(
+    ui: &mut egui::Ui,
+    cfg: &mut AppSettings,
+    save_needed: &mut bool,
+    startup_gpu: Option<&str>,
+    active_gpu: &str,
+) {
+    ui.label(egui::RichText::new("GPU").size(13.0).strong().color(TEXT));
+    egui::ComboBox::from_id_salt("graphics_gpu_device")
+        .selected_text(cfg.gpu_device_label())
+        .show_ui(ui, |ui| {
+            *save_needed |= ui
+                .selectable_value(&mut cfg.gpu_device, None, "Auto")
+                .changed();
+            for device in nexium_gpu::adapter::available_devices() {
+                *save_needed |= ui
+                    .selectable_value(&mut cfg.gpu_device, Some(device.id.clone()), device.label())
+                    .changed();
+            }
+        });
+    let (gpu_status, restart_pending) =
+        gpu_selection_status(cfg.gpu_device.as_deref(), startup_gpu, active_gpu);
+    ui.label(
+        egui::RichText::new(gpu_status)
+            .size(11.0)
+            .color(if restart_pending { AMBER } else { MUTED }),
+    );
+    ui.add_space(12.0);
     ui.label(
         egui::RichText::new("Aspect Mode")
             .size(13.0)
