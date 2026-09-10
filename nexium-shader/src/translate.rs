@@ -1854,7 +1854,7 @@ impl Translator {
         not_a: bool,
         not_b: bool,
         pred: Option<Predicate>,
-    ) {
+    ) -> ValueId {
         let dest = reg_dest(raw);
         let a = self.read_reg(reg_a(raw));
         self.write_reg(
@@ -1867,7 +1867,36 @@ impl Translator {
                 not_b,
             },
             pred,
+        )
+    }
+
+    fn emit_lop_predicate(&mut self, raw: u64, result: ValueId, pred: Option<Predicate>) {
+        let dest_p = ((raw >> 48) & 7) as u8;
+        if dest_p == PT {
+            return;
+        }
+        let cmp = match (raw >> 44) & 3 {
+            0 => ICmp::F,
+            1 => ICmp::T,
+            2 => ICmp::Eq,
+            _ => ICmp::Ne,
+        };
+        let id = self.program.emit_pred(
+            Op::ISetPred {
+                cmp,
+                signed: false,
+                bop: BoolOp::And,
+                src_a: Value::Inst(result),
+                src_b: Value::Zero,
+                src_pred: PT,
+                src_pred_inv: false,
+                dest_p,
+                dest_np: PT,
+            },
+            None,
+            pred,
         );
+        self.pred_state.insert(dest_p, id);
     }
 
     fn emit_ishl(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
@@ -4688,7 +4717,7 @@ impl Translator {
 
             Opcode::LOP_reg => {
                 let b = self.read_reg(reg_b(raw));
-                self.emit_ilop(
+                let result = self.emit_ilop(
                     raw,
                     b,
                     LogicOp::from_bits(lop_op(raw)),
@@ -4696,10 +4725,11 @@ impl Translator {
                     lop_not_b(raw),
                     pred,
                 );
+                self.emit_lop_predicate(raw, result, pred);
             }
             Opcode::LOP_cbuf => {
                 let id = self.load_cbuf(raw);
-                self.emit_ilop(
+                let result = self.emit_ilop(
                     raw,
                     Value::Inst(id),
                     LogicOp::from_bits(lop_op(raw)),
@@ -4707,16 +4737,18 @@ impl Translator {
                     lop_not_b(raw),
                     pred,
                 );
+                self.emit_lop_predicate(raw, result, pred);
             }
             Opcode::LOP_imm => {
-                self.emit_ilop(
+                let result = self.emit_ilop(
                     raw,
                     Value::ImmU32(imm20(raw) as u32),
                     LogicOp::from_bits(lop_op(raw)),
-                    false,
-                    false,
+                    lop_not_a(raw),
+                    lop_not_b(raw),
                     pred,
                 );
+                self.emit_lop_predicate(raw, result, pred);
             }
             Opcode::LOP32I => {
                 self.emit_ilop(
@@ -8613,6 +8645,91 @@ mod tests {
         let mut t = Translator::new_compute();
         assert!(!t.translate(wide));
         assert_eq!(t.unimplemented_count, 1);
+    }
+
+    #[test]
+    fn lop_forms_write_all_predicate_result_modes() {
+        for opcode in [0x5c40u64, 0x4c40, 0x3840] {
+            for (mode, expected) in [ICmp::F, ICmp::T, ICmp::Eq, ICmp::Ne]
+                .into_iter()
+                .enumerate()
+            {
+                for destination in [0, RZ] {
+                    let raw = (opcode << 48)
+                        | ((mode as u64) << 44)
+                        | (1 << 41)
+                        | (2 << 20)
+                        | (7 << 16)
+                        | (1 << 8)
+                        | u64::from(destination);
+                    let mut t = Translator::new_fragment();
+                    assert!(t.translate(raw), "raw={raw:#018x}");
+                    let logical = t
+                        .program
+                        .instructions
+                        .iter()
+                        .find(|inst| matches!(inst.op, Op::ILop { .. }))
+                        .unwrap();
+                    let predicate = t.program.instructions.last().unwrap();
+                    assert!(matches!(predicate.op, Op::ISetPred {
+                        cmp, src_a: Value::Inst(result), src_b: Value::Zero,
+                        dest_p: 0, dest_np: PT, ..
+                    } if cmp == expected && Some(result) == logical.result));
+                    assert_eq!(t.snapshot_pred_state().get(&0), predicate.result.as_ref());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lop_predicate_write_keeps_its_instruction_guard() {
+        let raw = 0x5c40_3380_0028_01ff;
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(raw));
+        let predicate = t.program.instructions.last().unwrap();
+        assert_eq!(
+            predicate.pred,
+            Some(Predicate {
+                idx: 0,
+                negate: true
+            })
+        );
+        assert!(matches!(
+            predicate.op,
+            Op::ISetPred {
+                cmp: ICmp::Ne,
+                dest_p: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lop_immediate_honors_complement_flags() {
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(0x3847_0180_0017_0100));
+        assert!(matches!(
+            t.program.instructions.last().unwrap().op,
+            Op::ILop {
+                a: Value::GprIn(1),
+                b: Value::ImmU32(1),
+                not_a: true,
+                not_b: true,
+                ..
+            }
+        ));
+        assert!(t.snapshot_pred_state().is_empty());
+    }
+
+    #[test]
+    fn lop32i_does_not_treat_immediate_bits_as_predicates() {
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(0x0400_3000_0017_0100));
+        assert!(t.snapshot_pred_state().is_empty());
+        assert!(matches!(
+            t.program.instructions.last().unwrap().op,
+            Op::ILop { .. }
+        ));
     }
 
     #[test]

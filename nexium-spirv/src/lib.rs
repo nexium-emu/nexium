@@ -13151,6 +13151,65 @@ mod tests {
     }
 
     #[test]
+    fn lop_predicate_controls_fragment_discard() {
+        let bytes = build_test_program(&[0x5c40_3380_0027_01ff, 0xe330_0000_0008_000f, enc_exit()]);
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let words = emit_fragment(&cfg);
+        assert!(validate_structured_cfg(&words).is_ok());
+        validates_with_naga(&words);
+        let module = rspirv::dr::load_words(&words).unwrap();
+        let function = &module.functions[0];
+        let kill_label = function
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| inst.class.opcode == rspirv::spirv::Op::Kill)
+            })
+            .and_then(|block| block.label.as_ref().and_then(|label| label.result_id))
+            .expect("discard block");
+        let branch = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find(|inst| {
+                inst.class.opcode == rspirv::spirv::Op::BranchConditional
+                    && inst.operands.get(1) == Some(&Operand::IdRef(kill_label))
+            })
+            .expect("conditional discard");
+        let mut pending = vec![branch.operands[0].unwrap_id_ref()];
+        let mut visited = std::collections::HashSet::new();
+        let definitions: std::collections::HashMap<_, _> = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|inst| inst.result_id.map(|id| (id, inst)))
+            .collect();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if let Some(inst) = definitions.get(&id) {
+                pending.extend(inst.operands.iter().filter_map(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                }));
+            }
+        }
+        for opcode in [rspirv::spirv::Op::INotEqual, rspirv::spirv::Op::BitwiseOr] {
+            assert!(
+                visited.iter().any(|id| definitions
+                    .get(id)
+                    .is_some_and(|inst| inst.class.opcode == opcode)),
+                "discard must depend on the logical result: {opcode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn alpha_test_kill_exit_is_a_valid_selection_termination() {
         let cfg = Cfg {
             blocks: vec![empty_cfg_block(0, BranchKind::Exit)],
