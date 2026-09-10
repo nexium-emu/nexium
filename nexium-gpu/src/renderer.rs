@@ -21,6 +21,7 @@ use crate::texture_manifest::{
 };
 
 pub struct Renderer {
+    presenter: Option<crate::presentation::Presenter>,
     inner: Mutex<RendererInner>,
     raw_storage_resident:
         Arc<Mutex<nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>>>,
@@ -29,10 +30,17 @@ pub struct Renderer {
     submit_state: Arc<SubmitState>,
 }
 
-struct SubmitState {
+pub(crate) struct SubmitState {
     generation: std::sync::atomic::AtomicU64,
     last_idle_generation: std::sync::atomic::AtomicU64,
-    sequence: std::sync::Mutex<()>,
+    pub(crate) sequence: std::sync::Mutex<()>,
+    pub(crate) presentation_sequence: std::sync::Mutex<()>,
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        self.presenter.take();
+    }
 }
 
 impl SubmitState {
@@ -41,6 +49,7 @@ impl SubmitState {
             generation: std::sync::atomic::AtomicU64::new(0),
             last_idle_generation: std::sync::atomic::AtomicU64::new(u64::MAX),
             sequence: std::sync::Mutex::new(()),
+            presentation_sequence: std::sync::Mutex::new(()),
         }
     }
 
@@ -1412,6 +1421,7 @@ pub fn graphics_draw_ring_bytes_upper_bound(call: &crate::draw::Maxwell3dDrawCal
 struct RendererInner {
     entry: ash::Entry,
     instance: ash::Instance,
+    debug_messenger: vk::DebugUtilsMessengerEXT,
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
     native_bc_formats: Vec<vk::Format>,
@@ -4122,6 +4132,7 @@ impl Renderer {
     }
 
     fn wait_idle_locked(&self, inner: &RendererInner, generation: u64) -> bool {
+        let _presentation = self.submit_state.presentation_sequence.lock().unwrap_or_else(|error| error.into_inner());
         match unsafe { inner.device.device_wait_idle() } {
             Ok(()) => {
                 self.submit_state
@@ -4315,6 +4326,16 @@ impl Renderer {
     }
 
     pub fn new() -> Result<Arc<Self>, String> {
+        Self::new_with_presentation(None)
+    }
+
+    pub fn new_with_presentation(
+        mut presentation_target: Option<Arc<crate::presentation::PresentationTarget>>,
+    ) -> Result<Arc<Self>, String> {
+        if presentation_target.is_some() && nexium_common::depth_share::enabled() {
+            log::info!("[vulkan-present] depth export selected; using GUI frame delivery");
+            presentation_target = None;
+        }
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| format!("Vulkan entry load failed: {:?}", e))?;
 
@@ -4336,6 +4357,24 @@ impl Renderer {
         }
         let mut layer_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
         let mut ext_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
+        if presentation_target.is_some() {
+            let required = [ash::khr::surface::NAME, ash::khr::get_surface_capabilities2::NAME,
+                ash::ext::surface_maintenance1::NAME];
+            let available = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+            if !required.iter().all(|required| available.iter().any(|extension| unsafe {
+                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == *required
+            })) {
+                log::warn!("[vulkan-present] native surface extensions unavailable; using GUI frame delivery");
+                presentation_target = None;
+            }
+        }
+        if presentation_target.is_some() {
+            ext_ptrs.push(ash::khr::surface::NAME.as_ptr());
+            ext_ptrs.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
+            ext_ptrs.push(ash::ext::surface_maintenance1::NAME.as_ptr());
+            #[cfg(windows)]
+            ext_ptrs.push(ash::khr::win32_surface::NAME.as_ptr());
+        }
         let want_syncval = std::env::var("NEXIUM_VK_SYNCVAL").ok().as_deref() == Some("1");
         if validation_available {
             layer_ptrs.push(validation_layer.as_ptr());
@@ -4388,7 +4427,7 @@ impl Renderer {
                 .map_err(|e| format!("create_instance: {:?}", e))?
         };
 
-        if validation_available {
+        let debug_messenger = if validation_available {
             let dbg = ash::ext::debug_utils::Instance::new(&entry, &instance);
             let info = vk::DebugUtilsMessengerCreateInfoEXT {
                 s_type: vk::StructureType::DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
@@ -4404,10 +4443,13 @@ impl Renderer {
                 _marker: std::marker::PhantomData,
             };
             match unsafe { dbg.create_debug_utils_messenger(&info, None) } {
-                Ok(_) => {}
-                Err(e) => log::warn!("debug_utils messenger create failed: {:?}", e),
+                Ok(messenger) => messenger,
+                Err(e) => {
+                    log::warn!("debug_utils messenger create failed: {:?}", e);
+                    vk::DebugUtilsMessengerEXT::null()
+                }
             }
-        }
+        } else { vk::DebugUtilsMessengerEXT::null() };
 
         let phys_devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| format!("enumerate_physical_devices: {:?}", e))?;
@@ -4440,12 +4482,17 @@ impl Renderer {
             .queue_flags
             .contains(vk::QueueFlags::COMPUTE);
 
-        let prio = 1.0f32;
+        let prio = [1.0f32, 1.0];
+        let queue_count = if presentation_target.is_some() {
+            qf[queue_family as usize].queue_count.min(2)
+        } else {
+            1
+        };
         let queue_info = vk::DeviceQueueCreateInfo {
             s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
             queue_family_index: queue_family,
-            queue_count: 1,
-            p_queue_priorities: &prio,
+            queue_count,
+            p_queue_priorities: prio.as_ptr(),
             p_next: std::ptr::null(),
             flags: Default::default(),
             _marker: std::marker::PhantomData,
@@ -4534,6 +4581,8 @@ impl Renderer {
             ..Default::default()
         };
         unsafe { instance.get_physical_device_features2(physical_device, &mut supported_features) };
+        let sampler_filter_minmax_supported = sampler_filter_minmax_supported
+            && supported_features_12.sampler_filter_minmax == vk::TRUE;
         let native_bc_formats = NATIVE_BC_FORMATS
             .iter()
             .copied()
@@ -4584,6 +4633,7 @@ impl Renderer {
             ..Default::default()
         };
         let mut features_12 = vk::PhysicalDeviceVulkan12Features {
+            sampler_filter_minmax: sampler_filter_minmax_supported as u32,
             shader_output_layer: if shader_output_layer_supported {
                 vk::TRUE
             } else {
@@ -4666,6 +4716,24 @@ impl Renderer {
         }
 
         let mut enabled_ext_names: Vec<*const std::os::raw::c_char> = Vec::new();
+        let mut present_features = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+        if presentation_target.is_some() {
+            let supported = device_extensions.iter().any(|extension| unsafe {
+                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr())
+                    == ash::ext::swapchain_maintenance1::NAME
+            });
+            if supported {
+                let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut present_features);
+                unsafe { instance.get_physical_device_features2(physical_device, &mut features); }
+            }
+            if !supported || present_features.swapchain_maintenance1 != vk::TRUE {
+                log::warn!("[vulkan-present] swapchain maintenance unavailable; using GUI frame delivery");
+                presentation_target = None;
+            } else {
+                enabled_ext_names.push(ash::khr::swapchain::NAME.as_ptr());
+                enabled_ext_names.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
+            }
+        }
         if enable_depth_clip_control {
             enabled_ext_names.push(vk::EXT_DEPTH_CLIP_CONTROL_NAME.as_ptr());
         }
@@ -4696,13 +4764,17 @@ impl Renderer {
         } else {
             log::info!("vertex attribute divisor extension unavailable; divisors >1 collapse to instance rate");
         }
-        let p_next_chain: *mut std::ffi::c_void = if enable_depth_clip_control {
+        let mut p_next_chain: *mut std::ffi::c_void = if enable_depth_clip_control {
             &mut dcc_feature as *mut _ as *mut std::ffi::c_void
         } else if vertex_attribute_divisor_supported {
             &mut vertex_attribute_divisor_feature as *mut _ as *mut std::ffi::c_void
         } else {
             compute_feature_chain
         };
+        if presentation_target.is_some() {
+            present_features.p_next = p_next_chain;
+            p_next_chain = &mut present_features as *mut _ as *mut std::ffi::c_void;
+        }
         let core_features = unsafe { instance.get_physical_device_features(physical_device) };
         let depth_clamp_supported = core_features.depth_clamp == vk::TRUE;
         let independent_blend_supported = core_features.independent_blend == vk::TRUE;
@@ -5146,11 +5218,28 @@ impl Renderer {
         let device_handle = device.clone();
         let raw_storage_resident =
             Arc::new(Mutex::new(nexium_common::fast_hash::FastSet::default()));
+        let presenter = if let Some(target) = presentation_target {
+            let present_queue = unsafe { device.get_device_queue(queue_family, queue_count - 1) };
+            match crate::presentation::Presenter::new(
+                &entry, &instance, &device, physical_device, queue_family, present_queue,
+                submit_timeline, submit_state.clone(), target,
+            ) {
+                Ok(presenter) => Some(presenter),
+                Err(error) => {
+                    log::warn!("[vulkan-present] {error}; using GUI frame delivery");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let renderer = Arc::new(Self {
+            presenter,
             raw_storage_resident: Arc::clone(&raw_storage_resident),
             inner: Mutex::new(RendererInner {
                 entry,
                 instance,
+                debug_messenger,
                 device,
                 physical_device,
                 native_bc_formats,
@@ -5224,6 +5313,67 @@ impl Renderer {
         });
         renderer.prewarm();
         Ok(renderer)
+    }
+
+    pub fn present_image(
+        &self,
+        key: RtKey,
+        stamp: u64,
+        may_advance: bool,
+        mut parameters: crate::presentation::PresentParameters,
+    ) -> Result<bool, String> {
+        let Some(presenter) = &self.presenter else { return Ok(false); };
+        let Some(mut slot) = presenter.reserve() else { return Ok(false); };
+        let mut inner = self.inner.lock();
+        let RendererInner { device, rt_cache, mem_props, queue, submit_state, submit_timeline, .. } = &mut *inner;
+        let Some((_, source, _, layout, source_format, current_stamp)) = rt_cache.color_exact_with_format(key) else {
+            static MISSING: std::sync::Once = std::sync::Once::new();
+            MISSING.call_once(|| log::warn!("[vulkan-present] source cache miss: {} stamp={stamp}", key.label()));
+            presenter.recycle(slot);
+            return Ok(false);
+        };
+        static SOURCE: std::sync::Once = std::sync::Once::new();
+        SOURCE.call_once(|| log::info!("[vulkan-present] source={} format={source_format:?} layout={layout:?} stamp={current_stamp}/{stamp} may_advance={may_advance}", key.label()));
+        if layout == vk::ImageLayout::UNDEFINED || current_stamp == 0 || key.is_3d || key.depth != 1
+            || if may_advance { current_stamp < stamp } else { current_stamp != stamp } {
+            presenter.recycle(slot);
+            return Ok(false);
+        }
+        let format = match source_format {
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB
+                | vk::Format::A8B8G8R8_UNORM_PACK32 | vk::Format::A8B8G8R8_SRGB_PACK32 => vk::Format::R8G8B8A8_UNORM,
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
+            _ => { presenter.recycle(slot); return Ok(false); }
+        };
+        parameters.flip_y = rt_cache.present_flip_y(key).unwrap_or(parameters.flip_y);
+        let result = (|| -> Result<(), String> {
+        slot.prepare(mem_props, key.width, key.height, format)?;
+        reset_command_buffer(device, slot.cmd)?;
+        begin_one_time(device, slot.cmd)?;
+        transition_image(device, slot.cmd, source, layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        crate::presentation::barrier(device, slot.cmd, slot.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        let copy = vk::ImageCopy::default()
+            .src_subresource(crate::presentation::color_layers())
+            .dst_subresource(crate::presentation::color_layers())
+            .extent(vk::Extent3D { width: key.width, height: key.height, depth: 1 });
+        unsafe {
+            device.cmd_copy_image(slot.cmd, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                slot.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
+        }
+        crate::presentation::barrier(device, slot.cmd, slot.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        end_one_time(device, slot.cmd)?;
+        slot.generation = submit_with_fence(submit_state, *submit_timeline, device, *queue, slot.cmd, slot.fence)?;
+        Ok(())
+        })();
+        if let Err(error) = result {
+            presenter.fail(error.clone());
+            return Err(error);
+        }
+        if let Some(image) = rt_cache.get_existing(key) { image.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL; }
+        rt_cache.reset_frame_draws();
+        drop(inner);
+        presenter.submit(slot, parameters)?;
+        Ok(true)
     }
 
     fn prewarm(&self) {
@@ -17271,7 +17421,7 @@ fn settle_pending_compute_record(
     });
     let wait_elapsed = wait_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     if let Err(error) = wait_result {
-        match unsafe { inner.device.device_wait_idle() } {
+        match synchronized_device_idle(inner) {
             Ok(()) => {
                 resources.destroy(&inner.device);
                 free_compute_descriptor_set(inner, pending.descriptor_pool, pending.descriptor_set);
@@ -19420,7 +19570,7 @@ fn execute_compute_dispatch(
     let submit_elapsed =
         submit_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     if let Err(error) = submit_result {
-        match unsafe { inner.device.device_wait_idle() } {
+        match synchronized_device_idle(inner) {
             Ok(()) => {
                 resources.destroy(&inner.device);
                 if lazy {
@@ -28134,6 +28284,7 @@ fn drain_rt_copies_before_color_recreate(
         .map(|(_, _, _, _, previous, _)| previous);
     let started = std::time::Instant::now();
     unsafe {
+        let _sequence = submit_state.sequence.lock().unwrap_or_else(|error| error.into_inner());
         device
             .queue_wait_idle(queue)
             .map_err(|e| format!("queue_wait_idle(color image recreate): {:?}", e))?;
@@ -28170,6 +28321,7 @@ fn drain_rt_copies_before_depth_recreate(
         return Ok(());
     }
     unsafe {
+        let _sequence = submit_state.sequence.lock().unwrap_or_else(|error| error.into_inner());
         device
             .queue_wait_idle(queue)
             .map_err(|e| format!("queue_wait_idle(depth image recreate): {:?}", e))?;
@@ -28380,6 +28532,7 @@ fn submit_and_wait(
         vk::Fence::null(),
         true,
     )?;
+    let _sequence = submit_state.sequence.lock().unwrap_or_else(|error| error.into_inner());
     unsafe {
         device
             .queue_wait_idle(queue)
@@ -28430,6 +28583,12 @@ fn wait_fence(device: &ash::Device, fence: vk::Fence) -> Result<(), String> {
             .map_err(|e| format!("reset_fences: {:?}", e))?;
     }
     Ok(())
+}
+
+fn synchronized_device_idle(inner: &RendererInner) -> Result<(), vk::Result> {
+    let _sequence = inner.submit_state.sequence.lock().unwrap_or_else(|error| error.into_inner());
+    let _presentation = inner.submit_state.presentation_sequence.lock().unwrap_or_else(|error| error.into_inner());
+    unsafe { inner.device.device_wait_idle() }
 }
 
 fn align_up(x: u64, align: u64) -> u64 {
@@ -29313,6 +29472,10 @@ impl Drop for RendererInner {
                 self.device.destroy_command_pool(self.cmd_pool, None);
             }
             self.device.destroy_device(None);
+            if self.debug_messenger != vk::DebugUtilsMessengerEXT::null() {
+                ash::ext::debug_utils::Instance::new(&self.entry, &self.instance)
+                    .destroy_debug_utils_messenger(self.debug_messenger, None);
+            }
             self.instance.destroy_instance(None);
         }
         let _ = &self.entry;

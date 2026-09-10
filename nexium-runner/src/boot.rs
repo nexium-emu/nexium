@@ -708,6 +708,7 @@ impl Drop for FrameDeliveryGuard {
 }
 
 pub struct EmulationHandle {
+    pub presentation_target: Option<Arc<nexium_gpu::presentation::PresentationTarget>>,
     pub stop_flag: Arc<AtomicBool>,
     pub pause_flag: Arc<AtomicBool>,
     pub frame_rx: Receiver<Frame>,
@@ -722,6 +723,15 @@ impl EmulationHandle {
         nro_path: &str,
         cpu_backend: nexium_cpu::CpuBackendKind,
         repaint: Option<RepaintHook>,
+    ) -> Result<Self, String> {
+        Self::new_with_presentation(nro_path, cpu_backend, repaint, None)
+    }
+
+    pub fn new_with_presentation(
+        nro_path: &str,
+        cpu_backend: nexium_cpu::CpuBackendKind,
+        repaint: Option<RepaintHook>,
+        presentation_target: Option<Arc<nexium_gpu::presentation::PresentationTarget>>,
     ) -> Result<Self, String> {
         let nro_path = nro_path.to_string();
 
@@ -746,6 +756,7 @@ impl EmulationHandle {
         let stats = Arc::new(Mutex::new(EmuStats::default()));
         let stats_clone = Arc::clone(&stats);
 
+        let thread_target = presentation_target.clone();
         let thread_handle = thread::spawn(move || {
             nexium_common::thread_cpu_set::apply_current_thread_cpu_set(
                 nexium_common::thread_cpu_set::ThreadCpuSetTarget::GuestCore0,
@@ -784,6 +795,7 @@ impl EmulationHandle {
                 config.argv_override = chained_argv.take();
                 config.cpu_backend = cpu_backend;
                 let mut boot_ctx = BootContext::new(config)?;
+                boot_ctx.kernel.lock().nvdrv.presentation_target = thread_target.clone();
                 let (frame_queue, frame_stats) = {
                     let kernel = boot_ctx.kernel.lock();
                     (
@@ -2239,6 +2251,7 @@ impl EmulationHandle {
         });
 
         Ok(Self {
+            presentation_target,
             stop_flag,
             pause_flag,
             frame_rx,
@@ -2258,6 +2271,7 @@ impl EmulationHandle {
     }
 
     pub fn stop(&mut self) {
+        if let Some(target) = &self.presentation_target { target.stop(); }
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(handle) = self.thread_handle.take() {
             std::thread::spawn(move || {
@@ -2267,6 +2281,7 @@ impl EmulationHandle {
     }
 
     pub fn stop_blocking(&mut self) {
+        if let Some(target) = &self.presentation_target { target.stop(); }
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
@@ -2282,6 +2297,7 @@ impl EmulationHandle {
     }
 
     pub fn pause(&self) {
+        if let Some(target) = &self.presentation_target { target.request_snapshot(); }
         self.pause_flag.store(true, Ordering::Relaxed);
     }
 
@@ -2291,6 +2307,9 @@ impl EmulationHandle {
 
     pub fn toggle_pause(&self) -> bool {
         let now = !self.is_paused();
+        if now {
+            if let Some(target) = &self.presentation_target { target.request_snapshot(); }
+        }
         self.pause_flag.store(now, Ordering::Relaxed);
         now
     }

@@ -256,6 +256,8 @@ pub struct HorizonApp {
     egui_ctx: egui::Context,
     wgpu_state: Option<eframe::egui_wgpu::RenderState>,
     game_texture_native: Option<NativeGameTexture>,
+    native_game: Option<crate::native_game::NativeGameWindow>,
+    native_overlay_rect: Option<egui::Rect>,
     game_depth: Option<std::sync::Arc<nexium_gpu::PresentDepth>>,
     game_depth_seq: u64,
     last_game_rect: Option<egui::Rect>,
@@ -523,6 +525,8 @@ impl HorizonApp {
             egui_ctx: cc.egui_ctx.clone(),
             wgpu_state: cc.wgpu_render_state.clone(),
             game_texture_native: None,
+            native_game: crate::native_game::NativeGameWindow::new(cc),
+            native_overlay_rect: None,
             game_depth: None,
             game_depth_seq: 0,
             last_game_rect: None,
@@ -652,12 +656,14 @@ impl HorizonApp {
         if !nro_path.is_empty() {
             let backend = app.app_settings.effective_cpu_backend().to_cpu_kind();
             let repaint_ctx = cc.egui_ctx.clone();
-            if let Ok(handle) = EmulationHandle::new(
+            let target = app.native_game.as_mut().map(|window| window.begin_game(&cc.egui_ctx));
+            if let Ok(handle) = EmulationHandle::new_with_presentation(
                 &nro_path,
                 backend,
                 Some(std::sync::Arc::new(move || {
                     request_game_frame_repaint(&repaint_ctx)
                 })),
+                target,
             ) {
                 app.emulation_handle = Some(handle);
                 let launched = std::path::PathBuf::from(&nro_path);
@@ -1116,6 +1122,28 @@ impl HorizonApp {
     }
 
     fn poll_frames(&mut self, ctx: &egui::Context) {
+        if let Some(window) = &mut self.native_game {
+            if window.poll() {
+                self.game_depth = None;
+                gui_rate_stats(1);
+                self.performance.record_frame();
+                self.last_frame_res = (window.dimensions[0], window.dimensions[1]);
+                self.carousel.boot_stage = crate::carousel::BootStage::None;
+                if self.game_texture.is_none() {
+                    self.game_texture = Some(ctx.load_texture("native_game_preview",
+                        egui::ColorImage::new([1, 1], vec![Color32::BLACK]), egui::TextureOptions::LINEAR));
+                }
+            }
+            if let Some(snapshot) = window.target.as_ref().and_then(|target| target.take_snapshot()) {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [snapshot.width as usize, snapshot.height as usize], &snapshot.pixels);
+                if let Some(texture) = &mut self.game_texture {
+                    texture.set(image, egui::TextureOptions::LINEAR);
+                } else {
+                    self.game_texture = Some(ctx.load_texture("native_game_preview", image, egui::TextureOptions::LINEAR));
+                }
+            }
+        }
         let Some(handle) = &self.emulation_handle else {
             return;
         };
@@ -1124,6 +1152,7 @@ impl HorizonApp {
             crate::app_settings::FilterMode::Nearest => egui::TextureOptions::NEAREST,
         };
         if let Some(mut frame) = take_next_game_frame(&handle.frame_rx) {
+            if let Some(window) = &mut self.native_game { window.active = false; }
             gui_rate_stats(1);
             self.performance.record_frame();
             self.last_frame_res = (frame.width, frame.height);
@@ -5823,6 +5852,7 @@ impl HorizonApp {
         );
         self.perf_pos = Some(pos);
         let rect = egui::Rect::from_min_size(pos, egui::vec2(bw, bh));
+        self.native_overlay_rect = Some(rect.expand(3.0));
 
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -6361,6 +6391,10 @@ impl HorizonApp {
     }
 
     fn game_display(&self) -> Option<(egui::TextureId, Vec2)> {
+        if let Some(window) = self.native_game.as_ref().filter(|window| window.active) {
+            return self.game_texture.as_ref().map(|texture| (texture.id(),
+                Vec2::new(window.dimensions[0] as f32, window.dimensions[1] as f32)));
+        }
         if let Some(t) = &self.game_texture_native {
             Some((t.id, Vec2::new(t.width as f32, t.height as f32)))
         } else {
@@ -6435,12 +6469,14 @@ impl HorizonApp {
         self.stop_anim = None;
         self.resume_anim = None;
         let repaint_ctx = ctx.clone();
-        match EmulationHandle::new(
+        let target = self.native_game.as_mut().map(|window| window.begin_game(ctx));
+        match EmulationHandle::new_with_presentation(
             &self.nro_path,
             backend,
             Some(std::sync::Arc::new(move || {
                 request_game_frame_repaint(&repaint_ctx)
             })),
+            target,
         ) {
             Ok(h) => {
                 crate::ui_audio::play(crate::ui_audio::Sfx::GameBoot);
@@ -7755,10 +7791,17 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
 }
 
 impl eframe::App for HorizonApp {
+    fn on_exit(&mut self) {
+        if let Some(mut handle) = self.emulation_handle.take() { handle.stop_blocking(); }
+        while crate::boot::emu_alive() { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        self.native_game.take();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|input| input.viewport().visible() != Some(false)) {
             return;
         }
+        if let Some(window) = &mut self.native_game { window.hide(); }
         let Some(handle) = &self.emulation_handle else {
             return;
         };
@@ -7781,6 +7824,7 @@ impl eframe::App for HorizonApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
+        self.native_overlay_rect = None;
         if ctx.input(|i| i.viewport().close_requested()) {
             self.play_times.save_if_dirty();
             if let Some(mut h) = self.emulation_handle.take() {
@@ -9314,6 +9358,21 @@ impl eframe::App for HorizonApp {
             &mut self.app_settings,
         );
 
+        let native_visible = !carousel_mode && self.emulation_handle.as_ref().is_some_and(|h| h.is_running() && !h.is_paused())
+            && !self.modal_active() && !self.show_settings && !self.show_profile
+            && self.profile_anim == 0.0 && self.pause_anim.is_none() && self.resume_anim.is_none()
+            && !self.debugger.show_memory && !self.debugger.show_registers && !self.debugger.show_disasm
+            && !self.debugger.show_logs && !self.debugger.show_performance && !self.debugger.show_wait_tree;
+        if let Some(window) = &mut self.native_game {
+            let mut holes: Vec<_> = self.native_overlay_rect.into_iter().collect();
+            if self.download_toast.is_some() {
+                let screen = ctx.viewport_rect();
+                holes.push(egui::Rect::from_min_size(egui::pos2(screen.center().x - 184.0, screen.min.y + 20.0), egui::vec2(368.0, 74.0)));
+            }
+            window.update(self.last_game_rect.filter(|_| native_visible), &holes, ctx.pixels_per_point(),
+                crate::host_vsync_enabled(self.app_settings.vsync, std::env::var("NEXIUM_VSYNC").ok().as_deref()),
+                self.app_settings.filter == FilterMode::Nearest);
+        }
         request_idle_repaint(
             ctx,
             std::time::Duration::from_millis(if frame_driven_game { 100 } else { 16 }),

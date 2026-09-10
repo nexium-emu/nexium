@@ -1817,6 +1817,7 @@ pub struct Nvdrv {
     video_decoder: video_decode_thread::VideoDecoder,
     pub legacy_gfx: std::sync::atomic::AtomicBool,
     pub renderer: std::sync::OnceLock<Option<Arc<nexium_gpu::Renderer>>>,
+    pub presentation_target: Option<Arc<nexium_gpu::presentation::PresentationTarget>>,
     as_gpu_states: HashMap<u32, AsGpuState>,
     gpu_async: Option<Arc<AsyncGpuQueue>>,
     sync_prep_thread: bool,
@@ -1851,6 +1852,7 @@ impl Nvdrv {
             video_decoder: video_decode_thread::VideoDecoder::new(),
             legacy_gfx: std::sync::atomic::AtomicBool::new(false),
             renderer: std::sync::OnceLock::new(),
+            presentation_target: None,
             as_gpu_states: HashMap::new(),
             gpu_async: None,
             sync_prep_thread: false,
@@ -1865,7 +1867,7 @@ impl Nvdrv {
     pub fn renderer(&self) -> Option<&Arc<nexium_gpu::Renderer>> {
         let slot = self
             .renderer
-            .get_or_init(|| match nexium_gpu::Renderer::new() {
+            .get_or_init(|| match nexium_gpu::Renderer::new_with_presentation(self.presentation_target.clone()) {
                 Ok(r) => {
                     log::info!("nexium-nvdrv: Vulkan Renderer initialized");
                     self.gpu

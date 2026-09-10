@@ -8559,6 +8559,14 @@ fn igbp_handle_transact(
                                     );
                                 }
                             }
+                            if submit_native_gpu_present(
+                                &renderer,
+                                exact_present_source.map(|(_, token)| (token.source, token.source_stamp, token.source_may_advance))
+                                    .or_else(|| direct_present.map(|(key, stamp)| (key, stamp, false))),
+                                present_width, present_height, transform, queue_crop, pace_until, &stats,
+                            ) {
+                                return;
+                            }
                             submit_ordered_gpu_present(
                                 move |read_rect| {
                                     if let Some((_, token)) = exact_present_source {
@@ -9027,7 +9035,12 @@ fn igbp_handle_transact(
                                 );
                             }
                         }
-                        let emitted = submit_ordered_gpu_present(
+                        let emitted = submit_native_gpu_present(
+                            &r_async,
+                            exact_present_source.map(|(_, token)| (token.source, token.source_stamp, token.source_may_advance))
+                                .or_else(|| direct_present.map(|(key, stamp)| (key, stamp, false))),
+                            pw, ph, transform, queue_crop, pace_until, &stats,
+                        ) || submit_ordered_gpu_present(
                             move |read_rect| {
                                 if let Some((_, token)) = exact_present_source {
                                     if token.source_may_advance {
@@ -9874,6 +9887,37 @@ fn present_read_rect(width: u32, height: u32) -> Option<[u32; 4]> {
             [x0, y0, w, h]
         }
     })
+}
+
+fn submit_native_gpu_present(
+    renderer: &nexium_gpu::Renderer,
+    source: Option<(nexium_gpu::rt_cache::RtKey, u64, bool)>,
+    width: u32,
+    height: u32,
+    transform: u32,
+    crop: Option<(u32, u32, u32, u32)>,
+    present_at: Option<std::time::Instant>,
+    stats: &nexium_nvdrv::PipelineStats,
+) -> bool {
+    if legacy_present_enabled() { return false; }
+    let Some((key, stamp, may_advance)) = source else { return false; };
+    let parameters = nexium_gpu::presentation::PresentParameters {
+        read_rect: present_read_rect(width, height),
+        crop: crop.map(|(x, y, w, h)| [x, y, w, h]),
+        flip_y: should_flip_vulkan_present(width, height),
+        transform,
+        present_at: present_at.unwrap_or_else(std::time::Instant::now),
+    };
+    match renderer.present_image(key, stamp, may_advance, parameters) {
+        Ok(true) => {
+            use std::sync::atomic::Ordering;
+            stats.frames_submitted.fetch_add(1, Ordering::Relaxed);
+            stats.frames_drained.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Ok(false) => false,
+        Err(error) => { log::error!("[vulkan-present] frame submission failed: {error}"); false }
+    }
 }
 
 fn submit_present_frame(

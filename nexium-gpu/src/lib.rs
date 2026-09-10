@@ -7,6 +7,7 @@ pub mod descriptor;
 pub mod deswizzle;
 pub mod draw;
 pub mod pipeline;
+pub mod presentation;
 pub mod pitch_oracle;
 pub mod renderer;
 pub mod rt_cache;

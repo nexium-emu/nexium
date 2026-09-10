@@ -12,6 +12,7 @@ nexium-core = { workspace = true, default-features = false }
 nexium-cpu = { workspace = true, default-features = false }
 nexium-kernel = { workspace = true, default-features = false }
 nexium-nvdrv.workspace = true
+nexium-gpu.workspace = true
 
 parking_lot = "0.12"
 log = "0.4"

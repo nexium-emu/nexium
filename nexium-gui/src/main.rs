@@ -12,6 +12,7 @@ mod depth_emit;
 mod homebrew;
 mod input;
 mod library;
+mod native_game;
 mod performance;
 mod playtime;
 mod profile;
