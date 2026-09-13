@@ -629,6 +629,22 @@ pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
 }
 
 pub fn texture_guest_size_bytes(tic: &TicEntry, layers: u32) -> Option<usize> {
+    if tic.is_block_linear && tic.texture_type == 2 {
+        if tic.mip_levels() != 1 || tic.sample_count()? != 1 {
+            return None;
+        }
+        let (width, height, bpp) = tic.physical_storage_extent(0)?;
+        return checked_block_linear_byte_size_3d_with_block_width(
+            width as usize,
+            height as usize,
+            layers.max(1) as usize,
+            bpp,
+            tic.block_width_log2,
+            tic.block_height_log2,
+            tic.block_depth_log2,
+            tic.tile_width_spacing,
+        );
+    }
     tic.pitch_linear_size(layers).or_else(|| {
         block_linear_mip_layout(tic).map(|layout| layout.guest_size_bytes(layers.max(1)))
     })
@@ -898,6 +914,64 @@ pub fn unswizzle_block_linear(
     )
 }
 
+fn copy_block_linear_row<const SWIZZLE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    linear_row: usize,
+    tiled_row: usize,
+    row_bytes: usize,
+    x_shift: usize,
+    bpp: usize,
+) {
+    let mut byte_x = 0;
+    while row_bytes - byte_x >= 64 {
+        let tiled = tiled_row + ((byte_x >> 6) << x_shift);
+        let linear = linear_row + byte_x;
+        let (source, destination, source_len, destination_len) = if SWIZZLE {
+            (linear, tiled, 64, 304)
+        } else {
+            (tiled, linear, 304, 64)
+        };
+        let Some(source) = src.get(source..source.saturating_add(source_len)) else {
+            break;
+        };
+        let Some(destination) = dst.get_mut(destination..destination.saturating_add(destination_len)) else {
+            break;
+        };
+        if SWIZZLE {
+            destination[0..16].copy_from_slice(&source[0..16]);
+            destination[32..48].copy_from_slice(&source[16..32]);
+            destination[256..272].copy_from_slice(&source[32..48]);
+            destination[288..304].copy_from_slice(&source[48..64]);
+        } else {
+            destination[0..16].copy_from_slice(&source[0..16]);
+            destination[16..32].copy_from_slice(&source[32..48]);
+            destination[32..48].copy_from_slice(&source[256..272]);
+            destination[48..64].copy_from_slice(&source[288..304]);
+        }
+        byte_x += 64;
+    }
+    for byte_x in (byte_x..row_bytes).step_by(16) {
+        let tiled = tiled_row + ((byte_x >> 6) << x_shift)
+            + ((byte_x & 32) << 3) + ((byte_x & 16) << 1);
+        let linear = linear_row + byte_x;
+        let (source, destination) = if SWIZZLE { (linear, tiled) } else { (tiled, linear) };
+        if row_bytes - byte_x >= 16
+            && source <= src.len().saturating_sub(16) && src.len() >= 16
+            && destination <= dst.len().saturating_sub(16) && dst.len() >= 16
+        {
+            dst[destination..destination + 16].copy_from_slice(&src[source..source + 16]);
+        } else {
+            let count = (row_bytes - byte_x).min(16)
+                .min(src.len().saturating_sub(source))
+                .min(dst.len().saturating_sub(destination)) / bpp * bpp;
+            if count != 0 {
+                dst[destination..destination + count].copy_from_slice(&src[source..source + count]);
+            }
+        }
+    }
+}
+
 pub fn unswizzle_block_linear_strided(
     src: &[u8],
     width_px: u32,
@@ -924,6 +998,14 @@ pub fn unswizzle_block_linear_strided(
         let gob_row_in_block = y_in_block / GOB_H;
         let y_in_gob = y_in_block - gob_row_in_block * GOB_H;
         let block_row_offset = block_y * block_row_stride_bytes;
+        if matches!(bpp, 1 | 2 | 4 | 8 | 16) {
+            let tiled_row = block_row_offset + gob_row_in_block * GOB_SIZE
+                + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
+            copy_block_linear_row::<false>(
+                src, &mut dst, y * dst_stride, tiled_row, dst_stride, 9 + block_height_log2 as usize, bpp,
+            );
+            continue;
+        }
         for x in 0..width {
             let byte_x = x * bpp;
             let gob_col = byte_x / GOB_W;
@@ -975,6 +1057,14 @@ pub fn swizzle_block_linear_strided(
         let gob_row_in_block = y_in_block / GOB_H;
         let y_in_gob = y_in_block - gob_row_in_block * GOB_H;
         let block_row_offset = block_y * block_row_stride_bytes;
+        if matches!(bpp, 1 | 2 | 4 | 8 | 16) {
+            let tiled_row = block_row_offset + gob_row_in_block * GOB_SIZE
+                + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
+            copy_block_linear_row::<true>(
+                src, &mut dst, y * src_stride, tiled_row, src_stride, 9 + block_height_log2 as usize, bpp,
+            );
+            continue;
+        }
         for x in 0..width {
             let byte_x = x * bpp;
             let gob_col = byte_x / GOB_W;
@@ -1064,6 +1154,14 @@ pub fn unswizzle_block_linear_3d_with_block_width(
             let offset_y =
                 (block_y / block_height) * block_size + (block_y & block_height_mask) * GOB_SIZE;
             let y_in_gob = y & (GOB_H - 1);
+            if matches!(bpp, 1 | 2 | 4 | 8 | 16) {
+                let tiled_row = offset_z + offset_y
+                    + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
+                copy_block_linear_row::<false>(
+                    src, &mut dst, (z * height + y) * dst_stride, tiled_row, dst_stride, x_shift, bpp,
+                );
+                continue;
+            }
             for x in 0..width {
                 let byte_x = x.saturating_mul(bpp);
                 let offset_x = (byte_x / GOB_W) << x_shift;
@@ -1095,22 +1193,37 @@ pub fn swizzle_block_linear_3d(
     block_depth_log2: u32,
     tile_width_spacing: u32,
 ) -> Vec<u8> {
+    swizzle_block_linear_3d_with_buffer(
+        src, width_px, height_px, depth_px, bpp, block_height_log2,
+        block_depth_log2, tile_width_spacing, Vec::new(),
+    )
+}
+
+pub fn swizzle_block_linear_3d_with_buffer(
+    src: &[u8],
+    width_px: u32,
+    height_px: u32,
+    depth_px: u32,
+    bpp: usize,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+    tile_width_spacing: u32,
+    mut dst: Vec<u8>,
+) -> Vec<u8> {
     let width = width_px as usize;
     let height = height_px as usize;
     let depth = depth_px as usize;
     let src_stride = width.saturating_mul(bpp);
-    let mut dst = vec![
-        0u8;
-        block_linear_byte_size_3d(
-            width_px,
-            height_px,
-            depth_px,
-            bpp,
-            block_height_log2,
-            block_depth_log2,
-            tile_width_spacing,
-        )
-    ];
+    let required = block_linear_byte_size_3d(
+        width_px, height_px, depth_px, bpp, block_height_log2,
+        block_depth_log2, tile_width_spacing,
+    );
+    if dst.capacity() < required {
+        dst = vec![0; required];
+    } else {
+        dst.resize(required, 0);
+        dst.fill(0);
+    }
     let gobs_in_x = block_linear_gobs_in_x(
         width,
         height,
@@ -1136,6 +1249,14 @@ pub fn swizzle_block_linear_3d(
             let offset_y =
                 (block_y / block_height) * block_size + (block_y & block_height_mask) * GOB_SIZE;
             let y_in_gob = y & (GOB_H - 1);
+            if matches!(bpp, 1 | 2 | 4 | 8 | 16) {
+                let tiled_row = offset_z + offset_y
+                    + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
+                copy_block_linear_row::<true>(
+                    src, &mut dst, (z * height + y) * src_stride, tiled_row, src_stride, x_shift, bpp,
+                );
+                continue;
+            }
             for x in 0..width {
                 let byte_x = x.saturating_mul(bpp);
                 let offset_x = (byte_x / GOB_W) << x_shift;
@@ -2160,6 +2281,30 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reused_3d_swizzle_clears_padding_and_truncated_texels() {
+        let mut reusable = vec![0xff; 131072];
+        for (width, height, depth, bpp, bh, bd, spacing) in [
+            (57, 50, 64, 16, 2, 2, 0),
+            (19, 13, 5, 4, 1, 1, 2),
+            (31, 9, 3, 3, 0, 0, 0),
+            (2, 1, 1, 16, 0, 0, 0),
+        ] {
+            let size = width as usize * height as usize * depth as usize * bpp;
+            let full: Vec<u8> = (0..size).map(|i| i.wrapping_mul(37) as u8).collect();
+            for length in [size, size.saturating_sub(1), size / 3, 0] {
+                reusable.fill(0xff);
+                let expected = super::swizzle_block_linear_3d(
+                    &full[..length], width, height, depth, bpp, bh, bd, spacing,
+                );
+                reusable = super::swizzle_block_linear_3d_with_buffer(
+                    &full[..length], width, height, depth, bpp, bh, bd, spacing, reusable,
+                );
+                assert_eq!(reusable, expected);
+            }
+        }
+    }
+
     use super::{
         block_linear_byte_size_3d, block_linear_byte_size_3d_with_block_width,
         block_linear_mip_layout, decode_to_rgba8, decode_to_rgba8_typed, maxwell_sample_grid,
