@@ -130,6 +130,7 @@ pub enum ProfileAction {
     SetName(String),
     SetBackdropTheme(crate::app_settings::BackdropTheme),
     SetDockbarTheme(crate::app_settings::DockbarTheme),
+    SetOverlayCorner(crate::app_settings::OverlayCorner),
     SetLightMode(bool),
     SetMusicVolume(f32),
     SetSfxVolume(f32),
@@ -224,6 +225,7 @@ pub fn profile_view(
     scale_factor: f32,
     backdrop_theme: crate::app_settings::BackdropTheme,
     dockbar_theme: crate::app_settings::DockbarTheme,
+    perf_overlay_corner: crate::app_settings::OverlayCorner,
     light_mode: bool,
     music_volume: f32,
     sfx_volume: f32,
@@ -425,7 +427,7 @@ pub fn profile_view(
         ProfileTab::System,
     ];
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
-    const N_SETTINGS: usize = 4;
+    const N_SETTINGS: usize = 5;
     let launch_enter = enter && state.focus_content;
 
     if state.tab == ProfileTab::System && update_clickable && enter {
@@ -511,6 +513,14 @@ pub fn profile_view(
         } else if state.row_selected == 3 && (enter || leave) {
             action = ProfileAction::SetEuDates(!eu_dates);
             crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+        } else if state.row_selected == 4 {
+            if enter {
+                action = ProfileAction::SetOverlayCorner(perf_overlay_corner.next());
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            } else if leave {
+                action = ProfileAction::SetOverlayCorner(perf_overlay_corner.prev());
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
         }
     } else {
         if up {
@@ -656,6 +666,7 @@ pub fn profile_view(
                 state,
                 backdrop_theme,
                 dockbar_theme,
+                perf_overlay_corner,
                 light_mode,
                 music_volume,
                 sfx_volume,
@@ -846,6 +857,7 @@ fn settings_page(
     state: &mut ProfileState,
     backdrop_theme: crate::app_settings::BackdropTheme,
     dockbar_theme: crate::app_settings::DockbarTheme,
+    perf_overlay_corner: crate::app_settings::OverlayCorner,
     light_mode: bool,
     _music_volume: f32,
     _sfx_volume: f32,
@@ -858,10 +870,10 @@ fn settings_page(
     scale_rect: &impl Fn(egui::Rect) -> egui::Rect,
     pal: Pal,
 ) {
-    let row_h = 68.0 * s;
     let row_gap = 12.0 * s;
+    let row_h = (68.0 * s).min(((content.height() - 4.0 * row_gap) / 5.0).max(44.0 * s));
 
-    let rows: [(&str, &str, String); 4] = [
+    let rows: [(&str, &str, String); 5] = [
         (
             "Backdrop Theme",
             "Background style behind the menus",
@@ -889,6 +901,11 @@ fn settings_page(
             } else {
                 "12h".to_string()
             },
+        ),
+        (
+            "FPS Overlay",
+            "Corner where the performance overlay appears",
+            perf_overlay_corner.label().to_string(),
         ),
     ];
 
@@ -920,6 +937,10 @@ fn settings_page(
                 }
                 3 => {
                     *action = ProfileAction::SetEuDates(!eu_dates);
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                }
+                4 => {
+                    *action = ProfileAction::SetOverlayCorner(perf_overlay_corner.next());
                     crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
                 _ => {}
@@ -983,6 +1004,13 @@ fn settings_page(
                     }
                     2 => *action = ProfileAction::SetLightMode(!light_mode),
                     3 => *action = ProfileAction::SetEuDates(!eu_dates),
+                    4 => {
+                        *action = ProfileAction::SetOverlayCorner(if fwd {
+                            perf_overlay_corner.next()
+                        } else {
+                            perf_overlay_corner.prev()
+                        })
+                    }
                     _ => {}
                 }
                 state.focus_content = true;

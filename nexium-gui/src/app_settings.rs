@@ -531,6 +531,8 @@ pub struct AppSettings {
     pub sfx_muted: bool,
     #[serde(default)]
     pub dockbar_theme: DockbarTheme,
+    #[serde(default)]
+    pub perf_overlay_corner: OverlayCorner,
     #[serde(default = "default_left_deadzone")]
     pub left_deadzone: f32,
     #[serde(default = "default_right_deadzone")]
@@ -577,6 +579,55 @@ impl DockbarTheme {
         all[(i + 1) % all.len()]
     }
     pub fn prev(&self) -> DockbarTheme {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OverlayCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Default for OverlayCorner {
+    fn default() -> Self {
+        OverlayCorner::TopLeft
+    }
+}
+
+impl OverlayCorner {
+    pub fn all() -> &'static [OverlayCorner] {
+        &[
+            OverlayCorner::TopLeft,
+            OverlayCorner::TopRight,
+            OverlayCorner::BottomLeft,
+            OverlayCorner::BottomRight,
+        ]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            OverlayCorner::TopLeft => "Top Left",
+            OverlayCorner::TopRight => "Top Right",
+            OverlayCorner::BottomLeft => "Bottom Left",
+            OverlayCorner::BottomRight => "Bottom Right",
+        }
+    }
+    pub fn is_left(&self) -> bool {
+        matches!(self, OverlayCorner::TopLeft | OverlayCorner::BottomLeft)
+    }
+    pub fn is_top(&self) -> bool {
+        matches!(self, OverlayCorner::TopLeft | OverlayCorner::TopRight)
+    }
+    pub fn next(&self) -> OverlayCorner {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+    pub fn prev(&self) -> OverlayCorner {
         let all = Self::all();
         let i = all.iter().position(|x| x == self).unwrap_or(0);
         all[(i + all.len() - 1) % all.len()]
@@ -682,6 +733,7 @@ impl Default for AppSettings {
             menu_music_track: default_menu_music_track(),
             sfx_muted: false,
             dockbar_theme: DockbarTheme::default(),
+            perf_overlay_corner: OverlayCorner::default(),
             left_deadzone: default_left_deadzone(),
             right_deadzone: default_right_deadzone(),
             emulate_mouse: default_emulated_device(),
@@ -831,6 +883,20 @@ mod tests {
             settings.performance_debug,
             PerformanceDebugSettings::default()
         );
+    }
+
+    #[test]
+    fn legacy_settings_json_defaults_overlay_corner() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("perf_overlay_corner");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.perf_overlay_corner, OverlayCorner::TopLeft);
+        assert!(OverlayCorner::TopLeft.is_left() && OverlayCorner::TopLeft.is_top());
+        assert!(!OverlayCorner::BottomRight.is_left() && !OverlayCorner::BottomRight.is_top());
+        assert_eq!(OverlayCorner::BottomRight.next(), OverlayCorner::TopLeft);
+        assert_eq!(OverlayCorner::TopLeft.prev(), OverlayCorner::BottomRight);
+        let json = serde_json::to_string(&OverlayCorner::BottomLeft).unwrap();
+        assert_eq!(serde_json::from_str::<OverlayCorner>(&json).unwrap(), OverlayCorner::BottomLeft);
     }
 
     #[test]

@@ -5845,9 +5845,18 @@ impl HorizonApp {
         let base_bh = 138.0;
         let mut sc = self.perf_scale.clamp(0.7, 3.0);
         let margin = 14.0;
+        let corner = self.app_settings.perf_overlay_corner;
         let default_pos = egui::pos2(
-            full.max.x - base_bw * sc - margin,
-            full.max.y - base_bh * sc - margin,
+            if corner.is_left() {
+                full.min.x + margin
+            } else {
+                full.max.x - base_bw * sc - margin
+            },
+            if corner.is_top() {
+                full.min.y + margin
+            } else {
+                full.max.y - base_bh * sc - margin
+            },
         );
         let mut pos = self.perf_pos.unwrap_or(default_pos);
         let bw = base_bw * sc;
@@ -5909,7 +5918,9 @@ impl HorizonApp {
             full.min.y + 4.0,
             (full.max.y - bh - 4.0).max(full.min.y + 4.0),
         );
-        self.perf_pos = Some(pos);
+        if self.perf_drag || self.perf_pos.is_some() {
+            self.perf_pos = Some(pos);
+        }
         let rect = egui::Rect::from_min_size(pos, egui::vec2(bw, bh));
         self.native_overlay_rect = Some(rect.expand(3.0));
 
@@ -8701,6 +8712,7 @@ impl eframe::App for HorizonApp {
                         profile_scale,
                         self.app_settings.backdrop_theme,
                         self.app_settings.dockbar_theme,
+                        self.app_settings.perf_overlay_corner,
                         self.app_settings.light_mode,
                         self.app_settings.music_volume,
                         self.app_settings.sfx_volume,
@@ -8750,6 +8762,13 @@ impl eframe::App for HorizonApp {
                             crate::profile::ProfileAction::SetDockbarTheme(theme) => {
                                 if self.app_settings.dockbar_theme != theme {
                                     self.app_settings.dockbar_theme = theme;
+                                    let _ = self.app_settings.save();
+                                }
+                            }
+                            crate::profile::ProfileAction::SetOverlayCorner(corner) => {
+                                if self.app_settings.perf_overlay_corner != corner {
+                                    self.app_settings.perf_overlay_corner = corner;
+                                    self.perf_pos = None;
                                     let _ = self.app_settings.save();
                                 }
                             }
