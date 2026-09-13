@@ -141,6 +141,11 @@ impl FfmpegDecoder {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn close_input(&mut self) {
+        self.stdin.take();
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -173,6 +178,13 @@ impl FfmpegDecoder {
         }
         stdin
             .write_all(packet)
+            .and_then(|_| {
+                if self.codec == FfmpegCodec::H264 {
+                    stdin.write_all(&[0, 0, 0, 1, 9, 0xf0])
+                } else {
+                    Ok(())
+                }
+            })
             .and_then(|_| stdin.flush())
             .map_err(|error| format!("ffmpeg write: {}", error))
     }
@@ -248,6 +260,41 @@ mod tests {
             frame[0]
         );
         assert!(frame[256..].iter().all(|&value| value == 128));
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg; set NEXIUM_FFMPEG and run with --ignored"]
+    fn h264_packet_boundary_does_not_add_a_frame_of_delay() {
+        let stream = include_bytes!("../tests/fixtures/h264_b_frames.h264");
+        let offsets: Vec<_> = stream
+            .windows(5)
+            .enumerate()
+            .filter_map(|(index, bytes)| (bytes == [0, 0, 0, 1, 9]).then_some(index))
+            .chain(std::iter::once(stream.len()))
+            .collect();
+        assert_eq!(offsets.len(), 25);
+        let mut decoder = FfmpegDecoder::new(16, 16, FfmpegCodec::H264).unwrap();
+        for (index, range) in offsets.windows(2).enumerate() {
+            decoder.submit(&stream[range[0]..range[1]]).unwrap();
+            if index >= 2 {
+                let frame = decoder
+                    .frames
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or_else(|error| {
+                        panic!("packet {index} needed another delimiter: {error}")
+                    });
+                assert_eq!(frame[0], 32 + 8 * (index - 2) as u8);
+            }
+        }
+        decoder.close_input();
+        for index in 22..24 {
+            let frame = decoder.frames.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(frame[0], 32 + 8 * index);
+        }
+        assert_eq!(
+            decoder.frames.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
     }
 
     #[test]

@@ -9,11 +9,14 @@ use std::time::Duration;
 pub const FRAME_CACHE_CAPACITY: usize = 32;
 const PENDING_TARGET_WARNING_THRESHOLD: usize = 64;
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const H264_OUTPUT_WAIT_BUDGET: Duration = Duration::from_millis(4);
 
 #[derive(Default)]
 pub struct VideoFrameCacheState {
     frames: HashMap<u64, OwnedI420Frame>,
     order: VecDeque<u64>,
+    pending: HashMap<u64, (u64, PacketDetail)>,
+    next_generation: u64,
 }
 
 impl VideoFrameCacheState {
@@ -31,6 +34,30 @@ impl VideoFrameCacheState {
     pub fn remove(&mut self, luma_iova: u64) {
         self.frames.remove(&luma_iova);
         self.order.retain(|key| *key != luma_iova);
+    }
+
+    pub fn take(&mut self, luma_iova: u64) -> Option<OwnedI420Frame> {
+        self.order.retain(|key| *key != luma_iova);
+        self.frames.remove(&luma_iova)
+    }
+
+    fn begin_decode(&mut self, luma_iova: u64, detail: PacketDetail) -> u64 {
+        self.remove(luma_iova);
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.pending
+            .insert(luma_iova, (self.next_generation, detail));
+        self.next_generation
+    }
+
+    fn publish_decoded(&mut self, luma_iova: u64, generation: u64, frame: OwnedI420Frame) {
+        if self.pending.get(&luma_iova).map(|pending| pending.0) == Some(generation) {
+            self.pending.remove(&luma_iova);
+            self.insert(luma_iova, frame);
+        }
+    }
+
+    pub fn expire_decode(&mut self, luma_iova: u64) {
+        self.pending.remove(&luma_iova);
     }
 
     pub fn get_cloned(&self, luma_iova: u64) -> Option<OwnedI420Frame> {
@@ -73,11 +100,14 @@ pub enum PacketDetail {
     H264 {
         picture_index: u32,
         guest_frame: u32,
+        picture_order: i32,
+        is_idr: bool,
     },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingFrameTarget {
+    generation: u64,
     luma_iova: u64,
     packet_len: usize,
     detail: PacketDetail,
@@ -93,10 +123,30 @@ fn queue_frame_target(
         return;
     }
     targets.push_back(PendingFrameTarget {
+        generation: 0,
         luma_iova,
         packet_len,
         detail,
     });
+}
+
+fn pop_frame_target(targets: &mut VecDeque<PendingFrameTarget>) -> Option<PendingFrameTarget> {
+    if !matches!(targets.front()?.detail, PacketDetail::H264 { .. }) {
+        return targets.pop_front();
+    }
+    let boundary = targets
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, target)| {
+            matches!(target.detail, PacketDetail::H264 { is_idr: true, .. }).then_some(index)
+        })
+        .unwrap_or(targets.len());
+    let index = (0..boundary).min_by_key(|index| match targets[*index].detail {
+        PacketDetail::H264 { picture_order, .. } => picture_order,
+        _ => i32::MAX,
+    })?;
+    targets.remove(index)
 }
 
 pub enum DecodeWork {
@@ -119,7 +169,7 @@ pub enum DecodeWork {
 }
 
 enum Message {
-    Work(DecodeWork),
+    Work(DecodeWork, Option<u64>),
     Shutdown,
 }
 
@@ -142,7 +192,7 @@ impl DecodeWorkerState {
         }
     }
 
-    fn handle(&mut self, work: DecodeWork) {
+    fn handle(&mut self, work: DecodeWork, generation: Option<u64>) {
         match work {
             DecodeWork::Configure {
                 fd,
@@ -156,7 +206,7 @@ impl DecodeWorkerState {
                 packet,
                 target_luma_iova,
                 detail,
-            } => self.decode_packet(fd, &packet, target_luma_iova, detail),
+            } => self.decode_packet(fd, &packet, target_luma_iova, detail, generation),
             DecodeWork::Release { fd } => {
                 self.channels.remove(&fd);
             }
@@ -210,11 +260,18 @@ impl DecodeWorkerState {
         packet: &[u8],
         target_luma_iova: u64,
         detail: PacketDetail,
+        generation: Option<u64>,
     ) {
         let healthy = match self.channels.get_mut(&fd) {
-            Some(channel) => {
-                decode_into_cache(&self.cache, fd, channel, packet, target_luma_iova, detail)
-            }
+            Some(channel) => decode_into_cache(
+                &self.cache,
+                fd,
+                channel,
+                packet,
+                target_luma_iova,
+                detail,
+                generation,
+            ),
             None => return,
         };
         if !healthy {
@@ -249,9 +306,15 @@ fn decode_into_cache(
     packet: &[u8],
     target_luma_iova: u64,
     detail: PacketDetail,
+    generation: Option<u64>,
 ) -> bool {
     let previous_count = channel.targets.len();
     queue_frame_target(&mut channel.targets, target_luma_iova, packet.len(), detail);
+    if channel.targets.len() > previous_count {
+        let generation = generation
+            .unwrap_or_else(|| lock_frame_cache(cache).begin_decode(target_luma_iova, detail));
+        channel.targets.back_mut().unwrap().generation = generation;
+    }
     if previous_count == PENDING_TARGET_WARNING_THRESHOLD && channel.targets.len() > previous_count
     {
         log::warn!(
@@ -279,7 +342,7 @@ fn drain_channel_outputs(cache: &VideoFrameCache, fd: u32, channel: &mut Channel
                 return false;
             }
         };
-        let Some(target) = channel.targets.pop_front() else {
+        let Some(target) = pop_frame_target(&mut channel.targets) else {
             log::warn!(
                 "[video-decode] fd={} ffmpeg produced an unassociated frame",
                 fd
@@ -293,7 +356,7 @@ fn drain_channel_outputs(cache: &VideoFrameCache, fd: u32, channel: &mut Channel
                 return false;
             }
         };
-        lock_frame_cache(cache).insert(target.luma_iova, frame);
+        lock_frame_cache(cache).publish_decoded(target.luma_iova, target.generation, frame);
         log_decoded_frame(
             fd,
             width,
@@ -317,7 +380,7 @@ fn log_decoded_frame(
 ) {
     static DECODED_FRAMES: AtomicU64 = AtomicU64::new(0);
     let frame_index = DECODED_FRAMES.fetch_add(1, Ordering::Relaxed);
-    if frame_index >= 32 && frame_index % 300 != 0 {
+    if frame_index >= 32 && frame_index % 300 != 0 && !crate::video_trace_enabled() {
         return;
     }
     match detail {
@@ -335,8 +398,10 @@ fn log_decoded_frame(
         PacketDetail::H264 {
             picture_index,
             guest_frame,
+            picture_order,
+            ..
         } => log::info!(
-            "[video-decode] frame={} fd={} {}x{} bytes={} luma_iova={:#x} picture={} guest_frame={}",
+            "[video-decode] frame={} fd={} {}x{} bytes={} luma_iova={:#x} picture={} guest_frame={} poc={}",
             frame_index,
             fd,
             width,
@@ -344,7 +409,8 @@ fn log_decoded_frame(
             packet_len,
             luma_iova,
             picture_index,
-            guest_frame
+            guest_frame,
+            picture_order
         ),
     }
 }
@@ -365,7 +431,7 @@ fn worker_loop(rx: Receiver<Message>, cache: VideoFrameCache) {
             }
         };
         match message {
-            Some(Message::Work(work)) => state.handle(work),
+            Some(Message::Work(work, generation)) => state.handle(work, generation),
             Some(Message::Shutdown) => return,
             None => {}
         }
@@ -404,16 +470,50 @@ impl VideoDecoder {
         &self.cache
     }
 
+    pub fn wait_for_frame(&self, luma_iova: u64, timeout: Duration) -> Option<OwnedI420Frame> {
+        let started = std::time::Instant::now();
+        let requested_deadline = started + timeout;
+        let h264_deadline = started + timeout.min(H264_OUTPUT_WAIT_BUDGET);
+        loop {
+            let deadline = {
+                let mut cache = lock_frame_cache(self.cache());
+                if let Some(frame) = cache.take(luma_iova) {
+                    return Some(frame);
+                }
+                match cache.pending.get(&luma_iova) {
+                    Some((_, PacketDetail::Vp9 { .. })) => requested_deadline,
+                    Some((_, PacketDetail::H264 { .. })) => h264_deadline,
+                    None => return None,
+                }
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            std::thread::sleep(remaining.min(OUTPUT_POLL_INTERVAL));
+        }
+    }
+
     pub fn submit(&self, work: DecodeWork) {
+        let generation = match &work {
+            DecodeWork::Packet {
+                target_luma_iova,
+                detail,
+                ..
+            } if !matches!(detail, PacketDetail::Vp9 { show_frame: false }) => {
+                Some(lock_frame_cache(&self.cache).begin_decode(*target_luma_iova, *detail))
+            }
+            _ => None,
+        };
         match self.dispatch() {
             Dispatch::Worker { tx, .. } => {
-                let _ = tx.send(Message::Work(work));
+                let _ = tx.send(Message::Work(work, generation));
             }
             Dispatch::Inline(state) => {
                 let mut state = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.handle(work);
+                state.handle(work, generation);
                 state.drain_outputs();
             }
         }
@@ -493,6 +593,148 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FFmpeg; set NEXIUM_FFMPEG and run with --ignored"]
+    fn h264_b_frames_keep_their_guest_output_surfaces() {
+        const STREAM: &[u8] = include_bytes!("../tests/fixtures/h264_b_frames.h264");
+        let offsets: Vec<_> = STREAM
+            .windows(5)
+            .enumerate()
+            .filter_map(|(i, word)| (word == [0, 0, 0, 1, 9]).then_some(i))
+            .chain(std::iter::once(STREAM.len()))
+            .collect();
+        let order = [
+            0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18, 22, 32, 28, 26, 30, 40, 36, 34, 38, 46, 42,
+            44,
+        ];
+        assert_eq!(offsets.len(), order.len() + 1);
+        let cache = new_frame_cache();
+        let mut channel = ChannelDecoder {
+            decoder: FfmpegDecoder::new(16, 16, FfmpegCodec::H264).unwrap(),
+            failed: Arc::new(AtomicBool::new(false)),
+            targets: VecDeque::new(),
+        };
+        for (i, packet) in offsets.windows(2).enumerate() {
+            assert!(decode_into_cache(
+                &cache,
+                1,
+                &mut channel,
+                &STREAM[packet[0]..packet[1]],
+                0x1000 + i as u64 * 0x100,
+                PacketDetail::H264 {
+                    picture_index: i as u32,
+                    guest_frame: i as u32,
+                    picture_order: order[i],
+                    is_idr: i == 0,
+                },
+                None
+            ));
+        }
+        channel.decoder.close_input();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !channel.targets.is_empty() && std::time::Instant::now() < deadline {
+            let healthy = drain_channel_outputs(&cache, 1, &mut channel);
+            if !healthy {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(channel.targets.is_empty());
+        for (i, poc) in order.into_iter().enumerate() {
+            let frame = lock_frame_cache(&cache)
+                .get_cloned(0x1000 + i as u64 * 0x100)
+                .unwrap();
+            assert_eq!(
+                frame.y()[0],
+                (32 + 4 * poc) as u8,
+                "decoded packet {i} poc={poc}"
+            );
+        }
+    }
+
+    #[test]
+    fn h264_picture_order_reset_keeps_prior_sequence_first() {
+        let mut targets = VecDeque::new();
+        for (index, order) in [0, 8, 4, 2, 6, 0, 6, 2, 4].into_iter().enumerate() {
+            queue_frame_target(
+                &mut targets,
+                index as u64,
+                1,
+                PacketDetail::H264 {
+                    picture_index: index as u32,
+                    guest_frame: index as u32,
+                    picture_order: order,
+                    is_idr: index == 0 || index == 5,
+                },
+            );
+        }
+        let received: Vec<_> = std::iter::from_fn(|| pop_frame_target(&mut targets))
+            .map(|target| target.luma_iova)
+            .collect();
+        assert_eq!(received, [0, 3, 2, 4, 1, 5, 7, 8, 6]);
+    }
+
+    #[test]
+    fn vic_waits_for_its_requested_surface_instead_of_a_newer_frame() {
+        let decoder = VideoDecoder::new();
+        lock_frame_cache(decoder.cache()).insert(0x2000, test_frame(4, 4));
+        let cache = decoder.cache().clone();
+        let generation =
+            lock_frame_cache(&cache).begin_decode(0x1000, PacketDetail::Vp9 { show_frame: true });
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_ready = ready.clone();
+        let worker = std::thread::spawn(move || {
+            writer_ready.wait();
+            std::thread::sleep(Duration::from_millis(5));
+            lock_frame_cache(&cache).publish_decoded(0x1000, generation, test_frame(2, 2));
+        });
+        ready.wait();
+        let requested = decoder
+            .wait_for_frame(0x1000, Duration::from_secs(1))
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(requested.width(), 2);
+        assert!(decoder.wait_for_frame(0x3000, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn h264_wait_does_not_block_the_packets_needed_for_reordering() {
+        let decoder = VideoDecoder::new();
+        lock_frame_cache(decoder.cache()).begin_decode(
+            0x1000,
+            PacketDetail::H264 {
+                picture_index: 0,
+                guest_frame: 0,
+                picture_order: 0,
+                is_idr: true,
+            },
+        );
+        let started = std::time::Instant::now();
+        assert!(decoder
+            .wait_for_frame(0x1000, Duration::from_secs(1))
+            .is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn reused_video_surface_rejects_late_prior_decode() {
+        let mut cache = VideoFrameCacheState::default();
+        let first = cache.begin_decode(0x1000, PacketDetail::Vp9 { show_frame: true });
+        let second = cache.begin_decode(0x1000, PacketDetail::Vp9 { show_frame: true });
+        cache.publish_decoded(0x1000, first, test_frame(2, 2));
+        assert!(cache.get_cloned(0x1000).is_none());
+        cache.publish_decoded(0x1000, second, test_frame(4, 4));
+        assert_eq!(cache.take(0x1000).unwrap().width(), 4);
+        assert!(cache.get_cloned(0x1000).is_none());
+        let expired = cache.begin_decode(0x1000, PacketDetail::Vp9 { show_frame: true });
+        cache.expire_decode(0x1000);
+        cache.publish_decoded(0x1000, expired, test_frame(2, 2));
+        assert!(cache.get_cloned(0x1000).is_none());
+        let current = cache.begin_decode(0x1000, PacketDetail::Vp9 { show_frame: true });
+        cache.publish_decoded(0x1000, current, test_frame(6, 6));
+        assert_eq!(cache.take(0x1000).unwrap().width(), 6);
+    }
+
+    #[test]
     fn invisible_vp9_packets_do_not_shift_visible_output_surfaces() {
         let mut targets = VecDeque::new();
         for (luma_iova, show_frame) in [
@@ -531,6 +773,8 @@ mod tests {
                 PacketDetail::H264 {
                     picture_index: index as u32,
                     guest_frame: index as u32 + 100,
+                    picture_order: index as i32,
+                    is_idr: index == 0,
                 },
             );
         }
@@ -544,6 +788,8 @@ mod tests {
                 PacketDetail::H264 {
                     picture_index: index as u32,
                     guest_frame: index as u32 + 100,
+                    picture_order: index as i32,
+                    is_idr: index == 0,
                 }
             );
         }

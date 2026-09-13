@@ -2841,8 +2841,12 @@ impl Nvdrv {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) -> IoctlOutcome {
+        let reuses_video_mappings = matches!(device, NvDevice::NvhostNvdec | NvDevice::NvhostVic)
+            && cmd == 0x0009
+            && self.channel_map_reuses_addresses(req);
         if self.gpu_async.is_some()
             && ioctl_requires_async_gpu_drain(device, cmd)
+            && !reuses_video_mappings
             && !self.wait_gpu_idle_checked()
         {
             log::error!(
@@ -2865,6 +2869,17 @@ impl Nvdrv {
             }
             _ => IoctlOutcome::ok(vec![0u8; req.out_size]),
         }
+    }
+
+    fn channel_map_reuses_addresses(&self, req: &IoctlRequest) -> bool {
+        let requested = read_u32(&req.in_data, 0).unwrap_or(0) as usize;
+        let parsed = req.in_data.len().saturating_sub(0x0c) / 8;
+        (0..requested.min(parsed)).all(|index| {
+            let handle_id = read_u32(&req.in_data, 0x0c + index * 8).unwrap_or(0);
+            self.nvmap_handles
+                .get(&handle_id)
+                .is_some_and(|handle| handle.channel_map_address != 0)
+        })
     }
 
     fn pin_channel_buffer(&mut self, handle_id: u32) -> u32 {
@@ -3136,6 +3151,9 @@ impl Nvdrv {
                 None
             };
 
+        let is_idr = packet
+            .windows(4)
+            .any(|word| word[..3] == [0, 0, 1] && word[3] & 31 == 5);
         if let Some((width, height)) = ffmpeg_dims {
             let config = (video_ffmpeg::FfmpegCodec::H264, width, height);
             if runtime.ffmpeg_config != Some(config) {
@@ -3157,6 +3175,13 @@ impl Nvdrv {
                     detail: video_decode_thread::PacketDetail::H264 {
                         picture_index: picture_index as u32,
                         guest_frame: context.parameter_set.frame_number,
+                        picture_order: if context.parameter_set.field_picture {
+                            context.field_order_count
+                                [usize::from(context.parameter_set.bottom_field)]
+                        } else {
+                            context.field_order_count[0].min(context.field_order_count[1])
+                        },
+                        is_idr,
                     },
                 });
             return;
@@ -3209,7 +3234,7 @@ impl Nvdrv {
 
         static DECODED_FRAMES: AtomicU64 = AtomicU64::new(0);
         let frame_index = DECODED_FRAMES.fetch_add(1, Ordering::Relaxed);
-        if frame_index < 32 || frame_index % 300 == 0 {
+        if frame_index < 32 || frame_index % 300 == 0 || video_trace_enabled() {
             log::info!(
                 "[video-decode] frame={} fd={} {}x{} bytes={} luma_iova={:#x} picture={} guest_frame={}",
                 frame_index,
@@ -3470,16 +3495,19 @@ impl Nvdrv {
             }
         }
 
-        let selected = {
-            let cache = video_decode_thread::lock_frame_cache(self.video_decoder.cache());
-            match cache.get_cloned(input_luma_iova) {
-                Some(frame) => Some((input_luma_iova, true, frame)),
-                None => cache
-                    .latest_cloned()
-                    .map(|(fallback_key, frame)| (fallback_key, false, frame)),
-            }
-        };
-        let Some((frame_key, exact_frame, frame)) = selected else {
+        let selected = self
+            .video_decoder
+            .wait_for_frame(input_luma_iova, std::time::Duration::from_millis(30))
+            .map(|frame| (true, frame))
+            .or_else(|| {
+                let mut cache = video_decode_thread::lock_frame_cache(self.video_decoder.cache());
+                if let Some(frame) = cache.take(input_luma_iova) {
+                    return Some((true, frame));
+                }
+                cache.expire_decode(input_luma_iova);
+                cache.latest_cloned().map(|(_, frame)| (false, frame))
+            });
+        let Some((exact_frame, frame)) = selected else {
             log::warn!(
                 "[video-vic] fd={} no decoded frame for input luma={:#x}",
                 fd,
@@ -3611,14 +3639,9 @@ impl Nvdrv {
             return;
         }
 
-        if output_is_nv12 || exact_frame {
-            let mut cache = video_decode_thread::lock_frame_cache(self.video_decoder.cache());
-            if exact_frame {
-                cache.remove(frame_key);
-            }
-            if output_is_nv12 {
-                cache.insert(output_luma_iova, frame);
-            }
+        if output_is_nv12 {
+            video_decode_thread::lock_frame_cache(self.video_decoder.cache())
+                .insert(output_luma_iova, frame);
         }
 
         let first_output = mapped_writes[0].0.address;
@@ -3633,7 +3656,7 @@ impl Nvdrv {
             .unwrap_or(&[]);
         static CONVERTED_FRAMES: AtomicU64 = AtomicU64::new(0);
         let frame_index = CONVERTED_FRAMES.fetch_add(1, Ordering::Relaxed);
-        if frame_index < 32 || frame_index % 300 == 0 {
+        if frame_index < 32 || frame_index % 300 == 0 || video_trace_enabled() {
             log::info!(
                 "[video-vic] frame={} fd={} input={:#x} exact={} output=[{:#x},{:#x}] aliases={:?}/{:?} format={} block={:?}/{} {}x{} target={:?} source={:?} dest={:?}",
                 frame_index,
@@ -8512,6 +8535,55 @@ mod tests {
         assert_eq!(&unmapped.data[..0x14], &[0u8; 0x14]);
         assert_eq!(&unmapped.data[0x14..], &input[0x14..]);
         assert_eq!(nvdrv.nvmap_handles[&497].channel_pin_count, 0);
+    }
+
+    #[test]
+    fn repeated_video_mapping_preserves_addresses_and_mapping_generation() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-nvdec").unwrap();
+        nvdrv
+            .nvmap_handles
+            .insert(497, test_nvmap_handle(497, 0x8000, 0x4a07_f000_00));
+        nvdrv
+            .nvmap_handles
+            .insert(498, test_nvmap_handle(498, 0x8000, 0x4a07_f100_00));
+        let mut input = vec![0u8; 0x0c + 2 * 8];
+        write_u32(&mut input, 0, 1);
+        write_u32(&mut input, 0x0c, 497);
+        write_u32(&mut input, 0x14, 498);
+        let map_request = || request(fd, 0xc01c_0009, input.clone(), input.len());
+        assert!(!nvdrv.channel_map_reuses_addresses(&map_request()));
+        let first = nvdrv.dispatch_ioctl(map_request());
+        let generation = nvdrv.gpu.mappings.read().generation();
+        assert!(nvdrv.channel_map_reuses_addresses(&map_request()));
+        let second = nvdrv.dispatch_ioctl(map_request());
+        assert_eq!(first.data, second.data);
+        assert_eq!(nvdrv.gpu.mappings.read().generation(), generation);
+        assert_eq!(nvdrv.nvmap_handles[&497].channel_pin_count, 2);
+        nvdrv.unpin_channel_buffer(497);
+        nvdrv.unpin_channel_buffer(497);
+        assert!(nvdrv.channel_map_reuses_addresses(&map_request()));
+        write_u32(&mut input, 0, 2);
+        assert!(!nvdrv.channel_map_reuses_addresses(&request(
+            fd,
+            0xc01c_0009,
+            input.clone(),
+            input.len()
+        )));
+        nvdrv.dispatch_ioctl(request(fd, 0xc01c_0009, input.clone(), input.len()));
+        assert!(nvdrv.channel_map_reuses_addresses(&request(
+            fd,
+            0xc01c_0009,
+            input.clone(),
+            input.len()
+        )));
+        write_u32(&mut input, 0x14, 999);
+        assert!(!nvdrv.channel_map_reuses_addresses(&request(
+            fd,
+            0xc01c_0009,
+            input.clone(),
+            input.len()
+        )));
     }
 
     #[test]

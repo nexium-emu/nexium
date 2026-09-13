@@ -129,6 +129,7 @@ pub struct H264ParameterSet {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct H264DecoderContext {
     pub stream_len: u32,
+    pub field_order_count: [i32; 2],
     pub parameter_set: H264ParameterSet,
     pub weight_scale_4x4: [u8; 0x60],
     pub weight_scale_8x8: [u8; 0x80],
@@ -192,6 +193,7 @@ impl H264DecoderContext {
 
         Ok(Self {
             stream_len: read_u32(bytes, STREAM_LEN_OFFSET),
+            field_order_count: [read_i32(bytes, 0xb8), read_i32(bytes, 0xbc)],
             parameter_set,
             weight_scale_4x4,
             weight_scale_8x8,
@@ -673,7 +675,10 @@ mod tests {
         flags |= (0x3bu64 << 16) | (0x1du64 << 22) | (0x1cu64 << 27);
         put_u64(&mut bytes, PARAMETER_FLAGS_OFFSET, flags);
 
+        put_i32(&mut bytes, 0xb8, -2);
+        put_i32(&mut bytes, 0xbc, 3);
         let parsed = H264DecoderContext::parse(&bytes).unwrap();
+        assert_eq!(parsed.field_order_count, [-2, 3]);
         assert_eq!(parsed.stream_len, 0x5678);
         assert_eq!(parsed.parameter_set.log2_max_pic_order_cnt_lsb_minus4, 7);
         assert_eq!(parsed.parameter_set.pitch_luma, 0x1020_3040);
