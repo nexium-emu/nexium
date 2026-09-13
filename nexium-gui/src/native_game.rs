@@ -96,22 +96,23 @@ impl NativeGameWindow {
         target
     }
 
-    pub fn poll(&mut self) -> bool {
+    pub fn poll(&mut self) -> u64 {
         let Some(target) = &self.target else {
-            return false;
+            return 0;
         };
         if let Some(error) = target.take_error() {
             log::error!("Native game presentation stopped: {error}");
             self.active = false;
         }
         let (sequence, width, height) = target.progress();
-        if sequence == self.sequence {
-            return false;
+        let new_frames = sequence.saturating_sub(self.sequence);
+        if new_frames == 0 {
+            return 0;
         }
         self.sequence = sequence;
         self.dimensions = [width, height];
         self.active = true;
-        true
+        new_frames
     }
 
     pub fn update(

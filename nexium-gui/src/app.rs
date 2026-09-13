@@ -130,7 +130,10 @@ fn status_icon(ui: &mut egui::Ui, icon: StatusIcon, color: Color32) -> egui::Res
     resp
 }
 
-fn gui_rate_stats(kind: usize) {
+const PERF_GRAPH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const PERF_READOUT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn gui_rate_stats(kind: usize, count: u64) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("NEXIUM_GUI_PROFILE").is_some()) {
@@ -139,7 +142,7 @@ fn gui_rate_stats(kind: usize) {
     static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     static LAST: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
         std::sync::OnceLock::new();
-    COUNTS[kind.min(2)].fetch_add(1, Ordering::Relaxed);
+    COUNTS[kind.min(2)].fetch_add(count, Ordering::Relaxed);
     let last = LAST.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
     let Ok(mut guard) = last.try_lock() else {
         return;
@@ -366,6 +369,9 @@ pub struct HorizonApp {
     perf_grab_off: egui::Vec2,
     perf_hist: Vec<f32>,
     perf_scale: f32,
+    perf_sampled: Option<std::time::Instant>,
+    perf_readout_at: Option<std::time::Instant>,
+    perf_readout: (f32, f32, u64, u64),
     last_frame_res: (u32, u32),
     music_was_on: bool,
     music_fade_start: Option<std::time::Instant>,
@@ -633,6 +639,9 @@ impl HorizonApp {
             perf_grab_off: egui::Vec2::ZERO,
             perf_hist: Vec::new(),
             perf_scale: 1.0,
+            perf_sampled: None,
+            perf_readout_at: None,
+            perf_readout: (0.0, 0.0, 0, 0),
             last_frame_res: (0, 0),
             music_was_on: false,
             music_fade_start: None,
@@ -1124,11 +1133,13 @@ impl HorizonApp {
     }
 
     fn poll_frames(&mut self, ctx: &egui::Context) {
+        self.performance.tick();
         if let Some(window) = &mut self.native_game {
-            if window.poll() {
+            let new_frames = window.poll();
+            if new_frames != 0 {
                 self.game_depth = None;
-                gui_rate_stats(1);
-                self.performance.record_frame();
+                gui_rate_stats(1, new_frames);
+                self.performance.record_frames(new_frames);
                 self.last_frame_res = (window.dimensions[0], window.dimensions[1]);
                 self.carousel.boot_stage = crate::carousel::BootStage::None;
                 if self.game_texture.is_none() {
@@ -1155,7 +1166,7 @@ impl HorizonApp {
         };
         if let Some(mut frame) = take_next_game_frame(&handle.frame_rx) {
             if let Some(window) = &mut self.native_game { window.active = false; }
-            gui_rate_stats(1);
+            gui_rate_stats(1, 1);
             self.performance.record_frame();
             self.last_frame_res = (frame.width, frame.height);
             log::trace!(
@@ -5776,22 +5787,37 @@ impl HorizonApp {
     }
 
     fn draw_perf_overlay(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        let fps = self.performance.get_fps();
-        self.perf_hist.push(fps);
+        let now = std::time::Instant::now();
         let cap = 140usize;
-        if self.perf_hist.len() > cap {
-            let n = self.perf_hist.len() - cap;
-            self.perf_hist.drain(0..n);
+        if self
+            .perf_sampled
+            .map_or(true, |at| now.duration_since(at) >= PERF_GRAPH_INTERVAL)
+        {
+            self.perf_sampled = Some(now);
+            self.perf_hist.push(self.performance.get_fps());
+            if self.perf_hist.len() > cap {
+                let n = self.perf_hist.len() - cap;
+                self.perf_hist.drain(0..n);
+            }
         }
-        let ft = self.performance.get_frame_time();
-        let (svc, cyc) = self
-            .emulation_handle
-            .as_ref()
-            .map(|h| {
-                let s = h.stats.lock();
-                (s.svc_count, s.cycle_count)
-            })
-            .unwrap_or((0, 0));
+        if self
+            .perf_readout_at
+            .map_or(true, |at| now.duration_since(at) >= PERF_READOUT_INTERVAL)
+        {
+            self.perf_readout_at = Some(now);
+            let (svc, cyc) = self
+                .emulation_handle
+                .as_ref()
+                .and_then(|h| h.stats.try_lock().map(|s| (s.svc_count, s.cycle_count)))
+                .unwrap_or((self.perf_readout.2, self.perf_readout.3));
+            self.perf_readout = (
+                self.performance.get_fps(),
+                self.performance.get_frame_time(),
+                svc,
+                cyc,
+            );
+        }
+        let (fps, ft, svc, cyc) = self.perf_readout;
         let (rw, rh) = self.last_frame_res;
         let (mut fmin, mut fmax) = (f32::MAX, 0.0f32);
         for &v in &self.perf_hist {
@@ -7849,7 +7875,7 @@ impl eframe::App for HorizonApp {
             dropped += 1;
         }
         if dropped != 0 {
-            gui_rate_stats(2);
+            gui_rate_stats(2, dropped);
             static NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = NOTED.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
             if n == 0 {
@@ -7871,7 +7897,7 @@ impl eframe::App for HorizonApp {
             }
             return;
         }
-        gui_rate_stats(0);
+        gui_rate_stats(0, 1);
         let frame_driven_game = self
             .emulation_handle
             .as_ref()
