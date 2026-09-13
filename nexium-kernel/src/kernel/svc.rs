@@ -2636,31 +2636,42 @@ fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
     } else {
         return 1;
     };
+    const HEAP_SIZE_ALIGNMENT: u64 = 0x20_0000;
+    const MAIN_MEMORY_SIZE_MAX: u64 = 0x2_0000_0000;
+    const KERNEL_HEAP_INVALID_SIZE: u32 = 1 | (101 << 9);
+    const KERNEL_LIMIT_REACHED: u32 = 1 | (132 << 9);
+    const KERNEL_OUT_OF_MEMORY: u32 = 1 | (104 << 9);
+    let fail = |code: u32| {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, code as u64);
+        }
+        code
+    };
+    if size % HEAP_SIZE_ALIGNMENT != 0 || size >= MAIN_MEMORY_SIZE_MAX {
+        log::warn!("svcSetHeapSize rejected invalid size {:#x}", size);
+        return fail(KERNEL_HEAP_INVALID_SIZE);
+    }
     if size > kernel.heap_size {
         log::warn!(
-            "svcSetHeapSize requested {:#x} > mapped heap {:#x}; clamping (guest may fault on overflow)",
+            "svcSetHeapSize requested {:#x} > physical memory limit {:#x}; returning LimitReached",
             size,
             kernel.heap_size
         );
+        return fail(KERNEL_LIMIT_REACHED);
     }
-    let committed = size.min(kernel.heap_size);
     if let Err(error) = kernel
         .address_space
-        .resize_committed(kernel.heap_base, committed)
+        .resize_committed(kernel.heap_base, size)
     {
-        const KERNEL_OUT_OF_MEMORY: u32 = 1 | (104 << 9);
         log::error!(
             "svcSetHeapSize failed to resize heap @ {:#x} to {:#x}: {}",
             kernel.heap_base,
-            committed,
+            size,
             error
         );
-        if let Some(cpu) = cpu_mut() {
-            cpu.set_register(0, KERNEL_OUT_OF_MEMORY as u64);
-        }
-        return KERNEL_OUT_OF_MEMORY;
+        return fail(KERNEL_OUT_OF_MEMORY);
     }
-    kernel.heap_committed = committed;
+    kernel.heap_committed = size;
     log::debug!(
         "svcSetHeapSize size={:#x} -> heap_base={:#x} (heap mapped {:#x})",
         size,
@@ -2672,6 +2683,101 @@ fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
+}
+
+#[cfg(all(test, feature = "backend-rustarmic"))]
+mod heap_size_tests {
+    use super::{svc_set_heap_size, Kernel, SUCCESS};
+    use crate::kernel::cpu_local::set_current_cpu;
+    use nexium_cpu::Cpu;
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::Arc;
+
+    const HEAP_ALIGNMENT: u64 = 0x20_0000;
+    const HEAP_LIMIT: u64 = 2 * HEAP_ALIGNMENT;
+
+    fn test_kernel(heap_base: u64) -> Kernel {
+        let address_space = Arc::new(AddressSpace::new());
+        address_space
+            .map_reserved(heap_base, HEAP_LIMIT, Perm::RW, "test_heap")
+            .unwrap();
+        Kernel::new(
+            address_space,
+            0x80_0000,
+            0x1000,
+            heap_base,
+            HEAP_LIMIT,
+            0xa0_0000,
+            0x1000,
+            0xb0_0000,
+            0xb0_1000,
+        )
+    }
+
+    fn request_size(kernel: &mut Kernel, cpu: &mut Cpu, size: u64) -> u32 {
+        cpu.set_register(0, u64::MAX);
+        cpu.set_register(1, size);
+        let _guard = set_current_cpu(cpu, 0);
+        let result = svc_set_heap_size(kernel);
+        assert_eq!(cpu.get_register(0), u64::from(result));
+        result
+    }
+
+    fn assert_committed_size(kernel: &Kernel, size: u64) {
+        assert_eq!(kernel.heap_committed, size);
+        let mut byte = [0];
+        if size != 0 {
+            assert!(kernel
+                .address_space
+                .read(kernel.heap_base + size - 1, &mut byte)
+                .is_ok());
+        }
+        assert!(kernel
+            .address_space
+            .read(kernel.heap_base + size, &mut byte)
+            .is_err());
+    }
+
+    #[test]
+    fn invalid_heap_sizes_preserve_commitment() {
+        let mut kernel = test_kernel(0x4100_0000);
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        assert_eq!(request_size(&mut kernel, &mut cpu, HEAP_ALIGNMENT), SUCCESS);
+
+        for size in [1, HEAP_ALIGNMENT + 1, 0x2_0000_0000, 0x2_0020_0000] {
+            assert_eq!(request_size(&mut kernel, &mut cpu, size), 0xca01);
+            assert_committed_size(&kernel, HEAP_ALIGNMENT);
+        }
+    }
+
+    #[test]
+    fn heap_limit_failure_preserves_existing_allocation() {
+        let mut kernel = test_kernel(0x4200_0000);
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        assert_eq!(request_size(&mut kernel, &mut cpu, HEAP_ALIGNMENT), SUCCESS);
+        kernel.address_space.write(kernel.heap_base, &[0xa5]).unwrap();
+
+        assert_eq!(
+            request_size(&mut kernel, &mut cpu, HEAP_LIMIT + HEAP_ALIGNMENT),
+            0x10801
+        );
+        assert_committed_size(&kernel, HEAP_ALIGNMENT);
+        let mut byte = [0];
+        kernel.address_space.read(kernel.heap_base, &mut byte).unwrap();
+        assert_eq!(byte, [0xa5]);
+    }
+
+    #[test]
+    fn valid_heap_sizes_return_base_and_resize_commitment() {
+        let mut kernel = test_kernel(0x4300_0000);
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+
+        for size in [HEAP_ALIGNMENT, HEAP_LIMIT, HEAP_ALIGNMENT, 0] {
+            assert_eq!(request_size(&mut kernel, &mut cpu, size), SUCCESS);
+            assert_eq!(cpu.get_register(1), kernel.heap_base);
+            assert_committed_size(&kernel, size);
+        }
+    }
 }
 
 fn svc_set_memory_permission(_kernel: &mut Kernel) -> u32 {
