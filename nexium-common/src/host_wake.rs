@@ -25,7 +25,7 @@ pub fn mwaitx_supported() -> bool {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            let leaf = unsafe { std::arch::x86_64::__cpuid(0x8000_0001) };
+            let leaf = std::arch::x86_64::__cpuid(0x8000_0001);
             (leaf.ecx & (1 << 29)) != 0
         }
         #[cfg(not(target_arch = "x86_64"))]

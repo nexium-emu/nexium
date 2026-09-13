@@ -951,6 +951,7 @@ struct AsyncGpuQueue {
     capacity: usize,
     profile: Option<AsyncGpuQueueProfile>,
     defer_small_rts: bool,
+    #[cfg(test)]
     hard_kicks: bool,
     failed: Arc<std::sync::atomic::AtomicBool>,
     stopping: Arc<std::sync::atomic::AtomicBool>,
@@ -1538,6 +1539,7 @@ impl AsyncGpuQueue {
             capacity,
             profile,
             defer_small_rts,
+            #[cfg(test)]
             hard_kicks,
             failed,
             stopping,

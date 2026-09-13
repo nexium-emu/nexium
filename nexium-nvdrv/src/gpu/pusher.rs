@@ -257,7 +257,6 @@ pub(crate) mod kickprof {
     pub const GPU_INVAL: usize = 60;
     pub const GPU_INVAL_N: usize = 61;
     pub const CBUF_MISS_COLD: usize = 62;
-    pub const PREP_CBUF: usize = 63;
     pub const PREP_VERTEX: usize = 64;
     pub const PREP_TIC: usize = 65;
     pub const PREP_TEXTURE: usize = 66;
@@ -339,7 +338,6 @@ pub(crate) mod kickprof {
     pub const PRES_WB_FLUSH: usize = 142;
     pub const PRES_WB_READ: usize = 143;
     pub const PRES_WB_POST: usize = 144;
-    pub const PREP_TEX_FAN: usize = 145;
     pub const VKF_CUBE_SCAN: usize = 146;
     pub const VKF_CUBE_WB: usize = 147;
     pub const M3D_PASSIVE_BULK: usize = 148;
@@ -1079,6 +1077,7 @@ impl Pusher {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn inline_prep(&mut self) -> &mut super::prep::PrepState {
         match &mut self.prep {
             super::prep::PrepLane::Inline(state) => state,

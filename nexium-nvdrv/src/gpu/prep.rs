@@ -1799,11 +1799,6 @@ impl PrepLane {
     }
 }
 
-pub(crate) enum PrepEngineAccess<'a, 'b> {
-    Direct(&'a mut PrepEngines<'b>),
-    Remote,
-}
-
 pub(crate) struct PrepThreadHandle {
     tx: crossbeam::channel::Sender<PrepEvent>,
     worker: std::thread::JoinHandle<PrepState>,

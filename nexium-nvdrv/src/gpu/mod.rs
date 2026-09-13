@@ -770,6 +770,7 @@ impl GpuMappings {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn add_tracked_with_metadata(
         &mut self,
         gpu_va: u64,
@@ -916,6 +917,7 @@ impl GpuMappings {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn add_sparse_with_metadata(&mut self, gpu_va: u64, size: u64) -> GpuMappingUpdate {
         if size == 0 || gpu_va.checked_add(size).is_none() {
             return GpuMappingUpdate {
@@ -930,6 +932,7 @@ impl GpuMappings {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn add_sparse(&mut self, gpu_va: u64, size: u64) -> GpuMappingChange {
         self.add_sparse_with_metadata(gpu_va, size).change
     }
