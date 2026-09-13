@@ -629,12 +629,13 @@ pub fn write_i420_to_rgba(
         }
     };
     let mut linear = zeroed(checked_plane_size(linear_pitch, config.storage.height)?)?;
+    let vector_width = rgba_vector_width(&frame, config, width, height, linear_pitch, &mut linear);
     for y in 0..height {
         let source_y = y * frame.y_stride;
         let source_u = (y / 2) * frame.u_stride;
         let source_v = (y / 2) * frame.v_stride;
         let destination = y * linear_pitch;
-        for x in 0..width {
+        for x in vector_width..width {
             let rgba = convert_pixel(
                 frame.y[source_y + x],
                 frame.u[source_u + x / 2],
@@ -671,6 +672,105 @@ pub fn write_i420_to_rgba(
         layout: output_layout,
         bytes,
     })
+}
+
+fn rgba_vector_width(
+    frame: &I420Frame,
+    config: RgbaOutputConfig,
+    width: usize,
+    height: usize,
+    pitch: usize,
+    output: &mut [u8],
+) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if width >= 4
+        && config.color_matrix.enabled
+        && config.color_matrix.shift < 64
+        && config
+            .color_matrix
+            .coefficients
+            .iter()
+            .flatten()
+            .chain(config.color_matrix.offsets.iter())
+            .all(|value| (-524_288..=524_287).contains(value))
+        && std::arch::is_x86_feature_detected!("sse4.1")
+    {
+        unsafe {
+            rgba_sse41(frame, config, width, height, pitch, output);
+        }
+        return width & !3;
+    }
+    let _ = (frame, config, width, height, pitch, output);
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn rgba_sse41(
+    frame: &I420Frame,
+    config: RgbaOutputConfig,
+    width: usize,
+    height: usize,
+    pitch: usize,
+    output: &mut [u8],
+) {
+    use std::arch::x86_64::*;
+    let matrix = config.color_matrix;
+    let coefficients = matrix
+        .coefficients
+        .map(|row| row.map(|value| _mm_set1_epi32(value)));
+    let offsets = matrix.offsets.map(|value| _mm_set1_epi32(value));
+    let shift = _mm_cvtsi32_si128(i32::from(matrix.shift));
+    let minimum = _mm_set1_epi32(i32::from(matrix.clamp_min.min(1023)));
+    let maximum = _mm_set1_epi32(i32::from(matrix.clamp_max.min(1023)));
+    let alpha = matrix
+        .alpha
+        .clamp(matrix.clamp_min, matrix.clamp_max)
+        .min(1023)
+        >> 2;
+    let alpha = _mm_set1_epi32(i32::from(alpha) << 24);
+    let vector_width = width & !3;
+    for row in 0..height {
+        let y = frame.y.as_ptr().add(row * frame.y_stride);
+        let u = frame.u.as_ptr().add(row / 2 * frame.u_stride);
+        let v = frame.v.as_ptr().add(row / 2 * frame.v_stride);
+        let destination = output.as_mut_ptr().add(row * pitch);
+        for x in (0..vector_width).step_by(4) {
+            let y = _mm_cvtsi32_si128(std::ptr::read_unaligned(y.add(x).cast::<i32>()));
+            let u = _mm_cvtsi32_si128(i32::from(std::ptr::read_unaligned(
+                u.add(x / 2).cast::<u16>(),
+            )));
+            let v = _mm_cvtsi32_si128(i32::from(std::ptr::read_unaligned(
+                v.add(x / 2).cast::<u16>(),
+            )));
+            let y = _mm_slli_epi32::<2>(_mm_cvtepu8_epi32(y));
+            let u = _mm_slli_epi32::<2>(_mm_cvtepu8_epi32(_mm_unpacklo_epi8(u, u)));
+            let v = _mm_slli_epi32::<2>(_mm_cvtepu8_epi32(_mm_unpacklo_epi8(v, v)));
+            let channels = std::array::from_fn::<_, 3, _>(|channel| {
+                let value = _mm_add_epi32(
+                    _mm_add_epi32(
+                        _mm_mullo_epi32(y, coefficients[channel][0]),
+                        _mm_mullo_epi32(u, coefficients[channel][1]),
+                    ),
+                    _mm_mullo_epi32(v, coefficients[channel][2]),
+                );
+                let value = _mm_srai_epi32::<8>(_mm_add_epi32(
+                    _mm_sra_epi32(value, shift),
+                    offsets[channel],
+                ));
+                _mm_srli_epi32::<2>(_mm_min_epi32(_mm_max_epi32(value, minimum), maximum))
+            });
+            let (red, blue) = match config.order {
+                RgbaOrder::Rgba => (channels[0], channels[2]),
+                RgbaOrder::Bgra => (channels[2], channels[0]),
+            };
+            let packed = _mm_or_si128(
+                _mm_or_si128(red, _mm_slli_epi32::<8>(channels[1])),
+                _mm_or_si128(_mm_slli_epi32::<16>(blue), alpha),
+            );
+            _mm_storeu_si128(destination.add(x * 4).cast::<__m128i>(), packed);
+        }
+    }
 }
 
 fn convert_pixel(y: u8, u: u8, v: u8, matrix: VicColorMatrix) -> [u8; 4] {
@@ -765,13 +865,25 @@ fn swizzle_block_linear(
         let source_row = y
             .checked_mul(linear_pitch)
             .ok_or(VideoSurfaceError::ArithmeticOverflow)?;
-        for x in 0..width_bytes {
+        let full_width = width_bytes & !15;
+        for x in (0..full_width).step_by(16) {
             let source = source_row
                 .checked_add(x)
                 .ok_or(VideoSurfaceError::ArithmeticOverflow)?;
             let destination = block_linear_byte_offset(width_bytes, block_height_log2, x, y)
                 .ok_or(VideoSurfaceError::ArithmeticOverflow)?;
-            tiled[destination] = linear[source];
+            tiled[destination..destination + 16].copy_from_slice(&linear[source..source + 16]);
+        }
+        if full_width < width_bytes {
+            let source = source_row
+                .checked_add(full_width)
+                .ok_or(VideoSurfaceError::ArithmeticOverflow)?;
+            let destination =
+                block_linear_byte_offset(width_bytes, block_height_log2, full_width, y)
+                    .ok_or(VideoSurfaceError::ArithmeticOverflow)?;
+            let count = width_bytes - full_width;
+            tiled[destination..destination + count]
+                .copy_from_slice(&linear[source..source + count]);
         }
     }
     Ok(tiled)
@@ -1018,6 +1130,122 @@ mod tests {
             clamp_min: 0,
             clamp_max: 1023,
             alpha: 1023,
+        }
+    }
+
+    #[test]
+    fn tiled_video_copies_preserve_partial_gobs_and_pitched_rows() {
+        for block_height in 0..=5 {
+            for width in [1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 80, 128, 260] {
+                for height in [1, 7, 8, 9, 15, 16, 17, 31, 33, 65] {
+                    let pitch = width + 3;
+                    let linear: Vec<_> = (0..pitch * height)
+                        .map(|index| (index * 31 + index / pitch * 17) as u8)
+                        .collect();
+                    let actual =
+                        swizzle_block_linear(&linear, pitch, width, height, block_height).unwrap();
+                    let mut expected = vec![0; actual.len()];
+                    for y in 0..height {
+                        for x in 0..width {
+                            let offset =
+                                block_linear_byte_offset(width, block_height, x, y).unwrap();
+                            expected[offset] = linear[y * pitch + x];
+                        }
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "{width}x{height}, block height {block_height}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_color_conversion_matches_scalar_for_signed_matrices_and_row_tails() {
+        let mut seed = 0x7b31_280du32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for case in 0..96 {
+            let width = [1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 127, 129][case % 12];
+            let height = 1 + case % 7;
+            let pitch = width * 4 + 12;
+            let frame = I420Frame {
+                width,
+                height,
+                y_stride: width + 3,
+                u_stride: div_ceil(width, 2) + 2,
+                v_stride: div_ceil(width, 2) + 1,
+                y: (0..(width + 3) * height).map(|_| next() as u8).collect(),
+                u: (0..(div_ceil(width, 2) + 2) * div_ceil(height, 2))
+                    .map(|_| next() as u8)
+                    .collect(),
+                v: (0..(div_ceil(width, 2) + 1) * div_ceil(height, 2))
+                    .map(|_| next() as u8)
+                    .collect(),
+            };
+            let mut matrix = VicColorMatrix {
+                enabled: case % 13 != 0,
+                coefficients: std::array::from_fn(|_| {
+                    std::array::from_fn(|_| (next() & 0xfffff) as i32 - 524_288)
+                }),
+                offsets: std::array::from_fn(|_| (next() & 0xfffff) as i32 - 524_288),
+                shift: [0, 1, 9, 15, 31, 63][case % 6],
+                clamp_min: [0, 11, 1000, 1024][case % 4],
+                clamp_max: [1023, 997, 1000, 2048][case % 4],
+                alpha: next() as u16,
+            };
+            if case % 8 == 7 {
+                matrix.coefficients = [
+                    [76284, 0, 104595],
+                    [76284, -25624, -53281],
+                    [76284, 132251, 0],
+                ];
+                matrix.offsets = [-56992, 34784, -70688];
+                matrix.shift = 9;
+                matrix.clamp_min = 0;
+                matrix.clamp_max = 1023;
+            }
+            if case % 17 == 0 {
+                matrix.coefficients[1][0] = i32::MAX;
+            }
+            if case % 19 == 0 {
+                matrix.offsets[2] = i32::MIN;
+            }
+            let mut config = rgba_config(
+                width,
+                height,
+                width,
+                height + 1,
+                PlaneMemoryLayout::Pitch { pitch },
+                if case % 2 == 0 {
+                    RgbaOrder::Rgba
+                } else {
+                    RgbaOrder::Bgra
+                },
+            );
+            config.color_matrix = matrix;
+            let mut expected = vec![0; pitch * (height + 1)];
+            for y in 0..height {
+                for x in 0..width {
+                    let mut pixel = convert_pixel(
+                        frame.y[y * frame.y_stride + x],
+                        frame.u[y / 2 * frame.u_stride + x / 2],
+                        frame.v[y / 2 * frame.v_stride + x / 2],
+                        matrix,
+                    );
+                    if config.order == RgbaOrder::Bgra {
+                        pixel.swap(0, 2);
+                    }
+                    expected[y * pitch + x * 4..y * pitch + x * 4 + 4].copy_from_slice(&pixel);
+                }
+            }
+            let actual = write_i420_to_rgba(frame, config).unwrap();
+            assert_eq!(actual.bytes, expected, "case {case}, {width}x{height}");
         }
     }
 
