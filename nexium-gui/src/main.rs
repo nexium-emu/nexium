@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod app;
 mod app_settings;
 mod audio;

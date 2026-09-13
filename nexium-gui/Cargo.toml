@@ -62,6 +62,9 @@ sdl3 = { version = "0.20.0", default-features = false, features = ["build-from-s
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+mimalloc = "0.1.52"
+
 [features]
 default = ["backend-dynarmic", "backend-rustarmic"]
 backend-dynarmic = ["nexium-core/backend-dynarmic", "nexium-cpu/backend-dynarmic", "nexium-runner/backend-dynarmic"]
