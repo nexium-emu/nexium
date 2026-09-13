@@ -921,7 +921,9 @@ fn watch_value_ne(size: usize, value: u64, filter: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_profile_due, dynarmic_fast_paths_default};
+    use super::{cache_profile_due, dynarmic_fast_paths_default, DynarmicCpu};
+    use crate::CpuEvent;
+    use nexium_memory::{AddressSpace, Perm};
     use std::ffi::OsStr;
     use std::time::{Duration, Instant};
 
@@ -938,5 +940,51 @@ mod tests {
         assert!(!cache_profile_due(last, last));
         assert!(!cache_profile_due(last, last + Duration::from_millis(999)));
         assert!(cache_profile_due(last, last + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn busy_wait_observes_lock_release_after_wfe() {
+        const CODE: u64 = 0x200000;
+        const LOCK: u64 = CODE + 0x1000;
+        let memory = AddressSpace::new();
+        memory.map(CODE, 0x2000, Perm::RWX, "busy-wait").unwrap();
+        let instructions = [
+            0x885ffe88u32,
+            0x34000068,
+            0xd503205f,
+            0x17fffffd,
+            0xd28000e0,
+            0xd4000381,
+        ];
+        let code: Vec<u8> = instructions
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        memory.write(CODE, &code).unwrap();
+        memory.write(LOCK, &1u32.to_le_bytes()).unwrap();
+        let mut cpu = DynarmicCpu::new().unwrap();
+        for region in memory.host_regions() {
+            unsafe {
+                cpu.map_host(region.base, region.size, region.perm, region.host_ptr)
+                    .unwrap();
+            }
+        }
+        cpu.set_pc(CODE);
+        cpu.set_register(20, LOCK);
+        assert!(matches!(cpu.run(64), CpuEvent::Running));
+        memory.write(LOCK, &0u32.to_le_bytes()).unwrap();
+        let mut event = CpuEvent::Running;
+        for _ in 0..8 {
+            event = cpu.run(64);
+            if !matches!(event, CpuEvent::Running) {
+                break;
+            }
+        }
+        assert!(
+            matches!(event, CpuEvent::Svc(0x1c)),
+            "{event:?} at {:#x}",
+            cpu.get_pc()
+        );
+        assert_eq!(cpu.get_register(0), 7);
     }
 }
