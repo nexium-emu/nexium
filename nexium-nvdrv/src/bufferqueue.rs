@@ -84,7 +84,16 @@ impl BufferQueue {
         now: std::time::Instant,
         swap_interval: i32,
     ) -> Option<std::time::Instant> {
-        if swap_interval <= 0 {
+        self.schedule_swap_with_limit(now, swap_interval, nexium_common::speed_limit::enabled())
+    }
+
+    fn schedule_swap_with_limit(
+        &mut self,
+        now: std::time::Instant,
+        swap_interval: i32,
+        limited: bool,
+    ) -> Option<std::time::Instant> {
+        if !limited || swap_interval <= 0 {
             self.next_swap_deadline = None;
             return None;
         }
@@ -412,6 +421,21 @@ mod tests {
         assert!(queue.schedule_swap(now, 1).is_some());
         assert_eq!(queue.schedule_swap(now, 0), None);
         assert_eq!(queue.schedule_swap(now, 1), Some(now + period));
+    }
+
+    #[test]
+    fn unlocking_clears_pacing_and_relocking_starts_a_fresh_deadline() {
+        let mut queue = BufferQueue::new(1);
+        let now = Instant::now();
+        let period = Duration::from_nanos(16_666_667);
+        assert_eq!(queue.schedule_swap_with_limit(now, 2, true), Some(now + period * 2));
+        for frame in 0..100 {
+            assert_eq!(queue.schedule_swap_with_limit(now + Duration::from_micros(frame), 2, false), None);
+        }
+        let resumed = now + Duration::from_millis(1);
+        assert_eq!(queue.schedule_swap_with_limit(resumed, 2, true), Some(resumed + period * 2));
+        assert_eq!(queue.schedule_swap_with_limit(resumed, 1, false), None);
+        assert_eq!(queue.schedule_swap_with_limit(resumed, 1, true), Some(resumed + period));
     }
 
     #[test]

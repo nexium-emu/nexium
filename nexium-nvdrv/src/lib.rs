@@ -462,7 +462,8 @@ impl FrameQueueState {
             .front()
             .and_then(|frame| frame.present_at)
             .is_none_or(|deadline| deadline <= now);
-        let frame = is_due.then(|| frames.pending.pop_front()).flatten();
+        let frame = (is_due || !nexium_common::speed_limit::enabled())
+            .then(|| frames.pending.pop_front()).flatten();
         let resumed = frame.is_some() && self.presenter_stalled.swap(false, Ordering::AcqRel);
         drop(frames);
         if frame.is_some() {
@@ -484,7 +485,9 @@ impl FrameQueueState {
                 continue;
             };
             let now = std::time::Instant::now();
-            if let Some(deadline) = front.present_at.filter(|deadline| *deadline > now) {
+            if let Some(deadline) = front.present_at
+                .filter(|deadline| nexium_common::speed_limit::enabled() && *deadline > now)
+            {
                 self.frame_available
                     .wait_for(&mut frames, (deadline - now).min(STOP_POLL));
                 continue;
@@ -2341,6 +2344,10 @@ impl Nvdrv {
     }
 
     pub fn pace_swap(&self, swap_interval: i32) {
+        if !nexium_common::speed_limit::enabled() || swap_interval <= 0 {
+            *self.last_swap_return.lock() = None;
+            return;
+        }
         const VSYNC_NS: u64 = 16_666_667;
         let n = swap_interval.clamp(1, 4) as u64;
         let target = std::time::Duration::from_nanos(VSYNC_NS.saturating_mul(n));

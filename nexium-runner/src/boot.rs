@@ -743,6 +743,7 @@ impl EmulationHandle {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         EMU_ALIVE.store(true, Ordering::Release);
+        nexium_common::speed_limit::reset();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);

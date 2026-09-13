@@ -14,6 +14,7 @@ pub mod log_sink;
 pub mod paths;
 pub mod result;
 pub mod shader_progress;
+pub mod speed_limit;
 pub mod thread_cpu_set;
 pub mod title;
 

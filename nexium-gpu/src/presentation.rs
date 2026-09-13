@@ -714,7 +714,9 @@ impl Worker {
 
     fn wait_present_time(&self, deadline: Instant) {
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            if self.target.stopped.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+            if self.target.stopped.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire)
+                || !nexium_common::speed_limit::enabled()
+            {
                 break;
             }
             std::thread::sleep(remaining.min(Duration::from_millis(2)));

@@ -162,6 +162,20 @@ fn gui_rate_stats(kind: usize, count: u64) {
     }
 }
 
+fn take_speed_limit_shortcut(input: &mut egui::InputState) -> bool {
+    let mut toggle = false;
+    input.events.retain(|event| {
+        if let egui::Event::Key { key: egui::Key::U, pressed: true, repeat, modifiers, .. } = event {
+            if modifiers.ctrl && !modifiers.alt && !modifiers.shift {
+                toggle |= !repeat;
+                return false;
+            }
+        }
+        true
+    });
+    toggle
+}
+
 fn request_game_frame_repaint(ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_nanos(1));
 }
@@ -192,6 +206,27 @@ fn take_next_game_frame(
 mod frame_receive_tests {
     use super::{request_game_frame_repaint, take_next_game_frame};
     use crate::boot::Frame;
+
+    #[test]
+    fn speed_shortcut_consumes_ctrl_u_without_repeating_or_consuming_plain_u() {
+        let event = |ctrl, repeat| egui::Event::Key {
+            key: egui::Key::U,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: egui::Modifiers { ctrl, ..Default::default() },
+        };
+        let mut input = egui::InputState::default();
+        input.events = vec![event(false, false)];
+        assert!(!super::take_speed_limit_shortcut(&mut input));
+        assert_eq!(input.events.len(), 1);
+        input.events = vec![event(true, false)];
+        assert!(super::take_speed_limit_shortcut(&mut input));
+        assert!(input.events.is_empty());
+        input.events = vec![event(true, true)];
+        assert!(!super::take_speed_limit_shortcut(&mut input));
+        assert!(input.events.is_empty());
+    }
 
     #[test]
     fn game_frame_notification_does_not_schedule_a_second_repaint() {
@@ -5954,7 +5989,7 @@ impl HorizonApp {
         p.text(
             egui::pos2(lx, y),
             egui::Align2::LEFT_TOP,
-            "NeXium",
+            if nexium_common::speed_limit::enabled() { "NeXium" } else { "NeXium | Unlocked" },
             mono(10.5),
             white,
         );
@@ -6528,6 +6563,9 @@ impl HorizonApp {
         if let Some(rs) = self.wgpu_state.as_ref() {
             let info = rs.adapter.get_info();
             title.push_str(&format!(" | {:?} | {}", info.backend, info.name));
+        }
+        if !nexium_common::speed_limit::enabled() {
+            title.push_str(" | Unlocked");
         }
         title
     }
@@ -8128,6 +8166,20 @@ impl eframe::App for HorizonApp {
             }
         }
 
+        let speed_shortcut_active = self.emulation_handle.as_ref().is_some_and(|h| h.is_running())
+            && self.rebinding.is_none() && self.rebinding_pad.is_none()
+            && !self.modal_active() && !ctx.egui_wants_keyboard_input();
+        if speed_shortcut_active && ctx.input_mut(take_speed_limit_shortcut) {
+            let limited = nexium_common::speed_limit::toggle();
+            log::info!("Emulation speed: {}", if limited { "limited" } else { "unlocked" });
+            if let Some(path) = &self.playing_path {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.game_window_title(path)));
+            }
+            ctx.request_repaint();
+        }
+        let speed_key_held = speed_shortcut_active
+            && ctx.input(|i| i.modifiers.ctrl && i.key_down(egui::Key::U));
+
         if self.rebinding.is_none() && self.rebinding_pad.is_none() {
             let pressed: Vec<String> = ctx.input(|i| {
                 let mut v = Vec::new();
@@ -8136,7 +8188,9 @@ impl eframe::App for HorizonApp {
                         key, pressed: true, ..
                     } = ev
                     {
-                        v.push(format!("{:?}", key));
+                        if !(speed_key_held && *key == egui::Key::U) {
+                            v.push(format!("{:?}", key));
+                        }
                     }
                 }
                 for k in [
@@ -8185,7 +8239,7 @@ impl eframe::App for HorizonApp {
                     egui::Key::Space,
                     egui::Key::Escape,
                 ] {
-                    if i.key_down(k) {
+                    if i.key_down(k) && !(speed_key_held && k == egui::Key::U) {
                         let s = format!("{:?}", k);
                         if !v.contains(&s) {
                             v.push(s);
@@ -8254,6 +8308,9 @@ impl eframe::App for HorizonApp {
             if self.app_settings.emulate_keyboard && !wants_keyboard && !swkbd_open {
                 ctx.input(|i| {
                     for key in i.keys_down.iter() {
+                        if speed_key_held && *key == egui::Key::U {
+                            continue;
+                        }
                         if let Some(index) = hid_keyboard_usage(*key) {
                             keys[(index / 8) as usize] |= 1 << (index % 8);
                         }
@@ -9461,7 +9518,8 @@ impl eframe::App for HorizonApp {
                 holes.push(egui::Rect::from_min_size(egui::pos2(screen.center().x - 184.0, screen.min.y + 20.0), egui::vec2(368.0, 74.0)));
             }
             window.update(self.last_game_rect.filter(|_| native_visible), &holes, ctx.pixels_per_point(),
-                crate::host_vsync_enabled(self.app_settings.vsync, std::env::var("NEXIUM_VSYNC").ok().as_deref()),
+                nexium_common::speed_limit::enabled()
+                    && crate::host_vsync_enabled(self.app_settings.vsync, std::env::var("NEXIUM_VSYNC").ok().as_deref()),
                 self.app_settings.filter == FilterMode::Nearest);
         }
         request_idle_repaint(
