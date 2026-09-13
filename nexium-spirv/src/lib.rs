@@ -34,6 +34,7 @@ fn lop3_anf_coefficients(lut: u8) -> u8 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Vertex,
+    Geometry,
     Fragment,
     Compute,
 }
@@ -222,6 +223,7 @@ pub struct ComputeImageResource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComputeOptions {
     pub local_size: [u32; 3],
+    pub vertex_memory_store: bool,
     pub local_memory_low_size: u32,
     pub local_memory_high_size: u32,
     pub local_memory_crs_size: u32,
@@ -237,6 +239,7 @@ impl Default for ComputeOptions {
     fn default() -> Self {
         Self {
             local_size: [1, 1, 1],
+            vertex_memory_store: false,
             local_memory_low_size: 0,
             local_memory_high_size: 0,
             local_memory_crs_size: 0,
@@ -741,6 +744,7 @@ pub fn link_graphics_varyings(
                 IrOp::LoadAttr { slot } | IrOp::InterpAttr { slot, .. } => {
                     record(*slot, &mut generic, &mut fixed);
                 }
+                IrOp::LoadAttrIndexed { .. } | IrOp::InterpAttrIndexed { .. } => generic = u32::MAX,
                 _ => {}
             }
         }
@@ -766,7 +770,7 @@ const UBO_VEC4S: u32 = 4096;
 const COMPUTE_CBUF_SLOT_VEC4S: u32 = UBO_VEC4S / 32;
 
 pub const GFX_CBUF_STAGE_SLOTS: u32 = 18;
-pub const GFX_CBUF_SLOTS: u32 = GFX_CBUF_STAGE_SLOTS * 2;
+pub const GFX_CBUF_SLOTS: u32 = GFX_CBUF_STAGE_SLOTS * 3;
 pub const GFX_CBUF_DIRECTORY_WORDS: u32 = GFX_CBUF_SLOTS * 2;
 pub const GFX_CBUF_ZERO_WORD: u32 = GFX_CBUF_DIRECTORY_WORDS;
 pub const GFX_CBUF_PAYLOAD_WORD: u32 = (GFX_CBUF_ZERO_WORD + 4) & !3;
@@ -854,6 +858,8 @@ pub const MAX_COMPUTE_LOCAL_MEMORY_SIZE: u32 = 512 * 1024;
 pub struct Emitter {
     b: rspirv::dr::Builder,
     stage: Stage,
+    geometry: GeometryOptions,
+    geometry_inputs: HashMap<u32, Word>,
     force_fp32_ftz: bool,
     force_signed_zero_preserve: bool,
     f32_t: Word,
@@ -928,6 +934,8 @@ pub struct Emitter {
     layer_var: Option<Word>,
     frag_coord_var: Option<Word>,
     front_facing_var: Option<Word>,
+    sample_id_var: Option<Word>,
+    single_sample: bool,
     frag_color_vars: HashMap<u32, Word>,
     vertex_index_var: Option<Word>,
     instance_index_var: Option<Word>,
@@ -971,9 +979,9 @@ pub struct Emitter {
     bool_t: Word,
     bool_true: Word,
     bool_false: Word,
-    pred_regs: [Option<Word>; 7],
+    pred_regs: [Option<Word>; 9],
     pred_value_to_word: HashMap<(ValueId, u8), Word>,
-    block_pred_exits: HashMap<BlockId, [Option<Word>; 7]>,
+    block_pred_exits: HashMap<BlockId, [Option<Word>; 9]>,
     ssbo_vars: Vec<Option<Word>>,
     ptr_storage_u32: Option<Word>,
     return_block: Option<Word>,
@@ -990,6 +998,7 @@ pub struct Emitter {
     sampler_arrayed: bool,
     no_kil_shader: bool,
     fragment_color_outputs: u32,
+    fragment_dual_source: bool,
     fragment_output_map: u32,
     fragment_writes_depth: bool,
     fragment_depth_var: Option<Word>,
@@ -997,6 +1006,7 @@ pub struct Emitter {
     fragment_sint_output_mask: u32,
     texel_buffer_mask: u32,
     ps_input_map: [u8; 32],
+    fragment_indexed_input_mask: u32,
     alpha_test_func: u32,
     alpha_test_ref: u32,
     y_negate: bool,
@@ -1233,6 +1243,8 @@ impl Emitter {
             b,
             stage,
             force_fp32_ftz: std::env::var("NEXIUM_SPIRV_FTZ").ok().as_deref() == Some("1"),
+            geometry: GeometryOptions::default(),
+            geometry_inputs: HashMap::new(),
             force_signed_zero_preserve: stage != Stage::Compute
                 && std::env::var("NEXIUM_SPIRV_SIGNED_ZERO_PRESERVE")
                     .ok()
@@ -1310,6 +1322,8 @@ impl Emitter {
             layer_var: None,
             frag_coord_var: None,
             front_facing_var: None,
+            sample_id_var: None,
+            single_sample: false,
             frag_color_vars: HashMap::new(),
             vertex_index_var: None,
             instance_index_var: None,
@@ -1353,7 +1367,7 @@ impl Emitter {
             bool_t,
             bool_true,
             bool_false,
-            pred_regs: [None; 7],
+            pred_regs: [None; 9],
             pred_value_to_word: HashMap::new(),
             block_pred_exits: HashMap::new(),
             ssbo_vars: vec![
@@ -1403,6 +1417,7 @@ impl Emitter {
             sampler_arrayed: false,
             no_kil_shader: false,
             fragment_color_outputs: 1,
+            fragment_dual_source: false,
             fragment_output_map: 0,
             fragment_writes_depth: false,
             fragment_depth_var: None,
@@ -1410,6 +1425,7 @@ impl Emitter {
             fragment_sint_output_mask: 0,
             texel_buffer_mask: 0,
             ps_input_map: [0; 32],
+            fragment_indexed_input_mask: u32::MAX,
             alpha_test_func: 0,
             alpha_test_ref: 0,
             y_negate: false,
@@ -1832,7 +1848,13 @@ impl Emitter {
         self.b.decorate(
             var,
             Decoration::BuiltIn,
-            [Operand::BuiltIn(BuiltIn::WorkgroupId)],
+            [Operand::BuiltIn(
+                if self.compute_options.as_ref().is_some_and(|options| options.vertex_memory_store) {
+                    BuiltIn::GlobalInvocationId
+                } else {
+                    BuiltIn::WorkgroupId
+                },
+            )],
         );
         self.interface.push(var);
         self.workgroup_id_var = Some(var);
@@ -1931,8 +1953,7 @@ impl Emitter {
         if let Some(v) = self.layer_var {
             return v;
         }
-        self.b.capability(Capability::ShaderViewportIndexLayerEXT);
-        self.b.extension("SPV_EXT_shader_viewport_index_layer");
+        self.b.capability(Capability::ShaderLayer);
         let v = self
             .b
             .variable(self.ptr_output_u32, None, StorageClass::Output, None);
@@ -1957,6 +1978,26 @@ impl Emitter {
         );
         self.interface.push(v);
         self.frag_coord_var = Some(v);
+        v
+    }
+
+    fn sample_id_var_id(&mut self) -> Word {
+        assert_eq!(self.stage, Stage::Fragment);
+        if let Some(v) = self.sample_id_var {
+            return v;
+        }
+        self.b.capability(Capability::SampleRateShading);
+        let v = self
+            .b
+            .variable(self.ptr_input_u32, None, StorageClass::Input, None);
+        self.b.decorate(v, Decoration::Flat, []);
+        self.b.decorate(
+            v,
+            Decoration::BuiltIn,
+            [Operand::BuiltIn(BuiltIn::SampleId)],
+        );
+        self.interface.push(v);
+        self.sample_id_var = Some(v);
         v
     }
 
@@ -2009,6 +2050,11 @@ impl Emitter {
             Decoration::Location,
             [Operand::LiteralBit32(attachment_location)],
         );
+        if self.fragment_dual_source {
+            let index = self.fragment_output_locations().iter()
+                .position(|&output| output == location).unwrap_or(0) as u32;
+            self.b.decorate(v, Decoration::Index, [Operand::LiteralBit32(index)]);
+        }
         self.interface.push(v);
         self.frag_color_vars.insert(location, v);
         v
@@ -2085,7 +2131,7 @@ impl Emitter {
     }
 
     fn fragment_output_locations(&self) -> Vec<u32> {
-        let count = self.fragment_color_outputs.max(1).min(8);
+        let count = if self.fragment_dual_source { 2 } else { self.fragment_color_outputs.max(1).min(8) };
         if self.fragment_output_map == 0 {
             if self.fragment_writes_depth {
                 return Vec::new();
@@ -2099,6 +2145,9 @@ impl Emitter {
     }
 
     fn fragment_output_attachment_location(&self, location: u32) -> u32 {
+        if self.fragment_dual_source {
+            return 0;
+        }
         if self.fragment_output_map == 0 {
             return location;
         }
@@ -2477,6 +2526,41 @@ impl Emitter {
             raw
         };
         Some(self.b.bitcast(self.f32_t, None, raw).unwrap())
+    }
+
+    fn geometry_predicate_begin(&mut self, inst: &IrInst) -> Option<Word> {
+        let pred = inst.pred?;
+        let condition = self.resolve_pred(pred.idx, pred.negate);
+        let body = self.b.id();
+        let merge = self.b.id();
+        self.b.selection_merge(merge, rspirv::spirv::SelectionControl::NONE).unwrap();
+        self.b.branch_conditional(condition, body, merge, []).unwrap();
+        self.b.begin_block(Some(body)).unwrap();
+        Some(merge)
+    }
+
+    fn geometry_predicate_end(&mut self, merge: Option<Word>) {
+        if let Some(merge) = merge {
+            self.b.branch(merge).unwrap();
+            self.b.begin_block(Some(merge)).unwrap();
+        }
+    }
+
+    fn geometry_input(&mut self, slot: u32) -> Word {
+        if let Some(&var) = self.geometry_inputs.get(&slot) { return var; }
+        let count = self.const_u32(self.geometry.input_vertices);
+        let array = self.b.type_array(self.vec4_t, count);
+        let pointer = self.b.type_pointer(None, StorageClass::Input, array);
+        let var = self.b.variable(pointer, None, StorageClass::Input, None);
+        if slot == 0x70 {
+            self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Position)]);
+        } else {
+            let location = self.varying_map.location(slot).expect("geometry input location");
+            self.b.decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
+        }
+        self.interface.push(var);
+        self.geometry_inputs.insert(slot, var);
+        var
     }
 
     fn input_var(&mut self, slot: u32) -> AttrVar {
@@ -4204,7 +4288,7 @@ impl Emitter {
     }
 
     fn write_pred_reg(&mut self, idx: u8, value: Word, guard: Option<Word>) {
-        if idx >= 7 {
+        if idx == 7 || idx as usize >= self.pred_regs.len() {
             return;
         }
         let value = if let Some(cond) = guard {
@@ -4272,18 +4356,69 @@ impl Emitter {
         }
     }
 
+    fn transform_position(&mut self) {
+                let do_z_remap = if std::env::var("NEXIUM_VS_Z_REMAP").ok().as_deref() == Some("1")
+                {
+                    true
+                } else {
+                    self.vertex_opts.apply_z_remap
+                };
+                let pos = self.position_var();
+                let cur = self.b.load(self.vec4_t, None, pos, None, []).unwrap();
+                let mut new_pos = cur;
+                if do_z_remap {
+                    let cur_z = self
+                        .b
+                        .composite_extract(self.f32_t, None, cur, [2])
+                        .unwrap();
+                    let cur_w = self
+                        .b
+                        .composite_extract(self.f32_t, None, cur, [3])
+                        .unwrap();
+                    let sum = self.b.f_add(self.f32_t, None, cur_z, cur_w).unwrap();
+                    let half = self.const_f32(0.5f32.to_bits());
+                    let new_z = self.b.f_mul(self.f32_t, None, sum, half).unwrap();
+                    new_pos = self
+                        .b
+                        .composite_insert(self.vec4_t, None, new_z, cur, [2])
+                        .unwrap();
+                }
+                let vs = self.vertex_opts.vptx_scale_z;
+                let vt = self.vertex_opts.vptx_translate_z;
+                if (vs - 1.0).abs() > 1e-6 || vt.abs() > 1e-6 {
+                    let cur_z = self
+                        .b
+                        .composite_extract(self.f32_t, None, new_pos, [2])
+                        .unwrap();
+                    let cur_w = self
+                        .b
+                        .composite_extract(self.f32_t, None, new_pos, [3])
+                        .unwrap();
+                    let scale = self.const_f32(vs.to_bits());
+                    let trans = self.const_f32(vt.to_bits());
+                    let sz = self.b.f_mul(self.f32_t, None, scale, cur_z).unwrap();
+                    let tw = self.b.f_mul(self.f32_t, None, trans, cur_w).unwrap();
+                    let remapped_z = self.b.f_add(self.f32_t, None, sz, tw).unwrap();
+                    new_pos = self
+                        .b
+                        .composite_insert(self.vec4_t, None, remapped_z, new_pos, [2])
+                        .unwrap();
+                }
+                self.b.store(pos, new_pos, None, []).unwrap();
+    }
+
     fn lower_store_attr(&mut self, slot: u32, src: &IrValue, guard: Option<Word>) {
         let mut val = self.lower_value(src);
         let component = (slot & 0xC) >> 2;
         let aligned_slot = slot & !0xF;
         if slot_is_gl_position(aligned_slot) {
             val = match (self.vertex_opts.window_ndc, component) {
-                (Some((sx, _)), 0) if matches!(self.stage, Stage::Vertex) => {
+                (Some((sx, _)), 0) if matches!(self.stage, Stage::Vertex | Stage::Geometry) => {
                     let s = self.const_f32(sx.to_bits());
                     let m = self.b.f_mul(self.f32_t, None, val, s).unwrap();
                     self.b.f_sub(self.f32_t, None, m, self.f32_one).unwrap()
                 }
-                (Some((_, sy)), 1) if matches!(self.stage, Stage::Vertex) => {
+                (Some((_, sy)), 1) if matches!(self.stage, Stage::Vertex | Stage::Geometry) => {
                     let s = self.const_f32(sy.to_bits());
                     let m = self.b.f_mul(self.f32_t, None, val, s).unwrap();
                     self.b.f_sub(self.f32_t, None, m, self.f32_one).unwrap()
@@ -4322,7 +4457,11 @@ impl Emitter {
             self.write_attr_component(av, component, val);
             if let Some(layer_src) = layer_src {
                 let layer = self.layer_var.expect("layer output must be preallocated");
-                let mut layer_value = self.b.bitcast(self.u32_t, None, layer_src).unwrap();
+                let mut layer_value = if self.vertex_opts.layer_output_float {
+                    self.b.convert_f_to_u(self.u32_t, None, layer_src).unwrap()
+                } else {
+                    self.b.bitcast(self.u32_t, None, layer_src).unwrap()
+                };
                 if let Some(cond) = guard {
                     let old = self.b.load(self.u32_t, None, layer, None, []).unwrap();
                     layer_value = self
@@ -4845,6 +4984,188 @@ impl Emitter {
         self.extract_texture_sample_lane(sample, component)
     }
 
+    fn indexed_attr_enabled(&self, slot: u32) -> bool {
+        let mask = match self.stage {
+            Stage::Vertex => self.vertex_opts.indexed_input_mask,
+            Stage::Fragment => self.fragment_indexed_input_mask,
+            Stage::Compute | Stage::Geometry => 0,
+        };
+        generic_varying_location(slot).is_some_and(|location| mask & (1 << location) != 0)
+    }
+
+    fn lower_indexed_attr(
+        &mut self,
+        address: &IrValue,
+        interp: Option<(&IrValue, &u8, &bool)>,
+    ) -> Word {
+        let raw = self.lower_value(address);
+        let raw = self.as_u32(raw);
+        let mask = self.const_u32(!3);
+        let address = self.b.bitwise_and(self.u32_t, None, raw, mask).unwrap();
+        let mut result = self.f32_zero;
+        for slot in (0x80..0x280).step_by(4) {
+            if !self.indexed_attr_enabled(slot) {
+                continue;
+            }
+            let value = if let Some((perspective, mode, sat)) = interp {
+                self.lower_interp_attr(&slot, perspective, mode, sat)
+            } else {
+                let av = self.input_var(slot & !0xf);
+                self.read_attr_component(av, (slot & 0xc) >> 2)
+            };
+            let expected = self.const_u32(slot);
+            let matches = self
+                .b
+                .i_equal(self.bool_t, None, address, expected)
+                .unwrap();
+            result = self
+                .b
+                .select(self.f32_t, None, matches, value, result)
+                .unwrap();
+        }
+        result
+    }
+
+    fn lower_interp_attr(
+        &mut self,
+        slot: &u32,
+        perspective: &IrValue,
+        mode: &u8,
+        sat: &bool,
+    ) -> Word {
+        let component = (slot & 0xC) >> 2;
+        let aligned_slot = slot & !0xF;
+        let fold_perspective_round_trip = matches!(self.stage, Stage::Fragment)
+            && *mode == 1
+            && generic_varying_location(aligned_slot)
+                .is_some_and(|location| self.ps_input_component_mode(location, component) == 2)
+            && matches!(
+                perspective,
+                IrValue::Inst(id) if self.fragment_position_w_reciprocals.contains(id)
+            );
+        let mut val = if self.stage == Stage::Fragment && *slot == 0x3fc {
+            self.load_front_facing_bits()
+        } else if aligned_slot == 0x70 {
+            let fc = self.frag_coord_var();
+            let idx = self.const_u32(component);
+            let ac = self
+                .b
+                .access_chain(self.ptr_input_f32, None, fc, [idx])
+                .unwrap();
+            self.b.load(self.f32_t, None, ac, None, []).unwrap()
+        } else {
+            let av = self.input_var(aligned_slot);
+            let mut val = self.read_attr_component(av, component);
+            if let Some(loc) = generic_varying_location(aligned_slot) {
+                if self.ps_input_component_mode(loc, component) == 2 && !fold_perspective_round_trip
+                {
+                    let fc = self.frag_coord_var();
+                    let idx = self.const_u32(3);
+                    let ac = self
+                        .b
+                        .access_chain(self.ptr_input_f32, None, fc, [idx])
+                        .unwrap();
+                    let w = self.b.load(self.f32_t, None, ac, None, []).unwrap();
+                    val = self.b.f_mul(self.f32_t, None, val, w).unwrap();
+                }
+            }
+            val
+        };
+        if *mode == 1 && fixed_varying_index(aligned_slot).is_none() && !fold_perspective_round_trip
+        {
+            let p = self.lower_value(perspective);
+            val = self.b.f_mul(self.f32_t, None, val, p).unwrap();
+        }
+        val = self.apply_sat(val, *sat);
+        val
+    }
+
+    fn lower_graphics_texel_fetch(
+        &mut self,
+        tex_id: u32,
+        x: &IrValue,
+        y: &Option<IrValue>,
+        z: &Option<IrValue>,
+        component: &u8,
+    ) -> Option<Word> {
+        self.texs_ids_used.insert(tex_id);
+        let x_value = self.lower_value(x);
+        let x_coord = self.as_i32(x_value);
+        let numeric_type = self.texture_numeric_type_at(tex_id);
+        let vec4_t = self.graphics_numeric_vec4_type(numeric_type);
+        if self
+            .ir_constant_facts
+            .texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref())
+            && self.texel_buffer_slot_enabled(tex_id)
+        {
+            let (decl, image_var) =
+                self.typed_fetch_image_at(tex_id, numeric_type, GraphicsImageKind::Buffer);
+            let image = self
+                .b
+                .load(decl.image_t, None, image_var, None, [])
+                .unwrap();
+            let fetched = self
+                .b
+                .image_fetch(vec4_t, None, image, x_coord, None, [])
+                .unwrap();
+            Some(self.graphics_fetch_component_as_f32(fetched, numeric_type, *component))
+        } else {
+            let (decl, image_var, coords) = if let Some(z) = z {
+                let y = y.as_ref().expect("3D texel fetch requires Y coordinate");
+                let y_value = self.lower_value(y);
+                let y_coord = self.as_i32(y_value);
+                let z_value = self.lower_value(z);
+                let z_coord = self.as_i32(z_value);
+                let coords = self
+                    .b
+                    .composite_construct(self.ivec3_t, None, [x_coord, y_coord, z_coord])
+                    .unwrap();
+                let (decl, image_var) =
+                    self.typed_fetch_image_at(tex_id, numeric_type, GraphicsImageKind::D3);
+                (decl, image_var, coords)
+            } else {
+                let y_coord = if let Some(y) = y {
+                    let y_value = self.lower_value(y);
+                    self.as_i32(y_value)
+                } else {
+                    self.i32_zero
+                };
+                let kind = if self.sampler_arrayed {
+                    GraphicsImageKind::D2Array
+                } else {
+                    GraphicsImageKind::D2
+                };
+                let (decl, image_var) = self.typed_fetch_image_at(tex_id, numeric_type, kind);
+                let coords = if self.sampler_arrayed {
+                    self.b
+                        .composite_construct(self.ivec3_t, None, [x_coord, y_coord, self.i32_zero])
+                        .unwrap()
+                } else {
+                    self.b
+                        .composite_construct(self.ivec2_t, None, [x_coord, y_coord])
+                        .unwrap()
+                };
+                (decl, image_var, coords)
+            };
+            let image = self
+                .b
+                .load(decl.image_t, None, image_var, None, [])
+                .unwrap();
+            let fetched = self
+                .b
+                .image_fetch(
+                    vec4_t,
+                    None,
+                    image,
+                    coords,
+                    Some(rspirv::spirv::ImageOperands::LOD),
+                    [Operand::IdRef(self.i32_zero)],
+                )
+                .unwrap();
+            Some(self.graphics_fetch_component_as_f32(fetched, numeric_type, *component))
+        }
+    }
+
     fn lower_op(&mut self, inst: &IrInst) {
         let result = inst.result;
         let word = match &inst.op {
@@ -4909,6 +5230,16 @@ impl Emitter {
             IrOp::DpdyFine { src } => {
                 let value = self.lower_value(src);
                 Some(self.b.d_pdy_fine(self.f32_t, None, value).unwrap())
+            }
+            IrOp::SampleId => {
+                assert_eq!(self.stage, Stage::Fragment);
+                let sample = if self.single_sample {
+                    self.const_u32(0)
+                } else {
+                    let var = self.sample_id_var_id();
+                    self.b.load(self.u32_t, None, var, None, []).unwrap()
+                };
+                Some(self.b.bitcast(self.f32_t, None, sample).unwrap())
             }
             IrOp::YDirection => {
                 Some(self.const_f32(if self.y_negate { -1.0f32 } else { 1.0f32 }.to_bits()))
@@ -5182,6 +5513,7 @@ impl Emitter {
             } => {
                 let logical_binding = match self.stage {
                     Stage::Vertex => u32::from(*binding),
+                    Stage::Geometry => GFX_CBUF_STAGE_SLOTS * 2 + u32::from(*binding),
                     Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*binding),
                     Stage::Compute => u32::from(*binding),
                 };
@@ -5222,6 +5554,7 @@ impl Emitter {
                 );
                 let logical_binding = match self.stage {
                     Stage::Vertex => u32::from(*binding),
+                    Stage::Geometry => GFX_CBUF_STAGE_SLOTS * 2 + u32::from(*binding),
                     Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*binding),
                     Stage::Compute => u32::from(*binding),
                 };
@@ -5332,6 +5665,7 @@ impl Emitter {
                         let addr_u = self.b.bitcast(u32_t, None, addr_f).unwrap();
                         let logical_binding = match self.stage {
                             Stage::Vertex => u32::from(*cbuf_binding),
+                            Stage::Geometry => GFX_CBUF_STAGE_SLOTS * 2 + u32::from(*cbuf_binding),
                             Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*cbuf_binding),
                             Stage::Compute => (*cbuf_binding as u32) & 0xF,
                         };
@@ -5428,6 +5762,7 @@ impl Emitter {
                     };
                     let logical_binding = match self.stage {
                         Stage::Vertex => u32::from(*cbuf_binding),
+                            Stage::Geometry => GFX_CBUF_STAGE_SLOTS * 2 + u32::from(*cbuf_binding),
                         Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*cbuf_binding),
                         Stage::Compute => (*cbuf_binding as u32) & 0xf,
                     };
@@ -5489,6 +5824,7 @@ impl Emitter {
                     };
                     let logical_binding = match self.stage {
                         Stage::Vertex => u32::from(*cbuf_binding),
+                            Stage::Geometry => GFX_CBUF_STAGE_SLOTS * 2 + u32::from(*cbuf_binding),
                         Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*cbuf_binding),
                         Stage::Compute => (*cbuf_binding as u32) & 0xf,
                     };
@@ -5559,6 +5895,50 @@ impl Emitter {
                 }
                 None
             }
+            IrOp::LoadAttrIndexed { address } => {
+                Some(self.lower_indexed_attr(address, None))
+            }
+            IrOp::InterpAttrIndexed { address, perspective, mode, sat } => {
+                Some(self.lower_indexed_attr(address, Some((perspective, mode, sat))))
+            }
+            IrOp::GeometryInvocationInfo => {
+                let bits = self.const_u32(self.geometry.input_vertices << 16);
+                Some(self.b.bitcast(self.f32_t, None, bits).unwrap())
+            }
+            IrOp::LoadGeometryAttr { slot, vertex } => {
+                let input = self.geometry_input(*slot & !0xf);
+                let vertex_f = self.lower_value(vertex);
+                let vertex = self.b.bitcast(self.u32_t, None, vertex_f).unwrap();
+                let count = self.const_u32(self.geometry.input_vertices);
+                let valid = self.b.u_less_than(self.bool_t, None, vertex, count).unwrap();
+                let zero = self.const_u32(0);
+                let vertex = self.b.select(self.u32_t, None, valid, vertex, zero).unwrap();
+                let component = self.const_u32((slot & 0xc) >> 2);
+                let ptr = self.b.access_chain(self.ptr_input_f32, None, input, [vertex, component]).unwrap();
+                let value = self.b.load(self.f32_t, None, ptr, None, []).unwrap();
+                Some(self.b.select(self.f32_t, None, valid, value, self.f32_zero).unwrap())
+            }
+            IrOp::EmitVertex => {
+                let merge = self.geometry_predicate_begin(inst);
+                let position = self.position_var();
+                let original = self.b.load(self.vec4_t, None, position, None, []).unwrap();
+                self.transform_position();
+                let variables: Vec<_> = self.output_vars.values().map(|attribute| attribute.var).collect();
+                let saved: Vec<_> = variables.into_iter().filter(|var| *var != 0).map(|var| {
+                    (var, self.b.load(self.vec4_t, None, var, None, []).unwrap())
+                }).collect();
+                self.b.emit_vertex().unwrap();
+                for (var, value) in saved { self.b.store(var, value, None, []).unwrap(); }
+                self.b.store(position, original, None, []).unwrap();
+                self.geometry_predicate_end(merge);
+                None
+            }
+            IrOp::EndPrimitive => {
+                let merge = self.geometry_predicate_begin(inst);
+                self.b.end_primitive().unwrap();
+                self.geometry_predicate_end(merge);
+                None
+            }
             IrOp::LoadAttr { slot } => {
                 if self.stage == Stage::Fragment && *slot == 0x3fc {
                     Some(self.load_front_facing_bits())
@@ -5577,55 +5957,7 @@ impl Emitter {
                 mode,
                 sat,
             } => {
-                let component = (slot & 0xC) >> 2;
-                let aligned_slot = slot & !0xF;
-                let fold_perspective_round_trip = matches!(self.stage, Stage::Fragment)
-                    && *mode == 1
-                    && generic_varying_location(aligned_slot).is_some_and(|location| {
-                        self.ps_input_component_mode(location, component) == 2
-                    })
-                    && matches!(
-                        perspective,
-                        IrValue::Inst(id) if self.fragment_position_w_reciprocals.contains(id)
-                    );
-                let mut val = if self.stage == Stage::Fragment && *slot == 0x3fc {
-                    self.load_front_facing_bits()
-                } else if aligned_slot == 0x70 {
-                    let fc = self.frag_coord_var();
-                    let idx = self.const_u32(component);
-                    let ac = self
-                        .b
-                        .access_chain(self.ptr_input_f32, None, fc, [idx])
-                        .unwrap();
-                    self.b.load(self.f32_t, None, ac, None, []).unwrap()
-                } else {
-                    let av = self.input_var(aligned_slot);
-                    let mut val = self.read_attr_component(av, component);
-                    if let Some(loc) = generic_varying_location(aligned_slot) {
-                        if self.ps_input_component_mode(loc, component) == 2
-                            && !fold_perspective_round_trip
-                        {
-                            let fc = self.frag_coord_var();
-                            let idx = self.const_u32(3);
-                            let ac = self
-                                .b
-                                .access_chain(self.ptr_input_f32, None, fc, [idx])
-                                .unwrap();
-                            let w = self.b.load(self.f32_t, None, ac, None, []).unwrap();
-                            val = self.b.f_mul(self.f32_t, None, val, w).unwrap();
-                        }
-                    }
-                    val
-                };
-                if *mode == 1
-                    && fixed_varying_index(aligned_slot).is_none()
-                    && !fold_perspective_round_trip
-                {
-                    let p = self.lower_value(perspective);
-                    val = self.b.f_mul(self.f32_t, None, val, p).unwrap();
-                }
-                val = self.apply_sat(val, *sat);
-                Some(val)
+                Some(self.lower_interp_attr(slot, perspective, mode, sat))
             }
             IrOp::StoreAttr { slot, src } => {
                 let guard = inst
@@ -5648,87 +5980,7 @@ impl Emitter {
                     *cbuf_word_offset,
                     *cbuf_secondary_word_offset,
                 );
-                self.texs_ids_used.insert(tex_id);
-                let x_value = self.lower_value(x);
-                let x_coord = self.as_i32(x_value);
-                let numeric_type = self.texture_numeric_type_at(tex_id);
-                let vec4_t = self.graphics_numeric_vec4_type(numeric_type);
-                if self
-                    .ir_constant_facts
-                    .texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref())
-                    && self.texel_buffer_slot_enabled(tex_id)
-                {
-                    let (decl, image_var) =
-                        self.typed_fetch_image_at(tex_id, numeric_type, GraphicsImageKind::Buffer);
-                    let image = self
-                        .b
-                        .load(decl.image_t, None, image_var, None, [])
-                        .unwrap();
-                    let fetched = self
-                        .b
-                        .image_fetch(vec4_t, None, image, x_coord, None, [])
-                        .unwrap();
-                    Some(self.graphics_fetch_component_as_f32(fetched, numeric_type, *component))
-                } else {
-                    let (decl, image_var, coords) = if let Some(z) = z {
-                        let y = y.as_ref().expect("3D texel fetch requires Y coordinate");
-                        let y_value = self.lower_value(y);
-                        let y_coord = self.as_i32(y_value);
-                        let z_value = self.lower_value(z);
-                        let z_coord = self.as_i32(z_value);
-                        let coords = self
-                            .b
-                            .composite_construct(self.ivec3_t, None, [x_coord, y_coord, z_coord])
-                            .unwrap();
-                        let (decl, image_var) =
-                            self.typed_fetch_image_at(tex_id, numeric_type, GraphicsImageKind::D3);
-                        (decl, image_var, coords)
-                    } else {
-                        let y_coord = if let Some(y) = y {
-                            let y_value = self.lower_value(y);
-                            self.as_i32(y_value)
-                        } else {
-                            self.i32_zero
-                        };
-                        let kind = if self.sampler_arrayed {
-                            GraphicsImageKind::D2Array
-                        } else {
-                            GraphicsImageKind::D2
-                        };
-                        let (decl, image_var) =
-                            self.typed_fetch_image_at(tex_id, numeric_type, kind);
-                        let coords = if self.sampler_arrayed {
-                            self.b
-                                .composite_construct(
-                                    self.ivec3_t,
-                                    None,
-                                    [x_coord, y_coord, self.i32_zero],
-                                )
-                                .unwrap()
-                        } else {
-                            self.b
-                                .composite_construct(self.ivec2_t, None, [x_coord, y_coord])
-                                .unwrap()
-                        };
-                        (decl, image_var, coords)
-                    };
-                    let image = self
-                        .b
-                        .load(decl.image_t, None, image_var, None, [])
-                        .unwrap();
-                    let fetched = self
-                        .b
-                        .image_fetch(
-                            vec4_t,
-                            None,
-                            image,
-                            coords,
-                            Some(rspirv::spirv::ImageOperands::LOD),
-                            [Operand::IdRef(self.i32_zero)],
-                        )
-                        .unwrap();
-                    Some(self.graphics_fetch_component_as_f32(fetched, numeric_type, *component))
-                }
+                self.lower_graphics_texel_fetch(tex_id, x, y, z, component)
             }
             IrOp::TexelFetchHandle {
                 handle,
@@ -5738,7 +5990,11 @@ impl Emitter {
                 z,
                 component,
             } => {
-                Some(self.lower_compute_texel_fetch(*handle, x, y.as_ref(), z.as_ref(), *component))
+                if self.stage == Stage::Compute {
+                    Some(self.lower_compute_texel_fetch(*handle, x, y.as_ref(), z.as_ref(), *component))
+                } else {
+                    self.lower_graphics_texel_fetch(graphics_texture_id(*handle), x, y, z, component)
+                }
             }
             IrOp::SampleTexHandle {
                 sample_site,
@@ -6846,6 +7102,12 @@ impl Emitter {
                     )
                     .unwrap();
                 Some(self.store_bits(r))
+            }
+            IrOp::BitReverse { value } => {
+                let value = self.lower_value(value);
+                let value = self.as_u32(value);
+                let result = self.b.bit_reverse(self.u32_t, None, value).unwrap();
+                Some(self.store_bits(result))
             }
             IrOp::BitCount { value } => {
                 let value = self.lower_value(value);
@@ -8311,7 +8573,7 @@ impl Emitter {
     }
 
     fn restore_pred_regs(&mut self, cfg: &Cfg, predecessors: &[Vec<BlockId>], block: &BasicBlock) {
-        self.pred_regs = [None; 7];
+        self.pred_regs = [None; 9];
         let Some(preds) = predecessors.get(block.id as usize) else {
             return;
         };
@@ -8949,6 +9211,9 @@ impl Emitter {
                     IrOp::LoadLocal { .. } | IrOp::StoreLocal { .. } => {
                         self.ensure_local_mem_var();
                     }
+                    IrOp::SampleId if !self.single_sample => {
+                        self.sample_id_var_id();
+                    }
                     IrOp::SubgroupLaneId | IrOp::SubgroupMask { .. } | IrOp::FSwzAdd { .. } => {
                         self.subgroup_id_var();
                     }
@@ -8996,6 +9261,17 @@ impl Emitter {
                         texture_query_ids.insert(tex_id);
                         record_graphics_texture_image_kind(&mut texture_kinds, tex_id, kind);
                     }
+                    IrOp::LoadAttrIndexed { .. } | IrOp::InterpAttrIndexed { .. } => {
+                        for slot in (0x80..0x280).step_by(16) {
+                            if self.indexed_attr_enabled(slot) {
+                                self.input_var(slot);
+                            }
+                        }
+                        if self.stage == Stage::Fragment {
+                            self.frag_coord_var();
+                        }
+                    }
+                    IrOp::LoadGeometryAttr { slot, .. } => { self.geometry_input(*slot & !0xf); }
                     IrOp::LoadAttr { slot } => {
                         if self.stage == Stage::Fragment && *slot == 0x3fc {
                             self.front_facing_var_id();
@@ -9085,6 +9361,14 @@ impl Emitter {
                             z.is_some(),
                         ));
                     }
+                    IrOp::TexelFetchHandle { handle, y, z, .. } if self.stage != Stage::Compute => {
+                        needs_image = true;
+                        let tex_id = graphics_texture_id(*handle);
+                        tex_ids.insert(tex_id);
+                        texel_fetches.push((tex_id,
+                            self.ir_constant_facts.texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref()),
+                            z.is_some()));
+                    }
                     IrOp::GatherTex { tex_id, .. } => {
                         needs_image = true;
                         needs_sampler = true;
@@ -9116,7 +9400,7 @@ impl Emitter {
                     self.fragment_depth_var();
                 }
             }
-            Stage::Compute => {}
+            Stage::Compute | Stage::Geometry => {}
         }
         if needs_image {
             self.sampler_arrayed = needs_arrayed_sampler;
@@ -9408,54 +9692,7 @@ impl Emitter {
                     self.b.store(pos_var, new_pos, None, []).unwrap();
                     self.cbuf_bindings_used |= 1;
                 }
-                let do_z_remap = if std::env::var("NEXIUM_VS_Z_REMAP").ok().as_deref() == Some("1")
-                {
-                    true
-                } else {
-                    self.vertex_opts.apply_z_remap
-                };
-                let pos = self.position_var();
-                let cur = self.b.load(self.vec4_t, None, pos, None, []).unwrap();
-                let mut new_pos = cur;
-                if do_z_remap {
-                    let cur_z = self
-                        .b
-                        .composite_extract(self.f32_t, None, cur, [2])
-                        .unwrap();
-                    let cur_w = self
-                        .b
-                        .composite_extract(self.f32_t, None, cur, [3])
-                        .unwrap();
-                    let sum = self.b.f_add(self.f32_t, None, cur_z, cur_w).unwrap();
-                    let half = self.const_f32(0.5f32.to_bits());
-                    let new_z = self.b.f_mul(self.f32_t, None, sum, half).unwrap();
-                    new_pos = self
-                        .b
-                        .composite_insert(self.vec4_t, None, new_z, cur, [2])
-                        .unwrap();
-                }
-                let vs = self.vertex_opts.vptx_scale_z;
-                let vt = self.vertex_opts.vptx_translate_z;
-                if (vs - 1.0).abs() > 1e-6 || vt.abs() > 1e-6 {
-                    let cur_z = self
-                        .b
-                        .composite_extract(self.f32_t, None, new_pos, [2])
-                        .unwrap();
-                    let cur_w = self
-                        .b
-                        .composite_extract(self.f32_t, None, new_pos, [3])
-                        .unwrap();
-                    let scale = self.const_f32(vs.to_bits());
-                    let trans = self.const_f32(vt.to_bits());
-                    let sz = self.b.f_mul(self.f32_t, None, scale, cur_z).unwrap();
-                    let tw = self.b.f_mul(self.f32_t, None, trans, cur_w).unwrap();
-                    let remapped_z = self.b.f_add(self.f32_t, None, sz, tw).unwrap();
-                    new_pos = self
-                        .b
-                        .composite_insert(self.vec4_t, None, remapped_z, new_pos, [2])
-                        .unwrap();
-                }
-                self.b.store(pos, new_pos, None, []).unwrap();
+                self.transform_position();
             }
             Stage::Fragment => {
                 if self.return_block.is_none() {
@@ -9595,7 +9832,7 @@ impl Emitter {
                     self.store_fragment_depth(exit_state);
                 }
             }
-            Stage::Compute => {}
+            Stage::Compute | Stage::Geometry => {}
         }
 
         self.b.ret().unwrap();
@@ -9603,11 +9840,19 @@ impl Emitter {
 
         let exec_model = match self.stage {
             Stage::Vertex => ExecutionModel::Vertex,
+            Stage::Geometry => ExecutionModel::Geometry,
             Stage::Fragment => ExecutionModel::Fragment,
             Stage::Compute => ExecutionModel::GLCompute,
         };
         self.b
             .entry_point(exec_model, main_id, "main", self.interface.clone());
+        if self.stage == Stage::Geometry {
+            self.b.capability(Capability::Geometry);
+            self.b.execution_mode(main_id, self.geometry.input_mode, []);
+            self.b.execution_mode(main_id, self.geometry.output_mode, []);
+            self.b.execution_mode(main_id, rspirv::spirv::ExecutionMode::OutputVertices, [self.geometry.output_vertices]);
+            self.b.execution_mode(main_id, rspirv::spirv::ExecutionMode::Invocations, [self.geometry.invocations]);
+        }
         if self.force_fp32_ftz {
             self.b.extension("SPV_KHR_float_controls");
             self.b.capability(Capability::DenormFlushToZero);
@@ -9653,7 +9898,38 @@ impl Emitter {
         } else {
             Vec::new()
         };
-        let words = opt::dedup_constants(self.b.module().assemble());
+        let uses_layer = self.layer_var.is_some();
+        let mut module = self.b.module();
+        if uses_layer {
+            module.header.as_mut().unwrap().version = 0x0001_0500;
+            for instruction in &mut module.types_global_values {
+                for operand in &mut instruction.operands {
+                    if *operand == Operand::StorageClass(StorageClass::Uniform) {
+                        *operand = Operand::StorageClass(StorageClass::StorageBuffer);
+                    }
+                }
+            }
+            for instruction in &mut module.annotations {
+                for operand in &mut instruction.operands {
+                    if *operand == Operand::Decoration(Decoration::BufferBlock) {
+                        *operand = Operand::Decoration(Decoration::Block);
+                    }
+                }
+            }
+            let globals = module.types_global_values.iter()
+                .filter(|instruction| instruction.class.opcode == rspirv::spirv::Op::Variable)
+                .filter_map(|instruction| instruction.result_id)
+                .collect::<Vec<_>>();
+            for entry in &mut module.entry_points {
+                for id in &globals {
+                    let operand = Operand::IdRef(*id);
+                    if !entry.operands[3..].contains(&operand) {
+                        entry.operands.push(operand);
+                    }
+                }
+            }
+        }
+        let words = opt::dedup_constants(module.assemble());
         dump_spirv_words(&words, self.stage, multi_exit);
         if !phi_preds_consistent(&words) {
             for line in phi_cfg_lines {
@@ -9681,6 +9957,7 @@ fn dump_spirv_words(words: &[u32], stage: Stage, multi_exit: bool) {
         Stage::Vertex => "vs",
         Stage::Fragment => "fs",
         Stage::Compute => "cs",
+        Stage::Geometry => "gs",
     };
     let mut hash: u64 = 1469598103934665603;
     for word in words {
@@ -11084,17 +11361,23 @@ pub struct VertexOptions {
     pub point_size: Option<f32>,
     pub window_ndc: Option<(f32, f32)>,
     pub num_ssbo: u32,
+    pub indexed_input_mask: u32,
     pub uint_attr_mask: u32,
     pub sint_attr_mask: u32,
     pub tex_slot_base: u32,
     pub texture_numeric_manifest: Vec<GraphicsTextureResource>,
     pub texel_buffer_mask: u32,
     pub layer_output_slot: Option<u32>,
+    pub layer_output_float: bool,
     pub varying_map: GraphicsVaryingMap,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FragmentOptions {
+    pub dual_source: bool,
+    pub num_ssbo: u32,
+    pub indexed_input_mask: Option<u32>,
+    pub single_sample: bool,
     pub uint_output_mask: u32,
     pub sint_output_mask: u32,
     pub texture_numeric_manifest: Vec<GraphicsTextureResource>,
@@ -11114,12 +11397,14 @@ impl Default for VertexOptions {
             point_size: None,
             window_ndc: None,
             num_ssbo: 0,
+            indexed_input_mask: u32::MAX,
             uint_attr_mask: 0,
             sint_attr_mask: 0,
             tex_slot_base: 0,
             texture_numeric_manifest: Vec::new(),
             texel_buffer_mask: 0,
             layer_output_slot: None,
+            layer_output_float: false,
             varying_map: GraphicsVaryingMap::default(),
         }
     }
@@ -11136,6 +11421,54 @@ fn cbuf_vec4s(cfg: &Cfg, floor_vec4s: u32) -> u32 {
     }
     let vec4s = ((max_byte + 15) / 16).max(floor_vec4s).max(16);
     ((vec4s + 15) & !15).min(UBO_VEC4S)
+}
+
+#[derive(Clone, Copy)]
+pub struct GeometryOptions {
+    pub input_vertices: u32,
+    pub output_vertices: u32,
+    pub invocations: u32,
+    pub input_mode: rspirv::spirv::ExecutionMode,
+    pub output_mode: rspirv::spirv::ExecutionMode,
+}
+
+impl GeometryOptions {
+    pub fn from_header(topology: u32, header: &[u8; 80]) -> Result<Self, String> {
+        use rspirv::spirv::ExecutionMode;
+        let (input_vertices, input_mode) = match topology {
+            0 => (1, ExecutionMode::InputPoints),
+            1 | 2 | 3 => (2, ExecutionMode::InputLines),
+            4 | 5 | 6 => (3, ExecutionMode::Triangles),
+            10 | 11 => (4, ExecutionMode::InputLinesAdjacency),
+            12 | 13 => (6, ExecutionMode::InputTrianglesAdjacency),
+            _ => return Err(format!("unsupported geometry input topology {topology}")),
+        };
+        let word = |i| u32::from_le_bytes(header[i..i + 4].try_into().unwrap());
+        let output_mode = match (word(12) >> 24) & 15 {
+            1 => ExecutionMode::OutputPoints,
+            6 => ExecutionMode::OutputLineStrip,
+            7 => ExecutionMode::OutputTriangleStrip,
+            mode => return Err(format!("unsupported geometry output topology {mode}")),
+        };
+        let output_vertices = word(16) & 0xfff;
+        let invocations = (word(8) >> 24).max(1);
+        if output_vertices == 0 { return Err("geometry shader has no output vertices".into()); }
+        Ok(Self { input_vertices, input_mode, output_mode, output_vertices, invocations })
+    }
+}
+
+impl Default for GeometryOptions {
+    fn default() -> Self {
+        Self { input_vertices: 3, output_vertices: 3, invocations: 1,
+            input_mode: rspirv::spirv::ExecutionMode::Triangles,
+            output_mode: rspirv::spirv::ExecutionMode::OutputTriangleStrip }
+    }
+}
+
+pub fn emit_geometry(cfg: &Cfg, outputs: &[u32], vertex: VertexOptions, geometry: GeometryOptions) -> (Vec<u32>, u64) {
+    let mut emitter = Emitter::new_with_vertex_opts_sized(Stage::Geometry, vertex, UBO_VEC4S);
+    emitter.geometry = geometry;
+    emitter.finish_with_required_outputs_and_bindings(cfg, outputs)
 }
 
 pub fn emit_vertex_with_bindings_opts(
@@ -11241,9 +11574,11 @@ pub fn emit_fragment_full_with_options(
 ) -> (Vec<u32>, u64, Vec<u32>, u32, bool) {
     let vec4s = cbuf_vec4s(cfg, 1).max(UBO_VEC4S);
     let mut emitter = Emitter::new_sized(Stage::Fragment, vec4s);
+    emitter.setup_ssbos(options.num_ssbo);
     emitter.varying_map = options.varying_map;
     emitter.fragment_debug_active = debug_active;
     emitter.fragment_writes_depth = options.writes_depth;
+    emitter.single_sample = options.single_sample;
     emitter.texture_numeric_manifest = normalize_graphics_texture_manifest(
         options.texture_numeric_manifest,
     )
@@ -11257,7 +11592,9 @@ pub fn emit_fragment_full_with_options(
         emitter.tex_v_flip_slots.clear();
     }
     emitter.ps_input_map = ps_input_map;
+    emitter.fragment_indexed_input_mask = options.indexed_input_mask.unwrap_or(u32::MAX);
     emitter.fragment_color_outputs = color_outputs.max(1).min(8);
+    emitter.fragment_dual_source = options.dual_source;
     emitter.fragment_output_map = output_map;
     emitter.fragment_uint_output_mask = options.uint_output_mask;
     emitter.fragment_sint_output_mask = options.sint_output_mask & !options.uint_output_mask;
@@ -11826,7 +12163,7 @@ mod tests {
             .collect::<Vec<_>>();
         std::fs::write(&path, bytes).expect("write temporary SPIR-V");
         let output = std::process::Command::new("spirv-val")
-            .args(["--target-env", "vulkan1.1"])
+            .args(["--target-env", if words.get(1).copied().unwrap_or(0) >= 0x0001_0500 { "vulkan1.2" } else { "vulkan1.1" }])
             .arg(&path)
             .output();
         let _ = std::fs::remove_file(&path);
@@ -12056,6 +12393,75 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(stride_targets.len(), 1);
+    }
+
+    #[test]
+    fn fragment_storage_loads_use_fragment_cbuf_and_shared_binding() {
+        let mut program = nexium_shader::IrProgram::new();
+        let base = program.emit(
+            IrOp::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x510,
+            },
+            None,
+        );
+        program.emit(
+            IrOp::LoadStorage {
+                buffer_index: 1,
+                addr_lo: IrValue::Inst(base),
+                base_addr_lo: IrValue::Inst(base),
+                imm: 16,
+                cbuf_binding: 0,
+                cbuf_offset: 0x510,
+                align: 16,
+            },
+            Some(0),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, mask, ..) = emit_fragment_full_with_options(
+            &cfg,
+            [0; 32],
+            1,
+            0xf,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                num_ssbo: 2,
+                ..Default::default()
+            },
+        );
+        validates_with_spirv_val_if_available(&words);
+        assert_eq!(mask, 1u64 << GFX_CBUF_STAGE_SLOTS);
+        let module = rspirv::dr::load_words(&words).unwrap();
+        let storage = module.annotations.iter().find_map(|inst| match inst.operands.as_slice() {
+            [Operand::IdRef(id), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(binding)]
+                if *binding == SSBO_BINDING_BASE + 1 => Some(*id),
+            _ => None,
+        }).unwrap();
+        let instructions: Vec<_> = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .collect();
+        let pointer = instructions
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == rspirv::spirv::Op::AccessChain
+                    && inst.operands.first() == Some(&Operand::IdRef(storage))
+            })
+            .unwrap()
+            .result_id
+            .unwrap();
+        assert!(instructions.iter().any(|inst| {
+            inst.class.opcode == rspirv::spirv::Op::Load
+                && inst.operands.first() == Some(&Operand::IdRef(pointer))
+        }));
     }
 
     #[test]
@@ -12704,6 +13110,105 @@ mod tests {
     }
 
     #[test]
+    fn condition_flag_exit_emits_valid_combined_branch() {
+        let words = [0u64, 0x4b5c_838c_0127_06ff, 0xe300_0000_0008_000d,
+            0x0103_f800_0007_f003, 0, 0xe300_0000_0007_000f];
+        let bytes = words.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>();
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let (words, _, _, _, _) = emit_fragment_full_with_options(
+            &cfg, [0; 32], 1, 0xf, false, 0, 0, FragmentOptions::default(),
+        );
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).unwrap();
+        assert!(module.all_inst_iter().any(|inst| inst.class.opcode == rspirv::spirv::Op::LogicalAnd));
+    }
+
+    #[test]
+    fn dual_source_outputs_share_attachment_with_distinct_indices() {
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, nexium_shader::IrProgram::new())],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        for dual_source in [false, true] {
+            let (words, _, _, _, _) = emit_fragment_full_with_options(
+                &cfg, [0; 32], 1, 0xff, false, 0, 0,
+                FragmentOptions { dual_source, ..Default::default() },
+            );
+            validates_with_spirv_val_if_available(&words);
+            let module = rspirv::dr::load_words(&words).unwrap();
+            let decorations = |decoration| module.annotations.iter().filter_map(|inst| {
+                match inst.operands.as_slice() {
+                    [Operand::IdRef(id), Operand::Decoration(kind), Operand::LiteralBit32(value)]
+                        if *kind == decoration => Some((*id, *value)),
+                    _ => None,
+                }
+            }).collect::<Vec<_>>();
+            let locations = decorations(Decoration::Location);
+            let indices = decorations(Decoration::Index);
+            assert_eq!(locations.len(), if dual_source { 2 } else { 1 });
+            assert!(locations.iter().all(|(_, location)| *location == 0));
+            if dual_source {
+                assert_eq!(indices.iter().map(|(_, index)| *index).collect::<Vec<_>>(), vec![0, 1]);
+                assert!(indices.iter().all(|(id, _)| locations.contains(&(*id, 0))));
+            } else {
+                assert!(indices.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_attribute_interfaces_use_declared_locations() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(IrOp::LoadAttrIndexed { address: IrValue::ImmU32(0x84) }, Some(0));
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        for mask in [0, 1, 0x81] {
+            let expected = (0..32).filter(|location| mask & (1 << location) != 0).collect::<Vec<_>>();
+            let (vertex, _, _) = emit_vertex_with_bindings_opts(&cfg, &[], VertexOptions {
+                indexed_input_mask: mask,
+                ..Default::default()
+            });
+            let (fragment, _, _, _, _) = emit_fragment_full_with_options(
+                &cfg, [0; 32], 1, 0xf, false, 0, 0,
+                FragmentOptions { indexed_input_mask: Some(mask), ..Default::default() },
+            );
+            assert_eq!(scan_input_locations(&vertex), expected);
+            assert_eq!(scan_input_locations(&fragment), expected);
+            validates_with_spirv_val_if_available(&vertex);
+            validates_with_spirv_val_if_available(&fragment);
+        }
+    }
+
+    #[test]
+    fn vertex_float_layer_output_converts_face_number() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit_void(IrOp::StoreAttr {
+            slot: 0x88,
+            src: IrValue::ImmU32(5.0f32.to_bits()),
+        });
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, _, _) = emit_vertex_with_bindings_opts(&cfg, &[], VertexOptions {
+            layer_output_slot: Some(0x88),
+            layer_output_float: true,
+            ..Default::default()
+        });
+        assert!(validate_structured_cfg(&words).is_ok());
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).unwrap();
+        assert!(module.all_inst_iter().any(|instruction|
+            instruction.class.opcode == rspirv::spirv::Op::ConvertFToU));
+    }
+
+    #[test]
     fn vertex_layer_output_mirrors_selected_generic_bits() {
         let mut program = nexium_shader::IrProgram::new();
         program.emit_void(IrOp::StoreAttr {
@@ -12732,13 +13237,11 @@ mod tests {
         let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
 
         assert!(module.capabilities.iter().any(|inst| {
-            inst.operands == [Operand::Capability(Capability::ShaderViewportIndexLayerEXT)]
+            inst.operands == [Operand::Capability(Capability::ShaderLayer)]
         }));
-        assert!(module.extensions.iter().any(|inst| {
-            inst.operands
-                == [Operand::LiteralString(
-                    "SPV_EXT_shader_viewport_index_layer".to_string(),
-                )]
+        assert_eq!(module.header.as_ref().unwrap().version, 0x0001_0500);
+        assert!(!module.extensions.iter().any(|inst| {
+            inst.operands == [Operand::LiteralString("SPV_EXT_shader_viewport_index_layer".to_string())]
         }));
 
         let layer = module
@@ -17405,6 +17908,7 @@ mod tests {
         ComputeOptions {
             local_size: [64, 1, 1],
             local_memory_low_size: 0,
+            vertex_memory_store: false,
             local_memory_high_size: 0,
             local_memory_crs_size: 0,
             shared_memory_size: 0,
@@ -17469,8 +17973,37 @@ mod tests {
     }
 
     #[test]
+    fn vertex_memory_store_uses_global_ids_only_when_requested() {
+        let cfg = compute_test_cfg();
+        for vertex_memory_store in [false, true] {
+            let mut options = compute_test_options(TextureNumericType::Float);
+            options.local_size = [30, 1, 1];
+            options.vertex_memory_store = vertex_memory_store;
+            let emitted = emit_compute(&cfg, &options).unwrap();
+            validates_with_spirv_val_if_available(&emitted.words);
+            let module = rspirv::dr::load_words(&emitted.words).unwrap();
+            for (builtin, expected) in [
+                (BuiltIn::LocalInvocationId, true),
+                (BuiltIn::WorkgroupId, !vertex_memory_store),
+                (BuiltIn::GlobalInvocationId, vertex_memory_store),
+            ] {
+                assert_eq!(module.annotations.iter().any(|annotation| {
+                    annotation.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+                        && annotation.operands.get(2) == Some(&Operand::BuiltIn(builtin))
+                }), expected);
+            }
+        }
+    }
+
+    #[test]
     fn compute_integer_bit_ops_emit_valid_spirv() {
         let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::BitReverse {
+                value: IrValue::ImmU32(0x0000_0009),
+            },
+            Some(4),
+        );
         program.emit(
             IrOp::FindUMsb {
                 value: IrValue::ImmU32(0x8000_0000),
@@ -17526,6 +18059,7 @@ mod tests {
                     ))
         }));
         for opcode in [
+            rspirv::spirv::Op::BitReverse,
             rspirv::spirv::Op::BitCount,
             rspirv::spirv::Op::BitwiseAnd,
             rspirv::spirv::Op::BitwiseOr,
@@ -17540,7 +18074,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn compute_subgroup_big_warp_emulates_guest_warp_width() {
         let mut program = nexium_shader::IrProgram::new();
@@ -17628,6 +18161,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn compute_subgroup_ir_emits_lane_masks_ballot_all_any_and_equal() {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(IrOp::SubgroupLaneId, Some(0));
@@ -18985,6 +19519,7 @@ mod tests {
         let options = ComputeOptions {
             local_size: [64, 1, 1],
             local_memory_low_size: 0,
+            vertex_memory_store: false,
             local_memory_high_size: 0,
             local_memory_crs_size: 0,
             shared_memory_size: 0,
@@ -19807,10 +20342,10 @@ mod tests {
 
     #[test]
     fn graphics_cbuf_banks_sixteen_and_seventeen_use_extended_directory() {
-        assert_eq!(GFX_CBUF_DIRECTORY_WORDS, 72);
-        assert_eq!(GFX_CBUF_ZERO_WORD, 72);
-        assert_eq!(GFX_CBUF_PAYLOAD_WORD, 76);
-        assert_eq!(GFX_CBUF_MIN_SIZE, 304);
+        assert_eq!(GFX_CBUF_DIRECTORY_WORDS, 108);
+        assert_eq!(GFX_CBUF_ZERO_WORD, 108);
+        assert_eq!(GFX_CBUF_PAYLOAD_WORD, 112);
+        assert_eq!(GFX_CBUF_MIN_SIZE, 448);
         assert_eq!(GFX_CBUF_PAYLOAD_WORD % 4, 0);
 
         for binding in [16, 17] {

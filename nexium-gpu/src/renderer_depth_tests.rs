@@ -249,6 +249,7 @@ fn depth_fallback_preserves_clears_stencil_aliases_and_quantization() {
             }
         }
     }
+    uploaded_depth_textures_preserve_mips_layers_and_updates(&renderer);
     drop(renderer);
     let errors = ERRORS.lock().unwrap();
     assert!(errors.is_empty(), "{errors:?}");
@@ -263,6 +264,254 @@ fn submit_test(device: &ash::Device, queue: vk::Queue, cmd: vk::CommandBuffer) {
             .queue_submit(queue, &info, vk::Fence::null())
             .unwrap();
         device.queue_wait_idle(queue).unwrap();
+    }
+}
+
+fn uploaded_depth_textures_preserve_mips_layers_and_updates(renderer: &Renderer) {
+    use crate::texture::{ComponentType, SwizzleSource, TicEntry, TicFormat};
+    let mut inner = renderer.inner.lock();
+    let RendererInner {
+        device,
+        mem_props,
+        cmd_pool,
+        queue,
+        frame_slots,
+        debug_messenger,
+        ..
+    } = &mut *inner;
+    assert_ne!(*debug_messenger, vk::DebugUtilsMessengerEXT::null());
+    let copies = [
+        TextureMipCopy {
+            buffer_offset: 0,
+            mip_level: 0,
+            width: 4,
+            height: 4,
+        },
+        TextureMipCopy {
+            buffer_offset: 128,
+            mip_level: 1,
+            width: 2,
+            height: 2,
+        },
+    ];
+    let swizzle = [
+        SwizzleSource::R,
+        SwizzleSource::R,
+        SwizzleSource::R,
+        SwizzleSource::One,
+    ];
+    let tic = TicEntry {
+        format: TicFormat::X8Z24,
+        width: 4,
+        height: 4,
+        texture_type: 1,
+        swizzle,
+        component_types: [ComponentType::Unorm; 4],
+        gpu_va: 0x1000,
+        block_width_log2: 0,
+        block_height_log2: 0,
+        block_depth_log2: 0,
+        tile_width_spacing: 0,
+        pitch_bytes: 0,
+        is_block_linear: false,
+        depth: 1,
+        base_layer: 0,
+        normalized_coords: true,
+        is_srgb: false,
+        is_sparse: false,
+        msaa_mode: 0,
+        max_mip_level: 1,
+        res_min_mip_level: 0,
+        res_max_mip_level: 1,
+    };
+    let format =
+        texture_image_format_for_tic(&tic, nexium_spirv::TextureNumericType::Float).unwrap();
+    assert_eq!(format, vk::Format::D32_SFLOAT);
+    let values: Vec<_> = (0..40u32).map(|index| 0x123456 + index).collect();
+    let source: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let upload = texture_level_upload(&source, tic.format, 4, 4, 2, ComponentType::Unorm, format);
+    let cmd = alloc_one_time_cmd(device, *cmd_pool).unwrap();
+    begin_one_time(device, cmd).unwrap();
+    assert!(create_texture_image(
+        device,
+        cmd,
+        mem_props,
+        4,
+        4,
+        2,
+        0,
+        2,
+        true,
+        false,
+        false,
+        true,
+        2,
+        0,
+        2,
+        &upload,
+        &copies,
+        None,
+        &[],
+        swizzle,
+        format,
+        0,
+        None,
+        0,
+        None,
+    )
+    .is_err());
+    let (mut texture, stage) = create_texture_image(
+        device,
+        cmd,
+        mem_props,
+        4,
+        4,
+        2,
+        0,
+        2,
+        true,
+        false,
+        false,
+        false,
+        2,
+        0,
+        2,
+        &upload,
+        &copies,
+        None,
+        &[],
+        swizzle,
+        format,
+        0,
+        None,
+        0,
+        Some(&mut frame_slots[0]),
+    )
+    .unwrap();
+    if let Some(stage) = stage {
+        frame_slots[0].upload_buffers.push(stage);
+    }
+    submit_test(device, *queue, cmd);
+    unsafe {
+        device.free_command_buffers(*cmd_pool, &[cmd]);
+    }
+    for update in [false, true] {
+        let cmd = alloc_one_time_cmd(device, *cmd_pool).unwrap();
+        begin_one_time(device, cmd).unwrap();
+        let expected = if update {
+            values.iter().copied().rev().collect::<Vec<_>>()
+        } else {
+            values.clone()
+        };
+        if update {
+            let packed: Vec<_> = expected
+                .iter()
+                .flat_map(|v| ((v << 8) | 0xa5).to_le_bytes())
+                .collect();
+            let upload = texture_level_upload(
+                &packed,
+                TicFormat::Z24S8,
+                4,
+                4,
+                2,
+                ComponentType::Unorm,
+                format,
+            );
+            assert!(update_texture_image(
+                device,
+                cmd,
+                mem_props,
+                texture.image,
+                texture.layout,
+                format,
+                2,
+                true,
+                2,
+                &upload,
+                &copies,
+                &[],
+                &mut frame_slots[0],
+            )
+            .is_err());
+            let stage = update_texture_image(
+                device,
+                cmd,
+                mem_props,
+                texture.image,
+                texture.layout,
+                format,
+                2,
+                false,
+                2,
+                &upload,
+                &copies,
+                &[],
+                &mut frame_slots[0],
+            )
+            .unwrap();
+            if let Some(stage) = stage {
+                frame_slots[0].upload_buffers.push(stage);
+            }
+            texture.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        }
+        let staging = create_staging_owned(device, mem_props, 160).unwrap();
+        transition_image_range(
+            device,
+            cmd,
+            texture.image,
+            texture.layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageAspectFlags::DEPTH,
+            0,
+            2,
+            0,
+            2,
+        );
+        let regions: Vec<_> = copies
+            .iter()
+            .map(|copy| {
+                vk::BufferImageCopy::default()
+                    .buffer_offset(copy.buffer_offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .mip_level(copy.mip_level)
+                            .layer_count(2),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: copy.width,
+                        height: copy.height,
+                        depth: 1,
+                    })
+            })
+            .collect();
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                texture.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                staging.buffer,
+                &regions,
+            );
+        }
+        submit_test(device, *queue, cmd);
+        texture.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        let bytes = read_test_buffer(device, &staging, 160);
+        let result: Vec<_> = bytes
+            .chunks_exact(4)
+            .map(|word| crate::depth::pack_d24(f32::from_le_bytes(word.try_into().unwrap())))
+            .collect();
+        assert_eq!(result, expected);
+        unsafe {
+            device.destroy_buffer(staging.buffer, None);
+            device.free_memory(staging.memory, None);
+            device.free_command_buffers(*cmd_pool, &[cmd]);
+        }
+    }
+    unsafe {
+        device.destroy_image_view(texture.view, None);
+        device.destroy_image(texture.image, None);
+        device.free_memory(texture.memory, None);
     }
 }
 

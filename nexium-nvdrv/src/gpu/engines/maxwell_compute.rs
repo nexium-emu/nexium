@@ -41,7 +41,7 @@ static FRONTEND_CACHE_PROFILE_INDIRECT_VARIANT_INSERTS: std::sync::atomic::Atomi
     std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug)]
-pub(super) enum MaxwellComputeOutcome {
+pub(crate) enum MaxwellComputeOutcome {
     Executed,
     Unsupported(String),
     SubmittedFailure(String),
@@ -87,6 +87,41 @@ struct OutputTarget {
 struct PreparedWrite {
     target: OutputTarget,
     bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct StorageWritebackPool {
+    buffers: Vec<Vec<u8>>,
+}
+
+impl StorageWritebackPool {
+    fn take(&mut self, size: usize) -> Vec<u8> {
+        self.buffers.iter().position(|buffer| buffer.len() == size)
+            .map(|index| self.buffers.swap_remove(index))
+            .unwrap_or_default()
+    }
+
+    fn recycle(&mut self, buffer: Vec<u8>) {
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+        let retained: usize = self.buffers.iter().map(Vec::capacity).sum();
+        if !buffer.is_empty() && self.buffers.len() < 4
+            && buffer.capacity() <= MAX_BYTES.saturating_sub(retained)
+        {
+            self.buffers.push(buffer);
+        }
+    }
+}
+
+thread_local! {
+    static STORAGE_WRITEBACK_POOL: std::cell::RefCell<StorageWritebackPool> =
+        std::cell::RefCell::new(StorageWritebackPool::default());
+}
+
+impl Drop for PreparedWrite {
+    fn drop(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        let _ = STORAGE_WRITEBACK_POOL.try_with(|pool| pool.borrow_mut().recycle(bytes));
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -362,6 +397,7 @@ fn raw_storage_mapping_is_current(key: ComputeRawStorageKey, mappings: &GpuMappi
 struct ModuleCacheKey {
     frontend: FrontendCacheKey,
     local_size: [u32; 3],
+    vertex_memory_store: bool,
     local_memory_low_size: u32,
     local_memory_high_size: u32,
     local_memory_crs_size: u32,
@@ -754,6 +790,185 @@ fn dispatch_requires_pending_writeback_resolution(
     raw_storage_overlap || image_overlap
 }
 
+pub(crate) fn vertex_memory_store_code(code: &[u8]) -> Option<Vec<u8>> {
+    type Entry = (u64, Vec<u8>, Option<Vec<u8>>);
+    thread_local! {
+        static CACHE: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    }
+    if code.len() > MAX_CODE_BYTES {
+        return convert_vertex_memory_store_code(code);
+    }
+    let hash = xxhash_rust::xxh3::xxh3_64(code);
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, _, converted)) = cache
+            .iter()
+            .find(|(cached_hash, source, _)| *cached_hash == hash && source == code)
+        {
+            return converted.clone();
+        }
+        let converted = convert_vertex_memory_store_code(code);
+        if cache.len() >= 16 {
+            cache.remove(0);
+        }
+        cache.push((hash, code.to_vec(), converted.clone()));
+        converted
+    })
+}
+
+fn convert_vertex_memory_store_code(code: &[u8]) -> Option<Vec<u8>> {
+    if !code.chunks_exact(8).enumerate().any(|(index, chunk)| {
+        index % 4 != 0
+            && nexium_shader::decode_one(u64::from_le_bytes(chunk.try_into().unwrap())).is_some_and(
+                |decoded| {
+                    matches!(
+                        decoded.opcode,
+                        nexium_shader::Opcode::SUST | nexium_shader::Opcode::STG
+                    )
+                },
+            )
+    }) {
+        return None;
+    }
+    let cfg = nexium_shader::build_cfg(code);
+    if cfg
+        .blocks
+        .iter()
+        .any(|block| matches!(block.branch, nexium_shader::BranchKind::Indirect { .. }))
+    {
+        return None;
+    }
+    let mut stores = false;
+    for inst in cfg
+        .blocks
+        .iter()
+        .flat_map(|block| &block.program.instructions)
+    {
+        match &inst.op {
+            IrOp::Unimplemented {
+                opcode: nexium_shader::Opcode::SUST,
+                ..
+            }
+            | IrOp::StoreGlobal { .. } => stores = true,
+            IrOp::LoadAttr { slot: 0x2fc } => {}
+            IrOp::LoadAttr { .. }
+            | IrOp::LoadAttrIndexed { .. }
+            | IrOp::InterpAttr { .. }
+            | IrOp::InterpAttrIndexed { .. }
+            | IrOp::StoreAttr { .. }
+            | IrOp::Unimplemented { .. }
+            | IrOp::Shfl { .. }
+            | IrOp::SubgroupVote { .. }
+            | IrOp::FSwzAdd { .. }
+            | IrOp::SubgroupLaneId
+            | IrOp::SubgroupMask { .. }
+            | IrOp::LocalInvocationId { .. }
+            | IrOp::WorkgroupId { .. }
+            | IrOp::LoadShared { .. }
+            | IrOp::StoreShared { .. }
+            | IrOp::WorkgroupBarrier
+            | IrOp::SampleId => return None,
+            _ => {}
+        }
+    }
+    if !stores {
+        return None;
+    }
+    let mut converted = code.to_vec();
+    for (index, chunk) in converted.chunks_exact_mut(8).enumerate() {
+        if index % 4 == 0
+            || !cfg
+                .blocks
+                .iter()
+                .any(|block| (block.start_offset..block.end_offset).contains(&(index * 8)))
+        {
+            continue;
+        }
+        let raw = u64::from_le_bytes(chunk.try_into().unwrap());
+        if nexium_shader::decode_one(raw)
+            .is_some_and(|decoded| decoded.opcode == nexium_shader::Opcode::S2R)
+        {
+            return None;
+        }
+        if nexium_shader::decode_one(raw)
+            .is_some_and(|decoded| decoded.opcode == nexium_shader::Opcode::ALD)
+            && (raw >> 20) & 0x3ff == 0x2fc
+            && (raw >> 8) & 0xff == 0xff
+        {
+            let replacement = 0xf0c8_0000_0250_0000u64 | (raw & 0xf00ff);
+            chunk.copy_from_slice(&replacement.to_le_bytes());
+        }
+    }
+    Some(converted)
+}
+
+fn vertex_memory_store_group_size(vertex_count: u32) -> u32 {
+    (1..=32)
+        .rev()
+        .find(|size| vertex_count % size == 0)
+        .unwrap_or(1)
+}
+
+pub(crate) fn execute_vertex_memory_store(
+    draw: &super::maxwell3d::DrawCall,
+    sph: &[u8; 0x50],
+    code: &[u8],
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+) -> MaxwellComputeOutcome {
+    let program = draw.shader_programs[1];
+    let mut qmd = [0u32; 0x40];
+    qmd[0x08] = program.address_lo.wrapping_add(0x50);
+    qmd[0x0b] = u32::from(draw.sampler_binding == 1) << 30;
+    let group_size = vertex_memory_store_group_size(draw.vertex_count);
+    qmd[0x0c] = draw.vertex_count / group_size;
+    qmd[0x0d] = 1 | (1 << 16);
+    qmd[0x12] = group_size << 16;
+    qmd[0x13] = 1 | (1 << 16);
+    for slot in 0..8 {
+        let (address, size) = draw.cbuf_binds[program.cbuf_group(0)][slot];
+        if address != 0 && size != 0 {
+            if address >> 40 != 0 || size > 0x1ffff {
+                return MaxwellComputeOutcome::Unsupported("vertex cbuf exceeds QMD range".into());
+            }
+            qmd[0x14] |= 1 << slot;
+            qmd[0x1d + slot * 2] = address as u32;
+            qmd[0x1e + slot * 2] = ((address >> 32) as u32) | (size << 15);
+        }
+    }
+    for index in 0..3 {
+        qmd[0x2d + index] =
+            u32::from_le_bytes(sph[4 + index * 4..8 + index * 4].try_into().unwrap()) & 0xffffff;
+    }
+    let texture = ComputeTextureState {
+        tic_pool_gpu_va: draw.tic_pool_gpu_va,
+        tic_limit: draw.tic_pool_limit,
+        tsc_pool_gpu_va: draw.tsc_pool_gpu_va,
+        tsc_limit: draw.tsc_pool_limit,
+        tex_cb_index: draw.bindless_texture_const_buffer_slot,
+    };
+    match prepare_and_execute(
+        &qmd,
+        draw.program_region_gpu_va,
+        texture,
+        Some(renderer),
+        mappings,
+        mem_read,
+        mem_write,
+        &|_, _| None,
+        Some(code),
+    ) {
+        Ok(()) => {
+            resolve_pending_writebacks(renderer, mappings, mem_write);
+            MaxwellComputeOutcome::Executed
+        }
+        Err(ExecuteError::Unsupported(reason)) => MaxwellComputeOutcome::Unsupported(reason),
+        Err(ExecuteError::Submitted(reason)) => MaxwellComputeOutcome::SubmittedFailure(reason),
+    }
+}
+
 pub(super) fn try_execute(
     qmd: &[u32; 0x40],
     code_base: u64,
@@ -773,6 +988,7 @@ pub(super) fn try_execute(
         mem_read,
         mem_write,
         content_key,
+        None,
     ) {
         Ok(()) => MaxwellComputeOutcome::Executed,
         Err(ExecuteError::Unsupported(reason)) => MaxwellComputeOutcome::Unsupported(reason),
@@ -801,7 +1017,9 @@ fn prepare_and_execute(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
     content_key: &dyn Fn(u64, usize) -> Option<u64>,
+    code_override: Option<&[u8]>,
 ) -> Result<(), ExecuteError> {
+    let kp_frontend = crate::gpu::pusher::kickprof::start();
     let group_count = [qmd[0x0c] & 0x7fff_ffff, qmd[0x0d] & 0xffff, qmd[0x0d] >> 16];
     let local_size = [qmd[0x12] >> 16, qmd[0x13] & 0xffff, qmd[0x13] >> 16];
     let local_memory = qmd_local_memory(qmd);
@@ -844,7 +1062,10 @@ fn prepare_and_execute(
         }
     }
     let kp_snap = crate::gpu::pusher::kickprof::start();
-    let code = snapshot_code(mappings, mem_read, code_gpu)?;
+    let code = match code_override {
+        Some(code) => code.to_vec(),
+        None => snapshot_code(mappings, mem_read, code_gpu)?,
+    };
     let cbufs = snapshot_cbufs(qmd, mappings, mem_read);
     crate::gpu::pusher::kickprof::add_sized(
         crate::gpu::pusher::kickprof::KC_SNAP,
@@ -857,7 +1078,11 @@ fn prepare_and_execute(
             let _ = std::fs::write(path, &code);
         }
     }
-    let code_sha256 = memoized_code_sha256(code_gpu, &code);
+    let code_sha256 = if code_override.is_some() {
+        Sha256::digest(&code).into()
+    } else {
+        memoized_code_sha256(code_gpu, &code)
+    };
     let (frontend_key, frontend) = cached_frontend_plan(code_sha256, &code, &cbufs)?;
     let needs = &frontend.needs;
     let texture_bound_cbuf = u8::try_from(texture.tex_cb_index)
@@ -980,7 +1205,7 @@ fn prepare_and_execute(
         resolved.push(ResolvedResource {
             metadata: ComputeImageResource {
                 handle: need.handle,
-                binding: index as u32 + 1,
+                binding: index as u32 + 1 + frontend.storage_buffers.len() as u32,
                 kind,
                 dimension,
                 numeric_type,
@@ -1000,6 +1225,7 @@ fn prepare_and_execute(
     });
     let options = ComputeOptions {
         local_size,
+        vertex_memory_store: code_override.is_some(),
         local_memory_low_size: local_memory.low_size,
         local_memory_high_size: local_memory.high_size,
         local_memory_crs_size: local_memory.crs_size,
@@ -1013,6 +1239,7 @@ fn prepare_and_execute(
     let module_key = ModuleCacheKey {
         frontend: frontend_key,
         local_size,
+        vertex_memory_store: options.vertex_memory_store,
         local_memory_low_size: options.local_memory_low_size,
         local_memory_high_size: options.local_memory_high_size,
         local_memory_crs_size: options.local_memory_crs_size,
@@ -1047,6 +1274,7 @@ fn prepare_and_execute(
 
     let renderer_arc = renderer.ok_or_else(|| "the Vulkan renderer is unavailable".to_string())?;
     let renderer: &nexium_gpu::Renderer = renderer_arc;
+    crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_FRONTEND, kp_frontend);
     let kp_sync = crate::gpu::pusher::kickprof::start();
     let offload = lazy_compute_enabled()
         && compute_offload_enabled()
@@ -1058,6 +1286,7 @@ fn prepare_and_execute(
             .to_string()
             .into());
     }
+    let kp_resources = crate::gpu::pusher::kickprof::start();
     let mut resolved_storage_buffers = Vec::with_capacity(frontend.storage_buffers.len());
     let mut raw_storage_ranges = Vec::with_capacity(frontend.storage_buffers.len());
     let mut raw_storage_keys = Vec::with_capacity(frontend.storage_buffers.len());
@@ -1098,6 +1327,13 @@ fn prepare_and_execute(
             let Ok(size) = resource_size(&resource.tic) else {
                 return false;
             };
+            if resource.tic.is_sparse {
+                return sparse_texture_ranges(&resource.tic, mappings).is_ok_and(|ranges| {
+                    ranges.into_iter().any(|(gpu, cpu, len)| {
+                        cpu.is_some_and(|cpu| pending_writeback_overlaps(gpu, cpu, len))
+                    })
+                });
+            }
             let Ok((view_tic, _)) = sampled_view_tic(&resource.tic) else {
                 return false;
             };
@@ -1385,10 +1621,26 @@ fn prepare_and_execute(
                         tic: resource.tic,
                         tsc,
                         sample_type: compute_sample_type(resource.metadata.numeric_type),
-                        guest_bytes: Some(vec![0; size]),
+                        guest_bytes: Some(Arc::new(vec![0; size])),
                         guest_bytes_authoritative: true,
                         require_live: false,
                         content_key: None,
+                    });
+                    continue;
+                }
+                if resource.tic.is_sparse {
+                    let (tic, bytes, key, content_key) =
+                        snapshot_sparse_texture(&resource.tic, mappings, mem_read)?;
+                    sampled_rts.push(ComputeSampledRt {
+                        binding: descriptor.binding,
+                        key,
+                        tic,
+                        tsc,
+                        sample_type: compute_sample_type(resource.metadata.numeric_type),
+                        guest_bytes: Some(bytes),
+                        guest_bytes_authoritative: true,
+                        require_live: false,
+                        content_key: Some(content_key),
                     });
                     continue;
                 }
@@ -1425,7 +1677,7 @@ fn prepare_and_execute(
                     tic: view_tic,
                     tsc,
                     sample_type: compute_sample_type(resource.metadata.numeric_type),
-                    guest_bytes: Some(guest_bytes),
+                    guest_bytes: Some(Arc::new(guest_bytes)),
                     guest_bytes_authoritative: layered
                         || overlapping_sampled.contains(&descriptor.binding),
                     require_live: false,
@@ -1451,10 +1703,25 @@ fn prepare_and_execute(
                         key: None,
                         tic: resource.tic,
                         sample_type: compute_sample_type(resource.metadata.numeric_type),
-                        guest_bytes: vec![0; size],
+                        guest_bytes: Arc::new(vec![0; size]),
                         guest_bytes_authoritative: true,
                         require_live: false,
                         content_key: None,
+                    });
+                    continue;
+                }
+                if resource.tic.is_sparse {
+                    let (tic, bytes, key, content_key) =
+                        snapshot_sparse_texture(&resource.tic, mappings, mem_read)?;
+                    sampled_images.push(ComputeSampledImage {
+                        binding: descriptor.binding,
+                        key: Some(key),
+                        tic,
+                        sample_type: compute_sample_type(resource.metadata.numeric_type),
+                        guest_bytes: bytes,
+                        guest_bytes_authoritative: true,
+                        require_live: false,
+                        content_key: Some(content_key),
                     });
                     continue;
                 }
@@ -1471,7 +1738,7 @@ fn prepare_and_execute(
                     key,
                     tic: view_tic,
                     sample_type: compute_sample_type(resource.metadata.numeric_type),
-                    guest_bytes,
+                    guest_bytes: Arc::new(guest_bytes),
                     guest_bytes_authoritative: layered
                         || overlapping_sampled.contains(&descriptor.binding),
                     require_live: false,
@@ -1704,9 +1971,10 @@ fn prepare_and_execute(
         );
     }
 
+    crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_RESOURCES, kp_resources);
     let kp_exec = crate::gpu::pusher::kickprof::start();
     crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::KC_DISPATCH, 1);
-    if lazy_compute_enabled() && compute_offload_enabled() {
+    if code_override.is_none() && lazy_compute_enabled() && compute_offload_enabled() {
         if let Some(rt) = crate::render_thread::maybe_render_thread() {
             let (id_tx, id_rx) = crossbeam::channel::bounded(1);
             let job_renderer = std::sync::Arc::clone(renderer_arc);
@@ -1741,7 +2009,7 @@ fn prepare_and_execute(
             return Ok(());
         }
     }
-    let outcome = if lazy_compute_enabled() {
+    let outcome = if code_override.is_none() && lazy_compute_enabled() {
         renderer.dispatch_compute_lazy(dispatch)
     } else {
         renderer.dispatch_compute_sync(dispatch)
@@ -2816,7 +3084,10 @@ fn delinearize_storage_image(
             subresource.stride_alignment_log2,
         )
     } else if effective_block_linear {
-        nexium_gpu::texture::swizzle_block_linear_3d(
+        let buffer = STORAGE_WRITEBACK_POOL.with(|pool| {
+            pool.borrow_mut().take(subresource.guest_size)
+        });
+        nexium_gpu::texture::swizzle_block_linear_3d_with_buffer(
             &linear_bytes,
             subresource.width,
             subresource.height,
@@ -2825,6 +3096,7 @@ fn delinearize_storage_image(
             tic.block_height_log2,
             tic.block_depth_log2,
             tic.tile_width_spacing,
+            buffer,
         )
     } else {
         linear_bytes
@@ -2908,6 +3180,190 @@ fn mapped_resources_overlap(
     ranges_overlap(a_gpu, a_size, b_gpu, b_size) || ranges_overlap(a_cpu, a_size, b_cpu, b_size)
 }
 
+fn sparse_texture_ranges(
+    tic: &TicEntry,
+    mappings: &GpuMappings,
+) -> Result<Vec<(u64, Option<u64>, usize)>, String> {
+    if !tic.is_sparse
+        || !tic.is_block_linear
+        || tic.texture_type != 2
+        || tic.mip_levels() != 1
+        || tic.base_layer != 0
+        || tic.sample_count() != Some(1)
+    {
+        return Err(format!(
+            "unsupported sparse compute texture layout: {tic:?}"
+        ));
+    }
+    let size = resource_size(tic)?;
+    let mut ranges: Vec<(u64, Option<u64>, usize)> = Vec::new();
+    let mut offset = 0usize;
+    while offset < size {
+        let gpu = tic
+            .gpu_va
+            .checked_add(offset as u64)
+            .ok_or_else(|| "sparse texture address overflow".to_string())?;
+        let (cpu, available) = mappings
+            .texture_memory_range(gpu)
+            .ok_or_else(|| format!("sparse texture address {gpu:#x} is not reserved"))?;
+        let len = available.min((size - offset) as u64) as usize;
+        if len == 0 {
+            return Err("empty sparse texture range".into());
+        }
+        let merge = ranges.last().is_some_and(|(previous_gpu, previous_cpu, previous_len)| {
+            previous_gpu.checked_add(*previous_len as u64) == Some(gpu)
+                && match (*previous_cpu, cpu) {
+                    (None, None) => true,
+                    (Some(previous), Some(current)) => previous.checked_add(*previous_len as u64) == Some(current),
+                    _ => false,
+                }
+        });
+        if merge {
+            ranges.last_mut().unwrap().2 += len;
+        } else {
+            ranges.push((gpu, cpu, len));
+        }
+        offset += len;
+    }
+    Ok(ranges)
+}
+
+pub(crate) fn snapshot_sparse_texture(
+    tic: &TicEntry,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Result<(TicEntry, Arc<Vec<u8>>, RtKey, u64), String> {
+    snapshot_sparse_texture_observed(tic, mappings, mem_read, &|cpu, len| {
+        if !nexium_memory::fastmem::write_watch_available() {
+            return None;
+        }
+        let commit = nexium_memory::fastmem::commit_generation();
+        let mut spans = Vec::new();
+        let observation = nexium_memory::fastmem::take_write_watch_spans_observed(cpu, len, &mut spans);
+        match observation.result {
+            nexium_memory::fastmem::WriteWatchResult::Clean
+            | nexium_memory::fastmem::WriteWatchResult::Dirty => Some((commit, observation.generation_after)),
+            nexium_memory::fastmem::WriteWatchResult::Unavailable => None,
+        }
+    })
+}
+
+fn snapshot_sparse_texture_observed(
+    tic: &TicEntry,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    observe: &dyn Fn(u64, usize) -> Option<(u64, u64)>,
+) -> Result<(TicEntry, Arc<Vec<u8>>, RtKey, u64), String> {
+    type Observation = Vec<(u64, Option<u64>, usize, u64, u64)>;
+    type CacheEntry = ((u64, u64, usize), u64, Arc<Vec<u8>>, Option<Observation>);
+    thread_local! {
+        static CACHE: RefCell<Vec<CacheEntry>> = const { RefCell::new(Vec::new()) };
+    }
+    let started = compute_stage_profile_enabled().then(std::time::Instant::now);
+    let ranges = sparse_texture_ranges(tic, mappings)?;
+    let range_count = ranges.len();
+    let size = resource_size(tic)?;
+    let cache_key = (mappings.instance_id(), tic.gpu_va, size);
+    let observation = ranges.iter().map(|&(gpu, cpu, len)| {
+        let (commit, generation) = match cpu {
+            Some(cpu) => observe(cpu, len)?,
+            None => (0, 0),
+        };
+        Some((gpu, cpu, len, commit, generation))
+    }).collect::<Option<Observation>>();
+    if let Some(observation) = observation.as_ref() {
+        let cached = CACHE.with(|cache| cache.borrow().iter()
+            .find(|(key, _, _, previous)| *key == cache_key && previous.as_ref() == Some(observation))
+            .map(|(_, hash, bytes, _)| (Arc::clone(bytes), *hash)));
+        if let Some((bytes, hash)) = cached {
+            profile_sparse_snapshot(started, true, range_count);
+            return Ok(sparse_texture_snapshot_result(tic, bytes, hash));
+        }
+    }
+    let mut pages = Vec::new();
+    let mut hash = xxhash_rust::xxh3::Xxh3::new();
+    size.hash(&mut hash);
+    for (gpu, cpu, len) in ranges {
+        if let Some(cpu) = cpu {
+            let offset = (gpu - tic.gpu_va) as usize;
+            let mut page = vec![0; len];
+            if !mem_read(cpu, &mut page) {
+                return Err(format!("sparse texture read failed at {gpu:#x}"));
+            }
+            offset.hash(&mut hash);
+            page.hash(&mut hash);
+            pages.push((offset, page));
+        }
+    }
+    let content_key = hash.finish();
+    let bytes = CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, _, bytes, previous)) = cache
+            .iter_mut()
+            .find(|(key, hash, _, _)| *key == cache_key && *hash == content_key)
+        {
+            *previous = observation;
+            return Arc::clone(bytes);
+        }
+        let mut bytes = vec![0; size];
+        for (offset, page) in pages {
+            bytes[offset..offset + page.len()].copy_from_slice(&page);
+        }
+        let bytes = Arc::new(bytes);
+        cache.retain(|(key, _, _, _)| *key != cache_key);
+        if cache.len() >= 16
+            || cache
+                .iter()
+                .map(|(_, _, bytes, _)| bytes.len())
+                .sum::<usize>()
+                .saturating_add(size)
+                > MAX_RESOURCE_BYTES
+        {
+            cache.clear();
+        }
+        cache.push((cache_key, content_key, Arc::clone(&bytes), observation));
+        bytes
+    });
+    profile_sparse_snapshot(started, false, range_count);
+    Ok(sparse_texture_snapshot_result(tic, bytes, content_key))
+}
+
+fn profile_sparse_snapshot(started: Option<std::time::Instant>, reused: bool, ranges: usize) {
+    let Some(started) = started else { return; };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static RANGES: AtomicU64 = AtomicU64::new(0);
+    static TIME_NS: AtomicU64 = AtomicU64::new(0);
+    HITS.fetch_add(reused as u64, Ordering::Relaxed);
+    RANGES.fetch_add(ranges as u64, Ordering::Relaxed);
+    TIME_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if (CALLS.fetch_add(1, Ordering::Relaxed) + 1) % 512 == 0 {
+        log::warn!("[compute-sparse-snapshot] calls=512 hits={} avg_ranges={:.1} avg_us={:.2}",
+            HITS.swap(0, Ordering::Relaxed), RANGES.swap(0, Ordering::Relaxed) as f64 / 512.0,
+            TIME_NS.swap(0, Ordering::Relaxed) as f64 / 512_000.0);
+    }
+}
+
+fn sparse_texture_snapshot_result(
+    tic: &TicEntry,
+    bytes: Arc<Vec<u8>>,
+    content_key: u64,
+) -> (TicEntry, Arc<Vec<u8>>, RtKey, u64) {
+    let mut dense = *tic;
+    dense.is_sparse = false;
+    let key = RtKey::with_cpu(0, tic.width, tic.height, tic.gpu_va, 0)
+        .with_volume_depth(tic.depth)
+        .with_guest_size_bytes(bytes.len() as u64)
+        .with_block_linear_layout(
+            tic.block_width_log2,
+            tic.block_height_log2,
+            tic.block_depth_log2,
+            tic.tile_width_spacing,
+        );
+    (dense, bytes, key, content_key)
+}
+
 fn validate_sampled_writable_aliases(
     module: &ComputeModule,
     resolved: &[ResolvedResource],
@@ -2938,18 +3394,42 @@ fn validate_sampled_writable_aliases(
         if resource.null {
             continue;
         }
+        if resource.tic.is_sparse && !writable {
+            for (gpu_va, cpu_addr, size) in sparse_texture_ranges(&resource.tic, mappings)? {
+                if let Some(cpu_addr) = cpu_addr {
+                    ranges.push(MappedComputeResource {
+                        binding: descriptor.binding,
+                        kind: descriptor.kind,
+                        writable: false,
+                        tic_gpu_va: resource.tic.gpu_va,
+                        width: 0,
+                        height: 0,
+                        depth: 0,
+                        mip_level: None,
+                        view_base_mip: 0,
+                        view_mip_levels: 1,
+                        gpu_va,
+                        cpu_addr,
+                        size,
+                    });
+                }
+            }
+            continue;
+        }
         let (cpu_addr, available) =
             mapped_range(mappings, resource.tic.gpu_va).ok_or_else(|| {
                 format!(
-                    "compute resource binding {} at {:#x} is unmapped",
-                    descriptor.binding, resource.tic.gpu_va
+                    "compute resource binding {} at {:#x} is unmapped: {:?}; {}",
+                    descriptor.binding, resource.tic.gpu_va, resource.tic,
+                    mappings.bracket(resource.tic.gpu_va)
                 )
             })?;
         let required_size = resource_size(&resource.tic)?;
         if !writable && required_size as u64 > available {
             return Err(format!(
-                "sampled compute resource binding {} mapping is short ({available:#x} < {required_size:#x})",
-                descriptor.binding
+                "sampled compute resource binding {} mapping is short ({available:#x} < {required_size:#x}): {:?}; {}",
+                descriptor.binding, resource.tic,
+                mappings.bracket(resource.tic.gpu_va.saturating_add(available))
             ));
         }
         if resource.tic.is_buffer() {
@@ -3075,8 +3555,12 @@ fn collect_sampled_writable_aliases(
     static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut aliases = Vec::new();
     let mut overlapping = HashSet::new();
+    let writable_ranges = ranges.iter().filter(|resource| resource.writable).collect::<Vec<_>>();
+    if writable_ranges.is_empty() {
+        return (aliases, overlapping);
+    }
     for sampled in ranges.iter().filter(|resource| !resource.writable) {
-        for writable in ranges.iter().filter(|resource| resource.writable) {
+        for writable in &writable_ranges {
             let overlaps = mapped_resources_overlap(
                 sampled.gpu_va,
                 sampled.cpu_addr,
@@ -3650,11 +4134,23 @@ fn read_gpu_vec(
 }
 
 fn mapped_range(mappings: &GpuMappings, gpu_va: u64) -> Option<(u64, u64)> {
-    mappings.cpu_range_for(gpu_va).or_else(|| {
-        mappings
-            .cpu_address_for_any32(gpu_va)
-            .map(|(_, cpu_addr, available)| (cpu_addr, available))
-    })
+    let Some((cpu_addr, mut available)) = mappings.cpu_range_for(gpu_va) else {
+        return mappings.cpu_address_for_any32(gpu_va)
+            .map(|(_, cpu_addr, available)| (cpu_addr, available));
+    };
+    while let Some(next_gpu) = gpu_va.checked_add(available) {
+        let Some((next_cpu, next_size)) = mappings.cpu_range_for(next_gpu) else {
+            break;
+        };
+        if next_size == 0 || cpu_addr.checked_add(available) != Some(next_cpu) {
+            break;
+        }
+        let Some(combined) = available.checked_add(next_size) else {
+            break;
+        };
+        available = combined;
+    }
+    Some((cpu_addr, available))
 }
 
 fn cbuf_u32(cbuf: &[u8], byte_offset: u32) -> Option<u32> {
@@ -3666,10 +4162,335 @@ fn cbuf_u32(cbuf: &[u8], byte_offset: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_writeback_pool_reuses_exact_sizes_and_bounds_retention() {
+        let mut pool = super::StorageWritebackPool::default();
+        let bytes = vec![0x5a; 4096];
+        let pointer = bytes.as_ptr();
+        pool.recycle(bytes);
+        assert!(pool.take(2048).is_empty());
+        let reused = pool.take(4096);
+        assert_eq!(reused.as_ptr(), pointer);
+        assert!(reused.iter().all(|&byte| byte == 0x5a));
+        assert!(pool.take(4096).is_empty());
+        for _ in 0..5 {
+            pool.recycle(vec![0; 4096]);
+        }
+        assert_eq!(pool.buffers.len(), 4);
+        pool.buffers.clear();
+        pool.recycle(vec![0; 12 * 1024 * 1024]);
+        pool.recycle(vec![0; 8 * 1024 * 1024]);
+        assert_eq!(pool.buffers.len(), 1);
+        pool.recycle(Vec::new());
+        assert_eq!(pool.buffers.len(), 1);
+    }
+
     use super::*;
 
     fn write_shader_word(bytes: &mut [u8], offset: usize, word: u64) {
         bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
+    fn vertex_store_program(attribute: u64) -> Vec<u8> {
+        [
+            0,
+            attribute,
+            0x4c98078804870000,
+            0xeb20000a00f70c10,
+            0,
+            0xe30000000007000fu64,
+        ]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect()
+    }
+
+    #[test]
+    fn vertex_memory_store_groups_preserve_exact_invocation_count() {
+        for vertices in 1..=65535 {
+            let size = vertex_memory_store_group_size(vertices);
+            assert!((1..=32).contains(&size));
+            assert_eq!(vertices % size, 0);
+            assert_eq!((vertices / size - 1) * size + size - 1, vertices - 1);
+        }
+        assert_eq!(vertex_memory_store_group_size(5700), 30);
+        assert_eq!(vertex_memory_store_group_size(11), 11);
+        assert_eq!(vertex_memory_store_group_size(37), 1);
+    }
+
+    #[test]
+    fn vertex_memory_store_maps_vertex_id_and_preserves_predication() {
+        for pred in [0, 7, 8] {
+            let code = vertex_store_program((0xefd87f802fc7ff00 & !(15 << 16)) | (pred << 16));
+            let converted = vertex_memory_store_code(&code).unwrap();
+            let cfg = nexium_shader::build_compute_cfg(&converted);
+            assert_eq!(cfg.unimplemented, 0);
+            let mut translator = nexium_shader::Translator::new_compute();
+            assert!(translator.translate(u64::from_le_bytes(converted[8..16].try_into().unwrap())));
+            let mut expected = nexium_shader::Translator::new();
+            assert!(expected.translate(u64::from_le_bytes(code[8..16].try_into().unwrap())));
+            for inst in &mut expected.program.instructions {
+                if matches!(inst.op, IrOp::LoadAttr { slot: 0x2fc }) {
+                    inst.op = IrOp::WorkgroupId { component: 0 };
+                }
+            }
+            assert_eq!(
+                format!("{:?}", translator.program.instructions),
+                format!("{:?}", expected.program.instructions)
+            );
+            assert!(cfg
+                .blocks
+                .iter()
+                .flat_map(|block| &block.program.instructions)
+                .any(|inst| matches!(
+                    inst.op,
+                    IrOp::ImageWrite {
+                        dimension: ImageDimension::D3,
+                        ..
+                    }
+                )));
+        }
+    }
+
+    #[test]
+    fn vertex_memory_store_preserves_global_writes() {
+        let code: Vec<u8> = [
+            0u64,
+            0xefd87f802fc7ff04,
+            0x4c98078004470006,
+            0x4c98078004570007,
+            0,
+            0xeedc200000070604,
+            0xe30000000007000f,
+        ]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect();
+        let converted = vertex_memory_store_code(&code).unwrap();
+        let mut cfg = nexium_shader::build_compute_cfg(&converted);
+        let buffers = nexium_shader::collect_storage_buffers(&mut cfg);
+        assert_eq!(cfg.unimplemented, 0);
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].cbuf_offset, 0x110);
+        assert!(
+            cfg.blocks
+                .iter()
+                .flat_map(|block| &block.program.instructions)
+                .any(|inst| matches!(inst.op, IrOp::StoreStorage { .. }))
+        );
+        assert!(
+            cfg.blocks
+                .iter()
+                .flat_map(|block| &block.program.instructions)
+                .any(|inst| matches!(inst.op, IrOp::WorkgroupId { component: 0 }))
+        );
+    }
+
+    #[test]
+    fn vertex_memory_store_cache_revalidates_modified_code() {
+        let mut code = vertex_store_program(0xefd87f802fc7ff00);
+        let expected = convert_vertex_memory_store_code(&code);
+        assert!(expected.is_some());
+        assert_eq!(vertex_memory_store_code(&code), expected);
+        assert_eq!(vertex_memory_store_code(&code), expected);
+        code = vertex_store_program(0xefd87f800807ff00);
+        assert!(vertex_memory_store_code(&code).is_none());
+        assert!(vertex_memory_store_code(&code).is_none());
+        let original = vertex_store_program(0xefd87f802fc7ff00);
+        assert_eq!(vertex_memory_store_code(&original), expected);
+    }
+
+    #[test]
+    fn vertex_memory_store_rejects_vertex_inputs_outputs_and_special_registers() {
+        for attribute in [0xefd87f800807ff00, 0xeff07f800807ff00, 0xf0c8000000070000] {
+            assert!(
+                vertex_memory_store_code(&vertex_store_program(attribute)).is_none(),
+                "{attribute:#x}"
+            );
+        }
+        assert!(vertex_memory_store_code(&direct_compute_program()).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires NEXIUM_VERTEX_STORE_TEST_SASS pointing to a local shader binary"]
+    fn vertex_memory_store_captured_shader_compiles() {
+        let code = std::fs::read(std::env::var_os("NEXIUM_VERTEX_STORE_TEST_SASS").unwrap()).unwrap();
+        let converted = vertex_memory_store_code(&code).expect("eligible vertex memory store");
+        let cbufs = std::array::from_fn(|_| Some(vec![0u8; 0x10000]));
+        let (_, frontend) =
+            cached_frontend_plan(Sha256::digest(&converted).into(), &converted, &cbufs).unwrap();
+        assert!(
+            frontend
+                .writable_storage_buffers
+                .iter()
+                .any(|writable| *writable)
+                || frontend
+                    .needs
+                    .iter()
+                    .any(|need| need.access == ResourceAccess::Storage)
+        );
+        let resources = frontend
+            .needs
+            .iter()
+            .enumerate()
+            .map(|(index, need)| ComputeImageResource {
+                handle: need.handle,
+                binding: index as u32 + 1,
+                kind: if need.access == ResourceAccess::Storage {
+                    ComputeResourceKind::StorageImage
+                } else if need.access == ResourceAccess::FilteredSample {
+                    ComputeResourceKind::CombinedSampledImage
+                } else {
+                    ComputeResourceKind::SampledImage
+                },
+                dimension: need.instruction_dimension.unwrap_or(ImageDimension::D2),
+                numeric_type: TextureNumericType::Float,
+                texel_format: None,
+            })
+            .collect();
+        let module = nexium_spirv::emit_compute(
+            &frontend.cfg,
+            &ComputeOptions {
+                local_size: [1; 3],
+                num_storage_buffers: frontend.storage_buffers.len() as u32,
+                resources,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!module.words.is_empty());
+        let output =
+            std::path::PathBuf::from(std::env::var_os("NEXIUM_VERTEX_STORE_TEST_SASS").unwrap())
+                .with_extension("spv");
+        std::fs::write(
+            &output,
+            module
+                .words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let validation = std::process::Command::new("spirv-val")
+            .args(["--target-env", "vulkan1.2"])
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            validation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&validation.stderr)
+        );
+    }
+
+    #[test]
+    fn sparse_ranges_merge_only_contiguous_physical_pages() {
+        let mut tic = null_tic(Some(ImageDimension::D3));
+        tic.gpu_va = 0x100000;
+        tic.width = 16;
+        tic.height = 16;
+        tic.depth = 16;
+        tic.is_sparse = true;
+        let mut mappings = GpuMappings::new();
+        mappings.add_sparse(tic.gpu_va, 16384);
+        mappings.add(tic.gpu_va, 4096, 0x20000, 7);
+        mappings.add(tic.gpu_va + 4096, 4096, 0x21000, 8);
+        mappings.add(tic.gpu_va + 8192, 4096, 0x30000, 9);
+        assert_eq!(sparse_texture_ranges(&tic, &mappings).unwrap(), vec![
+            (tic.gpu_va, Some(0x20000), 8192),
+            (tic.gpu_va + 8192, Some(0x30000), 4096),
+            (tic.gpu_va + 12288, None, 4096),
+        ]);
+    }
+
+    #[test]
+    fn sparse_snapshot_observes_writes_remaps_and_unavailable_tracking() {
+        use std::cell::Cell;
+        let mut tic = null_tic(Some(ImageDimension::D3));
+        tic.gpu_va = 0x100000;
+        tic.width = 16;
+        tic.height = 16;
+        tic.depth = 16;
+        tic.is_sparse = true;
+        let mut mappings = GpuMappings::new();
+        mappings.add_sparse(tic.gpu_va, resource_size(&tic).unwrap() as u64);
+        mappings.add(tic.gpu_va + 4096, 4096, 0x20000, 7);
+        let reads = Cell::new(0);
+        let value = Cell::new(0x5a);
+        let read = |_, dst: &mut [u8]| { reads.set(reads.get() + 1); dst.fill(value.get()); true };
+        let generation = Cell::new(1);
+        let commit = Cell::new(1);
+        let observe = |_, _| Some((commit.get(), generation.get()));
+        let snapshot = |mappings: &GpuMappings| snapshot_sparse_texture_observed(&tic, mappings, &read, &observe).unwrap();
+        let initial = snapshot(&mappings);
+        assert_eq!(reads.get(), 1);
+        assert!(Arc::ptr_eq(&initial.1, &snapshot(&mappings).1));
+        assert_eq!(reads.get(), 1);
+        value.set(0x6b);
+        generation.set(2);
+        let changed = snapshot(&mappings);
+        assert_eq!(reads.get(), 2);
+        assert_ne!(initial.3, changed.3);
+        assert_eq!(changed.1[4096], 0x6b);
+        commit.set(2);
+        snapshot(&mappings);
+        assert_eq!(reads.get(), 3);
+        mappings.add(tic.gpu_va + 4096, 4096, 0x30000, 7);
+        snapshot(&mappings);
+        assert_eq!(reads.get(), 4);
+        value.set(0x7c);
+        let fallback = snapshot_sparse_texture_observed(&tic, &mappings, &read, &|_, _| None).unwrap();
+        assert_eq!(reads.get(), 5);
+        assert_eq!(fallback.1[4096], 0x7c);
+        mappings.add_sparse(tic.gpu_va + 4096, 4096);
+        assert!(snapshot(&mappings).1.iter().all(|byte| *byte == 0));
+        assert_eq!(reads.get(), 5);
+    }
+
+    #[test]
+    fn sparse_texture_snapshot_preserves_pages_and_reserved_holes() {
+        let mut tic = null_tic(Some(ImageDimension::D3));
+        tic.gpu_va = 0x100000;
+        tic.width = 16;
+        tic.height = 16;
+        tic.depth = 16;
+        tic.is_sparse = true;
+        let size = resource_size(&tic).unwrap();
+        assert_eq!(size, 16384);
+        let mut mappings = GpuMappings::new();
+        mappings.add_sparse(tic.gpu_va, size as u64);
+        mappings.add(tic.gpu_va + 4096, 4096, 0x20000, 7);
+        let read = |cpu, dst: &mut [u8]| {
+            assert_eq!(cpu, 0x20000);
+            dst.fill(0x5a);
+            true
+        };
+        let (dense, bytes, _, hash) = snapshot_sparse_texture(&tic, &mappings, &read).unwrap();
+        assert!(!dense.is_sparse);
+        assert!(bytes[..4096].iter().all(|byte| *byte == 0));
+        assert!(bytes[4096..8192].iter().all(|byte| *byte == 0x5a));
+        assert!(bytes[8192..].iter().all(|byte| *byte == 0));
+        let (_, repeated, _, repeated_hash) = snapshot_sparse_texture(&tic, &mappings, &read).unwrap();
+        assert_eq!(hash, repeated_hash);
+        assert!(Arc::ptr_eq(&bytes, &repeated));
+        let changed = |_, dst: &mut [u8]| {
+            dst.fill(0x6b);
+            true
+        };
+        assert_ne!(
+            hash,
+            snapshot_sparse_texture(&tic, &mappings, &changed)
+                .unwrap()
+                .3
+        );
+        mappings.add_sparse(tic.gpu_va + 4096, 4096);
+        let (_, cleared, _, cleared_hash) =
+            snapshot_sparse_texture(&tic, &mappings, &|_, _| panic!("hole read")).unwrap();
+        assert!(cleared.iter().all(|byte| *byte == 0));
+        assert_ne!(hash, cleared_hash);
+        let mut gap = GpuMappings::new();
+        gap.add(tic.gpu_va + 4096, 4096, 0x20000, 7);
+        assert!(snapshot_sparse_texture(&tic, &gap, &read).is_err());
     }
 
     fn direct_compute_program() -> Vec<u8> {
@@ -4152,6 +4973,27 @@ mod tests {
         assert_eq!(needs[0].access, ResourceAccess::Atomic);
         assert_eq!(needs[0].instruction_dimension, Some(ImageDimension::Buffer));
         assert_eq!(needs[0].referenced_components, 0xf);
+    }
+
+    #[test]
+    fn compute_snapshot_spans_adjacent_contiguous_mappings() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 4, 0x2000, 1);
+        mappings.add(0x1004, 4, 0x2004, 2);
+        assert_eq!(mapped_range(&mappings, 0x1002), Some((0x2002, 6)));
+        let read = |cpu: u64, out: &mut [u8]| {
+            let data = [1, 2, 3, 4, 5, 6, 7, 8];
+            let offset = (cpu - 0x2000) as usize;
+            out.copy_from_slice(&data[offset..offset + out.len()]);
+            true
+        };
+        assert_eq!(read_gpu_vec(&mappings, &read, 0x1002, 6, "test").unwrap(), [3, 4, 5, 6, 7, 8]);
+        assert!(read_gpu_vec(&mappings, &read, 0x1002, 7, "test").is_err());
+        mappings.add(0x1004, 4, 0x3000, 3);
+        assert_eq!(mapped_range(&mappings, 0x1002), Some((0x2002, 2)));
+        assert!(read_gpu_vec(&mappings, &read, 0x1002, 6, "test").is_err());
+        mappings.add_sparse(0x1004, 4);
+        assert_eq!(mapped_range(&mappings, 0x1002), Some((0x2002, 2)));
     }
 
     #[test]

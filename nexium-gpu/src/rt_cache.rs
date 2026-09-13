@@ -157,6 +157,7 @@ pub struct RtKey {
     pub height: u32,
     pub depth: u32,
     pub is_3d: bool,
+    pub array_stride_bytes: u64,
     pub sample_width: u8,
     pub sample_height: u8,
     pub base_layer: u32,
@@ -216,6 +217,7 @@ impl RtKey {
             height,
             depth: 1,
             is_3d: false,
+            array_stride_bytes: 0,
             sample_width: 1,
             sample_height: 1,
             base_layer: 0,
@@ -263,6 +265,13 @@ impl RtKey {
         self
     }
 
+    pub fn with_array_layers(mut self, layers: u32, stride_bytes: u64) -> Self {
+        self.depth = layers.max(1);
+        self.is_3d = false;
+        self.array_stride_bytes = stride_bytes;
+        self
+    }
+
     pub fn with_sample_grid(mut self, width: u32, height: u32) -> Self {
         self.sample_width = u8::try_from(width.max(1)).unwrap_or(u8::MAX);
         self.sample_height = u8::try_from(height.max(1)).unwrap_or(u8::MAX);
@@ -280,6 +289,7 @@ impl RtKey {
 
     pub fn same_live_identity(self, other: Self) -> bool {
         self == other
+            && self.array_stride_bytes == other.array_stride_bytes
             && self.base_layer == other.base_layer
             && self.cpu_addr == other.cpu_addr
             && self.mapping_epoch == other.mapping_epoch
@@ -289,6 +299,7 @@ impl RtKey {
 
     pub fn same_alias_view_identity(self, other: Self) -> bool {
         self == other
+            && self.array_stride_bytes == other.array_stride_bytes
             && self.base_layer == other.base_layer
             && self.cpu_addr == other.cpu_addr
             && self.mapping_epoch == other.mapping_epoch
@@ -296,11 +307,7 @@ impl RtKey {
     }
 
     pub fn render_layer_count(self) -> u32 {
-        if self.is_3d {
-            self.depth.max(1)
-        } else {
-            1
-        }
+        self.depth.max(1)
     }
 
     pub fn request(nvmap_id: u32, width: u32, height: u32) -> Self {
@@ -2677,6 +2684,10 @@ impl RtCache {
             .map(|(k, image, view, layout, _)| (k, image, view, layout))
     }
 
+    pub(crate) fn color_base_format(&self, key: RtKey) -> Option<vk::Format> {
+        self.cache.get(&key).map(|image| image.base_format)
+    }
+
     pub fn find_color_with_format(
         &self,
         want: RtKey,
@@ -3317,7 +3328,7 @@ impl RtCache {
                 depth: if key.is_3d { key.depth.max(1) } else { 1 },
             },
             mip_levels: 1,
-            array_layers: 1,
+            array_layers: if key.is_3d { 1 } else { key.render_layer_count() },
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
             usage,
@@ -3474,7 +3485,7 @@ fn create_image_view(
     let view_info = vk::ImageViewCreateInfo {
         s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
         image,
-        view_type: if key.is_3d {
+        view_type: if key.render_layer_count() > 1 {
             vk::ImageViewType::TYPE_2D_ARRAY
         } else {
             vk::ImageViewType::TYPE_2D

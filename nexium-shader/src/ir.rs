@@ -105,6 +105,7 @@ pub enum HalfPrecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShaderStage {
     Vertex,
+    Geometry,
     Fragment,
     Compute,
 }
@@ -380,6 +381,11 @@ pub enum Op {
 
     YDirection,
 
+    SampleId,
+
+    LoadAttrIndexed { address: Value },
+    InterpAttrIndexed { address: Value, perspective: Value, mode: u8, sat: bool },
+
     FMin {
         a: Value,
         b: Value,
@@ -500,6 +506,11 @@ pub enum Op {
         cbuf_offset: u32,
         align: u32,
     },
+
+    LoadGeometryAttr { slot: u32, vertex: Value },
+    GeometryInvocationInfo,
+    EmitVertex,
+    EndPrimitive,
 
     LoadAttr {
         slot: u32,
@@ -848,6 +859,10 @@ pub enum Op {
         value: Value,
     },
 
+    BitReverse {
+        value: Value,
+    },
+
     IShl {
         a: Value,
         b: Value,
@@ -1026,6 +1041,9 @@ impl Inst {
             Op::FFma { a, b, c, .. } => write!(f, "FFma  {a}, {b}, {c}"),
             Op::DpdxFine { src } => write!(f, "DPdxFine {src}"),
             Op::DpdyFine { src } => write!(f, "DPdyFine {src}"),
+            Op::LoadAttrIndexed { address } => write!(f, "LoadAttrIndexed {address}"),
+            Op::InterpAttrIndexed { address, .. } => write!(f, "InterpAttrIndexed {address}"),
+            Op::SampleId => write!(f, "SampleId"),
             Op::YDirection => write!(f, "YDirection"),
             Op::HAdd { a, b, .. } => write!(f, "HAdd  {a}, {b}"),
             Op::HMul { a, b, .. } => write!(f, "HMul  {a}, {b}"),
@@ -1138,6 +1156,10 @@ impl Inst {
                 f,
                 "StStor ssbo{buffer_index}[{addr_lo}+{imm:#x} - ({base_addr_lo}&~{align:#x}); c[{cbuf_binding:#x}]:{cbuf_offset:#x}], {value}"
             ),
+            Op::LoadGeometryAttr { slot, vertex } => write!(f, "LdGeometryAttr {slot:#x}, {vertex}"),
+            Op::GeometryInvocationInfo => write!(f, "GeometryInvocationInfo"),
+            Op::EmitVertex => write!(f, "EmitVertex"),
+            Op::EndPrimitive => write!(f, "EndPrimitive"),
             Op::LoadAttr { slot } => write!(f, "LdAttr a[{slot:#x}]"),
             Op::StoreAttr { slot, src } => write!(f, "StAttr a[{slot:#x}], {src}"),
             Op::InterpAttr {
@@ -1495,6 +1517,7 @@ impl Inst {
             Op::ILop3 { a, b, c, lut } => write!(f, "ILop3.{lut:#04x} {a}, {b}, {c}"),
             Op::FindUMsb { value } => write!(f, "FindUMsb {value}"),
             Op::BitCount { value } => write!(f, "BitCount {value}"),
+            Op::BitReverse { value } => write!(f, "BitReverse {value}"),
             Op::IShl { a, b } => write!(f, "IShl  {a}, {b}"),
             Op::IShr { a, b, signed } => write!(f, "IShr  {a}, {b} signed={signed}"),
             Op::F2I { src, signed, round } => {

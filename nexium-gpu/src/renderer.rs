@@ -1445,7 +1445,7 @@ struct RendererInner {
     default_sampler: Option<vk::Sampler>,
     sampler_cache: HashMap<crate::texture::TscEntry, vk::Sampler>,
     integer_sampler_cache: HashMap<crate::texture::TscEntry, vk::Sampler>,
-    tex_cache: HashMap<TexCacheKey, CachedTexture>,
+    tex_cache: nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
     tex_cache_vas: HashMap<u64, u32>,
     texel_buffer_cache: HashMap<TexelBufferCacheKey, CachedTexelBuffer>,
     rt_reinterpret_cache: HashMap<RtReinterpretKey, RtReinterpretTexture>,
@@ -2519,8 +2519,8 @@ struct CachedComputeVolume {
 }
 
 const COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS: usize = 32;
-const COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES: usize = 64 * 1024 * 1024;
+const COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ComputeGuestImagePoolKey {
@@ -4584,6 +4584,14 @@ impl Renderer {
         unsafe { instance.get_physical_device_features2(physical_device, &mut supported_features) };
         let sampler_filter_minmax_supported = sampler_filter_minmax_supported
             && supported_features_12.sampler_filter_minmax == vk::TRUE;
+        DEPTH_TEXTURE_IMAGES.store(
+            depth_texture_images_supported(&instance, physical_device)
+                && std::env::var_os("NEXIUM_NO_DEPTH_TEXTURES").is_none(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if !depth_texture_images_enabled() {
+            log::info!("Guest depth textures are sampled as colour images");
+        }
         let native_bc_formats = NATIVE_BC_FORMATS
             .iter()
             .copied()
@@ -4823,6 +4831,8 @@ impl Renderer {
             log::warn!("Vulkan shaderOutputLayer unavailable; layered guest draws are unsupported");
         }
         let enabled_core_features = vk::PhysicalDeviceFeatures {
+            dual_src_blend: core_features.dual_src_blend,
+            geometry_shader: core_features.geometry_shader,
             robust_buffer_access: vk::TRUE,
             depth_clamp: if depth_clamp_supported {
                 vk::TRUE
@@ -5276,7 +5286,7 @@ impl Renderer {
                 default_sampler: None,
                 sampler_cache: HashMap::new(),
                 integer_sampler_cache: HashMap::new(),
-                tex_cache: HashMap::new(),
+                tex_cache: nexium_common::fast_hash::FastMap::default(),
                 tex_cache_vas: HashMap::new(),
                 texel_buffer_cache: HashMap::new(),
                 rt_reinterpret_cache: HashMap::new(),
@@ -5441,9 +5451,16 @@ impl Renderer {
                         continue;
                     }
                 };
+            let gs_mod = if spec.gs_spirv.is_empty() { vk::ShaderModule::null() } else {
+                match shader_compiler.compile_or_get_labeled(&spec.gs_spirv, device, "GS prewarm") {
+                    Ok(module) => module,
+                    Err(_) => { shader_failures += 1; continue; }
+                }
+            };
             let req = crate::pipeline::spec_to_request(
                 spec,
                 vs_mod,
+                gs_mod,
                 fs_mod,
                 *vertex_attribute_divisor_supported,
             );
@@ -6638,6 +6655,8 @@ impl Renderer {
         dst_key: RtKey,
         src_rect: [i32; 4],
         dst_rect: [i32; 4],
+        src_format: vk::Format,
+        dst_format: vk::Format,
     ) -> Result<bool, String> {
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
@@ -6656,6 +6675,21 @@ impl Renderer {
         else {
             return Ok(false);
         };
+        if src_key == dst_key || (src_key.gpu_va != 0 && src_key.gpu_va == dst_key.gpu_va) {
+            return Ok(false);
+        }
+        let src_base_format = rt_cache.color_base_format(src_key).unwrap();
+        let copy_bits = src_format == dst_format
+            && src_rect[2] - src_rect[0] == dst_rect[2] - dst_rect[0]
+            && src_rect[3] - src_rect[1] == dst_rect[3] - dst_rect[1];
+        if (copy_bits && (exact_rt_copy_format_bpp(src_format).is_none()
+            || exact_rt_copy_format_bpp(src_base_format) != exact_rt_copy_format_bpp(src_format)))
+            || (!copy_bits && (src_base_format != src_format
+                || !texture_numeric_type_matches_format(nexium_spirv::TextureNumericType::Float, src_format)
+                || !texture_numeric_type_matches_format(nexium_spirv::TextureNumericType::Float, dst_format)))
+        {
+            return Ok(false);
+        }
         drain_rt_copies_before_color_recreate(
             submit_state,
             device,
@@ -6663,10 +6697,13 @@ impl Renderer {
             rt_cache,
             rt_copy_slots,
             dst_key,
-            vk::Format::R8G8B8A8_UNORM,
+            dst_format,
         )?;
         let (dst_image, dst_layout) = {
-            let img = rt_cache.get_or_create(dst_key, device)?;
+            let img = rt_cache.get_or_create_with_format(dst_key, device, dst_format)?;
+            if !copy_bits && img.base_format != dst_format {
+                return Ok(false);
+            }
             (img.image, img.layout)
         };
         if src_image == dst_image {
@@ -6690,6 +6727,9 @@ impl Renderer {
             clampi(dst_rect[3], dst_key.height),
         ];
         if s1[0] <= s0[0] || s1[1] <= s0[1] || d1[0] <= d0[0] || d1[1] <= d0[1] {
+            return Ok(false);
+        }
+        if copy_bits && (s1[0] - s0[0] != d1[0] - d0[0] || s1[1] - s0[1] != d1[1] - d0[1]) {
             return Ok(false);
         }
         reset_command_buffer(device, utility_slot.cmd)?;
@@ -6759,15 +6799,24 @@ impl Renderer {
             ],
         };
         unsafe {
-            device.cmd_blit_image(
-                cmd,
-                src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[blit],
-                vk::Filter::LINEAR,
-            );
+            if copy_bits {
+                let region = vk::ImageCopy {
+                    src_subresource: blit.src_subresource,
+                    src_offset: blit.src_offsets[0],
+                    dst_subresource: blit.dst_subresource,
+                    dst_offset: blit.dst_offsets[0],
+                    extent: vk::Extent3D {
+                        width: (s1[0] - s0[0]) as u32,
+                        height: (s1[1] - s0[1]) as u32,
+                        depth: 1,
+                    },
+                };
+                device.cmd_copy_image(cmd, src_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dst_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            } else {
+                device.cmd_blit_image(cmd, src_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dst_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
+            }
         }
         transition_image(
             device,
@@ -7282,6 +7331,7 @@ impl Renderer {
             let bpp = readback_format_bpp(image.format);
             let Some(byte_len) = (key.width as u64)
                 .checked_mul(key.height as u64)
+                .and_then(|pixels| pixels.checked_mul(key.render_layer_count() as u64))
                 .and_then(|pixels| pixels.checked_mul(bpp as u64))
             else {
                 continue;
@@ -7374,13 +7424,13 @@ impl Renderer {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: if plan.key.is_3d { 1 } else { plan.key.render_layer_count() },
                 },
                 image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
                 image_extent: vk::Extent3D {
                     width: plan.width,
                     height: plan.height,
-                    depth: 1,
+                    depth: if plan.key.is_3d { plan.key.depth.max(1) } else { 1 },
                 },
             };
             unsafe {
@@ -8248,6 +8298,7 @@ impl Renderer {
     pub fn compile_pipeline(
         &self,
         vs_spirv: &[u32],
+        gs_spirv: &[u32],
         fs_spirv: &[u32],
         vs_hash: u64,
         fs_hash: u64,
@@ -8326,6 +8377,7 @@ impl Renderer {
         let (color_format, color_format_key, color_attachment_count) =
             crate::pipeline::color_format_key(&color_formats);
         let key = crate::pipeline::PipelineKey {
+            gs_hash: if gs_spirv.is_empty() { 0 } else { hash_spirv(gs_spirv) },
             vs_hash,
             fs_hash,
             topology: topology.as_raw() as u32,
@@ -8380,6 +8432,9 @@ impl Renderer {
         let fs_label = format!("runtime-fs hash={:016x}", fs_hash);
         let vs_mod = shader_compiler.compile_or_get_labeled(vs_spirv, device, &vs_label)?;
         let fs_mod = shader_compiler.compile_or_get_labeled(fs_spirv, device, &fs_label)?;
+        let gs_mod = if gs_spirv.is_empty() { vk::ShaderModule::null() } else {
+            shader_compiler.compile_or_get_labeled(gs_spirv, device, "GS")?
+        };
 
         let bindings: Vec<vk::VertexInputBindingDescription> = layout
             .bindings
@@ -8420,6 +8475,7 @@ impl Renderer {
         let req = crate::pipeline::PipelineBuildRequest {
             key,
             vs_mod,
+            gs_mod,
             fs_mod,
             bindings,
             binding_divisors,
@@ -8446,6 +8502,7 @@ impl Renderer {
         pipeline_cache.register_spec(crate::pipeline::PipelineSpec {
             key,
             vs_spirv: vs_spirv.to_vec(),
+            gs_spirv: gs_spirv.to_vec(),
             fs_spirv: fs_spirv.to_vec(),
             bindings: layout
                 .bindings
@@ -8559,6 +8616,7 @@ impl Renderer {
         let color_formats = color_formats_for_call(call, color_keys.len());
         let pipeline = match self.compile_pipeline(
             &call.vs_spirv,
+            &call.gs_spirv,
             &call.fs_spirv,
             call.vs_hash,
             call.fs_hash,
@@ -10037,24 +10095,7 @@ impl Renderer {
         };
         unsafe { device.cmd_begin_rendering(cmd, &render_info) };
 
-        let viewport = match call.vp_rect {
-            Some([x, y, w, h]) => vk::Viewport {
-                x,
-                y,
-                width: w,
-                height: h,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            },
-            None => vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: rt_extent.width as f32,
-                height: rt_extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            },
-        };
+        let viewport = draw_viewport(call.vp_rect, call.depth_range, rt_extent);
         let scissor = draw_scissor(call.scissor, rt_extent);
         unsafe {
             device.cmd_set_viewport(cmd, 0, &[viewport]);
@@ -10423,6 +10464,7 @@ impl Renderer {
                 let pipeline = match self
                     .compile_pipeline(
                         &call.vs_spirv,
+            &call.gs_spirv,
                         &call.fs_spirv,
                         call.vs_hash,
                         call.fs_hash,
@@ -12480,7 +12522,9 @@ impl Renderer {
                                     color_sync_checked.clear();
                                 }
                                 let mut updated_in_place = false;
-                                if texture_update_in_place_enabled() && volume_slices.is_none() {
+                                if texture_update_in_place_enabled(key.volume, key.mip_levels)
+                                    && volume_slices.is_none()
+                                {
                                     let existing = tex_cache
                                         .get(&key)
                                         .map(|texture| (texture.image, texture.layout));
@@ -12491,6 +12535,7 @@ impl Renderer {
                                             mem_props,
                                             image,
                                             old_layout,
+                                            image_format,
                                             key.layers,
                                             key.volume,
                                             key.mip_levels,
@@ -13551,14 +13596,7 @@ impl Renderer {
                     unsafe {
                         device.cmd_begin_rendering(cmd, &render_info);
                         if !record_state_dedup {
-                            let viewport = vk::Viewport {
-                                x: 0.0,
-                                y: 0.0,
-                                width: rt_extent.width as f32,
-                                height: rt_extent.height as f32,
-                                min_depth: 0.0,
-                                max_depth: 1.0,
-                            };
+                            let viewport = draw_viewport(call.vp_rect, call.depth_range, rt_extent);
                             let scissor = draw_scissor(call.scissor, rt_extent);
                             device.cmd_set_viewport(cmd, 0, &[viewport]);
                             device.cmd_set_scissor(cmd, 0, &[scissor]);
@@ -13580,24 +13618,7 @@ impl Renderer {
                     had_pass = true;
                 }
                 unsafe {
-                    let vp = match call.vp_rect {
-                        Some([x, y, w, h]) => vk::Viewport {
-                            x,
-                            y,
-                            width: w,
-                            height: h,
-                            min_depth: 0.0,
-                            max_depth: 1.0,
-                        },
-                        None => vk::Viewport {
-                            x: 0.0,
-                            y: 0.0,
-                            width: rt_extent.width as f32,
-                            height: rt_extent.height as f32,
-                            min_depth: 0.0,
-                            max_depth: 1.0,
-                        },
-                    };
+                    let vp = draw_viewport(call.vp_rect, call.depth_range, rt_extent);
                     let scissor = draw_scissor(call.scissor, rt_extent);
                     let viewport_key = viewport_record_key(vp);
                     let scissor_key = scissor_record_key(scissor);
@@ -13991,6 +14012,11 @@ impl RecordedGraphicsState {
         self.blend_constants = Some(blend_constants);
         decision
     }
+}
+
+fn draw_viewport(rect: Option<[f32; 4]>, depth_range: [f32; 2], extent: vk::Extent2D) -> vk::Viewport {
+    let [x, y, width, height] = rect.unwrap_or([0.0, 0.0, extent.width as f32, extent.height as f32]);
+    vk::Viewport { x, y, width, height, min_depth: depth_range[0], max_depth: depth_range[1] }
 }
 
 fn viewport_record_key(viewport: vk::Viewport) -> ViewportRecordKey {
@@ -16719,7 +16745,7 @@ fn compute_cross_access_view_components(
         ));
     }
     let numeric_type = sample_type.spirv_type();
-    let sampled_format = texture_image_format_for_tic(tic, numeric_type)?;
+    let sampled_format = color_texture_image_format_for_tic(tic, numeric_type)?;
     let storage_format = output.format.vk_format();
     if !compute_cross_access_formats_compatible(sampled_format, storage_format) {
         return Err(format!(
@@ -17571,6 +17597,7 @@ fn settle_pending_compute_record(
     }
     let outputs = std::mem::take(&mut resources.outputs);
     let readbacks = std::mem::take(&mut resources.readbacks);
+    let uploads: Vec<_> = resources.output_uploads.drain(..).flatten().collect();
     let recycle_counts = [
         uniforms.len(),
         raw_storage.len(),
@@ -17583,7 +17610,7 @@ fn settle_pending_compute_record(
         guest_images.len(),
         resources.sampled_alias_views.len(),
         outputs.len(),
-        resources.output_uploads.iter().flatten().count(),
+        uploads.len(),
         readbacks.len(),
     ];
     let extract_elapsed =
@@ -17601,14 +17628,14 @@ fn settle_pending_compute_record(
             ..
         } = &mut *inner;
         match compute_backend.as_mut() {
-            Some(backend) => backend.recycle_dispatch_resources(
-                device,
-                uniforms,
-                raw_storage,
-                outputs,
-                readbacks,
-            ),
+            Some(backend) => {
+                backend.recycle_upload_buffers(device, uploads);
+                backend.recycle_dispatch_resources(device, uniforms, raw_storage, outputs, readbacks);
+            }
             None => {
+                for resource in uploads {
+                    resource.destroy(device);
+                }
                 for resource in uniforms {
                     resource.destroy(device);
                 }
@@ -17683,7 +17710,7 @@ fn compute_guest_sampler_format_features(
     {
         required |= vk::FormatFeatureFlags2::SAMPLED_IMAGE_FILTER_LINEAR;
     }
-    if sampler_filter_minmax_supported
+    if sampler_uses_reduction(tsc, sampler_filter_minmax_supported)
         && !matches!(
             tsc.reduction,
             crate::texture::SamplerReduction::WeightedAverage
@@ -18663,13 +18690,7 @@ fn execute_compute_dispatch(
                     .initial_bytes
                     .as_deref()
                     .map(|bytes| {
-                        crate::compute::create_compute_buffer(
-                            device,
-                            mem_props,
-                            bytes,
-                            vk::BufferUsageFlags::TRANSFER_SRC,
-                            false,
-                        )
+                        backend.acquire_upload_buffer(device, mem_props, bytes)
                     })
                     .transpose()?,
             );
@@ -19133,7 +19154,7 @@ fn execute_compute_dispatch(
                     dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     image: guest.image.image,
                     subresource_range: vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        aspect_mask: texture_image_aspect(guest.image.format),
                         base_mip_level: 0,
                         level_count: guest.mip_levels,
                         base_array_layer: 0,
@@ -19223,7 +19244,7 @@ fn execute_compute_dispatch(
                         dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                         image: guest.image.image,
                         subresource_range: vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            aspect_mask: texture_image_aspect(guest.image.format),
                             base_mip_level: 0,
                             level_count: guest.mip_levels,
                             base_array_layer: 0,
@@ -19786,6 +19807,7 @@ fn execute_compute_dispatch(
     let guest_image_contents = std::mem::take(&mut resources.guest_image_contents);
     let outputs = std::mem::take(&mut resources.outputs);
     let readbacks = std::mem::take(&mut resources.readbacks);
+    let uploads: Vec<_> = resources.output_uploads.drain(..).flatten().collect();
     resources.destroy(&inner.device);
     {
         let RendererInner {
@@ -19794,16 +19816,23 @@ fn execute_compute_dispatch(
             compute_guest_image_pool,
             ..
         } = &mut *inner;
-        compute_backend
-            .as_mut()
-            .unwrap()
-            .recycle_dispatch_resources(device, uniforms, raw_storage, outputs, readbacks);
+        let backend = compute_backend.as_mut().unwrap();
+        backend.recycle_upload_buffers(device, uploads);
+        backend.recycle_dispatch_resources(device, uniforms, raw_storage, outputs, readbacks);
         recycle_compute_guest_images(
             device,
             compute_guest_image_pool,
             guest_image_keys,
             guest_image_contents,
             guest_images,
+        );
+    }
+    if let Some(started) = dispatch_started {
+        profile_compute_dispatch_stages(
+            prep_elapsed,
+            record_elapsed,
+            submit_elapsed,
+            started.elapsed(),
         );
     }
     ComputeDispatchOutcome::Executed(result)
@@ -20436,7 +20465,7 @@ fn read_image_mip_stats(
         image,
         prev_layout,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        vk::ImageAspectFlags::COLOR,
+        texture_image_aspect(format),
         mip_level,
         1,
         0,
@@ -20447,7 +20476,7 @@ fn read_image_mip_stats(
         buffer_row_length: 0,
         buffer_image_height: 0,
         image_subresource: vk::ImageSubresourceLayers {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: texture_image_aspect(format),
             mip_level,
             base_array_layer: 0,
             layer_count: 1,
@@ -20475,7 +20504,7 @@ fn read_image_mip_stats(
             image,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             prev_layout,
-            vk::ImageAspectFlags::COLOR,
+            texture_image_aspect(format),
             mip_level,
             1,
             0,
@@ -21605,10 +21634,14 @@ fn verify_volume_image(
 }
 
 fn async_shaders_enabled() -> bool {
-    if std::env::var_os("NEXIUM_SYNC_SHADERS").is_some() {
-        return false;
-    }
-    nexium_common::async_compile::enabled() || std::env::var_os("NEXIUM_ASYNC_SHADERS").is_some()
+    static OVERRIDES: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let &(force_sync, force_async) = OVERRIDES.get_or_init(|| {
+        (
+            std::env::var_os("NEXIUM_SYNC_SHADERS").is_some(),
+            std::env::var_os("NEXIUM_ASYNC_SHADERS").is_some(),
+        )
+    });
+    !force_sync && (nexium_common::async_compile::enabled() || force_async)
 }
 
 fn tex_gen_gating_enabled() -> bool {
@@ -22052,6 +22085,9 @@ fn texture_level_upload(
     component_type: crate::texture::ComponentType,
     format: vk::Format,
 ) -> Vec<u8> {
+    if format == vk::Format::D32_SFLOAT {
+        return crate::depth::unpack_texture_depth(linear, tic_format);
+    }
     let native_layout = matches!(
         (tic_format, format),
         (
@@ -22194,6 +22230,23 @@ fn g24r8_scalar_upload(linear: &[u8], numeric_type: nexium_spirv::TextureNumeric
     out
 }
 
+struct TextureEnvironmentOptions {
+    srgb: bool,
+    volume_debug: bool,
+    volume_partial: bool,
+    volume_source_right: bool,
+}
+
+fn texture_environment_options() -> &'static TextureEnvironmentOptions {
+    static OPTIONS: std::sync::OnceLock<TextureEnvironmentOptions> = std::sync::OnceLock::new();
+    OPTIONS.get_or_init(|| TextureEnvironmentOptions {
+        srgb: std::env::var_os("NEXIUM_NO_TEX_SRGB").is_none(),
+        volume_debug: std::env::var_os("NEXIUM_VOLUME_DBG").is_some(),
+        volume_partial: std::env::var_os("NEXIUM_VOLUME_PARTIAL").is_some(),
+        volume_source_right: std::env::var_os("NEXIUM_VOLUME_SRC_RIGHT").is_some(),
+    })
+}
+
 fn volume_from_guest(gpu_va: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let list = LIST.get_or_init(|| {
@@ -22214,7 +22267,7 @@ fn trace_volume_rt_skip(
     layers: u32,
     reason: &'static str,
 ) {
-    if std::env::var_os("NEXIUM_VOLUME_DBG").is_none() {
+    if !texture_environment_options().volume_debug {
         return;
     }
     use std::collections::HashSet;
@@ -22262,7 +22315,7 @@ fn find_volume_rt_slices(
         trace_volume_rt_skip(tic, pitch_size, layers, "empty-offsets");
         return None;
     }
-    if std::env::var_os("NEXIUM_VOLUME_DBG").is_some() {
+    if texture_environment_options().volume_debug {
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         static PROBED: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
@@ -22286,7 +22339,7 @@ fn find_volume_rt_slices(
             );
         }
     }
-    let allow_partial = std::env::var_os("NEXIUM_VOLUME_PARTIAL").is_some();
+    let allow_partial = texture_environment_options().volume_partial;
     let mut out = Vec::with_capacity(layers as usize);
     for layer in 0..layers {
         let offset = offsets.get(layer as usize).copied()?;
@@ -22307,7 +22360,7 @@ fn find_volume_rt_slices(
                 })
             })
         else {
-            if std::env::var_os("NEXIUM_VOLUME_DBG").is_some() {
+            if texture_environment_options().volume_debug {
                 use std::collections::HashSet;
                 use std::sync::{Mutex, OnceLock};
                 static MISSING: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
@@ -22338,7 +22391,7 @@ fn find_volume_rt_slices(
         };
         let mut src_x = region.src_x;
         let src_y = region.src_y;
-        if std::env::var_os("NEXIUM_VOLUME_SRC_RIGHT").is_some()
+        if texture_environment_options().volume_source_right
             && region.key.width >= tic.width.saturating_mul(2)
             && src_x == 0
             && tic.width <= region.key.width.saturating_sub(src_x)
@@ -22346,7 +22399,7 @@ fn find_volume_rt_slices(
         {
             src_x = tic.width;
         }
-        if std::env::var_os("NEXIUM_VOLUME_DBG").is_some() {
+        if texture_environment_options().volume_debug {
             use std::collections::HashSet;
             use std::sync::{Mutex, OnceLock};
             static SEEN_SLICE: OnceLock<Mutex<HashSet<(u64, u32, RtKey, u32, u32)>>> =
@@ -22387,7 +22440,7 @@ fn find_volume_rt_slices(
     if out.is_empty() {
         return None;
     }
-    if std::env::var_os("NEXIUM_VOLUME_DBG").is_some() {
+    if texture_environment_options().volume_debug {
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
@@ -23437,6 +23490,7 @@ where
             mem_props,
             image,
             old_layout,
+            target.format,
             key.depth,
             key.is_3d,
             1,
@@ -24045,6 +24099,7 @@ fn depth_self_shadow_key(key: RtKey) -> RtKey {
         height: key.height,
         depth: 1,
         is_3d: false,
+        array_stride_bytes: 0,
         sample_width: 1,
         sample_height: 1,
         base_layer: 0,
@@ -24254,6 +24309,7 @@ fn sync_sampled_depth_as_color(
         height: src_key.height,
         depth: 1,
         is_3d: false,
+        array_stride_bytes: 0,
         sample_width: 1,
         sample_height: 1,
         base_layer: 0,
@@ -25602,6 +25658,10 @@ fn create_integer_sampler_for_tsc(
     }
 }
 
+fn sampler_uses_reduction(tsc: &crate::texture::TscEntry, supported: bool) -> bool {
+    supported && !tsc.depth_compare_enabled
+}
+
 fn create_sampler_for_tsc(
     device: &ash::Device,
     tsc: &crate::texture::TscEntry,
@@ -25621,7 +25681,7 @@ fn create_sampler_for_tsc(
     };
     let mip = vk_mipmap_mode(tsc.mip_filter);
     let reduction_mode = vk_sampler_reduction(tsc.reduction);
-    let use_reduction = sampler_filter_minmax_supported;
+    let use_reduction = sampler_uses_reduction(tsc, sampler_filter_minmax_supported);
     let reduction_info = vk::SamplerReductionModeCreateInfoEXT {
         s_type: vk::StructureType::SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT,
         reduction_mode: if sampler_filter_minmax_supported {
@@ -26057,6 +26117,14 @@ fn update_texture_rt_mips_only(
     );
 }
 
+pub(crate) fn texture_image_aspect(format: vk::Format) -> vk::ImageAspectFlags {
+    if format == vk::Format::D32_SFLOAT {
+        vk::ImageAspectFlags::DEPTH
+    } else {
+        vk::ImageAspectFlags::COLOR
+    }
+}
+
 fn create_texture_image(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -26084,6 +26152,10 @@ fn create_texture_image(
     gen: u64,
     upload_slot: Option<&mut FrameSlot>,
 ) -> Result<(CachedTexture, Option<PersistentUploadBuffer>), String> {
+    let aspect = texture_image_aspect(format);
+    if aspect == vk::ImageAspectFlags::DEPTH && (volume || !rt_mips.is_empty()) {
+        return Err("Depth texture cannot use color render target copies".into());
+    }
     if (cube || cube_array) && width != height {
         return Err(format!(
             "cube texture must be square, got {}x{}",
@@ -26192,7 +26264,7 @@ fn create_texture_image(
         image,
         vk::ImageLayout::UNDEFINED,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageAspectFlags::COLOR,
+        aspect,
         0,
         mip_levels,
         0,
@@ -26204,7 +26276,7 @@ fn create_texture_image(
                 float32: [0.0, 0.0, 0.0, 0.0],
             };
             let range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask: aspect,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
@@ -26242,7 +26314,7 @@ fn create_texture_image(
             let regions: Vec<vk::ImageCopy> = (0..height)
                 .map(|y| vk::ImageCopy {
                     src_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        aspect_mask: aspect,
                         mip_level: 0,
                         base_array_layer: 0,
                         layer_count: 1,
@@ -26253,7 +26325,7 @@ fn create_texture_image(
                         z: 0,
                     },
                     dst_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        aspect_mask: aspect,
                         mip_level: 0,
                         base_array_layer: 0,
                         layer_count: 1,
@@ -26303,7 +26375,7 @@ fn create_texture_image(
                     buffer_row_length: 0,
                     buffer_image_height: 0,
                     image_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        aspect_mask: aspect,
                         mip_level: copy.mip_level,
                         base_array_layer: 0,
                         layer_count: if volume { 1 } else { layers },
@@ -26337,7 +26409,7 @@ fn create_texture_image(
         image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::ImageAspectFlags::COLOR,
+        aspect,
         0,
         mip_levels,
         0,
@@ -26360,7 +26432,7 @@ fn create_texture_image(
         },
         format,
         subresource_range: vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect,
             base_mip_level: base_mip,
             level_count: view_mips,
             base_array_layer: if volume { 0 } else { view_base_layer },
@@ -26400,6 +26472,7 @@ fn update_texture_image(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     image: vk::Image,
     old_layout: vk::ImageLayout,
+    format: vk::Format,
     layers: u32,
     volume: bool,
     mip_levels: u32,
@@ -26408,6 +26481,10 @@ fn update_texture_image(
     rt_mips: &[crate::texture_mips::TextureRtMip],
     upload_slot: &mut FrameSlot,
 ) -> Result<Option<PersistentUploadBuffer>, String> {
+    let aspect = texture_image_aspect(format);
+    if aspect == vk::ImageAspectFlags::DEPTH && (volume || !rt_mips.is_empty()) {
+        return Err("Depth texture cannot use color render target copies".into());
+    }
     if mip_copies.is_empty() {
         return Err("texture update has no mip copy regions".to_string());
     }
@@ -26419,7 +26496,7 @@ fn update_texture_image(
         image,
         old_layout,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageAspectFlags::COLOR,
+        aspect,
         0,
         mip_levels.max(1),
         0,
@@ -26437,7 +26514,7 @@ fn update_texture_image(
                 buffer_row_length: 0,
                 buffer_image_height: 0,
                 image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    aspect_mask: aspect,
                     mip_level: copy.mip_level,
                     base_array_layer: 0,
                     layer_count,
@@ -26467,7 +26544,7 @@ fn update_texture_image(
         image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::ImageAspectFlags::COLOR,
+        aspect,
         0,
         mip_levels.max(1),
         0,
@@ -26476,16 +26553,21 @@ fn update_texture_image(
     Ok(stage.dedicated)
 }
 
-fn texture_update_in_place_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NEXIUM_TEXTURE_UPDATE_IN_PLACE")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
-        )
-    })
+fn texture_update_in_place_value_enabled(value: Option<&str>, volume: bool, mip_levels: u32) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "on" | "yes") => true,
+        Some("0" | "false" | "off" | "no") => false,
+        _ => volume && mip_levels == 1,
+    }
+}
+
+fn texture_update_in_place_enabled(volume: bool, mip_levels: u32) -> bool {
+    static SETTING: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    texture_update_in_place_value_enabled(
+        SETTING.get_or_init(|| std::env::var("NEXIUM_TEXTURE_UPDATE_IN_PLACE").ok()).as_deref(),
+        volume,
+        mip_levels,
+    )
 }
 
 fn texture_rt_mip_update_value_enabled(legacy: Option<&str>, mip: Option<&str>) -> bool {
@@ -26532,7 +26614,7 @@ fn texture_image_format(
         vk::Format::R8G8B8A8_SINT
     } else if from_rt_slices && format == crate::texture::TicFormat::B10G11R11 {
         vk::Format::B10G11R11_UFLOAT_PACK32
-    } else if is_srgb && std::env::var_os("NEXIUM_NO_TEX_SRGB").is_none() {
+    } else if is_srgb && texture_environment_options().srgb {
         vk::Format::R8G8B8A8_SRGB
     } else {
         vk::Format::R8G8B8A8_UNORM
@@ -26606,7 +26688,7 @@ fn graphics_texture_image_format(
     if let Some(format) = native_bc_texture_format(
         tic,
         numeric_type,
-        std::env::var_os("NEXIUM_NO_TEX_SRGB").is_none(),
+        texture_environment_options().srgb,
     )
     .filter(|format| native_bc_formats.contains(format))
     {
@@ -26615,7 +26697,61 @@ fn graphics_texture_image_format(
     texture_image_format_for_tic(tic, numeric_type)
 }
 
+static DEPTH_TEXTURE_IMAGES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+fn depth_texture_images_enabled() -> bool {
+    DEPTH_TEXTURE_IMAGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn depth_texture_images_supported(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> bool {
+    let mut features3 = vk::FormatProperties3::default();
+    let mut features2 = vk::FormatProperties2 {
+        s_type: vk::StructureType::FORMAT_PROPERTIES_2,
+        p_next: &mut features3 as *mut _ as *mut std::ffi::c_void,
+        ..Default::default()
+    };
+    unsafe {
+        instance.get_physical_device_format_properties2(
+            physical_device,
+            vk::Format::D32_SFLOAT,
+            &mut features2,
+        );
+    }
+    features3.optimal_tiling_features.contains(
+        vk::FormatFeatureFlags2::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags2::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags2::SAMPLED_IMAGE_DEPTH_COMPARISON
+            | vk::FormatFeatureFlags2::TRANSFER_SRC
+            | vk::FormatFeatureFlags2::TRANSFER_DST,
+    )
+}
+
+fn depth_texture_image_format(
+    tic: &crate::texture::TicEntry,
+    numeric_type: nexium_spirv::TextureNumericType,
+    enabled: bool,
+) -> Option<vk::Format> {
+    (enabled
+        && numeric_type == nexium_spirv::TextureNumericType::Float
+        && tic_format_prefers_depth_alias(tic.format)
+        && !tic_is_volume(tic)
+        && !tic.is_buffer())
+    .then_some(vk::Format::D32_SFLOAT)
+}
+
 fn texture_image_format_for_tic(
+    tic: &crate::texture::TicEntry,
+    numeric_type: nexium_spirv::TextureNumericType,
+) -> Result<vk::Format, String> {
+    depth_texture_image_format(tic, numeric_type, depth_texture_images_enabled())
+        .map_or_else(|| color_texture_image_format_for_tic(tic, numeric_type), Ok)
+}
+
+fn color_texture_image_format_for_tic(
     tic: &crate::texture::TicEntry,
     numeric_type: nexium_spirv::TextureNumericType,
 ) -> Result<vk::Format, String> {
@@ -27767,7 +27903,7 @@ fn texture_view_swizzle(
     numeric_type: nexium_spirv::TextureNumericType,
     mut swizzle: [crate::texture::SwizzleSource; 4],
 ) -> [crate::texture::SwizzleSource; 4] {
-    if format == crate::texture::TicFormat::G24R8
+    if tic_format_prefers_depth_alias(format)
         && numeric_type == nexium_spirv::TextureNumericType::Float
     {
         for component in &mut swizzle {
@@ -29557,12 +29693,27 @@ mod depth_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn viewport_recording_distinguishes_depth_ranges() {
+        use super::{draw_viewport, viewport_record_key};
+        use ash::vk;
+        let extent = vk::Extent2D { width: 1600, height: 900 };
+        let world = draw_viewport(None, [0.0, 1.0], extent);
+        let hud = draw_viewport(None, [0.0, 0.01], extent);
+        assert_ne!(viewport_record_key(world), viewport_record_key(hud));
+        assert_eq!(hud.max_depth, 0.01);
+        let flipped = draw_viewport(Some([0.0, 900.0, 1600.0, -900.0]), [0.75, 0.25], extent);
+        assert_eq!(flipped.height, -900.0);
+        assert_eq!([flipped.min_depth, flipped.max_depth], [0.75, 0.25]);
+    }
+
     use super::{
         align_up, blend_constants_record_key, build_grouped_shared_ssbo_plans,
         build_shared_ssbo_plan, choose_aurora_resident_slot,
         clear_group_texture_bindings_after_invalidate, color_sync_clean_across_group,
         color_sync_supports_key, complete_compute_volume_rt_slices, completed_readback_backlog_len,
-        compute_cross_access_view_components, compute_guest_content_can_retain,
+        color_texture_image_format_for_tic, compute_cross_access_view_components,
+        compute_guest_content_can_retain, depth_texture_image_format, sampler_uses_reduction,
         compute_guest_content_matches, compute_guest_image_pool_can_admit,
         compute_guest_image_pool_key, compute_guest_sampler_format_features,
         compute_guest_source_matches, compute_guest_upload_is_current, compute_guest_upload_spec,
@@ -29570,7 +29721,7 @@ mod tests {
         compute_raw_storage_seed_is_valid, compute_sampled_image_alias_extent_matches,
         compute_texel_buffer_format_features, compute_volume_cache_can_admit,
         compute_volume_cache_identity, compute_volume_cache_needs_copy,
-        depth_stencil_component_mapping, depth_stencil_sample_aspect,
+        depth_stencil_component_mapping, depth_stencil_sample_aspect, texture_component_mapping,
         descriptor_slot_uses_arrayed_2d, draw_group_attachment_uses_with_clears,
         dummy_image_format_and_aspect, env_switch_value_default_enabled, env_switch_value_enabled,
         exact_rt_copy_format_bpp, format_graphics_texture_bind_trace,
@@ -30473,7 +30624,7 @@ mod tests {
                     chunk_index: 0,
                     byte_offset: 4,
                     byte_len: 5,
-                    packed_offset: 304,
+                    packed_offset: 448,
                 },
                 crate::draw::ResidentCbufSlot {
                     logical_slot: 5,
@@ -30481,10 +30632,10 @@ mod tests {
                     chunk_index: 0,
                     byte_offset: 24,
                     byte_len: 4,
-                    packed_offset: 320,
+                    packed_offset: 464,
                 },
             ],
-            packed_size: 324,
+            packed_size: 468,
             arena: None,
             arena_slot_start: 0,
             arena_slot_count: 0,
@@ -30512,14 +30663,14 @@ mod tests {
                 segment_start: 0,
                 segment_count: 1,
                 byte_len: 5,
-                packed_offset: 304,
+                packed_offset: 448,
             }]
             .into_boxed_slice(),
         };
         crate::draw::ResidentCbufDraw {
             chunks: Vec::new(),
             slots: Vec::new(),
-            packed_size: 312,
+            packed_size: 456,
             arena: Some(std::sync::Arc::new(arena)),
             arena_slot_start: 0,
             arena_slot_count: 1,
@@ -30690,16 +30841,16 @@ mod tests {
         let mut dst = vec![0xcc; draw.packed_size];
 
         assert!(write_resident_cbuf_payload(&draw, &mut dst));
-        assert_eq!(cbuf_directory_entry(&dst, 0), (76, 2));
-        assert_eq!(cbuf_directory_entry(&dst, 5), (80, 1));
+        assert_eq!(cbuf_directory_entry(&dst, 0), (112, 2));
+        assert_eq!(cbuf_directory_entry(&dst, 5), (116, 1));
         assert_eq!(
             cbuf_directory_entry(&dst, 1),
             (nexium_spirv::GFX_CBUF_ZERO_WORD, 0)
         );
-        assert_eq!(u32::from_le_bytes(dst[288..292].try_into().unwrap()), 0);
-        assert_eq!(&dst[304..309], &[1, 2, 3, 4, 5]);
-        assert!(dst[309..320].iter().all(|byte| *byte == 0));
-        assert_eq!(&dst[320..324], &[9, 8, 7, 6]);
+        assert_eq!(u32::from_le_bytes(dst[432..436].try_into().unwrap()), 0);
+        assert_eq!(&dst[448..453], &[1, 2, 3, 4, 5]);
+        assert!(dst[453..464].iter().all(|byte| *byte == 0));
+        assert_eq!(&dst[464..468], &[9, 8, 7, 6]);
     }
 
     #[test]
@@ -30710,8 +30861,8 @@ mod tests {
 
         assert!(resident_cbuf_draw_is_valid(&draw, draw.packed_size));
         assert!(write_resident_cbuf_payload(&draw, &mut dst));
-        assert_eq!(&dst[304..309], &[1, 2, 3, 4, 5]);
-        assert_eq!(&dst[320..324], &[9, 8, 7, 6]);
+        assert_eq!(&dst[448..453], &[1, 2, 3, 4, 5]);
+        assert_eq!(&dst[464..468], &[9, 8, 7, 6]);
     }
 
     #[test]
@@ -30730,9 +30881,9 @@ mod tests {
                 chunk_index: 0,
                 byte_offset: 0,
                 byte_len: 8,
-                packed_offset: 304,
+                packed_offset: 448,
             }],
-            packed_size: 312,
+            packed_size: 456,
             arena: None,
             arena_slot_start: 0,
             arena_slot_count: 0,
@@ -30740,7 +30891,7 @@ mod tests {
         let mut dst = vec![0; draw.packed_size];
 
         assert!(write_resident_cbuf_payload(&draw, &mut dst));
-        assert_eq!(&dst[304..312], data.as_slice());
+        assert_eq!(&dst[448..456], data.as_slice());
     }
 
     #[test]
@@ -30791,7 +30942,7 @@ mod tests {
         let mut dst = vec![0; draw.packed_size];
 
         assert!(write_resident_cbuf_payload(&draw, &mut dst));
-        assert_eq!(&dst[304..309], &[6, 5, 4, 3, 2]);
+        assert_eq!(&dst[448..453], &[6, 5, 4, 3, 2]);
     }
 
     #[test]
@@ -30801,9 +30952,9 @@ mod tests {
 
         assert!(resident_cbuf_draw_is_valid(&draw, draw.packed_size));
         assert!(write_resident_cbuf_payload(&draw, &mut dst));
-        assert_eq!(cbuf_directory_entry(&dst, 0), (76, 2));
-        assert_eq!(&dst[304..309], &[1, 2, 3, 4, 5]);
-        assert!(dst[309..312].iter().all(|byte| *byte == 0));
+        assert_eq!(cbuf_directory_entry(&dst, 0), (112, 2));
+        assert_eq!(&dst[448..453], &[1, 2, 3, 4, 5]);
+        assert!(dst[453..456].iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -30843,14 +30994,14 @@ mod tests {
                 segment_start: 0,
                 segment_count: 2,
                 byte_len: 8,
-                packed_offset: 304,
+                packed_offset: 448,
             }]
             .into_boxed_slice(),
         };
         let draw = crate::draw::ResidentCbufDraw {
             chunks: Vec::new(),
             slots: Vec::new(),
-            packed_size: 312,
+            packed_size: 456,
             arena: Some(std::sync::Arc::new(arena)),
             arena_slot_start: 0,
             arena_slot_count: 1,
@@ -30858,8 +31009,8 @@ mod tests {
         let mut dst = vec![0; draw.packed_size];
 
         assert!(write_resident_cbuf_payload(&draw, &mut dst));
-        assert_eq!(cbuf_directory_entry(&dst, 3), (76, 2));
-        assert_eq!(&dst[304..312], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(cbuf_directory_entry(&dst, 3), (112, 2));
+        assert_eq!(&dst[448..456], &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -31481,6 +31632,18 @@ mod tests {
             COMPUTE_RAW_STORAGE_CACHE_MAX_BYTES,
             1,
         ));
+    }
+
+    #[test]
+    fn compute_guest_image_pool_retains_multiple_large_lighting_volumes() {
+        let volume_bytes = 512u64 * 256 * 368 * 4;
+        let image_and_staging = volume_bytes * 2;
+        let mut retained = 0;
+        for count in 0..4 {
+            assert!(compute_guest_image_pool_can_admit(count, retained, image_and_staging));
+            retained += image_and_staging;
+        }
+        assert!(!compute_guest_image_pool_can_admit(4, retained, COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES));
     }
 
     #[test]
@@ -32604,6 +32767,19 @@ mod tests {
     }
 
     #[test]
+    fn texture_image_reuse_defaults_to_single_mip_volumes_and_honors_override() {
+        let enabled = super::texture_update_in_place_value_enabled;
+        assert!(enabled(None, true, 1));
+        for (volume, mips) in [(false, 1), (false, 4), (true, 0), (true, 4)] {
+            assert!(!enabled(None, volume, mips));
+        }
+        for disabled in ["0", "false", "OFF", "no"] {
+            assert!(!enabled(Some(disabled), true, 1));
+        }
+        assert!(enabled(Some("true"), false, 1));
+    }
+
+    #[test]
     fn compute_volume_cache_admission_is_bounded_by_items_and_bytes() {
         assert!(compute_volume_cache_can_admit(0, 0, 4096));
         assert!(!compute_volume_cache_can_admit(
@@ -33102,6 +33278,190 @@ mod tests {
             assert!(tic_format_prefers_depth_alias(format));
         }
         assert!(!tic_format_prefers_depth_alias(TicFormat::A8B8G8R8));
+    }
+
+    #[test]
+    fn depth_tic_formats_sample_as_d32_only_when_float_and_enabled() {
+        use crate::texture::TicFormat;
+        use nexium_spirv::TextureNumericType::{Float, Sint, Uint};
+
+        let mut tic = group_memo_test_tic(0x1000);
+        for format in [
+            TicFormat::G24R8,
+            TicFormat::Z24S8,
+            TicFormat::X8Z24,
+            TicFormat::S8Z24,
+            TicFormat::Z32,
+        ] {
+            tic.format = format;
+            tic.texture_type = 1;
+            tic.is_srgb = false;
+            assert_eq!(
+                texture_image_format_for_tic(&tic, Float).unwrap(),
+                vk::Format::D32_SFLOAT,
+                "{format:?}"
+            );
+            tic.is_srgb = true;
+            assert_eq!(
+                texture_image_format_for_tic(&tic, Float).unwrap(),
+                vk::Format::D32_SFLOAT,
+                "{format:?} srgb"
+            );
+            tic.is_srgb = false;
+            let color = color_texture_image_format_for_tic(&tic, Float);
+            assert_ne!(color, Ok(vk::Format::D32_SFLOAT), "{format:?}");
+            assert_eq!(depth_texture_image_format(&tic, Float, false), None);
+            for texture_type in [2, 6] {
+                tic.texture_type = texture_type;
+                assert_eq!(depth_texture_image_format(&tic, Float, true), None);
+                assert_eq!(
+                    texture_image_format_for_tic(&tic, Float),
+                    color_texture_image_format_for_tic(&tic, Float),
+                    "{format:?} type {texture_type}"
+                );
+            }
+            tic.texture_type = 1;
+            for numeric_type in [Uint, Sint] {
+                assert_eq!(depth_texture_image_format(&tic, numeric_type, true), None);
+                assert_eq!(
+                    texture_image_format_for_tic(&tic, numeric_type),
+                    color_texture_image_format_for_tic(&tic, numeric_type),
+                    "{format:?} {numeric_type:?}"
+                );
+            }
+        }
+        tic.format = TicFormat::G24R8;
+        assert_eq!(
+            color_texture_image_format_for_tic(&tic, Uint).unwrap(),
+            vk::Format::R32_UINT
+        );
+        tic.format = TicFormat::Z24S8;
+        assert_eq!(
+            color_texture_image_format_for_tic(&tic, Uint).unwrap(),
+            vk::Format::R8G8B8A8_UINT
+        );
+        tic.format = TicFormat::R8G8B8A8;
+        assert_eq!(depth_texture_image_format(&tic, Float, true), None);
+    }
+
+    #[test]
+    fn depth_texture_views_remap_green_like_render_target_aliases() {
+        use crate::texture::{SwizzleSource, TicFormat};
+        use nexium_spirv::TextureNumericType::{Float, Uint};
+
+        let logical = [
+            SwizzleSource::G,
+            SwizzleSource::B,
+            SwizzleSource::R,
+            SwizzleSource::A,
+        ];
+        let alias = depth_stencil_component_mapping(logical);
+        for format in [
+            TicFormat::G24R8,
+            TicFormat::Z24S8,
+            TicFormat::X8Z24,
+            TicFormat::S8Z24,
+            TicFormat::Z32,
+        ] {
+            let uploaded = texture_view_swizzle(format, Float, logical);
+            assert_eq!(
+                uploaded,
+                [
+                    SwizzleSource::R,
+                    SwizzleSource::B,
+                    SwizzleSource::R,
+                    SwizzleSource::A,
+                ],
+                "{format:?}"
+            );
+            let mapping = texture_component_mapping(uploaded);
+            assert_eq!(
+                (mapping.r, mapping.g, mapping.b, mapping.a),
+                (alias.r, alias.g, alias.b, alias.a),
+                "{format:?}"
+            );
+            assert_eq!(texture_view_swizzle(format, Uint, logical), logical, "{format:?}");
+        }
+        assert_eq!(
+            texture_view_swizzle(TicFormat::R8G8B8A8, Float, logical),
+            logical
+        );
+    }
+
+    #[test]
+    fn texture_level_upload_unpacks_depth_for_d32_images() {
+        use crate::texture::{ComponentType, TicFormat};
+
+        let packed = 0x1234_56abu32.to_le_bytes();
+        let high = (0x123456u32 as f32 / 16_777_215.0).to_le_bytes().to_vec();
+        let low = (0x3456abu32 as f32 / 16_777_215.0).to_le_bytes().to_vec();
+        let upload = |format, host| {
+            texture_level_upload(&packed, format, 1, 1, 1, ComponentType::Unorm, host)
+        };
+        for format in [TicFormat::G24R8, TicFormat::Z24S8] {
+            assert_eq!(upload(format, vk::Format::D32_SFLOAT), high, "{format:?}");
+        }
+        for format in [TicFormat::X8Z24, TicFormat::S8Z24] {
+            assert_eq!(upload(format, vk::Format::D32_SFLOAT), low, "{format:?}");
+        }
+        assert_eq!(upload(TicFormat::Z32, vk::Format::D32_SFLOAT), packed.to_vec());
+        assert_eq!(
+            upload(TicFormat::G24R8, vk::Format::R32_UINT),
+            0xabu32.to_le_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn compare_samplers_never_request_minmax_reduction() {
+        use crate::texture::{DepthCompareFunc, SamplerReduction, TexFilter, TscEntry, WrapMode};
+
+        let mut tsc = TscEntry {
+            wrap_u: WrapMode::Wrap,
+            wrap_v: WrapMode::Wrap,
+            wrap_p: WrapMode::Wrap,
+            depth_compare_enabled: true,
+            depth_compare_func: DepthCompareFunc::Less,
+            max_anisotropy: 0,
+            mag_filter: TexFilter::Linear,
+            min_filter: TexFilter::Linear,
+            mip_filter: TexFilter::None,
+            reduction: SamplerReduction::Min,
+            mip_lod_bias: 0,
+            min_lod_clamp: 0,
+            max_lod_clamp: 0,
+            border_color_bits: [0; 4],
+        };
+        let required = compute_guest_sampler_format_features(&tsc, false, true, false, false);
+        assert!(required.contains(vk::FormatFeatureFlags2::SAMPLED_IMAGE_DEPTH_COMPARISON));
+        assert!(!required.contains(vk::FormatFeatureFlags2::SAMPLED_IMAGE_FILTER_MINMAX));
+        assert!(!sampler_uses_reduction(&tsc, true));
+        tsc.depth_compare_enabled = false;
+        assert!(compute_guest_sampler_format_features(&tsc, false, true, false, false)
+            .contains(vk::FormatFeatureFlags2::SAMPLED_IMAGE_FILTER_MINMAX));
+        assert!(sampler_uses_reduction(&tsc, true));
+        assert!(!sampler_uses_reduction(&tsc, false));
+    }
+
+    #[test]
+    fn compute_cross_access_alias_compares_depth_tics_as_colour() {
+        use crate::compute::{ComputeSampleType, ComputeStorageFormat, ComputeStorageImage};
+        use crate::texture::TicFormat;
+
+        let mut tic = group_memo_test_tic(0x1000);
+        tic.format = TicFormat::Z24S8;
+        let output = ComputeStorageImage {
+            binding: 3,
+            width: 64,
+            height: 64,
+            depth: 1,
+            is_3d: false,
+            format: ComputeStorageFormat::Abgr8Unorm,
+            initial_bytes: Some(vec![0; 64 * 64 * 4]),
+        };
+        assert!(
+            compute_cross_access_view_components(1, &tic, ComputeSampleType::Float, &output)
+                .is_ok()
+        );
     }
 
     #[test]

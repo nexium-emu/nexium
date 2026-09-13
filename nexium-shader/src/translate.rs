@@ -1138,6 +1138,16 @@ impl Translator {
         }
     }
 
+    fn video_operand(&mut self, value: Value, width: u32, selector: u32, signed: bool) -> Value {
+        let (bits, offset) = match width {
+            0 | 1 => (8, selector * 8),
+            2 => (16, (selector & 1) * 16),
+            3 => return value,
+            _ => panic!("invalid video operand width"),
+        };
+        self.emit_value(Op::Bfe { a: value, b: Value::ImmU32((bits << 8) | offset), signed })
+    }
+
     fn emit_isetp(&mut self, raw: u64, src_b: Value, pred: Option<Predicate>) {
         let src_a = self.read_reg(reg_a(raw));
         let dest_p = isetp_dest_p(raw);
@@ -1921,7 +1931,10 @@ impl Translator {
 
     fn emit_bfe(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
         let dest = reg_dest(raw);
-        let a = self.read_reg(reg_a(raw));
+        let mut a = self.read_reg(reg_a(raw));
+        if raw & (1 << 40) != 0 {
+            a = self.emit_value(Op::BitReverse { value: a });
+        }
         self.write_reg(
             dest,
             Op::Bfe {
@@ -2076,7 +2089,7 @@ impl Translator {
     fn emit_iset(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
         let dest = reg_dest(raw);
         let a = self.read_reg(reg_a(raw));
-        self.write_reg(
+        let id = self.write_reg(
             dest,
             Op::ISet {
                 cmp: ICmp::from_bits(iset_cmp(raw)),
@@ -2087,6 +2100,27 @@ impl Translator {
             },
             pred,
         );
+        if raw & (1 << 47) != 0 && pred.is_none() {
+            self.cc_source = Some(Value::Inst(id));
+        }
+    }
+
+    pub(crate) fn emit_exit_flow_predicate(&mut self, raw: u64) -> bool {
+        let Some(source) = self.cc_source else { return false; };
+        if raw & 0x1f != 13 { return false; }
+        let predicate = decoded_pred(raw);
+        self.program.emit_pred(Op::ISetPred {
+            cmp: ICmp::Ne,
+            signed: false,
+            bop: BoolOp::And,
+            src_a: source,
+            src_b: Value::Zero,
+            src_pred: predicate.map_or(PT, |pred| pred.idx),
+            src_pred_inv: predicate.is_some_and(|pred| pred.negate),
+            dest_p: 8,
+            dest_np: PT,
+        }, None, None);
+        true
     }
 
     pub fn translate(&mut self, raw: u64) -> bool {
@@ -2845,6 +2879,57 @@ impl Translator {
                 self.write_reg(dest, op, pred);
             }
 
+            Opcode::AL2P => {
+                if ((raw >> 47) & 3) != 0 || self.stage == ShaderStage::Compute {
+                    self.program.emit_void(Op::Unimplemented { opcode: Opcode::AL2P, raw });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let source = self.read_reg(reg_a(raw));
+                let offset = (((raw >> 20) & 0x7ff) as i32) << 21 >> 21;
+                self.write_reg(reg_dest(raw), Op::IAdd {
+                    a: source, b: Value::ImmU32(offset as u32), neg_a: false, neg_b: false,
+                }, pred);
+            }
+
+            Opcode::ISBERD if self.stage == ShaderStage::Geometry && raw & 0x0001_ffff_ffff_0000 == 0x0000_0000_0007_0000 => {
+                self.write_reg(reg_dest(raw), Op::Mov(self.read_reg(reg_a(raw))), pred);
+            }
+            Opcode::OUT_reg if self.stage == ShaderStage::Geometry && reg_b(raw) == RZ => {
+                if raw & (1 << 39) != 0 { self.program.emit_void_pred(Op::EmitVertex, pred); }
+                if raw & (1 << 40) != 0 { self.program.emit_void_pred(Op::EndPrimitive, pred); }
+                self.write_reg(reg_dest(raw), Op::Mov(Value::Zero), pred);
+            }
+            Opcode::VMAD if raw & ((1 << 47) | (0x1f << 51)) == 0 => {
+                let a = self.video_operand(self.read_reg(reg_a(raw)), ((raw >> 37) & 3) as u32,
+                    ((raw >> 36) & 3) as u32, raw & (1 << 48) != 0);
+                let immediate = raw & (1 << 50) == 0;
+                let b = if immediate { Value::ImmU32(((raw >> 20) & 0xffff) as u32) } else { self.read_reg(reg_b(raw)) };
+                let b = self.video_operand(b, if immediate { 2 } else { ((raw >> 29) & 3) as u32 },
+                    if immediate { 0 } else { ((raw >> 28) & 3) as u32 }, raw & (1 << 49) != 0);
+                let product = self.emit_value(Op::IMul { a, b });
+                self.write_reg(reg_dest(raw), Op::IAdd { a: product, b: self.read_reg(reg_c(raw)), neg_a: false, neg_b: false }, pred);
+            }
+            Opcode::VSETP => {
+                let a = self.video_operand(self.read_reg(reg_a(raw)), ((raw >> 37) & 3) as u32,
+                    ((raw >> 36) & 3) as u32, raw & (1 << 48) != 0);
+                let immediate = raw & (1 << 50) == 0;
+                let b = if immediate { Value::ImmU32(((raw >> 20) & 0xffff) as u32) } else { self.read_reg(reg_b(raw)) };
+                let b = self.video_operand(b, if immediate { 2 } else { ((raw >> 29) & 3) as u32 },
+                    if immediate { 0 } else { ((raw >> 28) & 3) as u32 }, raw & (1 << 49) != 0);
+                let compare = ((raw >> 43) & 0x1f) as u64;
+                let compare = (compare & 3) | ((compare >> 2) & 4);
+                let dest_p = ((raw >> 3) & 7) as u8;
+                let dest_np = (raw & 7) as u8;
+                let id = self.program.emit_pred(Op::ISetPred {
+                    cmp: ICmp::from_bits(compare), signed: raw & (1 << 49) != 0,
+                    bop: BoolOp::from_bits((raw >> 45) & 3), src_a: a, src_b: b,
+                    src_pred: ((raw >> 39) & 7) as u8, src_pred_inv: raw & (1 << 42) != 0,
+                    dest_p, dest_np,
+                }, None, pred);
+                if dest_p != PT { self.pred_state.insert(dest_p, id); }
+                if dest_np != PT { self.pred_state.insert(dest_np, id); }
+            }
             Opcode::ALD => {
                 let base_dest = reg_dest(raw);
                 let base_slot = attr_slot_ald(raw);
@@ -2852,7 +2937,16 @@ impl Translator {
                 for elem in 0..n {
                     let dest = base_dest.wrapping_add(elem as u8);
                     let slot = base_slot + elem * 4;
-                    self.write_reg(dest, Op::LoadAttr { slot }, pred);
+                    let op = if self.stage == ShaderStage::Geometry {
+                        Op::LoadGeometryAttr { slot, vertex: self.read_reg(reg_c(raw)) }
+                    } else if reg_a(raw) != RZ {
+                        let address = self.read_reg(reg_a(raw));
+                        let address = self.emit_iadd_value(address, Value::ImmU32(elem * 4), false, false);
+                        Op::LoadAttrIndexed { address }
+                    } else {
+                        Op::LoadAttr { slot }
+                    };
+                    self.write_reg(dest, op, pred);
                 }
             }
             Opcode::AST => {
@@ -2872,11 +2966,20 @@ impl Translator {
                 let perspective = self.read_reg(reg_b(raw));
                 self.write_reg(
                     dest,
-                    Op::InterpAttr {
-                        slot: attr_slot_ipa(raw),
-                        perspective,
-                        mode: ipa_interpolation_mode(raw),
-                        sat: ipa_saturate(raw),
+                    if ((raw >> 38) & 1) != 0 && reg_a(raw) != RZ {
+                        Op::InterpAttrIndexed {
+                            address: self.read_reg(reg_a(raw)),
+                            perspective,
+                            mode: ipa_interpolation_mode(raw),
+                            sat: ipa_saturate(raw),
+                        }
+                    } else {
+                        Op::InterpAttr {
+                            slot: attr_slot_ipa(raw),
+                            perspective,
+                            mode: ipa_interpolation_mode(raw),
+                            sat: ipa_saturate(raw),
+                        }
                     },
                     pred,
                 );
@@ -3399,7 +3502,7 @@ impl Translator {
                 } else {
                     None
                 };
-                let compute_fetch = if !is_texs && self.stage == ShaderStage::Compute {
+                let compute_fetch = if !is_texs {
                     let fetch = match enc {
                         0 => (ImageDimension::D1, self.read_reg(ra), None, None),
                         2 => (
@@ -3874,12 +3977,12 @@ impl Translator {
                     return false;
                 }
                 let count = match size {
-                    4 => 1u32,
+                    0..=4 => 1u32,
                     5 => 2,
                     6 => 4,
                     _ => {
                         log::warn!(
-                            "LDC with sub-word size not yet lifted raw={:#018x} size={}",
+                            "LDC with unsupported size raw={:#018x} size={}",
                             raw,
                             size,
                         );
@@ -3932,7 +4035,34 @@ impl Translator {
                     } else {
                         dest.wrapping_add(w as u8)
                     };
-                    self.write_reg(dst, Op::Mov(Value::Inst(cb_id)), pred);
+                    let value = if size < 4 {
+                        let address = self.emit_iadd_value(index, Value::ImmU32(bo), false, false);
+                        let shifted = self.emit_value(Op::IShl {
+                            a: address,
+                            b: Value::ImmU32(3),
+                        });
+                        let position = self.emit_value(Op::ILop {
+                            a: shifted,
+                            b: Value::ImmU32(if size < 2 { 24 } else { 16 }),
+                            op: LogicOp::And,
+                            not_a: false,
+                            not_b: false,
+                        });
+                        let control = self.emit_iadd_value(
+                            position,
+                            Value::ImmU32(if size < 2 { 8 << 8 } else { 16 << 8 }),
+                            false,
+                            false,
+                        );
+                        self.emit_value(Op::Bfe {
+                            a: Value::Inst(cb_id),
+                            b: control,
+                            signed: size & 1 != 0,
+                        })
+                    } else {
+                        Value::Inst(cb_id)
+                    };
+                    self.write_reg(dst, Op::Mov(value), pred);
                 }
             }
 
@@ -4400,14 +4530,14 @@ impl Translator {
                     return false;
                 }
 
-                let handle = if is_bound {
-                    TextureHandleOrigin::Bound {
+                let (handle, pending_handle) = if is_bound {
+                    (TextureHandleOrigin::Bound {
                         cbuf_word_offset: ((raw >> 36) & 0x1fff) as u32,
-                    }
+                    }, None)
                 } else {
                     let handle_reg = ((raw >> 39) & 0xff) as u8;
                     let handle_value = self.read_reg(handle_reg);
-                    let Some((origin, false)) =
+                    let Some((origin, deferred)) =
                         self.trace_cbuf_handle_origin(&handle_value, pred, defs)
                     else {
                         log::debug!("SUST handle not traceable to LDC raw={:#018x}", raw);
@@ -4418,7 +4548,7 @@ impl Translator {
                         self.unimplemented_count += 1;
                         return false;
                     };
-                    origin.as_texture_handle()
+                    (origin.as_texture_handle(), deferred.then_some(handle_value))
                 };
 
                 let coord = reg_a(raw);
@@ -4438,6 +4568,7 @@ impl Translator {
                     self.read_reg(data.wrapping_add(2)),
                     self.read_reg(data.wrapping_add(3)),
                 ];
+                let instruction_index = self.program.instructions.len();
                 self.program.emit_void_pred(
                     Op::ImageWrite {
                         handle,
@@ -4449,6 +4580,12 @@ impl Translator {
                     },
                     pred,
                 );
+                if let Some(handle) = pending_handle {
+                    self.pending_bindless_origin_checks.push(PendingBindlessOriginCheck {
+                        opcode: Opcode::SUST, raw, handle, consumer_pred: pred,
+                        samples: vec![(instruction_index, Value::Zero)],
+                    });
+                }
             }
 
             Opcode::FSETP_reg | Opcode::FSETP_cbuf | Opcode::FSETP_imm => {
@@ -5114,6 +5251,27 @@ impl Translator {
 
             Opcode::DEPBAR => {}
 
+            Opcode::PIXLD => {
+                let mode = (raw >> 31) & 7;
+                let addr_reg = ((raw >> 8) & 0xff) as u8;
+                let offset = (raw >> 20) & 0xff;
+                let dest_pred = ((raw >> 45) & 7) as u8;
+                if self.stage != ShaderStage::Fragment
+                    || mode != 5
+                    || addr_reg != RZ
+                    || offset != 0
+                    || dest_pred != PT
+                {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::PIXLD,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                self.write_reg(reg_dest(raw), Op::SampleId, pred);
+            }
+
             Opcode::S2R => {
                 let dest = reg_dest(raw);
                 let sr = ((raw >> 20) & 0xFF) as u32;
@@ -5181,6 +5339,9 @@ impl Translator {
                     match sr {
                         0 => {
                             self.write_reg(dest, Op::Mov(Value::ImmU32(0)), pred);
+                        }
+                        0x1d if self.stage == ShaderStage::Geometry => {
+                            self.write_reg(dest, Op::GeometryInvocationInfo, pred);
                         }
                         18 => {
                             self.write_reg(dest, Op::YDirection, pred);

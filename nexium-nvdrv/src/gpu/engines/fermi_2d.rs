@@ -542,7 +542,9 @@ impl Fermi2D {
         if kw == 0 || kh == 0 {
             return false;
         }
-        if dst_x_step <= 0 || dst_y_step <= 0 {
+        if dst_x_step != 1 || dst_y_step != 1
+            || src_x0 as u32 != 0x8000_0000 || src_y0 as u32 != 0x8000_0000
+        {
             return false;
         }
         let sx_ratio = (self.src.width / kw).max(1) as i64;
@@ -558,6 +560,12 @@ impl Fermi2D {
         let Some(dst_key) = self.dst.rt_key(mappings) else {
             return false;
         };
+        let Some(src_format) = self.src.format_info().and_then(SurfaceFormat::vk_format) else {
+            return false;
+        };
+        let Some(dst_format) = self.dst.format_info().and_then(SurfaceFormat::vk_format) else {
+            return false;
+        };
         match renderer.resolve_rt_copy(
             src_nv,
             kw,
@@ -566,6 +574,8 @@ impl Fermi2D {
             dst_key,
             [sx0, sy0, sx1, sy1],
             [dx0, dy0, dx1, dy1],
+            src_format,
+            dst_format,
         ) {
             Ok(done) => {
                 if done {

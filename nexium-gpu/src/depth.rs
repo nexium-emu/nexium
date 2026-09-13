@@ -79,6 +79,25 @@ pub(crate) fn pack_d32_readback(bytes: &mut [u8]) {
     }
 }
 
+pub(crate) fn unpack_texture_depth(bytes: &[u8], format: crate::texture::TicFormat) -> Vec<u8> {
+    use crate::texture::TicFormat;
+    if format == TicFormat::Z32 {
+        return bytes.to_vec();
+    }
+    let high_depth = matches!(format, TicFormat::G24R8 | TicFormat::Z24S8);
+    let mut out = Vec::with_capacity(bytes.len());
+    for word in bytes.chunks_exact(4) {
+        let packed = u32::from_le_bytes(word.try_into().unwrap());
+        let depth = if high_depth {
+            packed >> 8
+        } else {
+            packed & 0x00ff_ffff
+        };
+        out.extend_from_slice(&(depth as f32 / 16_777_215.0).to_le_bytes());
+    }
+    out
+}
+
 pub(crate) struct DepthPackPipeline {
     descriptor_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
@@ -239,6 +258,44 @@ impl DepthPackPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_depth_preserves_low_bits_and_ignores_stencil() {
+        use crate::texture::TicFormat;
+        let values = [0, 1, 0x123456, 0x123457, 0x800000, 0xffffff];
+        for format in [
+            TicFormat::G24R8,
+            TicFormat::Z24S8,
+            TicFormat::X8Z24,
+            TicFormat::S8Z24,
+        ] {
+            let high = matches!(format, TicFormat::G24R8 | TicFormat::Z24S8);
+            for stencil in [0, 0xa5, 0xff] {
+                let bytes: Vec<_> = values
+                    .iter()
+                    .flat_map(|&depth| {
+                        let packed: u32 = if high {
+                            depth << 8 | stencil
+                        } else {
+                            depth | stencil << 24
+                        };
+                        packed.to_le_bytes()
+                    })
+                    .collect();
+                let unpacked = unpack_texture_depth(&bytes, format);
+                let result: Vec<_> = unpacked
+                    .chunks_exact(4)
+                    .map(|word| pack_d24(f32::from_le_bytes(word.try_into().unwrap())))
+                    .collect();
+                assert_eq!(result, values, "{format:?}");
+            }
+        }
+        let floats: Vec<_> = [0.0f32, 0.123456, 0.99999, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert_eq!(unpack_texture_depth(&floats, TicFormat::Z32), floats);
+    }
 
     #[test]
     fn depth_fallback_requires_all_image_usages() {

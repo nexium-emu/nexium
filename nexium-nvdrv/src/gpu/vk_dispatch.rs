@@ -429,6 +429,41 @@ fn collect_cbuf_reads(cfg: &nexium_shader::Cfg, stage_base: u32) -> Vec<CbufRead
     reads
 }
 
+fn collect_graphics_storage_buffers(
+    vs_cfg: &mut nexium_shader::Cfg,
+    fs_cfg: &mut nexium_shader::Cfg,
+) -> Result<Vec<nexium_shader::StorageBufferAddr>, String> {
+    let mut buffers = nexium_shader::collect_storage_buffers(vs_cfg);
+    let mut fragment = nexium_shader::collect_storage_buffers(fs_cfg);
+    let fragment_base = buffers.len() as u32;
+    if buffers.len() + fragment.len() > 8 {
+        return Err(format!(
+            "graphics storage buffer count {} exceeds 8 bindings",
+            buffers.len() + fragment.len()
+        ));
+    }
+    for block in &mut fs_cfg.blocks {
+        for instruction in &mut block.program.instructions {
+            match &mut instruction.op {
+                nexium_shader::IrOp::LoadStorage { buffer_index, .. }
+                | nexium_shader::IrOp::StoreStorage { buffer_index, .. }
+                | nexium_shader::IrOp::StorageAtomic { buffer_index, .. } => {
+                    *buffer_index += fragment_base;
+                }
+                _ => {}
+            }
+        }
+    }
+    for descriptor in &mut fragment {
+        descriptor.cbuf_binding += FRAGMENT_CBUF_BASE as u8;
+        if let Some(indirect) = &mut descriptor.indirect {
+            indirect.parent_buffer_index += fragment_base;
+        }
+    }
+    buffers.extend(fragment);
+    Ok(buffers)
+}
+
 fn collect_graphics_cbuf_reads(
     vs_cfg: &nexium_shader::Cfg,
     fs_cfg: &nexium_shader::Cfg,
@@ -623,8 +658,8 @@ fn storage_pointer_source_mask(descriptors: &[nexium_shader::StorageBufferAddr])
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub(crate) struct CbufPackKey {
     used: u64,
-    requirements: usize,
-    groups: (usize, usize),
+    requirements: PackedCbufReadRequirements,
+    groups: (usize, usize, usize),
     binds: [(u64, u32); nexium_spirv::GFX_CBUF_SLOTS as usize],
     epoch: u64,
 }
@@ -5392,6 +5427,21 @@ impl ComputeGraphicsProbe {
     }
 }
 
+fn vertex_memory_store_candidate(draw: &DrawCall) -> bool {
+    !draw.is_clear
+        && draw.draw_texture.is_none()
+        && !draw.indexed
+        && draw.first_vertex == 0
+        && (1..=65535).contains(&draw.vertex_count)
+        && draw.instance_count == 1
+        && draw.first_instance == 0
+        && draw.shader_programs[1].is_enabled(1)
+        && [0, 2, 3, 4].into_iter().all(|stage| {
+            let program = draw.shader_programs[stage];
+            !program.is_enabled(stage)
+        })
+}
+
 pub(crate) fn enqueue_draws(
     draws: &[DrawCall],
     batch: &mut PendingDrawBatch,
@@ -5409,6 +5459,7 @@ pub(crate) fn enqueue_draws(
     ssbo_snapshot_cache.refresh_deferred_writes(mappings);
     let mut completed = true;
     let predictive_rt_boundary = predictive_rt_boundary_enabled();
+    let mut vertex_store_cache: HashMap<u64, Option<Arc<Vec<u8>>>> = HashMap::new();
     let mut rt_signature_memo: Option<(RtBindingSignature, u64)> = None;
     let mut derived_state_cache = DrawDerivedStateCache::new(draw_derived_cache_enabled());
     for draw in draws {
@@ -5444,6 +5495,79 @@ pub(crate) fn enqueue_draws(
                     ),
                 );
                 continue;
+            }
+        }
+        if vertex_memory_store_candidate(draw) {
+            let address = draw
+                .program_region_gpu_va
+                .wrapping_add(draw.shader_programs[1].address_lo as u64);
+            if let Some(sph) = fetch_sph(address, mappings, mem_read)
+                .filter(|sph| sph[0x32..].iter().all(|byte| *byte == 0) && sph[3] & 0xf0 == 0)
+            {
+                let code = vertex_store_cache
+                    .entry(address)
+                    .or_insert_with(|| {
+                        fetch_sass(address, mappings, mem_read)
+                            .and_then(|code| {
+                                super::engines::maxwell_compute::vertex_memory_store_code(&code)
+                            })
+                            .map(Arc::new)
+                    })
+                    .clone();
+                if let Some(code) = code {
+                    derived_state_cache.clear();
+                    let kp_wait = super::pusher::kickprof::start();
+                    let mut ordered = flush_accum(
+                        batch,
+                        renderer,
+                        mappings,
+                        mem_read,
+                        mem_write,
+                        ssbo_snapshot_cache,
+                        packetizer,
+                    );
+                    ordered &= packetizer.drain_hard();
+                    if let Some(rt) = crate::render_thread::maybe_render_thread() {
+                        ordered &= rt.finish(std::time::Duration::from_secs(10));
+                    }
+                    if !ordered {
+                        completed = false;
+                        continue;
+                    }
+                    finish_ssbo_flush_boundary(ssbo_snapshot_cache);
+                    super::pusher::kickprof::add(super::pusher::kickprof::VERTEX_STORE_WAIT, kp_wait);
+                    let outcome = super::engines::maxwell_compute::execute_vertex_memory_store(
+                        draw, &sph, &code, renderer, mappings, mem_read, mem_write,
+                    );
+                    vertex_store_cache.clear();
+                    ssbo_snapshot_cache.refresh_deferred_writes(mappings);
+                    use super::engines::maxwell_compute::MaxwellComputeOutcome;
+                    static REPORTED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                        log::info!(
+                            "[vertex-memory-store] vs={address:#x} vertices={} {outcome:?}",
+                            draw.vertex_count
+                        );
+                    }
+                    match outcome {
+                        MaxwellComputeOutcome::Executed => continue,
+                        MaxwellComputeOutcome::SubmittedFailure(_) => {
+                            completed = false;
+                            continue;
+                        }
+                        MaxwellComputeOutcome::Unsupported(reason) => {
+                            static FAILURES: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            if FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                                log::warn!(
+                                    "[vertex-memory-store-unsupported] vs={address:#x} vertices={} {reason}",
+                                    draw.vertex_count
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         if draw.draw_texture.is_some() {
@@ -7930,6 +8054,53 @@ fn trace_vertex_input_batch(
     }
 }
 
+fn sparse_graphics_snapshot_identity(data: &Arc<Vec<u8>>) -> u64 {
+    thread_local! {
+        static IDENTITIES: std::cell::RefCell<Vec<TrustedTextureSnapshotIdentity>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    IDENTITIES.with(|entries| {
+        let mut entries = entries.borrow_mut();
+        entries.retain(|entry| entry.data.strong_count() != 0);
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.data.upgrade().is_some_and(|previous| Arc::ptr_eq(&previous, data))
+        }) {
+            return entry.identity;
+        }
+        let identity = next_texture_snapshot_identity();
+        if entries.len() >= 64 {
+            entries.remove(0);
+        }
+        entries.push(TrustedTextureSnapshotIdentity { identity, data: Arc::downgrade(data) });
+        identity
+    })
+}
+
+struct SparseGraphicsTextureSnapshot {
+    descriptor: Arc<Vec<u8>>,
+    gpu_va: u64,
+    data: Arc<Vec<u8>>,
+    generation: u64,
+}
+
+fn snapshot_sparse_graphics_texture(
+    raw: &[u8],
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Result<Option<SparseGraphicsTextureSnapshot>, String> {
+    let Some(tic) = nexium_gpu::texture::TicEntry::parse(raw).filter(|tic| tic.is_sparse) else {
+        return Ok(None);
+    };
+    let (_, data, _, generation) = super::engines::maxwell_compute::snapshot_sparse_texture(
+        &tic, mappings, mem_read,
+    )?;
+    let mut descriptor = raw.to_vec();
+    descriptor[23] &= !0x40;
+    Ok(Some(SparseGraphicsTextureSnapshot {
+        descriptor: Arc::new(descriptor), gpu_va: tic.gpu_va, data, generation,
+    }))
+}
+
 fn snapshot_tic_descriptor_once(
     snapshot: &DrawSnapshot,
     read_guest: &mut dyn FnMut(u64, usize) -> Option<Arc<Vec<u8>>>,
@@ -9273,9 +9444,31 @@ fn prepare_draw_batch_async(
                     continue;
                 }
                 let tic_addr = call.tic_pool_gpu_va.wrapping_add((tex_id as u64) * 32);
-                if let Some((tic_raw, tic_read)) =
+                if let Some((mut tic_raw, tic_read)) =
                     snapshot_tic_descriptor_once(&snapshot, &mut read_input_guest, tic_addr)
                 {
+                    match snapshot_sparse_graphics_texture(&tic_raw, mappings, mem_read) {
+                        Ok(Some(sparse)) => {
+                            let size = sparse.data.len();
+                            trusted_texture_snapshot_identities.insert(
+                                sparse.gpu_va,
+                                TrustedTextureSnapshotIdentity {
+                                    identity: sparse_graphics_snapshot_identity(&sparse.data),
+                                    data: Arc::downgrade(&sparse.data),
+                                },
+                            );
+                            snapshot.insert(sparse.gpu_va, sparse.data);
+                            snapshot_generations.insert((sparse.gpu_va, size), sparse.generation);
+                            tic_raw = sparse.descriptor;
+                        }
+                        Ok(None) => {}
+                        Err(reason) => {
+                            static FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            if FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                log::warn!("sparse graphics texture snapshot failed: {reason}");
+                            }
+                        }
+                    }
                     if tic_read {
                         snapshot_reads += 1;
                         snapshot_bytes += tic_raw.len();
@@ -9938,6 +10131,45 @@ fn submit_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_SUBMIT_TRACE").is_some())
 }
 
+struct GeometryShader {
+    spirv: std::sync::Arc<Vec<u32>>,
+    cbuf_mask: u64,
+    requirements: PackedCbufReadRequirements,
+}
+
+fn prepare_geometry_shader(
+    address: u64,
+    topology: u32,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    vertex: nexium_spirv::VertexOptions,
+) -> Result<std::sync::Arc<GeometryShader>, String> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, Arc<GeometryShader>>>> = OnceLock::new();
+    let sph = fetch_sph(address, mappings, mem_read).ok_or_else(|| format!("unmapped GS header {address:#x}"))?;
+    let options = nexium_spirv::GeometryOptions::from_header(topology, &sph)?;
+    let code = fetch_sass(address, mappings, mem_read).ok_or_else(|| format!("unmapped GS code {address:#x}"))?;
+    let scalars = [topology, vertex.vptx_scale_z.to_bits(), vertex.vptx_translate_z.to_bits(),
+        vertex.apply_z_remap as u32, vertex.window_ndc.map_or(0, |v| v.0.to_bits()),
+        vertex.window_ndc.map_or(0, |v| v.1.to_bits())];
+    let key = bundle_content_key(&code, &[], Some(&sph), &scalars);
+    let mut cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().unwrap();
+    if let Some(shader) = cache.get(&key) { return Ok(shader.clone()); }
+    let cfg = nexium_shader::cfg::build_geometry_cfg(&code);
+    if graphics_cfg_has_unimplemented(&cfg) {
+        return Err(format!("unsupported GS instructions at {address:#x}: {}", cfg.unimplemented));
+    }
+    let reads = collect_cbuf_reads(&cfg, nexium_spirv::GFX_CBUF_STAGE_SLOTS * 2);
+    let (spirv, cbuf_mask) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        nexium_spirv::emit_geometry(&cfg, &[], vertex, options)
+    })).map_err(|panic| format!("GS emit {address:#x}: {}", shader_panic_message(panic)))?;
+    let shader = Arc::new(GeometryShader { spirv: Arc::new(spirv), cbuf_mask,
+        requirements: packed_cbuf_read_requirements(&reads) });
+    log::info!("compiled GS {address:#x}: {} input vertices, {} output vertices", options.input_vertices, options.output_vertices);
+    cache.insert(key, shader.clone());
+    Ok(shader)
+}
+
 struct ShaderBundle {
     vs_spirv: std::sync::Arc<Vec<u32>>,
     vs_input_locations: Vec<u32>,
@@ -10024,6 +10256,10 @@ type ShaderKey = (
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ShaderResourceKey {
+    apply_z_remap: bool,
+    dual_source: bool,
+    geometry_enabled: bool,
+    vertex_input_mask: u32,
     resource_fingerprint: u64,
     environment_fingerprint: u128,
 }
@@ -10038,6 +10274,35 @@ fn fragment_depth_key(writes_depth: bool) -> u32 {
 
 fn layer_output_shader_key(slot: Option<u32>) -> u32 {
     slot.map_or(0, |slot| ((slot & 0xff) + 1) << 18)
+}
+
+fn passthrough_float_layer_slot(sph: &[u8; SPH_SIZE], sass: &[u8]) -> Option<u32> {
+    let header = u32::from_le_bytes(sph[..4].try_into().ok()?);
+    if header & (1 << 24) == 0 || (header >> 10) & 0xf != 4 {
+        return None;
+    }
+    let expected = [
+        (0x08, 0xf0c8000001d70000u64),
+        (0x10, 0x5f047f8020070003),
+        (0x18, 0x50f41ba06ff70007),
+        (0x28, 0xefd0000000070302),
+        (0x30, 0x5c9807800ff70000),
+        (0x38, 0x010800000000f002),
+        (0x50, 0x5cb0118000171a01),
+        (0x58, 0xeff000000647ff01),
+        (0x68, 0xe30000000007000f),
+    ];
+    for (offset, word) in expected {
+        if u64::from_le_bytes(sass.get(offset..offset + 8)?.try_into().ok()?) != word {
+            return None;
+        }
+    }
+    let load = u64::from_le_bytes(sass.get(0x48..0x50)?.try_into().ok()?);
+    let slot = ((load >> 20) & 0x3ff) as u32;
+    (load & !(0x3ff << 20) == 0xefd801000007ff01
+        && (0x80..0x280).contains(&slot)
+        && slot % 4 == 0)
+        .then_some(slot)
 }
 
 fn recognized_layer_output_slot(
@@ -10103,6 +10368,7 @@ struct GraphicsTextureLayout {
 #[derive(Clone, Copy, Debug)]
 struct ResolvedTicDescriptor {
     id: u32,
+    #[cfg(test)]
     address: u64,
     raw: [u8; 32],
     entry: nexium_gpu::texture::TicEntry,
@@ -11377,6 +11643,46 @@ fn writeback_small_rt_entries(
     result
 }
 
+fn small_rt_layer_writebacks(
+    key: RtKey,
+    tile_mode: u32,
+    width: u32,
+    height: u32,
+    bpp: usize,
+    raw: &mut [u8],
+) -> Option<Vec<(u64, Vec<u8>)>> {
+    if key.is_3d || width == 0 || height == 0 || bpp == 0 {
+        return None;
+    }
+    let row = (width as usize).checked_mul(bpp)?;
+    let layer_size = row.checked_mul(height as usize)?;
+    let layers = key.render_layer_count() as usize;
+    if raw.len() != layer_size.checked_mul(layers)? {
+        return None;
+    }
+    let mut writes = Vec::with_capacity(layers);
+    for (layer, pixels) in raw.chunks_exact_mut(layer_size).enumerate() {
+        for y in 0..height as usize / 2 {
+            let (top, bottom) = pixels.split_at_mut((height as usize - 1 - y) * row);
+            top[y * row..(y + 1) * row].swap_with_slice(&mut bottom[..row]);
+        }
+        let data = if tile_mode & (1 << 12) != 0 {
+            pixels.to_vec()
+        } else {
+            super::engines::maxwell_dma::swizzle_block_linear(
+                pixels, row, height as usize, row, row, height as usize,
+                (tile_mode >> 4) & 0x7, 0, 0,
+            )
+        };
+        if layers > 1 && key.array_stride_bytes < data.len() as u64 {
+            return None;
+        }
+        let address = key.gpu_va.checked_add(key.array_stride_bytes.checked_mul(layer as u64)?)?;
+        writes.push((address, data));
+    }
+    Some(writes)
+}
+
 fn process_small_rt_readbacks(
     renderer: &Arc<nexium_gpu::Renderer>,
     mappings: &GpuMappings,
@@ -11392,37 +11698,18 @@ fn process_small_rt_readbacks(
             unresolved.push((key, tile_mode));
             continue;
         };
-        let width_bytes = kw as usize * bpp;
-        if kh >= 2 && raw.len() >= width_bytes * kh as usize {
-            let height = kh as usize;
-            for y in 0..height / 2 {
-                let (top, bottom) = raw.split_at_mut((height - 1 - y) * width_bytes);
-                top[y * width_bytes..(y + 1) * width_bytes]
-                    .swap_with_slice(&mut bottom[..width_bytes]);
-            }
-        }
-        let guest_bytes = if (tile_mode >> 12) & 1 == 1 {
-            raw
-        } else {
-            let block_height_log2 = (tile_mode >> 4) & 0x7;
-            super::engines::maxwell_dma::swizzle_block_linear(
-                &raw,
-                width_bytes,
-                kh as usize,
-                width_bytes,
-                width_bytes,
-                kh as usize,
-                block_height_log2,
-                0,
-                0,
-            )
-        };
-        let bytes_to_write = guest_bytes.len();
-        if bytes_to_write == 0 {
+        let Some(layers) = small_rt_layer_writebacks(key, tile_mode, kw, kh, bpp, &mut raw) else {
             unresolved.push((key, tile_mode));
             continue;
+        };
+        let mut bytes_to_write = 0;
+        let mut write = GuestWriteResult { complete: true, written: Vec::new() };
+        for (address, data) in layers {
+            bytes_to_write += data.len();
+            let layer = write_guest_strict(mappings, mem_write, address, &data);
+            write.complete &= layer.complete;
+            write.written.extend(layer.written);
         }
-        let write = write_guest_strict(mappings, mem_write, key.gpu_va, &guest_bytes);
         invalidate_guest_write_chunks(renderer, mappings, &write.written);
         if !write.written.is_empty() {
             result.targets_written += 1;
@@ -11519,67 +11806,7 @@ fn writeback_cube_sample_dependencies(
         restore_small_rt_batch(pending);
         return SmallRtWritebackResult::default();
     };
-    let mut result = SmallRtWritebackResult::default();
-    let mut unresolved = Vec::new();
-    let SmallRtPendingBatch { epoch, entries } = pending;
-    for ((key, tile_mode), readback) in entries.into_iter().zip(readbacks) {
-        let Some((kw, kh, bpp, mut raw)) = readback else {
-            unresolved.push((key, tile_mode));
-            continue;
-        };
-        let width_bytes = kw as usize * bpp;
-        if kh >= 2 && raw.len() >= width_bytes * kh as usize {
-            let height = kh as usize;
-            for y in 0..height / 2 {
-                let (top, bottom) = raw.split_at_mut((height - 1 - y) * width_bytes);
-                top[y * width_bytes..(y + 1) * width_bytes]
-                    .swap_with_slice(&mut bottom[..width_bytes]);
-            }
-        }
-        let guest_bytes = if (tile_mode >> 12) & 1 == 1 {
-            raw
-        } else {
-            let block_height_log2 = (tile_mode >> 4) & 0x7;
-            super::engines::maxwell_dma::swizzle_block_linear(
-                &raw,
-                width_bytes,
-                kh as usize,
-                width_bytes,
-                width_bytes,
-                kh as usize,
-                block_height_log2,
-                0,
-                0,
-            )
-        };
-        let bytes_to_write = guest_bytes.len();
-        if bytes_to_write == 0 {
-            unresolved.push((key, tile_mode));
-            continue;
-        }
-        let write = write_guest_strict(mappings, mem_write, key.gpu_va, &guest_bytes);
-        invalidate_guest_write_chunks(renderer, mappings, &write.written);
-        if !write.written.is_empty() {
-            result.targets_written += 1;
-            result.written.extend(write.written.iter().copied());
-        }
-        if !write.complete {
-            unresolved.push((key, tile_mode));
-            continue;
-        }
-        log::debug!(
-            "[rt-writeback] {} bpp={} tile={:#x} bytes={:#x}",
-            key.label(),
-            bpp,
-            tile_mode,
-            bytes_to_write,
-        );
-    }
-    restore_small_rt_batch(SmallRtPendingBatch {
-        epoch,
-        entries: unresolved,
-    });
-    let writeback = result;
+    let writeback = process_small_rt_readbacks(renderer, mappings, mem_write, pending, readbacks);
     let written = writeback.targets_written;
     if written != 0 {
         for base in &dependencies.texture_bases {
@@ -12139,7 +12366,7 @@ fn execute_one_inner(
         }
     }
     let vs_active = vs_prog.enabled || vs_prog.address_lo != 0;
-    let gs_active = gs_prog.enabled || gs_prog.address_lo != 0;
+    let gs_active = gs_prog.is_enabled(4);
     let fs_active = fs_prog.enabled || fs_prog.address_lo != 0;
     if !vs_active || !fs_active {
         return Err("VS or FS program disabled".to_string());
@@ -12153,20 +12380,31 @@ fn execute_one_inner(
             && vsa_prog.address_lo != vs_prog.address_lo
     };
     let vsa_key = if vsa_active { vsa_prog.address_lo } else { 0 };
-    let layer_output_slot =
-        recognized_layer_output_slot(draw, rt, vs_prog.address_lo, gs_prog.address_lo, gs_active);
+    let float_layer_slot = if gs_active && rt_key.render_layer_count() > 1 {
+        let gs_addr = program_region.wrapping_add(gs_prog.address_lo as u64);
+        fetch_sph(gs_addr, mappings, mem_read).and_then(|sph| {
+            let code = read_gpu_strict(mappings, mem_read, gs_addr + SPH_SIZE as u64, 0x70)?;
+            passthrough_float_layer_slot(&sph, &code)
+        })
+    } else {
+        None
+    };
+    let layer_output_float = float_layer_slot.is_some();
+    let layer_output_slot = float_layer_slot.or_else(||
+        recognized_layer_output_slot(draw, rt, vs_prog.address_lo, gs_prog.address_lo, gs_active));
     if let Some(slot) = layer_output_slot {
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
         if !LOGGED.swap(true, Ordering::Relaxed) {
             log::info!(
-                "promoting PPS pass-through GS to VS Layer output slot={:#x} rt={}",
+                "promoting pass-through GS to VS Layer output slot={:#x} rt={}",
                 slot,
                 rt_key.label()
             );
         }
     }
 
+    let geometry_enabled = gs_active && layer_output_slot.is_none();
     let vs_addr = program_region.wrapping_add(vs_prog.address_lo as u64);
     let gs_addr = program_region.wrapping_add(gs_prog.address_lo as u64);
     let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
@@ -12224,32 +12462,9 @@ fn execute_one_inner(
     let derived_state = derived_state_source
         .as_ref()
         .and_then(|source| derived_state_cache.lookup(source, ssbo_snapshot_cache));
-    let guest_vptx = if draw.viewport.scale_z != 0.0 || draw.viewport.translate_z != 0.0 {
-        (draw.viewport.scale_z, draw.viewport.translate_z)
-    } else {
-        (1.0, 0.0)
-    };
     let depth_clip_control = depth_clip_control_enabled();
     let apply_z_remap = draw.depth_mode == 0 && !depth_clip_control;
-    let (vptx_scale_z, vptx_translate_z) = if apply_z_remap {
-        (1.0, 0.0)
-    } else {
-        guest_vptx
-    };
-    {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static LOGGED: AtomicBool = AtomicBool::new(false);
-        if !LOGGED.swap(true, Ordering::Relaxed) {
-            log::info!(
-                "viewport Z transform (first draw): captured scale_z={} translate_z={} \
-                 -> applied {}/{} (OpenGL conv ~0.5/0.5; D3D/identity ~1.0/0.0)",
-                draw.viewport.scale_z,
-                draw.viewport.translate_z,
-                vptx_scale_z,
-                vptx_translate_z,
-            );
-        }
-    }
+    let (vptx_scale_z, vptx_translate_z) = (1.0_f32, 0.0_f32);
 
     let ps_key = if draw.topology == 0 {
         draw.point_size.to_bits()
@@ -12272,6 +12487,10 @@ fn execute_one_inner(
     } else {
         0
     };
+    let vertex_input_mask = draw.vertex_attribs.iter().enumerate()
+        .filter(|(location, attribute)| *location < 32 && attribute.format != 0
+            && !(attribute.constant && skip_const_attr_enabled()))
+        .fold(0u32, |mask, (location, _)| mask | (1 << location));
     let mut uint_attr_mask: u32 = 0;
     let mut sint_attr_mask: u32 = 0;
     for (loc, attrib) in draw.vertex_attribs.iter().enumerate() {
@@ -12340,6 +12559,20 @@ fn execute_one_inner(
     let (fragment_uint_output_mask, fragment_sint_output_mask) = color_targets.numeric_masks();
     let via_header_index = draw.sampler_binding == 1;
     let color_output_count = (color_rt_formats.len() as u32).clamp(1, 8);
+    let dual_source = color_rt_formats.len() == 1
+        && !blend_forced_off_for_fs(fs_addr)
+        && color_rt_locations.first().is_some_and(|&rt| {
+            let blend = &draw.color_blend;
+            let factors = if blend.blend_per_target_enabled {
+                [blend.blend_pt_src_rgb[rt], blend.blend_pt_dst_rgb[rt],
+                 blend.blend_pt_src_alpha[rt], blend.blend_pt_dst_alpha[rt]]
+            } else {
+                [blend.blend_src_rgb, blend.blend_dst_rgb,
+                 blend.blend_src_alpha, blend.blend_dst_alpha]
+            };
+            effective_blend_enable_for_attachment(&blend.blend_enable, blend.blend_per_target_enabled, rt)
+                && factors.into_iter().any(|factor| matches!(factor, 0x10..=0x13 | 0xc900..=0xc903))
+        });
     super::pusher::kickprof::add(super::pusher::kickprof::ENQPRE_SPH, enq_pre_sub);
     enq_pre_sub = super::pusher::kickprof::start();
     if shader_map_debug_enabled() {
@@ -12629,7 +12862,8 @@ fn execute_one_inner(
             | (if texture_metadata_cached { 0 } else { 3 << 16 })
             | fragment_depth_key(fs_writes_depth)
             | y_direction_key(draw.window_origin.lower_left())
-            | layer_output_shader_key(layer_output_slot);
+            | layer_output_shader_key(layer_output_slot)
+            | ((layer_output_float as u32) << 27);
     let initial_manifest_fingerprint = texlay_hit
         .as_ref()
         .map(|hit| hit.manifest_fp)
@@ -12697,6 +12931,10 @@ fn execute_one_inner(
             ^ draw.alpha_test_ref.rotate_left(8),
         initial_numeric_key,
         ShaderResourceKey {
+            apply_z_remap,
+            dual_source,
+            geometry_enabled,
+            vertex_input_mask,
             resource_fingerprint: shader_resource_fingerprint(
                 initial_indirect_fingerprint,
                 texture_layout
@@ -12825,7 +13063,7 @@ fn execute_one_inner(
                 let _ = std::fs::write(&path, shader_cfg_dump(&vs_cfg));
                 log::warn!("[dump-vs-cfg] wrote {}", path.display());
             }
-            let fs_cfg =
+            let mut fs_cfg =
                 nexium_shader::build_fragment_cfg_with_cbuf(&fs_sass, |binding, offset| {
                     read_stage_cbuf_u32(
                         fs_cbuf_group,
@@ -12933,7 +13171,8 @@ fn execute_one_inner(
                 shader_numeric_key(fragment_uint_output_mask, fragment_sint_output_mask)
                     | fragment_depth_key(fs_writes_depth)
                     | y_direction_key(draw.window_origin.lower_left())
-                    | layer_output_shader_key(layer_output_slot);
+                    | layer_output_shader_key(layer_output_slot)
+            | ((layer_output_float as u32) << 27);
             shader_key.11.resource_fingerprint = shader_resource_fingerprint(
                 indirect_table_fingerprint(
                     &vs_tables,
@@ -12968,11 +13207,15 @@ fn execute_one_inner(
             let view_metadata_fingerprint =
                 texture_view_metadata_fingerprint(active_texture_layout);
             let mut content_key_scalars = vec![
+                apply_z_remap as u32,
+                geometry_enabled as u32,
                 vptx_scale_z.to_bits(),
                 vptx_translate_z.to_bits(),
                 ps_key,
                 win_key,
                 y_direction_key(draw.window_origin.lower_left()),
+                vertex_input_mask,
+                dual_source as u32,
                 uint_attr_mask,
                 sint_attr_mask,
                 color_output_count,
@@ -12984,6 +13227,7 @@ fn execute_one_inner(
                 fragment_uint_output_mask,
                 fragment_sint_output_mask,
                 layer_output_slot.unwrap_or(0),
+                layer_output_float as u32,
                 active_texture_layout.fs_texel_buffer_mask,
                 active_texture_layout.vs_texel_buffer_mask,
                 active_texture_layout.fs_sampler_arrayed as u32,
@@ -13010,6 +13254,24 @@ fn execute_one_inner(
                 bundle_content_key(&vs_sass, &fs_sass, fs_sph.as_ref(), &content_key_scalars);
             let l2_store = nexium_gpu::bundle_cache::bundle_store();
             if graphics_cfg_has_unimplemented(&vs_cfg) || graphics_cfg_has_unimplemented(&fs_cfg) {
+                if vs_cfg
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.program.instructions)
+                    .any(|inst| {
+                        matches!(
+                            inst.op,
+                            nexium_shader::IrOp::Unimplemented {
+                                opcode: nexium_shader::Opcode::SUST,
+                                ..
+                            }
+                        )
+                    })
+                {
+                    log::warn!("[vertex-image-store-rejected] candidate={} indexed={} first={} count={} instances={}/{} programs={:?} sph={:02x?}",
+                        vertex_memory_store_candidate(draw), draw.indexed, draw.first_vertex, draw.vertex_count,
+                        draw.instance_count, draw.first_instance, draw.shader_programs, fetch_sph(vs_addr, mappings, mem_read));
+                }
                 let vs_samples = unimplemented_samples(&vs_cfg);
                 let fs_samples = unimplemented_samples(&fs_cfg);
                 log::warn!(
@@ -13101,11 +13363,7 @@ fn execute_one_inner(
                         );
                     }
                 }
-                let ssbo_descs = if nexium_shader::shader_uses_ldg(&vs_sass) {
-                    nexium_shader::collect_storage_buffers(&mut vs_cfg)
-                } else {
-                    Vec::new()
-                };
+                let ssbo_descs = collect_graphics_storage_buffers(&mut vs_cfg, &mut fs_cfg)?;
                 let graphics_cbuf_reads = collect_graphics_cbuf_reads(&vs_cfg, &fs_cfg);
                 let graphics_cbuf_requirements =
                     packed_cbuf_read_requirements(&graphics_cbuf_reads);
@@ -13145,6 +13403,12 @@ fn execute_one_inner(
                                 0
                             },
                             nexium_spirv::FragmentOptions {
+                                dual_source,
+                                num_ssbo,
+                                indexed_input_mask: Some(fs_input_map.iter().enumerate()
+                                    .filter(|(_, modes)| **modes != 0)
+                                    .fold(0u32, |mask, (location, _)| mask | (1 << location))),
+                                single_sample: true,
                                 uint_output_mask: fragment_uint_output_mask,
                                 sint_output_mask: fragment_sint_output_mask,
                                 texture_numeric_manifest: spirv_texture_manifest_for_stage(
@@ -13194,16 +13458,17 @@ fn execute_one_inner(
                             &vs_cfg,
                             &required_outputs,
                             nexium_spirv::VertexOptions {
-                                vptx_scale_z,
-                                vptx_translate_z,
-                                apply_z_remap,
+                                vptx_scale_z: if geometry_enabled { 1.0 } else { vptx_scale_z },
+                                vptx_translate_z: if geometry_enabled { 0.0 } else { vptx_translate_z },
+                                apply_z_remap: apply_z_remap && !geometry_enabled,
                                 point_size: if draw.topology == 0 {
                                     Some(draw.point_size)
                                 } else {
                                     None
                                 },
-                                window_ndc,
+                                window_ndc: if geometry_enabled { None } else { window_ndc },
                                 num_ssbo,
+                                indexed_input_mask: vertex_input_mask,
                                 uint_attr_mask,
                                 sint_attr_mask,
                                 tex_slot_base: vs_tex_base,
@@ -13214,6 +13479,7 @@ fn execute_one_inner(
                                 ),
                                 texel_buffer_mask: active_texture_layout.vs_texel_buffer_mask,
                                 layer_output_slot,
+                                layer_output_float,
                                 varying_map,
                                 ..Default::default()
                             },
@@ -13406,7 +13672,19 @@ fn execute_one_inner(
         bundle.fs_spirv.clone()
     };
     let fs_hash = effective_fragment_pipeline_hash(bundle.fs_hash, &fs_spirv, solid_fs_probe);
-    let vs_cbuf_mask = bundle.vs_cbuf_mask;
+    let geometry = if geometry_enabled {
+        Some(prepare_geometry_shader(gs_addr, draw.topology, mappings, mem_read,
+            nexium_spirv::VertexOptions { vptx_scale_z, vptx_translate_z, apply_z_remap, window_ndc, ..Default::default() })?)
+    } else { None };
+    let gs_spirv = geometry.as_ref().map(|shader| shader.spirv.clone()).unwrap_or_default();
+    let vs_cbuf_mask = bundle.vs_cbuf_mask | geometry.as_ref().map_or(0, |shader| shader.cbuf_mask);
+    let mut graphics_cbuf_requirements = bundle.graphics_cbuf_requirements;
+    if let Some(shader) = &geometry {
+        for slot in 0..PACKED_CBUF_SLOTS {
+            graphics_cbuf_requirements.0[slot] = graphics_cbuf_requirements.0[slot].max(shader.requirements.0[slot]);
+            graphics_cbuf_requirements.1[slot] |= shader.requirements.1[slot];
+        }
+    }
     let fs_cbuf_mask = bundle.fs_cbuf_mask;
     let mut fs_tex_ids = bundle.fs_tex_ids.clone();
     let vs_tex_base = bundle.vs_tex_base;
@@ -13978,7 +14256,8 @@ fn execute_one_inner(
         fs_cbuf_mask,
         vs_cbuf_group,
         fs_cbuf_group,
-        &bundle.graphics_cbuf_requirements,
+        gs_prog.cbuf_group(3),
+        &graphics_cbuf_requirements,
         ssbo_snapshot_cache,
         mappings,
         mem_read,
@@ -14381,8 +14660,13 @@ fn execute_one_inner(
         let mut guest_addr = 0u64;
         let mut logical_size = 16usize;
         let mut data_offset = 0usize;
-        let (cb_va, _cb_sz) =
-            cbuf_binds[vs_cbuf_group][(d.cbuf_binding as usize).min(GRAPHICS_CBUF_SLOTS - 1)];
+        let stage = if usize::from(d.cbuf_binding) < FRAGMENT_CBUF_BASE {
+            vs_cbuf_group
+        } else {
+            fs_cbuf_group
+        };
+        let binding = usize::from(d.cbuf_binding) % GRAPHICS_CBUF_SLOTS;
+        let (cb_va, _cb_sz) = cbuf_binds[stage][binding];
         let mut dbg_base: u64 = 0;
         let mut dbg_slack: usize = 0;
         let mut dbg_size: u32 = 0;
@@ -14655,6 +14939,7 @@ fn execute_one_inner(
         }
     }
     let call = Maxwell3dDrawCall {
+        gs_spirv,
         vs_spirv,
         fs_spirv,
         vs_gpu_va: vs_addr,
@@ -14698,6 +14983,8 @@ fn execute_one_inner(
         color_rt_keys,
         color_rt_formats,
         rt_format,
+        depth_range: guest_depth_range(draw.viewport_transform_en, draw.depth_mode,
+            draw.viewport.scale_z, draw.viewport.translate_z),
         vp_rect: guest_viewport_rect(
             draw,
             rt_key.width as f32,
@@ -14954,6 +15241,14 @@ fn rt_key_for_target(
     .with_mapping_epoch(mappings.mapping_epoch_for(gpu_va)?)
     .with_sample_grid(samples.0, samples.1)
     .with_volume_depth(render_target_volume_depth(rt));
+    let key = if rt.tile_mode & ((1 << 12) | (1 << 16)) == 0
+        && rt.base_layer == 0
+        && rt.layer_stride != 0
+    {
+        key.with_array_layers((rt.depth & 0xffff).max(1), u64::from(rt.layer_stride) * 4)
+    } else {
+        key
+    };
     Some(finish_render_target_key(key, rt, format))
 }
 
@@ -15267,11 +15562,17 @@ fn trace_raw_rt_target(
         let guest_size = key.map(|key| key.guest_size_bytes).unwrap_or(0);
         let end = address.saturating_add(guest_size);
         let exact = address == target;
-        if !exact && !(guest_size != 0 && address <= target && target < end) {
+        let target_end = target.saturating_add(
+            std::env::var("NEXIUM_RAW_RT_SIZE")
+                .ok()
+                .and_then(|value| parse_env_u64(&value))
+                .unwrap_or(1),
+        );
+        if !exact && !(guest_size != 0 && address < target_end && target < end) {
             continue;
         }
         log::warn!(
-            "[raw-rt-target] target={:#x} match={} vs={:#x} fs={:#x} raw_slot={} addr={:#x} range={:#x}..{:#x} size={:#x} key={key:?} dims={}x{} format={:#x} tile_mode={:#x} rtctl={:#010x} count={} map=[{}] omap={:#010x} active_guest={:?} selected_physical={:?}",
+            "[raw-rt-target] target={:#x} match={} vs={:#x} fs={:#x} raw_slot={} addr={:#x} range={:#x}..{:#x} size={:#x} key={key:?} dims={}x{} format={:#x} tile_mode={:#x} depth={} stride={:#x} base_layer={} clear={} rtctl={:#010x} count={} map=[{}] omap={:#010x} active_guest={:?} selected_physical={:?}",
             target,
             if exact { "exact" } else { "overlap" },
             vs_addr,
@@ -15285,6 +15586,10 @@ fn trace_raw_rt_target(
             rt.height,
             rt.format,
             rt.tile_mode,
+            rt.depth,
+            rt.layer_stride,
+            rt.base_layer,
+            draw.is_clear,
             draw.rt_control,
             count,
             rt_control_map,
@@ -16166,6 +16471,14 @@ fn menu_cbuf_sample(
         ));
     }
     format!("s3({:#x}/{}) [{}]", addr, size, vals.join(" "))
+}
+
+fn guest_depth_range(transform_enabled: bool, depth_mode: u32, scale: f32, translate: f32) -> [f32; 2] {
+    if !transform_enabled || !scale.is_finite() || !translate.is_finite() {
+        return [0.0, 1.0];
+    }
+    let min = if depth_mode == 0 { translate - scale } else { translate };
+    [min.clamp(0.0, 1.0), (translate + scale).clamp(0.0, 1.0)]
 }
 
 fn guest_viewport_rect(
@@ -18234,6 +18547,42 @@ fn fragment_texture_numeric_metadata(
                     };
                     record_runtime_texture_image_kind(&mut image_kinds, shader_id, image_kind)?;
                 }
+                nexium_shader::IrOp::TexelFetchHandle {
+                    handle,
+                    y,
+                    z,
+                    component,
+                    ..
+                } => {
+                    let shader_id = match *handle {
+                        nexium_shader::TextureHandleOrigin::Bound { cbuf_word_offset } => {
+                            cbuf_word_offset
+                        }
+                        nexium_shader::TextureHandleOrigin::Bindless {
+                            cbuf_binding,
+                            cbuf_word_offset,
+                            cbuf_secondary_word_offset,
+                        } => nexium_shader::bindless_texture_id_pair(
+                            cbuf_binding,
+                            cbuf_word_offset,
+                            cbuf_secondary_word_offset,
+                        ),
+                    };
+                    *texel_fetches.entry(shader_id).or_insert(0u8) |= 1u8 << (*component).min(3);
+                    if constant_facts
+                        .texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref())
+                    {
+                        buffer_candidates.insert(shader_id);
+                    }
+                    let image_kind = if z.is_some() {
+                        GraphicsTextureImageKind::D3
+                    } else if sampler_arrayed {
+                        GraphicsTextureImageKind::D2Array
+                    } else {
+                        GraphicsTextureImageKind::D2
+                    };
+                    record_runtime_texture_image_kind(&mut image_kinds, shader_id, image_kind)?;
+                }
                 nexium_shader::IrOp::SampleTex {
                     tex_id,
                     array,
@@ -18491,6 +18840,7 @@ fn resolved_tic(
     let entry = nexium_gpu::texture::TicEntry::parse(&raw)?;
     Some(ResolvedTicDescriptor {
         id: tic_id,
+        #[cfg(test)]
         address: tic_addr,
         raw,
         entry,
@@ -20327,6 +20677,7 @@ fn pack_cbuf_data(
         fs_mask,
         vs_cbuf_group,
         fs_cbuf_group,
+        3,
         &requirements,
         snapshot_cache,
         mappings,
@@ -20351,6 +20702,7 @@ fn pack_cbuf_data_with_requirements(
     fs_mask: u64,
     vs_cbuf_group: usize,
     fs_cbuf_group: usize,
+    gs_cbuf_group: usize,
     requirements: &PackedCbufReadRequirements,
     snapshot_cache: &mut SsboSnapshotCache,
     mappings: &GpuMappings,
@@ -20418,7 +20770,9 @@ fn pack_cbuf_data_with_requirements(
             if logical_slot >= PACKED_CBUF_SLOTS {
                 continue;
             }
-            let stage = if logical_slot < FRAGMENT_CBUF_BASE {
+            let stage = if logical_slot >= FRAGMENT_CBUF_BASE * 2 {
+                gs_cbuf_group
+            } else if logical_slot < FRAGMENT_CBUF_BASE {
                 vs_cbuf_group
             } else {
                 fs_cbuf_group
@@ -20506,7 +20860,9 @@ fn pack_cbuf_data_with_requirements(
             if logical_slot >= PACKED_CBUF_SLOTS {
                 continue;
             }
-            let stage = if logical_slot < FRAGMENT_CBUF_BASE {
+            let stage = if logical_slot >= FRAGMENT_CBUF_BASE * 2 {
+                gs_cbuf_group
+            } else if logical_slot < FRAGMENT_CBUF_BASE {
                 vs_cbuf_group
             } else {
                 fs_cbuf_group
@@ -20515,8 +20871,8 @@ fn pack_cbuf_data_with_requirements(
         }
         CbufPackKey {
             used,
-            requirements: requirements as *const PackedCbufReadRequirements as usize,
-            groups: (vs_cbuf_group, fs_cbuf_group),
+            requirements: *requirements,
+            groups: (vs_cbuf_group, fs_cbuf_group, gs_cbuf_group),
             binds,
             epoch: snapshot_cache.input_mutation_epoch,
         }
@@ -20539,7 +20895,9 @@ fn pack_cbuf_data_with_requirements(
         if (used & (1u64 << logical_slot)) == 0 {
             continue;
         }
-        let stage = if logical_slot < FRAGMENT_CBUF_BASE {
+        let stage = if logical_slot >= FRAGMENT_CBUF_BASE * 2 {
+            gs_cbuf_group
+        } else if logical_slot < FRAGMENT_CBUF_BASE {
             vs_cbuf_group
         } else {
             fs_cbuf_group
@@ -20860,6 +21218,151 @@ mod tests {
         INPUT_INVALIDATION_MAX_QUERY_PAGES, INPUT_INVALIDATION_PAGE_SHIFT, MAX_ACCUMULATED_DRAWS,
         PREPARED_DRAW_PACKET_MAX_BATCHES, PREPARED_TIC_PLAN_CAPACITY, RECENT_CBUF_REQUEST_CAPACITY,
     };
+
+    #[test]
+    fn sparse_graphics_identity_tracks_immutable_snapshot_ownership() {
+        let bytes = std::sync::Arc::new(vec![1, 2, 3]);
+        let identity = super::sparse_graphics_snapshot_identity(&bytes);
+        assert_eq!(identity, super::sparse_graphics_snapshot_identity(&bytes.clone()));
+        let replacement = std::sync::Arc::new(vec![3, 2, 1]);
+        assert_ne!(identity, super::sparse_graphics_snapshot_identity(&replacement));
+        let same_content = std::sync::Arc::new(vec![1, 2, 3]);
+        assert_ne!(identity, super::sparse_graphics_snapshot_identity(&same_content));
+        let weak = std::sync::Arc::downgrade(&bytes);
+        drop(bytes);
+        assert!(weak.upgrade().is_none());
+        assert_ne!(identity, super::sparse_graphics_snapshot_identity(&std::sync::Arc::new(vec![1, 2, 3])));
+    }
+
+    #[test]
+    fn sparse_graphics_snapshot_preserves_residency_and_descriptor_layout() {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&0x08u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&0x100000u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&(3u32 << 21).to_le_bytes());
+        raw[16..20].copy_from_slice(&(15u32 | (2 << 23)).to_le_bytes());
+        raw[20..24].copy_from_slice(&(15u32 | (15 << 16) | (1 << 30) | (1 << 31)).to_le_bytes());
+        let mut dense_raw = raw;
+        dense_raw[23] &= !0x40;
+        let dense_tic = nexium_gpu::texture::TicEntry::parse(&dense_raw).unwrap();
+        let size = nexium_gpu::texture::texture_guest_size_bytes(&dense_tic, dense_tic.depth).unwrap();
+        assert!(size >= 8192);
+        let mut mappings = GpuMappings::new();
+        mappings.add_sparse(0x100000, size as u64);
+        mappings.add(0x101000, 4096, 0x20000, 7);
+        let read = |cpu, bytes: &mut [u8]| {
+            assert_eq!(cpu, 0x20000);
+            bytes.fill(0x5a);
+            true
+        };
+        let result = super::snapshot_sparse_graphics_texture(&raw, &mappings, &read).unwrap().unwrap();
+        assert_eq!(result.descriptor.as_slice(), dense_raw);
+        assert_eq!(result.data.len(), size);
+        assert!(result.data[..4096].iter().all(|byte| *byte == 0));
+        assert!(result.data[4096..8192].iter().all(|byte| *byte == 0x5a));
+        assert!(result.data[8192..].iter().all(|byte| *byte == 0));
+        assert!(super::snapshot_sparse_graphics_texture(&dense_raw, &mappings, &read).unwrap().is_none());
+        mappings.add_sparse(0x101000, 4096);
+        let removed = super::snapshot_sparse_graphics_texture(&raw, &mappings, &|_, _| panic!("hole read")).unwrap().unwrap();
+        assert!(removed.data.iter().all(|byte| *byte == 0));
+        assert_ne!(removed.generation, result.generation);
+        let mut gap = GpuMappings::new();
+        gap.add(0x101000, 4096, 0x20000, 7);
+        assert!(super::snapshot_sparse_graphics_texture(&raw, &gap, &read).is_err());
+    }
+
+    #[test]
+    fn guest_depth_range_preserves_overlay_and_reversed_depth() {
+        use super::guest_depth_range;
+        assert_eq!(guest_depth_range(true, 0, 0.5, 0.5), [0.0, 1.0]);
+        assert_eq!(guest_depth_range(true, 1, 1.0, 0.0), [0.0, 1.0]);
+        let overlay = guest_depth_range(true, 0, 0.005, 0.005);
+        let captured_hud_depth = 0.9529227;
+        let wall_depth = 0.9338776;
+        assert!(captured_hud_depth > wall_depth);
+        assert!(overlay[0] + captured_hud_depth * (overlay[1] - overlay[0]) < wall_depth);
+        assert_eq!(guest_depth_range(true, 0, -0.5, 0.5), [1.0, 0.0]);
+        assert_eq!(guest_depth_range(true, 1, -0.5, 0.75), [0.75, 0.25]);
+        assert_eq!(guest_depth_range(true, 0, 0.0, 0.0), [0.0, 0.0]);
+        assert_eq!(guest_depth_range(true, 1, 0.0, 0.25), [0.25, 0.25]);
+        assert_eq!(guest_depth_range(false, 0, 0.005, 0.005), [0.0, 1.0]);
+        assert_eq!(guest_depth_range(true, 0, 2.0, 0.5), [0.0, 1.0]);
+    }
+
+    #[test]
+    fn graphics_storage_keeps_stage_origins_and_nested_indices() {
+        use nexium_shader::{BasicBlock, BranchKind, Cfg, IrOp, IrProgram, IrValue};
+        fn shader(nested: bool) -> Cfg {
+            let mut program = IrProgram::new();
+            let root = program.emit(
+                IrOp::LoadCbuf {
+                    binding: 0,
+                    byte_offset: 0x510,
+                },
+                None,
+            );
+            let first = program.emit(
+                IrOp::LoadGlobal {
+                    addr_lo: IrValue::Inst(root),
+                    offset: 0,
+                },
+                Some(0),
+            );
+            if nested {
+                program.emit(
+                    IrOp::LoadGlobal {
+                        addr_lo: IrValue::Inst(first),
+                        offset: 16,
+                    },
+                    Some(1),
+                );
+            }
+            Cfg {
+                blocks: vec![BasicBlock {
+                    id: 0,
+                    start_offset: 0,
+                    end_offset: 0,
+                    branch: BranchKind::Exit,
+                    program,
+                    reg_exit: Default::default(),
+                    pred_phis: Vec::new(),
+                    pred_exit: Default::default(),
+                }],
+                unimplemented: 0,
+                bindless_or_partners: Default::default(),
+            }
+        }
+        let mut vertex = shader(false);
+        let mut fragment = shader(true);
+        let descriptors = super::collect_graphics_storage_buffers(&mut vertex, &mut fragment).unwrap();
+        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors[0].cbuf_binding, 0);
+        assert_eq!(descriptors[1].cbuf_binding, FRAGMENT_CBUF_BASE as u8);
+        assert_eq!(descriptors[2].cbuf_binding, FRAGMENT_CBUF_BASE as u8);
+        assert_eq!(descriptors[2].indirect.unwrap().parent_buffer_index, 1);
+        let accesses: Vec<_> = fragment.blocks[0]
+            .program
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                IrOp::LoadStorage {
+                    buffer_index,
+                    cbuf_binding,
+                    ..
+                } => Some((buffer_index, cbuf_binding)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(accesses, [(1, 0), (2, 0)]);
+        assert!(matches!(
+            vertex.blocks[0].program.instructions[1].op,
+            IrOp::LoadStorage {
+                buffer_index: 0,
+                cbuf_binding: 0,
+                ..
+            }
+        ));
+    }
 
     fn prepare_color_targets(
         draw: &crate::gpu::engines::DrawCall,
@@ -21375,6 +21878,60 @@ mod tests {
                 tile_mode: 4 << 4,
             }]
         );
+    }
+
+    #[test]
+    fn array_render_target_preserves_cube_layers_and_mip_stride() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x20000, 0x100000, 0x20000000, 10);
+        let rt = crate::gpu::engines::RenderTarget {
+            address_lo: 0x20000,
+            width: 128,
+            height: 128,
+            format: crate::gpu::formats::FMT_B10G11R11_FLOAT,
+            tile_mode: 0x40,
+            depth: 6,
+            layer_stride: 0x5800,
+            ..Default::default()
+        };
+        let key = super::rt_key_for_target(&rt, &mappings, (1, 1)).unwrap();
+        assert_eq!(key.render_layer_count(), 6);
+        assert!(!key.is_3d);
+        assert_eq!(key.array_stride_bytes, 0x16000);
+        assert_eq!(key.guest_size_bytes, 0x84000);
+        let mut raw = (0..24u32).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let mip_key = RtKey::new(10, 2, 2, 0x35000).with_array_layers(6, 0x16000);
+        let writes = super::small_rt_layer_writebacks(mip_key, 0, 2, 2, 4, &mut raw).unwrap();
+        assert_eq!(writes.len(), 6);
+        for (face, (address, data)) in writes.iter().enumerate() {
+            assert_eq!(*address, 0x35000 + face as u64 * 0x16000);
+            assert_eq!(data.len(), 512);
+            let pixels = nexium_gpu::texture::unswizzle_block_linear(data, 2, 2, 4, 0);
+            let values = pixels.chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>();
+            let base = face as u32 * 4;
+            assert_eq!(values, [base + 2, base + 3, base, base + 1]);
+        }
+        raw.pop();
+        assert!(super::small_rt_layer_writebacks(mip_key, 0, 2, 2, 4, &mut raw).is_none());
+    }
+
+    #[test]
+    fn passthrough_layer_recognition_checks_code_and_header() {
+        let mut sph = [0u8; super::SPH_SIZE];
+        sph[..4].copy_from_slice(&((4u32 << 10) | (1 << 24)).to_le_bytes());
+        let words = [
+            0, 0xf0c8000001d70000u64, 0x5f047f8020070003, 0x50f41ba06ff70007,
+            0, 0xefd0000000070302, 0x5c9807800ff70000, 0x010800000000f002,
+            0, 0xefd801000887ff01, 0x5cb0118000171a01, 0xeff000000647ff01,
+            0, 0xe30000000007000f,
+        ];
+        let mut code = words.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>();
+        assert_eq!(super::passthrough_float_layer_slot(&sph, &code), Some(0x88));
+        code[0x50] ^= 1;
+        assert_eq!(super::passthrough_float_layer_slot(&sph, &code), None);
+        code[0x50] ^= 1;
+        sph[3] = 0;
+        assert_eq!(super::passthrough_float_layer_slot(&sph, &code), None);
     }
 
     #[test]
@@ -22060,17 +22617,36 @@ mod tests {
     fn graphics_bundle_cache_keys_separate_spirv_environment_variants() {
         let resource_fingerprint = 0x7155_d873_b90f_dce1;
         let normal = super::ShaderResourceKey {
+            apply_z_remap: false,
+            dual_source: false,
+            geometry_enabled: false,
+            vertex_input_mask: u32::MAX,
             resource_fingerprint,
             environment_fingerprint: 0,
         };
         let force_output = super::ShaderResourceKey {
+            apply_z_remap: false,
+            dual_source: false,
+            geometry_enabled: false,
+            vertex_input_mask: u32::MAX,
             resource_fingerprint,
             environment_fingerprint: 1,
         };
         let sample_slot = super::ShaderResourceKey {
+            apply_z_remap: false,
+            dual_source: false,
+            geometry_enabled: false,
+            vertex_input_mask: u32::MAX,
             resource_fingerprint,
             environment_fingerprint: 2,
         };
+        let fewer_vertex_inputs = super::ShaderResourceKey {
+            vertex_input_mask: 1,
+            ..normal
+        };
+        assert_ne!(normal, fewer_vertex_inputs);
+        let remapped_depth = super::ShaderResourceKey { apply_z_remap: true, ..normal };
+        assert_ne!(normal, remapped_depth);
         assert_eq!(
             [normal, force_output, sample_slot]
                 .into_iter()
@@ -25925,6 +26501,7 @@ mod tests {
         mappings.add(0x40_000, 0x100, 0x30_0000, 3);
 
         let mut vs = vec![0u8; 0x1_0000];
+        let gs = vec![0x6a; 0x100];
         let mut fs = vec![0u8; 0x1_0000];
         vs[0x2a0..0x2a4].copy_from_slice(&0x1111_02a0u32.to_le_bytes());
         for (offset, value) in [
@@ -25950,17 +26527,17 @@ mod tests {
                 dst.copy_from_slice(bytes);
                 true
             };
-            copy(0x10_0000, &vs, dst) || copy(0x20_0000, &fs, dst)
+            copy(0x10_0000, &vs, dst) || copy(0x20_0000, &fs, dst) || copy(0x30_0000, &gs, dst)
         };
 
         let mut binds = [[(0u64, 0u32); GRAPHICS_CBUF_SLOTS]; 5];
         binds[0][6] = (0x1000, 0x1_0000);
         binds[4][6] = (0x20_000, 0x1_0000);
-        binds[0][7] = (0x40_000, 0x24);
+        binds[3][6] = (0x40_000, 0x100);
         let mut snapshot_cache = SsboSnapshotCache::default();
         let packed = pack_cbuf_data(
             &binds,
-            (1 << 6) | (1 << 7),
+            (1 << 6) | (1 << 42),
             1 << 24,
             0,
             4,
@@ -25983,11 +26560,11 @@ mod tests {
         ] {
             assert_eq!(packed_cbuf_word(&packed, 24, offset), Some(value));
         }
-        assert_eq!(packed_cbuf_slot(&packed, 7).unwrap(), &[0u8; 0x24]);
+        assert_eq!(packed_cbuf_slot(&packed, 42).unwrap(), gs.as_slice());
         assert!(packed_cbuf_slot(&packed, 12).unwrap().is_empty());
         let absent_base = u32::from_le_bytes(packed[12 * 8..12 * 8 + 4].try_into().unwrap());
         assert_eq!(absent_base, nexium_spirv::GFX_CBUF_ZERO_WORD);
-        for slot in [6usize, 7, 24] {
+        for slot in [6usize, 24, 42] {
             let base = u32::from_le_bytes(packed[slot * 8..slot * 8 + 4].try_into().unwrap());
             assert_eq!(base % 4, 0, "slot {slot} payload must be 16-byte aligned");
         }
@@ -26393,6 +26970,52 @@ mod tests {
         assert!(!snapshot.contains_key(&VIEW_GPU_VA));
         assert!(generations.contains_key(&(BACKING_GPU_VA, FULL_STORAGE_SIZE)));
         assert!(!generations.contains_key(&(VIEW_GPU_VA, FULL_STORAGE_SIZE)));
+    }
+
+    #[test]
+    fn async_volume_snapshot_includes_padded_depth_blocks() {
+        const GPU_VA: u64 = 0x4000;
+        const CPU_VA: u64 = 0x10_0000;
+        const PADDED_SIZE: usize = 3 * 2 * 9 * 512 * 4 * 4;
+
+        let mut raw = prepared_tic_plan_raw_with_view(GPU_VA, 2, 0);
+        raw[0..4].copy_from_slice(&0x6014_9208u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&(3u32 << 21).to_le_bytes());
+        raw[12..16].copy_from_slice(&((2u32 << 3) | (2 << 6)).to_le_bytes());
+        raw[16..20].copy_from_slice(&(32u32 | (2 << 23)).to_le_bytes());
+        raw[20..24].copy_from_slice(&(32u32 | (32 << 16) | (1 << 31)).to_le_bytes());
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, PADDED_SIZE as u64, CPU_VA, 7);
+        let plan = derive_prepared_tic_texture_plan(raw, &mappings).expect("volume plan");
+        assert_eq!(
+            (plan.tic.width, plan.tic.height, plan.tic.depth),
+            (33, 33, 33)
+        );
+        assert_eq!(plan.read_size, PADDED_SIZE);
+        assert_eq!(plan.cache_key.expect("mapped padded volume").len, PADDED_SIZE);
+
+        let mut guest = vec![0u8; PADDED_SIZE];
+        guest[PADDED_SIZE - 1] = 0xa5;
+        let mut snapshot = std::collections::HashMap::new();
+        let mut generations = std::collections::HashMap::new();
+        let mut trusted_identities = std::collections::HashMap::new();
+        let mut prepared_snapshots = std::collections::HashMap::new();
+        let copied = snapshot_texture_once(
+            &mut snapshot,
+            &mut generations,
+            &mut trusted_identities,
+            &mut prepared_snapshots,
+            &|address, len| {
+                assert_eq!(address, GPU_VA);
+                guest.get(..len).map(<[u8]>::to_vec)
+            },
+            plan.backing_gpu_va,
+            plan.read_size,
+            None,
+            None,
+        );
+        assert_eq!(copied, PADDED_SIZE);
+        assert_eq!(snapshot[&GPU_VA].get(PADDED_SIZE - 1), Some(&0xa5));
     }
 
     #[test]
@@ -27600,6 +28223,30 @@ mod tests {
             mixed.unimplemented = 1;
             assert!(super::sampled_only_texture_ids(&mixed).is_empty());
         }
+    }
+
+    #[test]
+    fn mpr_bound_tlds_is_a_typed_texel_fetch() {
+        let mut translator = nexium_shader::Translator::new_fragment();
+        assert!(translator.translate(0xda4000aff2c72717));
+        let cfg = nexium_shader::Cfg {
+            blocks: vec![nexium_shader::BasicBlock {
+                id: 0,
+                start_offset: 0,
+                end_offset: 8,
+                branch: nexium_shader::BranchKind::Exit,
+                program: translator.program,
+                reg_exit: Default::default(),
+                pred_phis: Vec::new(),
+                pred_exit: Default::default(),
+            }],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let metadata = fragment_texture_numeric_metadata(&cfg).unwrap();
+        assert_eq!(metadata.texture_ids, vec![10]);
+        assert!(metadata.sampled_ids.is_empty());
+        assert_eq!(metadata.texel_fetches, Some(vec![(10, 1)]));
     }
 
     #[test]

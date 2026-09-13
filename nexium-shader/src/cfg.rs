@@ -968,7 +968,7 @@ fn discover_sync_targets(
                             break;
                         }
                     }
-                    Opcode::EXIT if decoded_pred(raw).is_none() && !exit_never_taken(raw) => break,
+                    Opcode::EXIT if decoded_pred(raw).is_none() && raw & 0x1f == 15 && !exit_never_taken(raw) => break,
                     _ => {}
                 }
             }
@@ -1003,7 +1003,7 @@ fn discover_leaders(
             let pred = decoded_pred(raw);
             match d.opcode {
                 Opcode::EXIT if !exit_never_taken(raw) => {
-                    if pred.is_some() {
+                    if pred.is_some() || raw & 0x1f == 13 {
                         if next < bytes.len() && leaders.insert(next) {
                             worklist.push(next);
                         }
@@ -1074,6 +1074,10 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
 
 pub fn build_fragment_cfg(bytes: &[u8]) -> Cfg {
     build_cfg_with_cbuf_stage(bytes, |_, _| None, ShaderStage::Fragment)
+}
+
+pub fn build_geometry_cfg(bytes: &[u8]) -> Cfg {
+    build_cfg_with_cbuf_stage(bytes, |_, _| None, ShaderStage::Geometry)
 }
 
 pub fn build_compute_cfg(bytes: &[u8]) -> Cfg {
@@ -1158,6 +1162,16 @@ where
         }
 
         if let Some(term_off) = info.terminator_offset {
+            if term_off + 8 <= bytes.len() {
+                let raw = u64::from_le_bytes(bytes[term_off..term_off + 8].try_into().unwrap());
+                if decode_one(raw).is_some_and(|decoded| decoded.opcode == Opcode::EXIT)
+                    && raw & 0x1f == 13
+                    && !t.emit_exit_flow_predicate(raw)
+                {
+                    t.unimplemented_count += 1;
+                    t.program.emit_void(Op::Unimplemented { opcode: Opcode::EXIT, raw });
+                }
+            }
             if term_off + 8 <= bytes.len() && matches!(info.branch, BranchKind::Exit) {
                 let raw = u64::from_le_bytes(bytes[term_off..term_off + 8].try_into().unwrap());
                 t.translate_with_defs(raw, &value_defs);
@@ -1238,7 +1252,12 @@ fn discover_topology(
             if let Some(d) = decode_one(raw) {
                 match d.opcode {
                     Opcode::EXIT if !exit_never_taken(raw) => {
-                        match decoded_pred(raw) {
+                        let predicate = if raw & 0x1f == 13 {
+                            Some(Predicate { idx: 8, negate: false })
+                        } else {
+                            decoded_pred(raw)
+                        };
+                        match predicate {
                             None => branch = BranchKind::Exit,
                             Some(pred) => {
                                 branch = BranchKind::Conditional { target: 0, pred };
@@ -1589,6 +1608,7 @@ fn finalize_bindless_origin_checks(
                         matches!(inst.op, Op::TexelFetch { .. } | Op::TexelFetchHandle { .. })
                     }
                     Opcode::SUATOM => matches!(inst.op, Op::ImageAtomic { .. }),
+                    Opcode::SUST => matches!(inst.op, Op::ImageWrite { .. }),
                     _ => false,
                 })
         });
@@ -1627,6 +1647,9 @@ fn finalize_bindless_origin_checks(
                         *cbuf_secondary_word_offset = secondary_word_offset;
                     }
                     Op::ImageAtomic { handle, .. } if check.opcode == Opcode::SUATOM => {
+                        *handle = origin.as_texture_handle();
+                    }
+                    Op::ImageWrite { handle, .. } if check.opcode == Opcode::SUST => {
                         *handle = origin.as_texture_handle();
                     }
                     _ => unreachable!(),
@@ -1674,7 +1697,7 @@ pub fn merge_dual_vertex_sass(vertex_a: &[u8], vertex_b: &[u8]) -> Option<Vec<u8
             let raw = u64::from_le_bytes(vertex_a[offset..offset + 8].try_into().ok()?);
             if let Some(decoded) = decode_one(raw) {
                 match decoded.opcode {
-                    Opcode::EXIT if decoded_pred(raw).is_none() && !exit_never_taken(raw) => {
+                    Opcode::EXIT if decoded_pred(raw).is_none() && raw & 0x1f == 15 && !exit_never_taken(raw) => {
                         exit_offset = Some(offset);
                         break;
                     }
@@ -2722,6 +2745,29 @@ mod tests {
     }
 
     #[test]
+    fn bindless_sust_validates_loop_carried_image_handle() {
+        for changed_handle in [false, true] {
+            let mut bytes = pps_loop_tex_b_program();
+            write_word(&mut bytes, 0xb8, 0xeb20000a00f70c10 | (14 << 39));
+            if changed_handle {
+                write_word(&mut bytes, 0xf8, 0x4c98_0788_05b7_000e);
+            }
+            let cfg = build_compute_cfg(&bytes);
+            let stores: Vec<_> = cfg.blocks.iter().flat_map(|block| &block.program.instructions)
+                .filter_map(|inst| match inst.op { Op::ImageWrite { handle, .. } => Some(handle), _ => None }).collect();
+            if changed_handle {
+                assert_eq!(cfg.unimplemented, 1);
+                assert!(stores.is_empty());
+            } else {
+                assert_eq!(cfg.unimplemented, 0);
+                assert_eq!(stores, vec![crate::ir::TextureHandleOrigin::Bindless {
+                    cbuf_binding: 2, cbuf_word_offset: 0x5a, cbuf_secondary_word_offset: Some(0x15a),
+                }]);
+            }
+        }
+    }
+
+    #[test]
     fn fragment_tld_b_resolves_dusk_loop_invariant_self_phi() {
         let bytes = build_program(&[
             0x4c98_0784_0047_0003,
@@ -2918,6 +2964,35 @@ mod tests {
         let cfg = build_cfg(&bytes);
         assert_eq!(cfg.blocks.len(), 1);
         assert!(matches!(cfg.blocks[0].branch, BranchKind::Exit));
+    }
+
+    #[test]
+    fn exit_neu_combines_condition_flags_and_instruction_predicate() {
+        for exit in [0xe300_0000_0008_000d, 0xe300_0000_0007_000d] {
+            let cfg = build_cfg(&build_program(&[
+                0x4b5c_838c_0127_06ff, exit, enc_fadd_reg(3, 2, 1), enc_exit(),
+            ]));
+            assert_eq!(cfg.unimplemented, 0);
+            assert_eq!(cfg.blocks.len(), 3);
+            assert!(matches!(cfg.blocks[0].branch, BranchKind::Conditional {
+                pred: Predicate { idx: 8, negate: false }, ..
+            }));
+            let compare = cfg.blocks[0].program.instructions.iter()
+                .find(|inst| matches!(inst.op, Op::ISet { .. })).unwrap();
+            let condition = cfg.blocks[0].program.instructions.last().unwrap();
+            assert!(matches!(condition.op, Op::ISetPred {
+                cmp: super::super::ir::ICmp::Ne,
+                src_a: Value::Inst(id), src_b: Value::Zero,
+                src_pred, src_pred_inv, dest_p: 8, ..
+            } if Some(id) == compare.result
+                && src_pred == if exit == 0xe300_0000_0008_000d { 0 } else { 7 }
+                && src_pred_inv == (exit == 0xe300_0000_0008_000d)));
+            assert!(!cfg.blocks[0].pred_exit.contains_key(&8));
+        }
+        let unsupported = build_cfg(&build_program(&[
+            0xe300_0000_0007_000d, enc_exit(),
+        ]));
+        assert_eq!(unsupported.unimplemented, 1);
     }
 
     #[test]

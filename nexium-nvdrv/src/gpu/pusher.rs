@@ -369,7 +369,10 @@ pub(crate) mod kickprof {
     pub const CBUF_BARRIER_CHUNKS: usize = 174;
     pub const CBUF_WINDOW_HIT: usize = 175;
     pub const CBUF_WINDOW_MISS: usize = 176;
-    pub const COUNT: usize = 177;
+    pub const KC_FRONTEND: usize = 177;
+    pub const KC_RESOURCES: usize = 178;
+    pub const VERTEX_STORE_WAIT: usize = 179;
+    pub const COUNT: usize = 180;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -549,6 +552,9 @@ pub(crate) mod kickprof {
         "cbbarrierchunks",
         "cbwindowhit",
         "cbwindowmiss",
+        "kcfrontend",
+        "kcresources",
+        "vswait",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];

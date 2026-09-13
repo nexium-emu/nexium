@@ -233,7 +233,7 @@ pub struct ComputeSampledRt {
     pub tic: TicEntry,
     pub tsc: TscEntry,
     pub sample_type: ComputeSampleType,
-    pub guest_bytes: Option<Vec<u8>>,
+    pub guest_bytes: Option<Arc<Vec<u8>>>,
     pub guest_bytes_authoritative: bool,
     pub require_live: bool,
     pub content_key: Option<u64>,
@@ -245,7 +245,7 @@ pub struct ComputeSampledImage {
     pub key: Option<RtKey>,
     pub tic: TicEntry,
     pub sample_type: ComputeSampleType,
-    pub guest_bytes: Vec<u8>,
+    pub guest_bytes: Arc<Vec<u8>>,
     pub guest_bytes_authoritative: bool,
     pub require_live: bool,
     pub content_key: Option<u64>,
@@ -565,6 +565,7 @@ struct ComputeOutputPoolKey {
 
 struct ComputeResourcePool {
     uniforms: BoundedResourcePool<u64, ComputeBufferResource>,
+    uploads: BoundedResourcePool<u64, ComputeBufferResource>,
     raw_storage: BoundedResourcePool<u64, ComputeBufferResource>,
     outputs: BoundedResourcePool<ComputeOutputPoolKey, ComputeImageResource>,
     readbacks: BoundedResourcePool<u64, ComputeBufferResource>,
@@ -574,6 +575,8 @@ struct ComputeResourcePool {
 #[derive(Default)]
 struct ComputeResourcePoolStats {
     completed_dispatches: u64,
+    upload_hits: u64,
+    upload_misses: u64,
     uniform_hits: u64,
     uniform_misses: u64,
     raw_storage_hits: u64,
@@ -587,6 +590,7 @@ struct ComputeResourcePoolStats {
 impl ComputeResourcePool {
     fn new() -> Self {
         Self {
+            uploads: BoundedResourcePool::new(32, 32 * 1024 * 1024),
             uniforms: BoundedResourcePool::new(
                 COMPUTE_UNIFORM_POOL_MAX_ITEMS,
                 COMPUTE_UNIFORM_POOL_MAX_BYTES,
@@ -616,7 +620,7 @@ impl ComputeResourcePool {
         log::warn!(
             "[compute-pool] dispatches={} uniform_hit_miss={}/{} raw_storage_hit_miss={}/{} \
              output_hit_miss={}/{} readback_hit_miss={}/{} retained_items={}/{}/{}/{} \
-             retained_bytes={}/{}/{}/{}",
+             retained_bytes={}/{}/{}/{} upload_hit_miss={}/{} upload_retained={}/{}",
             dispatches,
             self.stats.uniform_hits,
             self.stats.uniform_misses,
@@ -634,10 +638,17 @@ impl ComputeResourcePool {
             self.raw_storage.retained_bytes,
             self.outputs.retained_bytes,
             self.readbacks.retained_bytes,
+            self.stats.upload_hits,
+            self.stats.upload_misses,
+            self.uploads.entries.len(),
+            self.uploads.retained_bytes,
         );
     }
 
     fn destroy(&mut self, device: &ash::Device) {
+        for buffer in self.uploads.drain_values() {
+            buffer.destroy(device);
+        }
         for buffer in self.uniforms.drain_values() {
             buffer.destroy(device);
         }
@@ -1012,6 +1023,42 @@ impl ComputeBackend {
             false,
             true,
         )
+    }
+
+    pub fn acquire_upload_buffer(
+        &mut self,
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        data: &[u8],
+    ) -> Result<ComputeBufferResource, String> {
+        let key = data.len().max(16) as u64;
+        if let Some(resource) = self.resource_pool.uploads.take(&key) {
+            self.resource_pool.stats.upload_hits = self.resource_pool.stats.upload_hits.saturating_add(1);
+            if let Err(error) = resource.write(device, data) {
+                resource.destroy(device);
+                return Err(error);
+            }
+            return Ok(resource);
+        }
+        self.resource_pool.stats.upload_misses = self.resource_pool.stats.upload_misses.saturating_add(1);
+        create_compute_buffer_allocation(
+            device, mem_props, key, Some(data), vk::BufferUsageFlags::TRANSFER_SRC,
+            None, false, true,
+        )
+    }
+
+    pub fn recycle_upload_buffers(
+        &mut self,
+        device: &ash::Device,
+        uploads: Vec<ComputeBufferResource>,
+    ) {
+        for resource in uploads {
+            let key = resource.size;
+            let bytes = resource.allocation_size;
+            for evicted in self.resource_pool.uploads.insert(key, resource, bytes) {
+                evicted.destroy(device);
+            }
+        }
     }
 
     pub fn acquire_raw_storage_buffer(
@@ -1621,6 +1668,7 @@ pub(crate) fn create_compute_sampled_image(
     view_base_mip: u32,
     view_mip_levels: u32,
 ) -> Result<ComputeImageResource, String> {
+    let aspect = crate::renderer::texture_image_aspect(format);
     let mip_levels = mip_levels.max(1);
     let max_mip_levels = u32::BITS - width.max(height).max(depth).max(1).leading_zeros();
     if width == 0
@@ -1703,7 +1751,7 @@ pub(crate) fn create_compute_sampled_image(
         format,
         components,
         subresource_range: vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect,
             base_mip_level: view_base_mip,
             level_count: view_mip_levels,
             base_array_layer: 0,
@@ -1790,6 +1838,7 @@ pub(crate) fn create_compute_guest_image(
         ));
     }
     let array_layers = if is_cube { 6 } else { 1 };
+    let aspect = crate::renderer::texture_image_aspect(format);
     let mip_levels = mip_levels.max(1);
     let max_mip_levels = u32::BITS - width.max(height).max(depth).max(1).leading_zeros();
     if (is_3d && mip_levels != 1)
@@ -1901,7 +1950,7 @@ pub(crate) fn create_compute_guest_image(
         format,
         components,
         subresource_range: vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect,
             base_mip_level: view_base_mip,
             level_count: view_mip_levels,
             base_array_layer: 0,
@@ -1949,7 +1998,7 @@ pub(crate) fn create_compute_guest_image(
                 buffer_row_length: 0,
                 buffer_image_height: 0,
                 image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    aspect_mask: aspect,
                     mip_level: copy.mip_level,
                     base_array_layer: 0,
                     layer_count: array_layers,

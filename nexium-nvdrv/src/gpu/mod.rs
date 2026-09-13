@@ -1580,6 +1580,17 @@ impl GpuMappings {
         Some((cached.gpu_lo, cached.gpu_hi - cached.gpu_lo, cpu_addr))
     }
 
+    pub(crate) fn texture_memory_range(&self, gpu_va: u64) -> Option<(Option<u64>, u64)> {
+        let cached = self.mapping_lookup_for(gpu_va)?;
+        let mapping = &self.mappings[cached.mapping_index];
+        let cpu = if mapping.sparse {
+            None
+        } else {
+            Some(mapping.cpu_addr.checked_add(gpu_va - mapping.gpu_va)?)
+        };
+        Some((cpu, cached.gpu_hi - gpu_va))
+    }
+
     #[inline]
     pub fn cpu_range_for(&self, gpu_va: u64) -> Option<(u64, u64)> {
         let cached = self.mapping_lookup_for(gpu_va)?;

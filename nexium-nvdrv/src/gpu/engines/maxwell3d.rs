@@ -293,6 +293,10 @@ pub struct ShaderProgram {
 }
 
 impl ShaderProgram {
+    pub fn is_enabled(self, stage: usize) -> bool {
+        stage == 1 || self.enabled
+    }
+
     pub fn cbuf_group(self, fallback: usize) -> usize {
         self.binding_group
             .and_then(|group| (group < 5).then_some(group as usize))
@@ -3310,6 +3314,23 @@ mod tests {
 
         engine.dispatch_method(0x904, (slot as u32) << 4, true);
         assert_eq!(engine.regs.cbuf_binds[0][slot], (0, 0));
+    }
+
+    #[test]
+    fn shader_stage_enable_ignores_stale_program_addresses() {
+        let mut program = ShaderProgram {
+            address_lo: 0x21130,
+            ..Default::default()
+        };
+        assert!(program.is_enabled(1));
+        for stage in [0, 2, 3, 4, 5] {
+            assert!(!program.is_enabled(stage));
+        }
+        program.enabled = true;
+        for stage in 0..6 {
+            assert!(program.is_enabled(stage));
+        }
+        assert!(ShaderProgram::default().is_enabled(1));
     }
 
     #[test]

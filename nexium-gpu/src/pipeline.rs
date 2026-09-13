@@ -19,6 +19,7 @@ fn cache_path(device_tag: &str) -> Option<PathBuf> {
 )]
 pub struct PipelineKey {
     pub vs_hash: u64,
+    pub gs_hash: u64,
     pub fs_hash: u64,
     pub topology: u32,
     pub primitive_restart_enable: bool,
@@ -62,7 +63,7 @@ impl CurrentPipeline {
     }
 }
 
-const SPEC_VERSION: u32 = 43;
+const SPEC_VERSION: u32 = 53;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
     &[(0x59b9_0e74_4b2a_7537, 0xe505_d075_601e_e633)];
@@ -84,6 +85,7 @@ fn cache_save_due(
 pub struct PipelineSpec {
     pub key: PipelineKey,
     pub vs_spirv: Vec<u32>,
+    pub gs_spirv: Vec<u32>,
     pub fs_spirv: Vec<u32>,
     pub bindings: Vec<(u32, u32, u32)>,
     pub attrs: Vec<(u32, u32, i32, u32)>,
@@ -132,6 +134,7 @@ fn specs_path(device_tag: &str) -> Option<PathBuf> {
 pub fn spec_to_request(
     spec: &PipelineSpec,
     vs_mod: vk::ShaderModule,
+    gs_mod: vk::ShaderModule,
     fs_mod: vk::ShaderModule,
     use_binding_divisors: bool,
 ) -> PipelineBuildRequest {
@@ -205,6 +208,7 @@ pub fn spec_to_request(
     PipelineBuildRequest {
         key: spec.key,
         vs_mod,
+        gs_mod,
         fs_mod,
         bindings,
         binding_divisors,
@@ -251,6 +255,7 @@ pub fn spec_to_request(
 pub struct PipelineBuildRequest {
     pub key: PipelineKey,
     pub vs_mod: vk::ShaderModule,
+    pub gs_mod: vk::ShaderModule,
     pub fs_mod: vk::ShaderModule,
     pub bindings: Vec<vk::VertexInputBindingDescription>,
     pub binding_divisors: Vec<vk::VertexInputBindingDivisorDescriptionKHR>,
@@ -317,7 +322,7 @@ pub fn build_graphics_pipeline(
         ));
     }
     let entry = c"main";
-    let stages = [
+    let mut stages = vec![
         vk::PipelineShaderStageCreateInfo {
             s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
             stage: vk::ShaderStageFlags::VERTEX,
@@ -339,6 +344,11 @@ pub fn build_graphics_pipeline(
             _marker: std::marker::PhantomData,
         },
     ];
+
+    if req.gs_mod != vk::ShaderModule::null() {
+        stages.insert(1, vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::GEOMETRY).module(req.gs_mod).name(entry));
+    }
 
     let divisor_state = vk::PipelineVertexInputDivisorStateCreateInfoKHR {
         vertex_binding_divisor_count: req.binding_divisors.len() as u32,

@@ -568,6 +568,7 @@ pub struct SmallColorRtWriteback {
 #[derive(Clone, Debug)]
 pub struct Maxwell3dDrawCall {
     pub vs_spirv: std::sync::Arc<Vec<u32>>,
+    pub gs_spirv: std::sync::Arc<Vec<u32>>,
     pub fs_spirv: std::sync::Arc<Vec<u32>>,
     pub vs_gpu_va: u64,
     pub fs_gpu_va: u64,
@@ -609,6 +610,7 @@ pub struct Maxwell3dDrawCall {
     pub color_rt_formats: Vec<vk::Format>,
     pub rt_format: vk::Format,
     pub vp_rect: Option<[f32; 4]>,
+    pub depth_range: [f32; 2],
     pub scissor: Option<[i32; 4]>,
     pub state: DrawState,
     pub blend: BlendState,
@@ -904,14 +906,14 @@ mod tests {
         let first = std::sync::Arc::new(vec![1, 2, 3, 4, 5]);
         let second = std::sync::Arc::new(vec![9, 8, 7, 6]);
         let slots = vec![
-            GraphicsCbufSlotSnapshot::new(0, 5, 304, first.clone()).unwrap(),
-            GraphicsCbufSlotSnapshot::new(24, 4, 320, second.clone()).unwrap(),
+            GraphicsCbufSlotSnapshot::new(0, 5, 448, first.clone()).unwrap(),
+            GraphicsCbufSlotSnapshot::new(24, 4, 464, second.clone()).unwrap(),
         ];
-        let payload = GraphicsCbufPayload::from_slots(324, slots).unwrap();
+        let payload = GraphicsCbufPayload::from_slots(468, slots).unwrap();
         let mut packed = vec![0xff; payload.packed_len()];
 
         assert!(payload.write_packed_to(&mut packed));
-        assert_eq!(u32::from_le_bytes(packed[0..4].try_into().unwrap()), 76);
+        assert_eq!(u32::from_le_bytes(packed[0..4].try_into().unwrap()), 112);
         assert_eq!(u32::from_le_bytes(packed[4..8].try_into().unwrap()), 2);
         assert_eq!(
             u32::from_le_bytes(packed[8..12].try_into().unwrap()),
@@ -919,11 +921,11 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(packed[24 * 8..24 * 8 + 4].try_into().unwrap()),
-            80
+            116
         );
-        assert_eq!(&packed[304..309], first.as_slice());
-        assert_eq!(&packed[309..320], &[0; 11]);
-        assert_eq!(&packed[320..324], second.as_slice());
+        assert_eq!(&packed[448..453], first.as_slice());
+        assert_eq!(&packed[453..464], &[0; 11]);
+        assert_eq!(&packed[464..468], second.as_slice());
         assert_eq!(payload.word(0, 4), Some(5));
         assert!(std::sync::Arc::ptr_eq(
             payload.slots().unwrap()[0].data(),

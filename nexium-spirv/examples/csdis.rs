@@ -7,6 +7,7 @@ fn main() {
     let buffers = nexium_shader::cfg::collect_storage_buffers(&mut cfg);
     let options = ComputeOptions {
         local_size: [1, 1, 1],
+        vertex_memory_store: false,
         local_memory_low_size: 0,
         local_memory_high_size: 0,
         local_memory_crs_size: 0,
