@@ -951,11 +951,21 @@ impl Kernel {
     }
 
     pub fn tick_audio_renderers(&mut self) {
+        self.tick_audio_renderers_at(
+            std::time::Instant::now(),
+            crate::audio_sink::host_audio_sink().map(|sink| sink.as_ref()),
+        );
+    }
+
+    fn tick_audio_renderers_at(
+        &mut self,
+        now: std::time::Instant,
+        sink: Option<&dyn crate::audio_sink::HostPcmSink>,
+    ) {
         const FRAMES_PER_AUDIO_FRAME: u64 = 240;
         const MAX_BACKLOG_BLOCKS: u64 = 400;
         const TARGET_QUEUE_BLOCKS: u64 = 24;
 
-        let now = std::time::Instant::now();
         if now.saturating_duration_since(self.audio_out_last_tick)
             >= std::time::Duration::from_millis(5)
         {
@@ -972,7 +982,7 @@ impl Kernel {
         let event_already_pending = to_signal
             .iter()
             .any(|ev| self.event_signals.get(ev).copied().unwrap_or(false));
-        if let Some(sink) = crate::audio_sink::host_audio_sink() {
+        if let Some(sink) = sink {
             use std::sync::atomic::{AtomicU64, Ordering};
             use std::sync::{Mutex, OnceLock};
             static UNDERRUN_ACCUM: AtomicU64 = AtomicU64::new(0);
@@ -1011,12 +1021,18 @@ impl Kernel {
                     self.audio_renderers.len(),
                     to_signal.len(),
                     event_already_pending,
-                    crate::audio_sink::host_audio_sink().is_some()
+                    sink.is_some()
                 );
             }
         }
 
-        let blocks = if let Some(sink) = crate::audio_sink::host_audio_sink() {
+        if now.saturating_duration_since(self.audio_renderer_last_tick)
+            < std::time::Duration::from_millis(5)
+        {
+            return;
+        }
+
+        let blocks = if let Some(sink) = sink {
             let mut n = sink.drain_pending_events();
             if !to_signal.is_empty() && !event_already_pending {
                 let queued_blocks = (sink.queued_frames() as u64) / FRAMES_PER_AUDIO_FRAME;
@@ -1038,13 +1054,6 @@ impl Kernel {
             }
             n
         } else {
-            let now = std::time::Instant::now();
-            if now.duration_since(self.audio_renderer_last_tick)
-                < std::time::Duration::from_millis(5)
-            {
-                return;
-            }
-            self.audio_renderer_last_tick = now;
             1
         };
         if blocks == 0 {
@@ -1055,19 +1064,20 @@ impl Kernel {
             return;
         }
         if event_already_pending {
-            if let Some(sink) = crate::audio_sink::host_audio_sink() {
+            if let Some(sink) = sink {
                 sink.repost_pending_events(blocks);
             }
             return;
         }
 
+        self.audio_renderer_last_tick = now;
         self.audio_renderer_frame_counter = self.audio_renderer_frame_counter.wrapping_add(1);
         for ev in &to_signal {
             self.event_signals.insert(*ev, true);
             self.threads.signal_handle(*ev);
         }
         if blocks > 1 {
-            if let Some(sink) = crate::audio_sink::host_audio_sink() {
+            if let Some(sink) = sink {
                 sink.repost_pending_events(blocks - 1);
             }
         }
@@ -1986,4 +1996,99 @@ fn build_time_shmem() -> Vec<u8> {
     buf[0x138..0x148].copy_from_slice(&source_id);
 
     buf
+}
+
+#[cfg(test)]
+mod audio_renderer_event_tests {
+    use super::{AudioRendererState, Kernel};
+    use crate::audio_sink::HostPcmSink;
+    use nexium_memory::AddressSpace;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct EmptySink;
+
+    impl HostPcmSink for EmptySink {
+        fn push_stereo_f32(&self, samples: &[f32]) -> usize {
+            samples.len() / 2
+        }
+
+        fn samples_consumed(&self) -> u64 {
+            0
+        }
+    }
+
+    fn renderer_kernel() -> Kernel {
+        let mut kernel = Kernel::new(
+            Arc::new(AddressSpace::new()),
+            0,
+            0,
+            0,
+            0,
+            0x8000,
+            0x1000,
+            0x9000,
+            0xa000,
+        );
+        kernel.audio_renderers.insert(
+            (1, 0),
+            AudioRendererState {
+                sample_rate: 48_000,
+                sample_count: 240,
+                mix_buffer_count: 0,
+                voice_count: 0,
+                sink_count: 0,
+                effect_count: 0,
+                revision: 0,
+                revision_num: 0,
+                state: 0,
+                rendering_time_limit: 0,
+                voice_drop_param: 0.0,
+                effect_states: Vec::new(),
+                voice_played_samples: Vec::new(),
+                voice_wbufs_consumed: Vec::new(),
+                voice_last_wb_index: Vec::new(),
+                voice_wb_progress_frames: Vec::new(),
+                voice_frac_q15: Vec::new(),
+                voice_prev_gain: Vec::new(),
+                voice_biquad_state: Vec::new(),
+                voice_hist: Vec::new(),
+                voice_adpcm_states: Vec::new(),
+            },
+        );
+        kernel.audio_renderer_events.insert((1, 0), 0x200);
+        kernel.event_signals.insert(0x200, false);
+        kernel
+    }
+
+    #[test]
+    fn empty_host_queue_does_not_rearm_audio_event_before_next_period() {
+        let mut kernel = renderer_kernel();
+        let now = Instant::now();
+        kernel.audio_renderer_last_tick = now - Duration::from_millis(5);
+        kernel.tick_audio_renderers_at(now, Some(&EmptySink));
+        assert_eq!(kernel.event_signals.get(&0x200), Some(&true));
+        assert_eq!(kernel.audio_renderer_frame_counter, 1);
+
+        kernel.event_signals.insert(0x200, false);
+        for micros in [0, 1, 1000, 4999] {
+            kernel.tick_audio_renderers_at(now + Duration::from_micros(micros), Some(&EmptySink));
+            assert_eq!(kernel.event_signals.get(&0x200), Some(&false));
+            assert_eq!(kernel.audio_renderer_frame_counter, 1);
+        }
+        kernel.tick_audio_renderers_at(now + Duration::from_millis(5), Some(&EmptySink));
+        assert_eq!(kernel.event_signals.get(&0x200), Some(&true));
+        assert_eq!(kernel.audio_renderer_frame_counter, 2);
+    }
+
+    #[test]
+    fn audio_event_period_also_applies_without_host_sink() {
+        let mut kernel = renderer_kernel();
+        let now = Instant::now();
+        kernel.audio_renderer_last_tick = now;
+        kernel.tick_audio_renderers_at(now + Duration::from_millis(4), None);
+        assert_eq!(kernel.event_signals.get(&0x200), Some(&false));
+        kernel.tick_audio_renderers_at(now + Duration::from_millis(5), None);
+        assert_eq!(kernel.event_signals.get(&0x200), Some(&true));
+    }
 }
