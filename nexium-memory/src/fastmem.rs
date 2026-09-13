@@ -203,6 +203,40 @@ pub fn observed_write_pages_changed_since(va: u64, len: usize, generation: u64) 
     changed
 }
 
+pub fn observed_write_spans_since(
+    va: u64,
+    len: usize,
+    generation: u64,
+    spans: &mut Vec<(u64, usize)>,
+) {
+    if len == 0 {
+        return;
+    }
+    let Some(end) = va.checked_add(len as u64) else {
+        spans.push((va, len));
+        return;
+    };
+    let pages = observed_write_pages()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut page = va & OBSERVED_WRITE_PAGE_4K_MASK;
+    let last = (end - 1) & OBSERVED_WRITE_PAGE_4K_MASK;
+    loop {
+        if pages.get(&page).copied().unwrap_or(0) > generation {
+            match spans.last_mut() {
+                Some((last_va, last_len)) if last_va.checked_add(*last_len as u64) == Some(page) => {
+                    *last_len += 4096;
+                }
+                _ => spans.push((page, 4096)),
+            }
+        }
+        if page == last {
+            break;
+        }
+        page += 4096;
+    }
+}
+
 pub fn observed_write_generation_pages(va: u64, len: usize) -> u64 {
     if len == 0 {
         return 0;

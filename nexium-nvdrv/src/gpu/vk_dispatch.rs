@@ -696,6 +696,7 @@ struct InputSourceKey {
 struct InputRangeEntry {
     data: Arc<Vec<u8>>,
     watch_range: HostWatchRange,
+    observed_write_serial: u64,
     serial: u64,
     last_used_kick: u64,
 }
@@ -2231,6 +2232,7 @@ impl SsboSnapshotCache {
 
         const MAX_CONSISTENT_READ_ATTEMPTS: usize = 3;
         for attempt in 0..MAX_CONSISTENT_READ_ATTEMPTS {
+            let observed_before = nexium_memory::fastmem::observed_write_serial();
             let Some(data) = Self::read_input_snapshot(cpu_addr, len, mem_read) else {
                 return None;
             };
@@ -2239,12 +2241,24 @@ impl SsboSnapshotCache {
             }
             let data = Arc::new(data);
             let kp_ww = super::pusher::kickprof::start();
-            let post_watch =
+            let mut post_watch =
                 nexium_memory::fastmem::take_write_watch(watch_range.cpu_addr, watch_range.len);
+            if post_watch == nexium_memory::fastmem::WriteWatchResult::Clean
+                && nexium_memory::fastmem::observed_write_pages_changed_since(
+                    watch_range.cpu_addr,
+                    watch_range.len,
+                    observed_before,
+                ) != 0
+            {
+                post_watch = nexium_memory::fastmem::WriteWatchResult::Dirty;
+            }
             super::pusher::kickprof::add(super::pusher::kickprof::CBUF_WW, kp_ww);
             match post_watch {
                 nexium_memory::fastmem::WriteWatchResult::Clean => {
                     self.insert_input_entry(key, watch_range, data.clone());
+                    if let Some(entry) = self.input_entries.get_mut(&key) {
+                        entry.observed_write_serial = observed_before;
+                    }
                     self.last_input =
                         self.input_entries
                             .get(&key)
@@ -3195,6 +3209,7 @@ impl SsboSnapshotCache {
             InputRangeEntry {
                 data,
                 watch_range,
+                observed_write_serial: nexium_memory::fastmem::observed_write_serial(),
                 serial,
                 last_used_kick: self.input_sweep_kick,
             },
@@ -3412,6 +3427,20 @@ impl SsboSnapshotCache {
                     dirty_spans.push((range.cpu_addr, range.len));
                 }
             }
+        }
+        let observed_serial = nexium_memory::fastmem::observed_write_serial();
+        for entry in self.input_entries.values_mut() {
+            if entry.observed_write_serial == observed_serial {
+                continue;
+            }
+            let range = entry.watch_range;
+            nexium_memory::fastmem::observed_write_spans_since(
+                range.cpu_addr,
+                range.len,
+                entry.observed_write_serial,
+                &mut dirty_spans,
+            );
+            entry.observed_write_serial = observed_serial;
         }
         if !dirty_spans.is_empty() {
             self.invalidate_cpu_spans(&dirty_spans);
@@ -25621,6 +25650,37 @@ mod tests {
         assert_eq!(reads.get(), 1);
         cache.clear();
         nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_refresh_observes_writes_consumed_by_another_cache() {
+        const GPU_VA: u64 = 0x4158_0000;
+        const CPU_VA: u64 = 0xeb_1800_0000;
+        const ARENA_LEN: usize = 0x3000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).unwrap();
+        unsafe { std::ptr::write_bytes(ptr, 0x13, ARENA_LEN) };
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut cache = SsboSnapshotCache::default();
+        let first = cache.read_input_or_insert(&mappings, GPU_VA, ARENA_LEN, &read).unwrap();
+        let disjoint = cache.read_input_or_insert(&mappings, GPU_VA + 0x2000, 16, &read).unwrap();
+        unsafe { ptr.add(3).write_volatile(0x7c) };
+        let foreign = nexium_memory::fastmem::take_write_watch(CPU_VA, 0x1000);
+        cache.refresh_input_guest_writes();
+        let refreshed = cache.read_input_or_insert(&mappings, GPU_VA, ARENA_LEN, &read).unwrap();
+        let retained = cache.read_input_or_insert(&mappings, GPU_VA + 0x2000, 16, &read).unwrap();
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+        assert_eq!(foreign, nexium_memory::fastmem::WriteWatchResult::Dirty);
+        assert_eq!(refreshed[3], 0x7c);
+        assert!(!std::sync::Arc::ptr_eq(&first, &refreshed));
+        assert!(std::sync::Arc::ptr_eq(&disjoint, &retained));
     }
 
     #[cfg(windows)]
