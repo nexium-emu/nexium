@@ -1,4 +1,5 @@
 pub mod async_compile;
+pub mod cache_affinity;
 pub mod constants;
 pub mod depth_share;
 pub mod dumps;

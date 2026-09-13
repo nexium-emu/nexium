@@ -762,6 +762,7 @@ impl EmulationHandle {
                 nexium_common::thread_cpu_set::ThreadCpuSetTarget::GuestCore0,
             );
             let _alive_guard = AliveGuard;
+            let _cache_affinity = nexium_common::cache_affinity::EmulationCacheAffinity::acquire();
             let initial_loader_path = nro_path.clone();
             let initial_loader_filename = Path::new(&initial_loader_path)
                 .file_name()
