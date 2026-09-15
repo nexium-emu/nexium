@@ -964,11 +964,8 @@ impl EmulationHandle {
                                         }
                                         if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
                                             aux_svcs = aux_svcs.saturating_add(1);
-                                            let result = k.dispatch_svc(imm);
+                                            k.dispatch_svc(imm);
                                             k.tick_audio_renderers();
-                                            if imm != 0x7f {
-                                                cpu_mut().unwrap().set_register(0, result as u64);
-                                            }
                                             let pace_until = k.present_pace_until.take();
                                             let ready_yield = k.yield_after_svc;
                                             let preempt_yield = k.preempt_after_svc;
@@ -2135,12 +2132,7 @@ impl EmulationHandle {
                         let _ = cpu;
 
                         if let nexium_core::cpu::CpuEvent::Svc(imm) = event_copy {
-                            let result = guard.dispatch_svc(imm);
-                            if imm != 0x7f {
-                                if let Some(cpu) = cpu_mut() {
-                                    cpu.set_register(0, result as u64);
-                                }
-                            }
+                            guard.dispatch_svc(imm);
                             let pace_present = guard.present_pace_until.take();
                             let timeslice = if hos_timeslice {
                                 guard

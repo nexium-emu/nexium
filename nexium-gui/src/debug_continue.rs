@@ -71,11 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     log.flush()?;
 
-                    let result = guard.dispatch_svc(imm);
-
-                    if let Some(cpu) = cpu_mut() {
-                        cpu.set_register(0, result as u64);
-                    }
+                    guard.dispatch_svc(imm);
 
                     if imm == 0x26 {
                         break_count += 1;

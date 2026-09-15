@@ -613,10 +613,6 @@ impl BootContext {
 
                     let result = self.kernel.lock().dispatch_svc(imm);
 
-                    if imm != 0x7f {
-                        cpu_mut().unwrap().set_register(0, result as u64);
-                    }
-
                     if result == 0 || result == 1 {
                         continue;
                     }

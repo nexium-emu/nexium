@@ -1661,7 +1661,13 @@ impl Kernel {
 
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {
         self.defer_user_preemption_if_disabled();
-        svc::dispatch(self, imm)
+        let status = svc::dispatch(self, imm);
+        if !matches!(imm, 0x10 | 0x1e | 0x7f) {
+            if let Some(cpu) = cpu_local::cpu_mut() {
+                cpu.set_register(0, status as u64);
+            }
+        }
+        status
     }
 }
 
@@ -1682,6 +1688,31 @@ mod user_preemption_tests {
 
     fn test_kernel(map_tls: bool) -> Kernel {
         test_kernel_at(map_tls, TEST_TLS)
+    }
+
+    #[cfg(feature = "backend-rustarmic")]
+    #[test]
+    fn svc_dispatch_preserves_core_ids_and_tick_values() {
+        let mut kernel = test_kernel(false);
+        let mut cpu = Cpu::new(nexium_cpu::CpuBackendKind::Rustarmic).unwrap();
+        for core in 0..threads::NUM_CORES {
+            let _guard = cpu_local::set_current_cpu(&mut cpu, core);
+            cpu.set_register(0, u64::MAX);
+            assert_eq!(kernel.dispatch_svc(0x10), 0);
+            assert_eq!(cpu.get_register(0), core as u64);
+        }
+
+        let _guard = cpu_local::set_current_cpu(&mut cpu, 0);
+        assert_eq!(kernel.dispatch_svc(0x1e), 0);
+        let first = cpu.get_register(0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(kernel.dispatch_svc(0x1e), 0);
+        assert!(cpu.get_register(0) > first);
+
+        cpu.set_register(0, u64::MAX);
+        let status = kernel.dispatch_svc(0xffff);
+        assert_ne!(status, 0);
+        assert_eq!(cpu.get_register(0), status as u64);
     }
 
     fn test_kernel_at(map_tls: bool, tls_base: u64) -> Kernel {

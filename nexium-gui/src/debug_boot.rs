@@ -116,11 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     log.flush()?;
 
-                    let result = guard.dispatch_svc(imm);
-
-                    if let Some(cpu) = cpu_mut() {
-                        cpu.set_register(0, result as u64);
-                    }
+                    guard.dispatch_svc(imm);
 
                     for f in guard.drain_frames() {
                         writeln!(log, "[{}] Frame: {}x{}", cycle_count, f.width, f.height)?;
