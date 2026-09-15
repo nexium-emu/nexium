@@ -510,6 +510,7 @@ pub struct RtCache {
     snapshots: HashMap<RtKey, GpuImage>,
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     drawn_stamp: HashMap<RtKey, u64>,
+    clear_stamp: HashMap<RtKey, u64>,
     guest_stale_color: HashSet<RtKey>,
     guest_stale_depth: HashSet<RtKey>,
     present_excluded: HashSet<RtKey>,
@@ -797,6 +798,7 @@ impl RtCache {
             snapshots: HashMap::default(),
             mem_properties: None,
             drawn_stamp: HashMap::default(),
+            clear_stamp: HashMap::default(),
             guest_stale_color: HashSet::default(),
             guest_stale_depth: HashSet::default(),
             present_excluded: HashSet::default(),
@@ -1004,6 +1006,7 @@ impl RtCache {
         }
         rekey_hash_map_value(&mut self.snapshots, canonical, key);
         rekey_hash_map_value(&mut self.drawn_stamp, canonical, key);
+        rekey_hash_map_value(&mut self.clear_stamp, canonical, key);
         rekey_hash_set(&mut self.guest_stale_color, canonical, key);
         rekey_hash_set(&mut self.present_excluded, canonical, key);
         rekey_hash_map_value(&mut self.present_flip_y, canonical, key);
@@ -1125,6 +1128,7 @@ impl RtCache {
             .and_then(|&position| self.color_guest_ranges.get(position))
             .map(|entry| entry.key);
         let (canonical, image) = self.cache.remove_entry(&key)?;
+        self.clear_stamp.remove(&canonical);
         self.unindex_color_lookup(indexed_key.unwrap_or(canonical), image.format);
         if remove_guest_range(
             &mut self.color_guest_ranges,
@@ -1290,6 +1294,7 @@ impl RtCache {
     }
 
     pub fn mark_drawn(&mut self, key: RtKey) -> u64 {
+        self.clear_stamp.remove(&key);
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
         self.guest_stale_color.remove(&key);
@@ -1323,6 +1328,7 @@ impl RtCache {
     }
 
     pub fn mark_synced_sample(&mut self, key: RtKey) -> u64 {
+        self.clear_stamp.remove(&key);
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
         self.guest_stale_color.remove(&key);
@@ -1332,6 +1338,7 @@ impl RtCache {
 
     pub fn mark_synced_sample_from(&mut self, key: RtKey, source_stamp: u64) -> u64 {
         debug_assert_ne!(source_stamp, 0);
+        self.clear_stamp.remove(&key);
         self.drawn_counter = self.drawn_counter.max(source_stamp);
         self.drawn_stamp.insert(key, source_stamp);
         self.guest_stale_color.remove(&key);
@@ -1346,6 +1353,7 @@ impl RtCache {
             .map(|(stored, _)| *stored)
             .unwrap_or(key);
         self.drawn_stamp.remove(&canonical);
+        self.clear_stamp.remove(&canonical);
         self.guest_stale_color.remove(&canonical);
         self.present_excluded.insert(canonical);
         self.frame_draws.remove(&canonical);
@@ -1361,6 +1369,7 @@ impl RtCache {
             .collect();
         for stale_key in stale {
             self.drawn_stamp.remove(&stale_key);
+            self.clear_stamp.remove(&stale_key);
             self.guest_stale_color.insert(stale_key);
             self.present_excluded.insert(stale_key);
             self.frame_draws.remove(&stale_key);
@@ -1382,6 +1391,7 @@ impl RtCache {
         let stale_color = self.cache.keys().copied().collect::<Vec<_>>();
         for key in stale_color {
             self.drawn_stamp.remove(&key);
+            self.clear_stamp.remove(&key);
             self.guest_stale_color.insert(key);
             self.present_excluded.insert(key);
             self.frame_draws.remove(&key);
@@ -1423,6 +1433,7 @@ impl RtCache {
             self.guest_range_hits_memoized(cpu_addr, cpu_end, gpu_ranges);
         for stale_key in stale_color {
             self.drawn_stamp.remove(&stale_key);
+            self.clear_stamp.remove(&stale_key);
             self.guest_stale_color.insert(stale_key);
             self.present_excluded.insert(stale_key);
             self.frame_draws.remove(&stale_key);
@@ -1523,11 +1534,12 @@ impl RtCache {
     }
 
     pub fn mark_cleared(&mut self, key: RtKey, full_target: bool) {
+        self.drawn_counter += 1;
+        self.clear_stamp.insert(key, self.drawn_counter);
         if full_target {
             self.drawn_stamp.remove(&key);
             self.guest_stale_color.remove(&key);
         } else if self.drawn_stamp.contains_key(&key) {
-            self.drawn_counter += 1;
             self.drawn_stamp.insert(key, self.drawn_counter);
             self.present_excluded.remove(&key);
             *self.frame_draws.entry(key).or_insert(0) += 1;
@@ -2031,6 +2043,12 @@ impl RtCache {
 
     pub fn drawn_stamp(&self, key: RtKey) -> Option<u64> {
         self.drawn_stamp.get(&key).copied()
+    }
+
+    pub fn writeback_stamp(&self, key: RtKey) -> Option<u64> {
+        self.drawn_stamp.get(&key).into_iter()
+            .chain(self.clear_stamp.get(&key))
+            .copied().max()
     }
 
     fn color_entries_for_nvmap(&self, nvmap_id: u32) -> impl Iterator<Item = (&RtKey, &GpuImage)> {
@@ -3498,6 +3516,7 @@ impl RtCache {
             pipeline.destroy(device);
         }
         self.clear_color_lookup_index();
+        self.clear_stamp.clear();
         self.note_guest_ranges_changed();
         self.guest_hit_memo.clear();
         self.color_guest_ranges.clear();
@@ -3863,6 +3882,56 @@ impl Drop for RtCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clears_order_after_older_draws_without_becoming_drawn_targets() {
+        let mut cache = RtCache::new();
+        let first = RtKey::with_cpu(1, 64, 64, 0x1000, 0x9000);
+        let alias = RtKey::with_cpu(2, 32, 32, 0x2000, 0x9000);
+        let original = cache.mark_drawn(first);
+        let later = cache.mark_drawn(alias);
+        cache.mark_cleared(first, true);
+        let full_clear = cache.writeback_stamp(first).unwrap();
+        assert!(full_clear > later && later > original);
+        assert_eq!(cache.drawn_stamp(first), None);
+        assert_eq!(cache.writeback_stamp(alias), Some(later));
+
+        cache.mark_cleared(first, false);
+        assert!(cache.writeback_stamp(first).unwrap() > full_clear);
+        assert_eq!(cache.drawn_stamp(first), None);
+        let redraw = cache.mark_drawn(first);
+        assert_eq!(cache.writeback_stamp(first), Some(redraw));
+        cache.mark_cleared(first, false);
+        assert!(cache.writeback_stamp(first).unwrap() > redraw);
+        assert_eq!(cache.writeback_stamp(first), cache.drawn_stamp(first));
+
+        cache.mark_synced_sample_from(first, original);
+        assert_eq!(cache.writeback_stamp(first), Some(original));
+    }
+
+    #[test]
+    fn clear_write_order_tracks_rekeys_invalidation_and_replacement() {
+        let mut cache = RtCache::new();
+        let key = RtKey::with_cpu(1, 64, 64, 0x1000, 0x9000)
+            .with_mapping_epoch(1);
+        cache.insert_color_image(key,
+            test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM));
+        cache.mark_cleared(key, true);
+        let stamp = cache.writeback_stamp(key);
+        let rekeyed = key.with_mapping_epoch(2);
+        assert!(cache.rekey_color_state(key, rekeyed));
+        assert_eq!(cache.writeback_stamp(rekeyed), stamp);
+        assert_eq!(cache.clear_stamp.keys().next().unwrap().mapping_epoch, 2);
+
+        cache.mark_guest_written_range(0x9000, 1, &[]);
+        assert_eq!(cache.writeback_stamp(rekeyed), None);
+        cache.mark_cleared(rekeyed, true);
+        cache.mark_guest_uploaded(rekeyed);
+        assert_eq!(cache.writeback_stamp(rekeyed), None);
+        cache.mark_cleared(rekeyed, true);
+        cache.remove_color_image(rekeyed).unwrap();
+        assert_eq!(cache.writeback_stamp(rekeyed), None);
+    }
+
     use super::{
         is_synthetic_copy_key, rt_alias_indexed_lookup_value_enabled, rt_formats_compatible,
         rt_sampleable_color_alias_equal, rt_sampleable_depth_alias_equal,

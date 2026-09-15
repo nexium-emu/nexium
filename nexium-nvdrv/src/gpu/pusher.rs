@@ -372,7 +372,10 @@ pub(crate) mod kickprof {
     pub const KC_FRONTEND: usize = 177;
     pub const KC_RESOURCES: usize = 178;
     pub const VERTEX_STORE_WAIT: usize = 179;
-    pub const COUNT: usize = 180;
+    pub const VKF_CUBE_DRAIN: usize = 180;
+    pub const VKF_CUBE_READ: usize = 181;
+    pub const VKF_CUBE_POST: usize = 182;
+    pub const COUNT: usize = 183;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -555,6 +558,9 @@ pub(crate) mod kickprof {
         "kcfrontend",
         "kcresources",
         "vswait",
+        "vkfcubedrain",
+        "vkfcuberead",
+        "vkfcubepost",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];

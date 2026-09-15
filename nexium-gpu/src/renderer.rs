@@ -20,6 +20,20 @@ use crate::texture_manifest::{
     TextureNumericBinding,
 };
 
+pub struct GuestColorTargetReadbacks {
+    pub readbacks: Vec<Option<RawColorTargetReadback>>,
+    pub superseded: Vec<RtKey>,
+}
+
+#[derive(Debug)]
+pub struct RawColorTargetReadback {
+    pub write_stamp: u64,
+    pub width: u32,
+    pub height: u32,
+    pub bpp: usize,
+    pub data: Vec<u8>,
+}
+
 pub struct Renderer {
     presenter: Option<crate::presentation::Presenter>,
     inner: Mutex<RendererInner>,
@@ -7390,7 +7404,7 @@ impl Renderer {
     pub fn readback_targets_raw_keys(
         &self,
         keys: &[RtKey],
-    ) -> Vec<Option<(u32, u32, usize, Vec<u8>)>> {
+    ) -> Vec<Option<RawColorTargetReadback>> {
         self.readback_keys_raw(keys)
     }
 
@@ -7409,10 +7423,22 @@ impl Renderer {
 
     fn readback_key_raw(&self, key: RtKey) -> Option<(u32, u32, usize, Vec<u8>)> {
         self.readback_keys_raw(&[key]).pop().flatten()
+            .map(|readback| (readback.width, readback.height, readback.bpp, readback.data))
     }
 
-    fn readback_keys_raw(&self, keys: &[RtKey]) -> Vec<Option<(u32, u32, usize, Vec<u8>)>> {
+    fn readback_keys_raw(&self, keys: &[RtKey]) -> Vec<Option<RawColorTargetReadback>> {
+        self.readback_keys_raw_impl(keys, None).readbacks
+    }
+
+    pub fn readback_guest_targets_raw(&self, targets: &[(RtKey, u32)]) -> GuestColorTargetReadbacks {
+        let keys: Vec<_> = targets.iter().map(|(key, _)| *key).collect();
+        let tile_modes: Vec<_> = targets.iter().map(|(_, mode)| *mode).collect();
+        self.readback_keys_raw_impl(&keys, Some(&tile_modes))
+    }
+
+    fn readback_keys_raw_impl(&self, keys: &[RtKey], tile_modes: Option<&[u32]>) -> GuestColorTargetReadbacks {
         struct ReadbackPlan {
+            write_stamp: u64,
             output_index: usize,
             key: RtKey,
             width: u32,
@@ -7422,8 +7448,10 @@ impl Renderer {
             byte_len: usize,
         }
 
-        let mut outputs: Vec<Option<(u32, u32, usize, Vec<u8>)>> =
-            std::iter::repeat_with(|| None).take(keys.len()).collect();
+        let mut outputs = GuestColorTargetReadbacks {
+            readbacks: std::iter::repeat_with(|| None).take(keys.len()).collect(),
+            superseded: Vec::new(),
+        };
         if keys.is_empty() {
             return outputs;
         }
@@ -7460,6 +7488,7 @@ impl Renderer {
                 continue;
             };
             plans.push(ReadbackPlan {
+                write_stamp: rt_cache.writeback_stamp(key).unwrap_or(0),
                 output_index,
                 key,
                 width: key.width,
@@ -7473,6 +7502,22 @@ impl Renderer {
         if plans.is_empty() {
             return outputs;
         }
+
+        let superseded = tile_modes.map(|modes| {
+            let writes: Vec<_> = plans.iter().map(|plan| crate::rt_writeback::WritebackFootprint {
+                key: plan.key, bpp: plan.bpp, tile_mode: modes[plan.output_index],
+                stamp: plan.write_stamp,
+            }).collect();
+            crate::rt_writeback::superseded_writebacks(&writes)
+        }).unwrap_or_else(|| vec![false; plans.len()]);
+        let mut discarded = Vec::new();
+        let mut index = 0;
+        plans.retain(|plan| {
+            let discard = superseded[index];
+            index += 1;
+            if discard { discarded.push(plan.key); }
+            !discard
+        });
 
         if sync_readback_slot.in_flight {
             match unsafe {
@@ -7612,10 +7657,17 @@ impl Renderer {
                     raw.as_mut_ptr(),
                     plan.byte_len,
                 );
-                outputs[plan.output_index] = Some((plan.width, plan.height, plan.bpp, raw));
+                outputs.readbacks[plan.output_index] = Some(RawColorTargetReadback {
+                    write_stamp: plan.write_stamp,
+                    width: plan.width,
+                    height: plan.height,
+                    bpp: plan.bpp,
+                    data: raw,
+                });
             }
             device.unmap_memory(stage_memory);
         }
+        outputs.superseded = discarded;
         outputs
     }
 

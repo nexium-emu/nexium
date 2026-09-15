@@ -13,6 +13,7 @@ pub mod presentation;
 pub mod pitch_oracle;
 pub mod renderer;
 pub mod rt_cache;
+mod rt_writeback;
 pub mod shader;
 pub mod tex_invalidate;
 pub mod texture;

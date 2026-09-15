@@ -11771,22 +11771,34 @@ fn restore_small_rt_batch(batch: SmallRtPendingBatch) {
     }
 }
 
-type RawTargetReadback = Option<(u32, u32, usize, Vec<u8>)>;
+type RawTargetReadback = Option<nexium_gpu::renderer::RawColorTargetReadback>;
+
+fn ordered_small_rt_readbacks(
+    entries: Vec<(RtKey, u32)>,
+    readbacks: Vec<RawTargetReadback>,
+) -> Vec<((RtKey, u32), RawTargetReadback)> {
+    let mut readbacks = readbacks.into_iter();
+    let mut ordered = entries.into_iter()
+        .map(|entry| (entry, readbacks.next().flatten()))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, readback)| readback.as_ref().map_or(0, |r| r.write_stamp));
+    ordered
+}
 
 fn readback_targets_on_render_thread(
     renderer: &Arc<nexium_gpu::Renderer>,
-    keys: &[RtKey],
+    targets: &[(RtKey, u32)],
     wait_timeout: std::time::Duration,
     label: &'static str,
-) -> Option<Vec<RawTargetReadback>> {
+) -> Option<nexium_gpu::renderer::GuestColorTargetReadbacks> {
     if let Some(rt) = crate::render_thread::maybe_render_thread() {
         let (tx, rx) = std::sync::mpsc::channel();
         let r = renderer.clone();
-        let queued_keys = keys.to_vec();
+        let queued_targets = targets.to_vec();
         let submitted = rt.submit_timeout_named(
             label,
             Box::new(move || {
-                let readbacks = r.readback_targets_raw_keys(&queued_keys);
+                let readbacks = r.readback_guest_targets_raw(&queued_targets);
                 let _ = tx.send(readbacks);
             }),
             wait_timeout,
@@ -11796,7 +11808,7 @@ fn readback_targets_on_render_thread(
         }
         rx.recv_timeout(wait_timeout).ok()
     } else {
-        Some(renderer.readback_targets_raw_keys(keys))
+        Some(renderer.readback_guest_targets_raw(targets))
     }
 }
 
@@ -11811,13 +11823,8 @@ fn writeback_small_rt_entries(
     if pending.entries.is_empty() {
         return SmallRtWritebackResult::default();
     }
-    let keys = pending
-        .entries
-        .iter()
-        .map(|(key, _)| *key)
-        .collect::<Vec<_>>();
     let kp_read = super::pusher::kickprof::start();
-    let readbacks = readback_targets_on_render_thread(renderer, &keys, wait_timeout, marker_label);
+    let readbacks = readback_targets_on_render_thread(renderer, &pending.entries, wait_timeout, marker_label);
     super::pusher::kickprof::add(super::pusher::kickprof::PRES_WB_READ, kp_read);
     let Some(readbacks) = readbacks else {
         restore_small_rt_batch(pending);
@@ -11878,17 +11885,61 @@ fn process_small_rt_readbacks(
     mappings: &GpuMappings,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
     pending: SmallRtPendingBatch,
-    readbacks: Vec<RawTargetReadback>,
+    readbacks: nexium_gpu::renderer::GuestColorTargetReadbacks,
 ) -> SmallRtWritebackResult {
+    let (result, unresolved) = resolve_small_rt_readbacks(
+        mappings, mem_write, pending, readbacks,
+        |chunks| invalidate_guest_write_chunks(renderer, mappings, chunks),
+    );
+    restore_small_rt_batch(unresolved);
+    result
+}
+
+fn resolve_small_rt_readbacks(
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    pending: SmallRtPendingBatch,
+    readbacks: nexium_gpu::renderer::GuestColorTargetReadbacks,
+    mut invalidate: impl FnMut(&[GuestWriteChunk]),
+) -> (SmallRtWritebackResult, SmallRtPendingBatch) {
+    let nexium_gpu::renderer::GuestColorTargetReadbacks { readbacks, superseded } = readbacks;
     let mut result = SmallRtWritebackResult::default();
     let mut unresolved = Vec::new();
+    let mut coverage_write_failed = false;
     let SmallRtPendingBatch { epoch, entries } = pending;
-    for ((key, tile_mode), readback) in entries.into_iter().zip(readbacks) {
-        let Some((kw, kh, bpp, mut raw)) = readback else {
+    let replay_entries = (!superseded.is_empty()).then(|| entries.clone());
+    for ((key, tile_mode), readback) in ordered_small_rt_readbacks(entries, readbacks) {
+        if superseded.contains(&key) { continue; }
+        let trace = rt_writeback_trace_target().is_some_and(|target| {
+            key.gpu_va <= target && target < key.gpu_va.saturating_add(key.guest_size_bytes.max(1))
+        });
+        let Some(nexium_gpu::renderer::RawColorTargetReadback {
+            width: kw, height: kh, bpp, data: mut raw, ..
+        }) = readback else {
+            if trace {
+                log::warn!("[rt-writeback-trace] {} tile={:#x} readback=none", key.label(), tile_mode);
+            }
             unresolved.push((key, tile_mode));
             continue;
         };
+        if trace {
+            log::warn!(
+                "[rt-writeback-trace] {} tile={:#x} readback={}x{} bpp={} bytes={:#x} guest_size={:#x} layers={}",
+                key.label(),
+                tile_mode,
+                kw,
+                kh,
+                bpp,
+                raw.len(),
+                key.guest_size_bytes,
+                key.render_layer_count()
+            );
+        }
         let Some(layers) = small_rt_layer_writebacks(key, tile_mode, kw, kh, bpp, &mut raw) else {
+            if trace {
+                log::warn!("[rt-writeback-trace] {} layer conversion failed", key.label());
+            }
+            coverage_write_failed = true;
             unresolved.push((key, tile_mode));
             continue;
         };
@@ -11900,12 +11951,22 @@ fn process_small_rt_readbacks(
             write.complete &= layer.complete;
             write.written.extend(layer.written);
         }
-        invalidate_guest_write_chunks(renderer, mappings, &write.written);
+        invalidate(&write.written);
         if !write.written.is_empty() {
             result.targets_written += 1;
             result.written.extend(write.written.iter().copied());
         }
+        if trace {
+            log::warn!(
+                "[rt-writeback-trace] {} write complete={} chunks={} bytes={:#x}",
+                key.label(),
+                write.complete,
+                write.written.len(),
+                bytes_to_write
+            );
+        }
         if !write.complete {
+            coverage_write_failed = true;
             unresolved.push((key, tile_mode));
             continue;
         }
@@ -11917,11 +11978,10 @@ fn process_small_rt_readbacks(
             bytes_to_write,
         );
     }
-    restore_small_rt_batch(SmallRtPendingBatch {
-        epoch,
-        entries: unresolved,
-    });
-    result
+    if coverage_write_failed {
+        if let Some(entries) = replay_entries { unresolved = entries; }
+    }
+    (result, SmallRtPendingBatch { epoch, entries: unresolved })
 }
 
 fn writeback_cube_sample_dependencies(
@@ -11948,12 +12008,34 @@ fn writeback_cube_sample_dependencies(
                 .chain(call.depth_key)
         })
         .collect::<std::collections::HashSet<_>>();
-    let has_external_target = small_rt_registry()
-        .lock()
-        .unwrap()
-        .entries
-        .keys()
-        .any(|key| !current_targets.contains(key));
+    let has_external_target = {
+        let registry = small_rt_registry().lock().unwrap();
+        if std::env::var_os("NEXIUM_CUBE_SCAN_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CALLS: AtomicU64 = AtomicU64::new(0);
+            if CALLS.fetch_add(1, Ordering::Relaxed) % 2048 == 0 {
+                let pitch = registry.entries.values().filter(|tile_mode| *tile_mode & (1 << 12) != 0).count();
+                let mut sample = registry
+                    .entries
+                    .iter()
+                    .filter(|(_, tile_mode)| *tile_mode & (1 << 12) == 0)
+                    .map(|(key, tile_mode)| format!("{}/{:#x}", key.label(), tile_mode))
+                    .collect::<Vec<_>>();
+                sample.truncate(12);
+                log::warn!(
+                    "[cube-scan] registry total={} pitch={} block={} sample={:?}",
+                    registry.entries.len(),
+                    pitch,
+                    registry.entries.len() - pitch,
+                    sample
+                );
+            }
+        }
+        registry
+            .entries
+            .iter()
+            .any(|(key, tile_mode)| tile_mode & (1 << 12) == 0 && !current_targets.contains(key))
+    };
     if !has_external_target {
         return SmallRtWritebackResult::default();
     }
@@ -11970,40 +12052,51 @@ fn writeback_cube_sample_dependencies(
     }
     let pending = {
         let mut registry = small_rt_registry().lock().unwrap();
-        registry.drain_matching(|key, _tile_mode| {
-            let matches = !current_targets.contains(key)
-                && small_rt_starts_in_ranges(*key, &dependencies.ranges);
-            matches
+        registry.drain_matching(|key, tile_mode| {
+            tile_mode & (1 << 12) == 0
+                && !current_targets.contains(key)
+                && small_rt_starts_in_ranges(*key, &dependencies.ranges)
         })
     };
     if pending.entries.is_empty() {
         return SmallRtWritebackResult::default();
     }
-    if !before_readback() {
+    let kp_drain = super::pusher::kickprof::start();
+    let drained = before_readback();
+    super::pusher::kickprof::add(super::pusher::kickprof::VKF_CUBE_DRAIN, kp_drain);
+    if !drained {
         restore_small_rt_batch(pending);
         return SmallRtWritebackResult::default();
     }
     let pending_count = pending.entries.len();
-    let keys = pending
-        .entries
-        .iter()
-        .map(|(key, _)| *key)
-        .collect::<Vec<_>>();
+    let sync_trace = std::env::var_os("NEXIUM_CUBE_RT_SYNC_TRACE").is_some();
+    let pending_labels = sync_trace.then(|| {
+        pending
+            .entries
+            .iter()
+            .map(|(key, tile_mode)| format!("{}/{:#x}", key.label(), tile_mode))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
     let wait_timeout = std::time::Duration::from_secs(5);
-    let Some(readbacks) =
-        readback_targets_on_render_thread(renderer, &keys, wait_timeout, "cube-rt-dependency")
-    else {
+    let kp_read = super::pusher::kickprof::start();
+    let readbacks =
+        readback_targets_on_render_thread(renderer, &pending.entries, wait_timeout, "cube-rt-dependency");
+    super::pusher::kickprof::add(super::pusher::kickprof::VKF_CUBE_READ, kp_read);
+    let Some(readbacks) = readbacks else {
         restore_small_rt_batch(pending);
         return SmallRtWritebackResult::default();
     };
+    let kp_post = super::pusher::kickprof::start();
     let writeback = process_small_rt_readbacks(renderer, mappings, mem_write, pending, readbacks);
+    super::pusher::kickprof::add(super::pusher::kickprof::VKF_CUBE_POST, kp_post);
     let written = writeback.targets_written;
     if written != 0 {
         for base in &dependencies.texture_bases {
             renderer.invalidate_texture_address(*base);
         }
     }
-    if std::env::var_os("NEXIUM_CUBE_RT_SYNC_TRACE").is_some() {
+    if sync_trace {
         let range_labels = dependencies
             .ranges
             .iter()
@@ -12011,11 +12104,12 @@ fn writeback_cube_sample_dependencies(
             .collect::<Vec<_>>()
             .join(",");
         log::warn!(
-            "[cube-rt-sync] fs={:#x} ranges=[{}] pending={} written={}",
+            "[cube-rt-sync] fs={:#x} ranges=[{}] pending={} written={} targets=[{}]",
             batch.first().map(|call| call.fs_gpu_va).unwrap_or(0),
             range_labels,
             pending_count,
             written,
+            pending_labels.unwrap_or_default(),
         );
     }
     writeback
@@ -12270,12 +12364,7 @@ pub(crate) fn spawn_small_rt_writeback_async(
         Box::new(move || {
             let result = match guest_memory.writer() {
                 Some(writer) => {
-                    let keys = pending
-                        .entries
-                        .iter()
-                        .map(|(key, _)| *key)
-                        .collect::<Vec<_>>();
-                    let readbacks = job_renderer.readback_targets_raw_keys(&keys);
+                    let readbacks = job_renderer.readback_guest_targets_raw(&pending.entries);
                     let mappings = guest_memory.read_mappings();
                     let mem_write = |addr: u64, bytes: &[u8]| writer(addr, bytes);
                     process_small_rt_readbacks(
@@ -21497,7 +21586,119 @@ fn vertex_buffer_bindings(
 
 #[cfg(test)]
 mod tests {
-    use nexium_common::fast_hash::{FastMap, FastSet};
+    #[test]
+    fn missing_rt_reads_do_not_replay_successful_coverage_groups() {
+        use nexium_gpu::renderer::{GuestColorTargetReadbacks, RawColorTargetReadback};
+        let old = RtKey::with_cpu(1, 4, 1, 0x1000, 0x9000);
+        let new = RtKey::with_cpu(1, 8, 1, 0x1000, 0x9000);
+        let missing = RtKey::with_cpu(1, 4, 1, 0x2000, 0xa000);
+        let entries = vec![(old, 1 << 12), (new, 1 << 12), (missing, 1 << 12)];
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x1000, 0x2000, 0x9000, 1);
+        for (fail_write, malformed_pixels) in [(false, false), (true, false), (false, true)] {
+            let writes = std::cell::RefCell::new(Vec::new());
+            let mut invalidated = Vec::new();
+            let (result, retry) = super::resolve_small_rt_readbacks(
+                &mappings,
+                &|address, data| {
+                    if fail_write { return false; }
+                    writes.borrow_mut().push((address, data.to_vec()));
+                    true
+                },
+                super::SmallRtPendingBatch { epoch: 7, entries: entries.clone() },
+                GuestColorTargetReadbacks {
+                    readbacks: vec![None, Some(RawColorTargetReadback {
+                        write_stamp: 20, width: 8, height: 1, bpp: 1,
+                        data: vec![9; if malformed_pixels { 7 } else { 8 }],
+                    }), None],
+                    superseded: vec![old],
+                },
+                |chunks| invalidated.extend_from_slice(chunks),
+            );
+            assert_eq!(retry.epoch, 7);
+            if fail_write || malformed_pixels {
+                assert_eq!(retry.entries, entries);
+                assert_eq!(result.targets_written, 0);
+                assert!(writes.borrow().is_empty());
+                assert!(invalidated.is_empty());
+            } else {
+                assert_eq!(retry.entries, [(missing, 1 << 12)]);
+                assert_eq!(result.targets_written, 1);
+                assert_eq!(*writes.borrow(), [(0x9000, vec![9; 8])]);
+                assert_eq!(invalidated.len(), 1);
+                assert_eq!(invalidated[0].cpu_addr, 0x9000);
+                assert_eq!(invalidated[0].len, 8);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_rt_readback_batch_keeps_every_target_pending() {
+        let entries = vec![(RtKey::new(1, 4, 1, 0x1000), 0), (RtKey::new(1, 8, 1, 0x1000), 0)];
+        let (result, retry) = super::resolve_small_rt_readbacks(
+            &crate::gpu::GpuMappings::new(), &|_, _| panic!("no pixels to write"),
+            super::SmallRtPendingBatch { epoch: 8, entries: entries.clone() },
+            nexium_gpu::renderer::GuestColorTargetReadbacks { readbacks: vec![None, None], superseded: vec![] },
+            |_| panic!("no guest writes to invalidate"),
+        );
+        assert_eq!(result.targets_written, 0);
+        assert_eq!(retry.epoch, 8);
+        assert_eq!(retry.entries, entries);
+    }
+
+    #[test]
+    fn overlapping_small_rt_writebacks_follow_gpu_order() {
+        use nexium_gpu::renderer::RawColorTargetReadback;
+        use nexium_gpu::rt_cache::RtKey;
+
+        let old = RtKey::with_cpu(1, 8, 1, 0x1000, 0x5000);
+        let new = RtKey::with_cpu(2, 4, 1, 0x2000, 0x5002);
+        for newest_first in [false, true] {
+            let mut entries = vec![(old, 1 << 12), (new, 1 << 12)];
+            let mut reads = vec![
+                Some(RawColorTargetReadback {
+                    write_stamp: 10, width: 8, height: 1, bpp: 1, data: vec![1; 8],
+                }),
+                Some(RawColorTargetReadback {
+                    write_stamp: 20, width: 4, height: 1, bpp: 1, data: vec![2; 4],
+                }),
+            ];
+            if newest_first { entries.reverse(); reads.reverse(); }
+            let mut guest = [0; 8];
+            for ((key, tile), read) in super::ordered_small_rt_readbacks(entries, reads) {
+                let mut read = read.unwrap();
+                let layers = super::small_rt_layer_writebacks(
+                    key, tile, read.width, read.height, read.bpp, &mut read.data,
+                ).unwrap();
+                for (address, data) in layers {
+                    let offset = (key.cpu_addr + address - key.gpu_va - 0x5000) as usize;
+                    guest[offset..offset + data.len()].copy_from_slice(&data);
+                }
+            }
+            assert_eq!(guest, [1, 1, 2, 2, 2, 2, 1, 1]);
+        }
+    }
+
+    #[test]
+    fn small_rt_order_preserves_failed_and_missing_reads() {
+        use nexium_gpu::renderer::RawColorTargetReadback;
+        use nexium_gpu::rt_cache::RtKey;
+        let keys = [1, 2, 3].map(|id| RtKey::new(id, 1, 1, id as u64 * 0x1000));
+        let ordered = super::ordered_small_rt_readbacks(
+            keys.map(|key| (key, 0)).to_vec(),
+            vec![Some(RawColorTargetReadback {
+                write_stamp: 20, width: 1, height: 1, bpp: 1, data: vec![7],
+            }), None],
+        );
+        assert_eq!(ordered.len(), 3);
+        let failed = ordered.iter().filter(|(_, read)| read.is_none())
+            .map(|((key, _), _)| *key).collect::<Vec<_>>();
+        assert_eq!(failed, keys[1..]);
+        assert_eq!(ordered[2].0.0, keys[0]);
+        assert_eq!(ordered[2].1.as_ref().unwrap().data, [7]);
+    }
+
+    use nexium_common::fast_hash::FastSet;
     use std::collections::HashSet;
     use std::sync::Arc;
 
