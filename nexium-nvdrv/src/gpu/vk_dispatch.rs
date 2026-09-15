@@ -1326,6 +1326,7 @@ struct SphMemoEntry {
 
 pub(crate) struct SsboSnapshotCache {
     mirror: MirrorPageCache,
+    compute_pending_cpu_ranges: Arc<[(u64, u64)]>,
     cbuf_slot_states: [Vec<CbufSlotState>; PACKED_CBUF_SLOTS],
     input_mutation_epoch: u64,
     resource_mutation_epoch: u64,
@@ -1417,6 +1418,26 @@ fn next_mirror_chunk_generation() -> u64 {
 fn next_mirror_cbuf_page_generation() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn cube_rt_sync_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_CUBE_RT_SYNC").ok().as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    })
+}
+
+fn exact_compute_barrier_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_EXACT_COMPUTE_BARRIER").ok().as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    })
 }
 
 fn resident_cache_value_enabled(value: Option<&str>) -> bool {
@@ -1909,6 +1930,7 @@ impl SsboSnapshotCache {
     fn with_input_capacity(input_max_bytes: usize, input_max_entries: usize) -> Self {
         Self {
             mirror: MirrorPageCache::new(),
+            compute_pending_cpu_ranges: Arc::from(Vec::new()),
             cbuf_slot_states: std::array::from_fn(|_| Vec::new()),
             input_mutation_epoch: 0,
             resource_mutation_epoch: 0,
@@ -4294,6 +4316,9 @@ impl SsboSnapshotCache {
         if last_key - first_key + 1 > MAX_RESIDENT_CHUNKS {
             return None;
         }
+        let _barrier_bypass = self
+            .exact_compute_barrier_for_resident_range(cpu_addr, range_end, mem_read)
+            .then(super::prep::compute_barrier_bypass);
         let mut forward_spans = std::mem::take(&mut self.mirror.span_scratch);
         forward_spans.clear();
         let mut chunks = Vec::with_capacity((last_key - first_key + 1) as usize);
@@ -4328,6 +4353,33 @@ impl SsboSnapshotCache {
             len,
             chunks,
         })
+    }
+
+    fn exact_compute_barrier_for_resident_range(
+        &mut self,
+        cpu_addr: u64,
+        range_end: u64,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> bool {
+        if self.compute_pending_cpu_ranges.is_empty() || !exact_compute_barrier_enabled() {
+            return false;
+        }
+        let pending = self.compute_pending_cpu_ranges.clone();
+        let exact = pending
+            .iter()
+            .find(|&&(base, size)| base < range_end && cpu_addr < base.saturating_add(size));
+        if let Some(&(base, _)) = exact {
+            let mut probe = [0u8; 1];
+            let _ = mem_read(base.max(cpu_addr), &mut probe);
+            for &(base, size) in pending.iter() {
+                self.mirror.mark_dirty(base, size as usize);
+            }
+        }
+        true
+    }
+
+    pub(crate) fn set_compute_pending_cpu_ranges(&mut self, ranges: Arc<[(u64, u64)]>) {
+        self.compute_pending_cpu_ranges = ranges;
     }
 
     pub(crate) fn mirror_mark_cpu(&mut self, cpu_addr: u64, len: usize) {

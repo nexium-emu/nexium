@@ -609,6 +609,19 @@ fn pending_writebacks() -> &'static Mutex<Vec<PendingComputeWriteback>> {
     PENDING.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+static PENDING_WRITEBACK_REVISION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn pending_writeback_revision() -> u64 {
+    PENDING_WRITEBACK_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn push_pending_writeback(record: PendingComputeWriteback) {
+    let mut pending = pending_writebacks().lock().unwrap_or_else(|error| error.into_inner());
+    pending.push(record);
+    PENDING_WRITEBACK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn lazy_compute_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_LAZY_COMPUTE").is_none())
@@ -741,6 +754,7 @@ pub(crate) fn pending_writeback_spans_snapshot() -> Vec<PendingComputeWritebackS
     pending_writeback_target_spans(&pending)
 }
 
+#[track_caller]
 pub(crate) fn resolve_pending_writebacks_report(
     renderer: &nexium_gpu::Renderer,
     mappings: &GpuMappings,
@@ -750,6 +764,9 @@ pub(crate) fn resolve_pending_writebacks_report(
         let mut pending = pending_writebacks()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if !pending.is_empty() {
+            PENDING_WRITEBACK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         pending.drain(..).collect()
     };
     let spans = pending_writeback_target_spans(&records);
@@ -758,8 +775,31 @@ pub(crate) fn resolve_pending_writebacks_report(
         return spans;
     }
     let kp = crate::gpu::pusher::kickprof::start();
+    let trace = std::env::var_os("NEXIUM_KC_RESOLVE_TRACE").is_some();
+    let caller = std::panic::Location::caller();
+    let record_count = records.len();
     for record in records {
-        let Some(id) = record.id.wait() else {
+        let wait_started = std::time::Instant::now();
+        let waited = record.id.wait();
+        if trace {
+            log::warn!(
+                "[kc-resolve] caller={}:{} records={} id={:?} wait_ms={:.3} outputs={} texels={} bytes={}",
+                caller.file(),
+                caller.line(),
+                record_count,
+                waited,
+                wait_started.elapsed().as_secs_f64() * 1000.0,
+                record.output_targets.len(),
+                record.texel_targets.len(),
+                record
+                    .output_targets
+                    .iter()
+                    .map(|target| target.guest_size)
+                    .chain(record.texel_targets.iter().map(|target| target.guest_size))
+                    .sum::<usize>()
+            );
+        }
+        let Some(id) = waited else {
             continue;
         };
         match renderer.take_pending_compute(id) {
@@ -785,6 +825,7 @@ pub(crate) fn resolve_pending_writebacks_report(
     spans
 }
 
+#[track_caller]
 pub(crate) fn resolve_pending_writebacks(
     renderer: &nexium_gpu::Renderer,
     mappings: &GpuMappings,
@@ -2011,10 +2052,7 @@ fn prepare_and_execute(
                     let _ = id_tx.send(sent);
                 }),
             );
-            pending_writebacks()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(PendingComputeWriteback {
+            push_pending_writeback(PendingComputeWriteback {
                     id: PendingComputeId::Deferred(id_rx),
                     output_targets,
                     texel_targets,
@@ -2051,10 +2089,7 @@ fn prepare_and_execute(
             {
                 log::warn!("[compute-submit] id={} program={:#x}", id, qmd[0x08]);
             }
-            pending_writebacks()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(PendingComputeWriteback {
+            push_pending_writeback(PendingComputeWriteback {
                     id: PendingComputeId::Ready(id),
                     output_targets,
                     texel_targets,

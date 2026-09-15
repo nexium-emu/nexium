@@ -85,7 +85,7 @@ fn eager_clear_resolve_enabled() -> bool {
     })
 }
 
-fn clear_target_ranges(draw: &super::engines::maxwell3d::DrawCall) -> Vec<(u64, u64)> {
+fn draw_target_ranges(draw: &super::engines::maxwell3d::DrawCall) -> Vec<(u64, u64)> {
     const CONSERVATIVE_BYTES_PER_PIXEL: u64 = 16;
     let mut ranges = Vec::with_capacity(9);
     for rt in &draw.rt {
@@ -113,23 +113,139 @@ fn clear_target_ranges(draw: &super::engines::maxwell3d::DrawCall) -> Vec<(u64, 
     ranges
 }
 
-fn draws_need_pending_compute(draws: &[super::engines::maxwell3d::DrawCall]) -> bool {
-    if draws.iter().any(|draw| !draw.is_clear) {
-        return true;
-    }
-    let spans = super::engines::maxwell_compute::pending_writeback_spans_snapshot();
-    if spans.is_empty() {
-        return false;
-    }
+fn draws_write_pending_compute(draws: &[DrawCall], ranges: &[(u64, u64)]) -> bool {
     draws.iter().any(|draw| {
-        clear_target_ranges(draw).into_iter().any(|(base, size)| {
-            let end = base.saturating_add(size);
-            spans.iter().any(|span| {
-                let span_end = span.gpu_va.saturating_add(span.len as u64);
-                span.gpu_va < end && base < span_end
-            })
+        draw_target_ranges(draw).into_iter().any(|(base, size)| {
+            ranges.iter().any(|&(address, length)| ranges_overlap(base, size, address, length))
         })
     })
+}
+
+fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
+    a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+}
+
+thread_local! {
+    static COMPUTE_BARRIER_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct ComputeBarrierBypassGuard(bool);
+
+impl Drop for ComputeBarrierBypassGuard {
+    fn drop(&mut self) {
+        COMPUTE_BARRIER_BYPASS.with(|bypass| bypass.set(self.0));
+    }
+}
+
+pub(crate) fn compute_barrier_bypass() -> ComputeBarrierBypassGuard {
+    ComputeBarrierBypassGuard(COMPUTE_BARRIER_BYPASS.with(|bypass| bypass.replace(true)))
+}
+
+fn compute_barrier_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_KC_BARRIER_DISABLE").is_some())
+}
+
+fn deferred_compute_draw_resolve_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_DEFER_COMPUTE_DRAW_RESOLVE").ok().as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    })
+}
+
+#[derive(Clone, Default)]
+struct ComputeMemoryBarrier {
+    cpu_ranges: Arc<[(u64, u64)]>,
+    gpu_ranges: Arc<[(u64, u64)]>,
+    armed: std::cell::Cell<bool>,
+}
+
+impl ComputeMemoryBarrier {
+    fn new(
+        spans: &[super::engines::maxwell_compute::PendingComputeWritebackSpan],
+        mappings: &GpuMappings,
+    ) -> Self {
+        let mut gpu_ranges = Vec::new();
+        let mut cpu_ranges = Vec::new();
+        for span in spans {
+            gpu_ranges.push((span.gpu_va, span.len as u64));
+            cpu_ranges.push((span.cpu_addr, span.len as u64));
+            gpu_ranges.extend(mappings.gpu_regions_for_cpu_range(span.cpu_addr, span.len as u64));
+        }
+        gpu_ranges.sort_unstable();
+        gpu_ranges.dedup();
+        Self {
+            cpu_ranges: cpu_ranges.into(),
+            gpu_ranges: gpu_ranges.into(),
+            armed: std::cell::Cell::new(!spans.is_empty()),
+        }
+    }
+
+    fn before_access(&self, address: u64, len: usize, resolve: impl FnOnce()) {
+        if !self.armed.get()
+            || COMPUTE_BARRIER_BYPASS.with(|bypass| bypass.get())
+            || compute_barrier_disabled()
+        {
+            return;
+        }
+        let Some(&(base, size)) = self
+            .cpu_ranges
+            .iter()
+            .find(|&&(base, size)| ranges_overlap(address, len as u64, base, size))
+        else {
+            return;
+        };
+        if std::env::var_os("NEXIUM_KC_BARRIER_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TRIGGERS: AtomicU64 = AtomicU64::new(0);
+            let trigger = TRIGGERS.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "[kc-barrier] access={:#x}+{:#x} pending={:#x}+{:#x} ranges={} trigger={}",
+                address,
+                len,
+                base,
+                size,
+                self.cpu_ranges.len(),
+                trigger
+            );
+        }
+        self.armed.set(false);
+        resolve();
+    }
+
+    fn invalidate_snapshots(&self, cache: &mut SsboSnapshotCache, mappings: &GpuMappings) {
+        let writes: Vec<_> = self.gpu_ranges.iter()
+            .map(|&(address, size)| (address, size as usize)).collect();
+        cache.invalidate_gpu_writes(mappings, &writes);
+        for &(address, size) in self.gpu_ranges.iter() {
+            nexium_gpu::tex_invalidate::bump_region(address, size);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ComputeBarrierCache {
+    revision: Option<(u64, u64)>,
+    barrier: ComputeMemoryBarrier,
+}
+
+impl ComputeBarrierCache {
+    fn get(
+        &mut self,
+        revision: u64,
+        spans: &[super::engines::maxwell_compute::PendingComputeWritebackSpan],
+        mappings: &GpuMappings,
+    ) -> ComputeMemoryBarrier {
+        let revision = (revision, mappings.generation());
+        if self.revision != Some(revision) {
+            self.barrier = ComputeMemoryBarrier::new(spans, mappings);
+            self.revision = Some(revision);
+        }
+        self.barrier.clone()
+    }
 }
 
 fn mirror_sweep_per_entry_enabled() -> bool {
@@ -266,11 +382,24 @@ pub(crate) struct PrepState {
     pub(crate) constbuf_invalidation_scratch: Vec<(u64, usize)>,
     pub(crate) constbuf_patched_scratch: Vec<(u64, u64, usize)>,
     pub(crate) constbuf_bytes_scratch: Vec<u8>,
+    compute_snapshot_revision: Option<(u64, u64)>,
+    compute_barrier_cache: ComputeBarrierCache,
     #[cfg(test)]
     pub(crate) prepared_packet_drain_counts: PreparedPacketDrainCounts,
 }
 
 impl PrepState {
+    fn invalidate_compute_snapshots(&mut self, barrier: &ComputeMemoryBarrier, mappings: &GpuMappings) {
+        let revision = (
+            super::engines::maxwell_compute::pending_writeback_revision(),
+            mappings.generation(),
+        );
+        if self.compute_snapshot_revision != Some(revision) {
+            barrier.invalidate_snapshots(&mut self.ssbo_snapshot_cache, mappings);
+            self.compute_snapshot_revision = Some(revision);
+        }
+    }
+
     pub(crate) fn schedule_kick_completion(&self, on_complete: Option<Box<dyn FnOnce() + Send>>) {
         let Some(on_complete) = on_complete else {
             return;
@@ -758,14 +887,46 @@ impl PrepState {
                 mut replay_constbuf_writes,
                 constbuf_trace,
             } => {
-                let compute_spans = if eager_clear_resolve_enabled()
-                    || !super::engines::maxwell_compute::has_pending_writebacks()
-                    || draws_need_pending_compute(&draws)
-                {
-                    self.resolve_pending_compute_report(mappings, mem_write)
-                } else {
-                    super::engines::maxwell_compute::pending_writeback_spans_snapshot()
+                let compute_spans =
+                    super::engines::maxwell_compute::pending_writeback_spans_snapshot();
+                let memory_barrier = self.compute_barrier_cache.get(
+                    super::engines::maxwell_compute::pending_writeback_revision(),
+                    &compute_spans,
+                    mappings,
+                );
+                if !compute_spans.is_empty() {
+                    let deferred = deferred_compute_draw_resolve_enabled()
+                        && crate::render_thread::maybe_render_thread().is_some();
+                    if eager_clear_resolve_enabled()
+                        || (!deferred && draws.iter().any(|draw| !draw.is_clear))
+                        || draws_write_pending_compute(&draws, &memory_barrier.gpu_ranges)
+                    {
+                        self.resolve_pending_compute(mappings, mem_write);
+                        memory_barrier.armed.set(false);
+                    } else {
+                        self.invalidate_compute_snapshots(&memory_barrier, mappings);
+                    }
+                }
+                self.ssbo_snapshot_cache
+                    .set_compute_pending_cpu_ranges(memory_barrier.cpu_ranges.clone());
+                let barrier_renderer = self.renderer.clone();
+                let resolve_memory = || {
+                    if let Some(renderer) = &barrier_renderer {
+                        super::engines::maxwell_compute::resolve_pending_writebacks(
+                            renderer, mappings, mem_write,
+                        );
+                    }
                 };
+                let guarded_read = |address, bytes: &mut [u8]| {
+                    memory_barrier.before_access(address, bytes.len(), &resolve_memory);
+                    mem_read(address, bytes)
+                };
+                let guarded_write = |address, bytes: &[u8]| {
+                    memory_barrier.before_access(address, bytes.len(), &resolve_memory);
+                    mem_write(address, bytes)
+                };
+                let mem_read: &dyn Fn(u64, &mut [u8]) -> bool = &guarded_read;
+                let mem_write: &dyn Fn(u64, &[u8]) -> bool = &guarded_write;
                 let mut compute_probe =
                     super::vk_dispatch::ComputeGraphicsProbe::new(&compute_spans);
                 let mut committed_constbuf_writes = 0;
@@ -879,6 +1040,7 @@ impl PrepState {
                     kickprof::add(kickprof::CBUFWB, kp);
                 }
                 replay_constbuf_writes.clear();
+                self.invalidate_resolved_compute_writebacks(mappings);
                 if let Some(probe) = compute_probe {
                     probe.finish();
                 }
@@ -1477,6 +1639,40 @@ impl PrepState {
             }
             return;
         }
+        let memory_barrier = if deferred_compute_draw_resolve_enabled()
+            && crate::render_thread::maybe_render_thread().is_some()
+        {
+            self.compute_barrier_cache.get(
+                super::engines::maxwell_compute::pending_writeback_revision(),
+                &super::engines::maxwell_compute::pending_writeback_spans_snapshot(),
+                mappings,
+            )
+        } else {
+            ComputeMemoryBarrier::default()
+        };
+        if memory_barrier.armed.get() {
+            self.invalidate_compute_snapshots(&memory_barrier, mappings);
+        }
+        self.ssbo_snapshot_cache
+            .set_compute_pending_cpu_ranges(memory_barrier.cpu_ranges.clone());
+        let barrier_renderer = self.renderer.clone();
+        let resolve_memory = || {
+            if let Some(renderer) = &barrier_renderer {
+                super::engines::maxwell_compute::resolve_pending_writebacks(
+                    renderer, mappings, mem_write,
+                );
+            }
+        };
+        let guarded_read = |address, bytes: &mut [u8]| {
+            memory_barrier.before_access(address, bytes.len(), &resolve_memory);
+            mem_read(address, bytes)
+        };
+        let guarded_write = |address, bytes: &[u8]| {
+            memory_barrier.before_access(address, bytes.len(), &resolve_memory);
+            mem_write(address, bytes)
+        };
+        let mem_read: &dyn Fn(u64, &mut [u8]) -> bool = &guarded_read;
+        let mem_write: &dyn Fn(u64, &[u8]) -> bool = &guarded_write;
         let dp = draw_prof_start();
         let batch_len = self.vk_batch.len();
         let kp = super::pusher::kickprof::start();
@@ -1510,6 +1706,7 @@ impl PrepState {
             false
         };
         self.vk_flush_completed &= completed;
+        self.invalidate_resolved_compute_writebacks(mappings);
         super::pusher::kickprof::add(super::pusher::kickprof::FLUSHP, kp);
         draw_prof_record(1, batch_len as u64, dp);
     }
@@ -1732,6 +1929,8 @@ impl PrepState {
             constbuf_invalidation_scratch: Vec::new(),
             constbuf_patched_scratch: Vec::new(),
             constbuf_bytes_scratch: Vec::new(),
+            compute_snapshot_revision: None,
+            compute_barrier_cache: ComputeBarrierCache::default(),
             #[cfg(test)]
             prepared_packet_drain_counts: PreparedPacketDrainCounts::default(),
         }
@@ -2321,6 +2520,86 @@ mod tests {
     };
     use crate::gpu::engines::maxwell3d::DrawCall;
     use crate::gpu::GpuMappings;
+
+    fn compute_span() -> crate::gpu::engines::maxwell_compute::PendingComputeWritebackSpan {
+        crate::gpu::engines::maxwell_compute::PendingComputeWritebackSpan {
+            dispatch_id: 1,
+            binding: 0,
+            raw: true,
+            gpu_va: 0x1000,
+            cpu_addr: 0x8000,
+            len: 0x100,
+        }
+    }
+
+    #[test]
+    fn compute_memory_barrier_resolves_before_overlapping_access_only_once() {
+        let barrier = super::ComputeMemoryBarrier::new(&[compute_span()], &GpuMappings::default());
+        let value = std::cell::Cell::new(0);
+        barrier.before_access(0x8100, 16, || panic!("adjacent range is independent"));
+        barrier.before_access(0x8000, 0, || panic!("empty range is independent"));
+        barrier.before_access(0x7ff0, 16, || panic!("adjacent range is independent"));
+        barrier.before_access(0x7fff, 2, || value.set(42));
+        assert_eq!(value.get(), 42);
+        barrier.before_access(0x8000, 16, || panic!("already resolved"));
+        assert!(!barrier.armed.get());
+    }
+
+    #[test]
+    fn compute_memory_barrier_orders_cpu_overwrites_after_old_results() {
+        let barrier = super::ComputeMemoryBarrier::new(&[compute_span()], &GpuMappings::default());
+        let memory = std::cell::Cell::new(0);
+        barrier.before_access(0x8000, 4, || memory.set(10));
+        memory.set(20);
+        barrier.before_access(0x8000, 4, || memory.set(10));
+        assert_eq!(memory.get(), 20);
+        assert!(super::ranges_overlap(u64::MAX - 8, 32, u64::MAX - 4, 4));
+    }
+
+    #[test]
+    fn compute_draw_dependency_covers_aliases_and_ordinary_render_targets() {
+        let mut mappings = GpuMappings::default();
+        mappings.add(0x1000, 0x1000, 0x8000, 1);
+        mappings.add(0x4000, 0x1000, 0x8000, 1);
+        let barrier = super::ComputeMemoryBarrier::new(&[compute_span()], &mappings);
+        assert!(barrier.gpu_ranges.contains(&(0x4000, 0x100)));
+        let mut draw = DrawCall::default();
+        draw.rt[0].address_lo = 0x4000;
+        draw.rt[0].width = 4;
+        draw.rt[0].height = 4;
+        draw.rt[0].depth = 1;
+        assert!(super::draws_write_pending_compute(&[draw.clone()], &barrier.gpu_ranges));
+        draw.is_clear = true;
+        assert!(super::draws_write_pending_compute(&[draw.clone()], &barrier.gpu_ranges));
+        draw.rt[0].address_lo = 0x9000;
+        assert!(!super::draws_write_pending_compute(&[draw], &barrier.gpu_ranges));
+    }
+
+    #[test]
+    fn compute_barrier_cache_rearms_and_tracks_dispatches_and_remappings() {
+        let mut cache = super::ComputeBarrierCache::default();
+        let mut mappings = GpuMappings::default();
+        mappings.add(0x1000, 0x1000, 0x8000, 1);
+        let first = cache.get(1, &[compute_span()], &mappings);
+        first.before_access(0x8000, 4, || {});
+        let second = cache.get(1, &[compute_span()], &mappings);
+        assert!(!first.armed.get());
+        assert!(second.armed.get());
+        assert!(std::sync::Arc::ptr_eq(&first.gpu_ranges, &second.gpu_ranges));
+        mappings.add(0x4000, 0x1000, 0x8000, 1);
+        let remapped = cache.get(1, &[compute_span()], &mappings);
+        assert!(remapped.gpu_ranges.contains(&(0x4000, 0x100)));
+        let mut next_span = compute_span();
+        next_span.cpu_addr = 0xa000;
+        let next = cache.get(2, &[next_span], &mappings);
+        next.before_access(0x8000, 4, || panic!("old dispatch no longer pending"));
+        let resolved = std::cell::Cell::new(false);
+        next.before_access(0xa000, 4, || resolved.set(true));
+        assert!(resolved.get());
+        let drained = cache.get(3, &[], &mappings);
+        assert!(!drained.armed.get());
+        assert!(drained.gpu_ranges.is_empty());
+    }
 
     fn test_prep_handle(
         tx: crossbeam::channel::Sender<PrepEvent>,
