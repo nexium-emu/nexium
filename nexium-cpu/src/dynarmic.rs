@@ -465,7 +465,7 @@ impl DynarmicCpu {
                 let x21 = self.get_register(21);
                 let x22 = self.get_register(22);
                 log::warn!(
-                    "[pc-until] hit={} label={} pc={:#x} lr={:#x} sp={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x}",
+                    target: "pc_until", "[pc-until] hit={} label={} pc={:#x} lr={:#x} sp={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x}",
                     hit,
                     label,
                     after,
@@ -481,6 +481,8 @@ impl DynarmicCpu {
                     x22
                 );
                 pc_until_video_probe(&self.emu.emu, &label, x0);
+                let regs: [u64; 31] = std::array::from_fn(|i| self.get_register(i as u32));
+                pc_until_mem_probe(&self.emu.emu, hit, &label, &regs);
                 if pc_until_strings_enabled() {
                     let ptrs = pc_until_string_probe(
                         &self.emu.emu,
@@ -496,11 +498,11 @@ impl DynarmicCpu {
                         ],
                     );
                     if !ptrs.is_empty() {
-                        log::warn!("[pc-until-str] hit={} {}", hit, ptrs.join(" "));
+                        log::warn!(target: "pc_until", "[pc-until-str] hit={} {}", hit, ptrs.join(" "));
                     }
                 }
                 if hit + 1 == pc_until_max_hits() {
-                    log::warn!("[pc-until] cap reached; disabling until-probe");
+                    log::warn!(target: "pc_until", "[pc-until] cap reached; disabling until-probe");
                 }
             }
         }
@@ -651,7 +653,7 @@ fn pc_until_video_probe(emu: &dynarmic_sys::Dynarmic<'static, ()>, label: &str, 
     let mut bytes = [0u8; 0x40];
     if emu.mem_read(sink.saturating_add(0x40), &mut bytes).is_err() {
         log::warn!(
-            "[pc-until-video] hit={} label={} sink={:#x} bytes40_80=<unreadable>",
+            target: "pc_until", "[pc-until-video] hit={} label={} sink={:#x} bytes40_80=<unreadable>",
             hit,
             label,
             sink
@@ -667,7 +669,7 @@ fn pc_until_video_probe(emu: &dynarmic_sys::Dynarmic<'static, ()>, label: &str, 
         ])
     };
     log::warn!(
-        "[pc-until-video] hit={} label={} sink={:#x} output_format={} field54={} decoder_mode={} width={} height={} native={} bytes40_80={:02x?}",
+        target: "pc_until", "[pc-until-video] hit={} label={} sink={:#x} output_format={} field54={} decoder_mode={} width={} height={} native={} bytes40_80={:02x?}",
         hit,
         label,
         sink,
@@ -728,11 +730,92 @@ fn pc_until_log_config(target: u64, label: &str) {
         return;
     }
     log::warn!(
-        "[pc-until] configured label={} target={:#x} max_hits={}",
+        target: "pc_until", "[pc-until] configured label={} target={:#x} max_hits={}",
         label,
         target,
         pc_until_max_hits()
     );
+}
+
+fn pc_until_mem_specs() -> &'static [(u32, u64, Vec<u64>, usize)] {
+    static SPECS: std::sync::OnceLock<Vec<(u32, u64, Vec<u64>, usize)>> =
+        std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        std::env::var("NEXIUM_PC_UNTIL_MEM")
+            .ok()
+            .map(|spec| spec.split(',').filter_map(parse_pc_until_mem_spec).collect())
+            .unwrap_or_default()
+    })
+}
+
+fn parse_pc_until_mem_spec(item: &str) -> Option<(u32, u64, Vec<u64>, usize)> {
+    let (path, len) = item.trim().rsplit_once(':')?;
+    let len = parse_pc_until_u64(len)? as usize;
+    let mut steps = path.split('>');
+    let first = steps.next()?.trim();
+    let (reg, off) = match first.split_once('+') {
+        Some((reg, off)) => (reg.trim(), parse_pc_until_u64(off)?),
+        None => (first, 0),
+    };
+    let reg = reg.trim_start_matches(['x', 'X']).parse::<u32>().ok()?;
+    if reg > 30 {
+        return None;
+    }
+    let derefs = steps
+        .map(|s| parse_pc_until_u64(s.trim()))
+        .collect::<Option<Vec<u64>>>()?;
+    Some((reg, off, derefs, len.min(256)))
+}
+
+fn pc_until_mem_probe(
+    emu: &dynarmic_sys::Dynarmic<'static, ()>,
+    hit: u64,
+    label: &str,
+    regs: &[u64; 31],
+) {
+    for (reg, off, derefs, len) in pc_until_mem_specs() {
+        let mut addr = regs[*reg as usize].wrapping_add(*off);
+        let mut readable = true;
+        for step in derefs {
+            let mut bytes = [0u8; 8];
+            if emu.mem_read(addr, &mut bytes).is_err() {
+                readable = false;
+                break;
+            }
+            addr = u64::from_le_bytes(bytes).wrapping_add(*step);
+        }
+        let mut buf = vec![0u8; *len];
+        if !readable || emu.mem_read(addr, &mut buf).is_err() {
+            log::warn!(
+                target: "pc_until", "[pc-until-mem] hit={} label={} x{}+{:#x} -> {:#x} unreadable",
+                hit,
+                label,
+                reg,
+                off,
+                addr
+            );
+            continue;
+        }
+        let hex = buf
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text: String = buf
+            .iter()
+            .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '.' })
+            .collect();
+        log::warn!(
+            target: "pc_until", "[pc-until-mem] hit={} label={} x{}+{:#x} -> {:#x} {} |{}|",
+            hit,
+            label,
+            reg,
+            off,
+            addr,
+            hex,
+            text
+        );
+    }
 }
 
 fn perm_to_dyn(p: Perm) -> u32 {
