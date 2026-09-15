@@ -530,6 +530,7 @@ pub struct RtCache {
     depth_guest_ranges: Vec<GuestRangeEntry>,
     depth_guest_range_index: HashMap<RtKey, usize>,
     guest_range_epoch: u64,
+    guest_range_lookup: GuestRangeLookup,
     guest_hit_memo: Vec<GuestHitMemoEntry>,
 }
 
@@ -551,6 +552,88 @@ struct GuestRangeEntry {
     cpu_hi: u64,
     gpu_lo: u64,
     gpu_hi: u64,
+}
+
+#[derive(Default)]
+struct GuestRangeLookup {
+    epoch: Option<u64>,
+    cpu: Vec<GuestRangeLookupEntry>,
+    gpu: Vec<GuestRangeLookupEntry>,
+}
+
+struct GuestRangeLookupEntry {
+    key: RtKey,
+    depth: bool,
+    lo: u64,
+    hi: u64,
+    prefix_hi: u64,
+}
+
+impl GuestRangeLookup {
+    fn rebuild(&mut self, epoch: u64, color: &[GuestRangeEntry], depth: &[GuestRangeEntry]) {
+        self.cpu.clear();
+        self.gpu.clear();
+        for (entry, depth) in color
+            .iter()
+            .map(|e| (e, false))
+            .chain(depth.iter().map(|e| (e, true)))
+        {
+            for (index, lo, hi) in [
+                (&mut self.cpu, entry.cpu_lo, entry.cpu_hi),
+                (&mut self.gpu, entry.gpu_lo, entry.gpu_hi),
+            ] {
+                if lo < hi {
+                    index.push(GuestRangeLookupEntry {
+                        key: entry.key,
+                        depth,
+                        lo,
+                        hi,
+                        prefix_hi: 0,
+                    });
+                }
+            }
+        }
+        for index in [&mut self.cpu, &mut self.gpu] {
+            index.sort_unstable_by_key(|entry| entry.lo);
+            let mut prefix_hi = 0;
+            for entry in index {
+                prefix_hi = prefix_hi.max(entry.hi);
+                entry.prefix_hi = prefix_hi;
+            }
+        }
+        self.epoch = Some(epoch);
+    }
+
+    fn hits(
+        &self,
+        cpu_addr: u64,
+        cpu_end: u64,
+        gpu_ranges: &[(u64, u64)],
+    ) -> (Vec<RtKey>, Vec<RtKey>) {
+        let mut color = Vec::new();
+        let mut depth = Vec::new();
+        let mut collect = |index: &[GuestRangeLookupEntry], lo: u64, hi: u64| {
+            if lo >= hi {
+                return;
+            }
+            let mut end = index.partition_point(|entry| entry.lo < hi);
+            while end > 0 && index[end - 1].prefix_hi > lo {
+                end -= 1;
+                let entry = &index[end];
+                if entry.hi > lo {
+                    let hits = if entry.depth { &mut depth } else { &mut color };
+                    if !hits.contains(&entry.key) {
+                        hits.push(entry.key);
+                    }
+                }
+            }
+        };
+        collect(&self.cpu, cpu_addr, cpu_end);
+        for &(gpu_va, size) in gpu_ranges {
+            collect(&self.gpu, gpu_va, gpu_va.saturating_add(size));
+        }
+        (color, depth)
+    }
 }
 
 fn rt_guest_size_bytes(key: RtKey, format: vk::Format) -> Option<u64> {
@@ -630,6 +713,7 @@ fn remove_guest_range(
     true
 }
 
+#[cfg(test)]
 fn guest_range_hits(
     ranges: &[GuestRangeEntry],
     cpu_addr: u64,
@@ -733,6 +817,7 @@ impl RtCache {
             depth_guest_ranges: Vec::new(),
             depth_guest_range_index: HashMap::default(),
             guest_range_epoch: 0,
+            guest_range_lookup: GuestRangeLookup::default(),
             guest_hit_memo: Vec::new(),
         }
     }
@@ -756,8 +841,14 @@ impl RtCache {
         }) {
             return (memo.color.clone(), memo.depth.clone());
         }
-        let color = guest_range_hits(&self.color_guest_ranges, cpu_addr, cpu_end, gpu_ranges);
-        let depth = guest_range_hits(&self.depth_guest_ranges, cpu_addr, cpu_end, gpu_ranges);
+        if self.guest_range_lookup.epoch != Some(epoch) {
+            self.guest_range_lookup.rebuild(
+                epoch,
+                &self.color_guest_ranges,
+                &self.depth_guest_ranges,
+            );
+        }
+        let (color, depth) = self.guest_range_lookup.hits(cpu_addr, cpu_end, gpu_ranges);
         if self.guest_hit_memo.len() >= GUEST_HIT_MEMO_SIZE {
             self.guest_hit_memo.remove(0);
         }
@@ -5172,6 +5263,44 @@ mod tests {
         cache.cache.clear();
         cache.clear_color_lookup_index();
         cache.depth_cache.clear();
+    }
+
+    #[test]
+    fn indexed_guest_writes_match_exhaustive_alias_overlap() {
+        let make_ranges = |count, base| {
+            (0..count).map(|i| {
+                let lo = base + (i * 7919) % 65536;
+                let size = if i % 13 == 0 { 65536 } else { 1 + (i * 101) % 4096 };
+                super::GuestRangeEntry {
+                    key: RtKey::with_cpu(i as u32, 1, 1, lo, lo + 0x100000),
+                    cpu_lo: lo + 0x100000,
+                    cpu_hi: lo + 0x100000 + size,
+                    gpu_lo: lo,
+                    gpu_hi: lo + size,
+                }
+            }).collect::<Vec<_>>()
+        };
+        let color = make_ranges(257, 0x200000);
+        let depth = make_ranges(125, 0x201000);
+        let mut lookup = super::GuestRangeLookup::default();
+        lookup.rebuild(1, &color, &depth);
+        for i in 0..2048u64 {
+            let lo = 0x1ff000 + (i * 127) % 0x24000;
+            let size = i % 1024;
+            let cpu_lo = if i % 3 == 0 { lo + 0x100000 } else { 0 };
+            let cpu_hi = if cpu_lo == 0 { 0 } else { cpu_lo + size };
+            let gpu = [(lo, size), (lo + 7, size / 2), (lo, size)];
+            let (got_color, got_depth) = lookup.hits(cpu_lo, cpu_hi, &gpu);
+            for (ranges, got) in [(&color, got_color), (&depth, got_depth)] {
+                let expected: std::collections::HashSet<_> =
+                    super::guest_range_hits(ranges, cpu_lo, cpu_hi, &gpu).into_iter().collect();
+                let unique: std::collections::HashSet<_> = got.iter().copied().collect();
+                assert_eq!(got.len(), unique.len(), "duplicate aliases");
+                assert_eq!(unique, expected, "write={lo:#x}+{size:#x}");
+            }
+        }
+        lookup.rebuild(2, &[], &[]);
+        assert_eq!(lookup.hits(1, u64::MAX, &[(1, u64::MAX)]), (vec![], vec![]));
     }
 
     #[test]
