@@ -123,6 +123,7 @@ impl DynarmicCpu {
         let fault_for_unmapped = last_fault.clone();
         let continue_flag = continue_on_null.clone();
         let skip_counter = null_skip_count.clone();
+        let watch_write_callbacks = env_flag("NEXIUM_WATCH_PAGE_PROTECT");
         emu.set_unmapped_mem_callback(move |dyn_, addr, size, value| {
             if let Some((lo, hi)) = nexium_memory::fastmem::watch_range() {
                 if addr >= lo && addr < hi {
@@ -178,6 +179,15 @@ impl DynarmicCpu {
                     if nexium_memory::fastmem::watch_write_through(addr, size as usize, value) {
                         return true;
                     }
+                }
+            }
+            if watch_write_callbacks {
+                let mut mapped = [0u8; 8];
+                if size > 0
+                    && size <= mapped.len()
+                    && dyn_.mem_read(addr, &mut mapped[..size]).is_ok()
+                {
+                    return false;
                 }
             }
             let pc = dyn_.reg_read_pc().unwrap_or(0);
