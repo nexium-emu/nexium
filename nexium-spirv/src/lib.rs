@@ -1690,6 +1690,7 @@ impl Emitter {
             Decoration::BuiltIn,
             [Operand::BuiltIn(BuiltIn::Position)],
         );
+        self.b.decorate(v, Decoration::Invariant, []);
         self.interface.push(v);
         self.pos_var = Some(v);
         v
@@ -4436,8 +4437,10 @@ impl Emitter {
                         .composite_extract(self.f32_t, None, cur, [3])
                         .unwrap();
                     let sum = self.b.f_add(self.f32_t, None, cur_z, cur_w).unwrap();
+                    self.decorate_guest_fp_result(sum);
                     let half = self.const_f32(0.5f32.to_bits());
                     let new_z = self.b.f_mul(self.f32_t, None, sum, half).unwrap();
+                    self.decorate_guest_fp_result(new_z);
                     new_pos = self
                         .b
                         .composite_insert(self.vec4_t, None, new_z, cur, [2])
@@ -4459,6 +4462,9 @@ impl Emitter {
                     let sz = self.b.f_mul(self.f32_t, None, scale, cur_z).unwrap();
                     let tw = self.b.f_mul(self.f32_t, None, trans, cur_w).unwrap();
                     let remapped_z = self.b.f_add(self.f32_t, None, sz, tw).unwrap();
+                    self.decorate_guest_fp_result(sz);
+                    self.decorate_guest_fp_result(tw);
+                    self.decorate_guest_fp_result(remapped_z);
                     new_pos = self
                         .b
                         .composite_insert(self.vec4_t, None, remapped_z, new_pos, [2])
@@ -13041,6 +13047,30 @@ mod tests {
             instruction.class.opcode,
             rspirv::spirv::Op::UMulExtended | rspirv::spirv::Op::SMulExtended
         )));
+    }
+
+    #[test]
+    fn vertex_depth_conversion_keeps_separate_rounding() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit_void(IrOp::StoreAttr { slot: 0x78, src: IrValue::ImmF32(0.25) });
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, _, _) = emit_vertex_with_bindings_opts(&cfg, &[], VertexOptions {
+            apply_z_remap: true, vptx_scale_z: 0.75, vptx_translate_z: 0.1,
+            ..Default::default()
+        });
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).unwrap();
+        assert!(module.annotations.iter().any(|inst| inst.operands.get(1)
+            == Some(&Operand::Decoration(Decoration::Invariant))));
+        for inst in module.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i.class.opcode, rspirv::spirv::Op::FAdd | rspirv::spirv::Op::FMul)) {
+            assert!(module.annotations.iter().any(|a| a.operands.as_slice() ==
+                [Operand::IdRef(inst.result_id.unwrap()), Operand::Decoration(Decoration::NoContraction)]));
+        }
     }
 
     #[test]

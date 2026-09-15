@@ -63,7 +63,7 @@ impl CurrentPipeline {
     }
 }
 
-const SPEC_VERSION: u32 = 53;
+const SPEC_VERSION: u32 = 55;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
     &[(0x59b9_0e74_4b2a_7537, 0xe505_d075_601e_e633)];
