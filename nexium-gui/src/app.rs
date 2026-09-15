@@ -1168,13 +1168,14 @@ impl HorizonApp {
     }
 
     fn poll_frames(&mut self, ctx: &egui::Context) {
-        self.performance.tick();
+        let mut observed_native_frame = false;
         if let Some(window) = &mut self.native_game {
             let new_frames = window.poll();
             if new_frames != 0 {
                 self.game_depth = None;
                 gui_rate_stats(1, new_frames);
                 self.performance.record_frames(new_frames);
+                observed_native_frame = true;
                 self.last_frame_res = (window.dimensions[0], window.dimensions[1]);
                 self.carousel.boot_stage = crate::carousel::BootStage::None;
                 if self.game_texture.is_none() {
@@ -1193,6 +1194,9 @@ impl HorizonApp {
             }
         }
         let Some(handle) = &self.emulation_handle else {
+            if !observed_native_frame {
+                self.performance.tick();
+            }
             return;
         };
         let tex_opts = match self.app_settings.filter {
@@ -1226,6 +1230,8 @@ impl HorizonApp {
                     self.carousel.boot_stage = crate::carousel::BootStage::None;
                 }
             }
+        } else if !observed_native_frame {
+            self.performance.tick();
         }
     }
 
