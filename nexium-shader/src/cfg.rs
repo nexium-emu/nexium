@@ -173,6 +173,15 @@ fn constant_offset(v: Value, defs: &HashMap<u32, Op>, depth: u32) -> Option<i64>
         Value::GprIn(_) => None,
         Value::Inst(id) => match defs.get(&id.0)? {
             Op::Mov(source) => constant_offset(*source, defs, depth + 1),
+            Op::Bfe { a, b, signed: false } => {
+                let value = constant_offset(*a, defs, depth + 1)? as u32;
+                let control = constant_offset(*b, defs, depth + 1)? as u32;
+                let shift = control & 0xff;
+                let width = (control >> 8) & 0xff;
+                if shift >= 32 || width == 0 { return Some(0); }
+                let mask = u32::MAX.checked_shr(32u32.saturating_sub(width)).unwrap_or(0);
+                Some(((value >> shift) & mask) as i64)
+            },
             Op::IAdd { a, b, neg_a, neg_b } => {
                 let a = constant_offset(*a, defs, depth + 1)?;
                 let b = constant_offset(*b, defs, depth + 1)?;
@@ -537,7 +546,123 @@ fn intern_storage_buffer(
     index
 }
 
+fn fold_stable_predicate_choices(cfg: &mut Cfg) {
+    for block in &mut cfg.blocks {
+        let mut versions = [0u64; 8];
+        let mut choices: HashMap<u32, (Predicate, u64, Value, Value)> = HashMap::new();
+        for inst in &mut block.program.instructions {
+            if let Op::SelectPred { pred, if_true, if_false } = &mut inst.op {
+                let version = versions[pred.idx as usize];
+                for (value, active) in [(if_true, true), (if_false, false)] {
+                    for _ in 0..24 {
+                        let Value::Inst(id) = *value else { break };
+                        let Some(&(inner, inner_version, yes, no)) = choices.get(&id.0) else { break };
+                        if inner.idx != pred.idx || inner_version != version { break; }
+                        *value = if active == (inner.negate == pred.negate) { yes } else { no };
+                    }
+                }
+            }
+            if let (Some(id), Op::SelectPred { pred, if_true, if_false }) = (inst.result, &inst.op) {
+                choices.insert(id.0, (*pred, versions[pred.idx as usize], *if_true, *if_false));
+            }
+            for pred in 0..8 {
+                if writes_predicate(&inst.op, pred) { versions[pred as usize] += 1; }
+            }
+        }
+    }
+}
+
+fn shared_slot(v: Value, defs: &HashMap<u32, Op>, depth: u32) -> Option<(Value, u64, u64, u64)> {
+    if depth > 24 { return None; }
+    let Value::Inst(id) = v else { return None };
+    let result = match defs.get(&id.0)? {
+        Op::Mov(source) => return shared_slot(*source, defs, depth + 1),
+        Op::Bfe { b, signed: false, .. } => {
+            let control = constant_offset(*b, defs, 0)? as u32;
+            let width = (control >> 8) & 0xff;
+            if width == 0 || width > 16 || control & 0xff >= 32 { return None; }
+            (v, 1, 0, (1u64 << width) - 1)
+        }
+        Op::LocalInvocationId { .. } => (v, 1, 0, 1023),
+        Op::IAdd { a, b, neg_a: false, neg_b: false } => {
+            let (source, offset) = if let Some(offset) = constant_offset(*b, defs, 0) {
+                (*a, u64::try_from(offset).ok()?)
+            } else { (*b, u64::try_from(constant_offset(*a, defs, 0)?).ok()?) };
+            let (root, stride, base, bound) = shared_slot(source, defs, depth + 1)?;
+            (root, stride, base.checked_add(offset)?, bound)
+        }
+        Op::IMul { a, b } => {
+            let (source, scale) = if let Some(scale) = constant_offset(*b, defs, 0) {
+                (*a, u64::try_from(scale).ok()?)
+            } else { (*b, u64::try_from(constant_offset(*a, defs, 0)?).ok()?) };
+            let (root, stride, base, bound) = shared_slot(source, defs, depth + 1)?;
+            (root, stride.checked_mul(scale)?, base.checked_mul(scale)?, bound)
+        }
+        _ => return None,
+    };
+    (result.1.checked_mul(result.3)?.checked_add(result.2)? <= u32::MAX as u64).then_some(result)
+}
+
+fn track_shared_pointer_spills(cfg: &Cfg, defs: &mut HashMap<u32, Op>) {
+    let mut stores = Vec::new();
+    for (bi, block) in cfg.blocks.iter().enumerate() {
+        for (ii, inst) in block.program.instructions.iter().enumerate() {
+            match inst.op {
+                Op::SharedAtomic { .. } => return,
+                Op::StoreShared { addr, value } => {
+                    let Some(slot) = shared_slot(addr, defs, 0) else { return };
+                    stores.push((bi, ii, inst.pred, slot, value));
+                }
+                _ => {}
+            }
+        }
+    }
+    if stores.is_empty() { return; }
+    let predecessors = cfg.predecessors();
+    let all: HashSet<usize> = (0..cfg.blocks.len()).collect();
+    let mut dominators = vec![all; cfg.blocks.len()];
+    dominators[0] = HashSet::from([0]);
+    loop {
+        let mut changed = false;
+        for bi in 1..cfg.blocks.len() {
+            let mut next = if let Some(&first) = predecessors[bi].first() {
+                dominators[first as usize].clone()
+            } else { HashSet::new() };
+            for &pred in predecessors[bi].iter().skip(1) {
+                next.retain(|entry| dominators[pred as usize].contains(entry));
+            }
+            next.insert(bi);
+            if next != dominators[bi] { dominators[bi] = next; changed = true; }
+        }
+        if !changed { break; }
+    }
+    let mut origins = Vec::new();
+    for (bi, block) in cfg.blocks.iter().enumerate() {
+        for (ii, inst) in block.program.instructions.iter().enumerate() {
+            let (Some(id), Op::LoadShared { addr }) = (inst.result, &inst.op) else { continue };
+            let Some(slot) = shared_slot(*addr, defs, 0) else { continue };
+            if slot.1 < 4 { continue; }
+            let mut source = None;
+            let mut safe = true;
+            for &(sbi, sii, pred, other, value) in &stores {
+                if slot.0 != other.0 || slot.1 != other.1 { safe = false; break; }
+                let residue = slot.2.abs_diff(other.2) % slot.1;
+                if slot.2 == other.2 {
+                    if source.is_some() || pred.is_some() || !dominators[bi].contains(&sbi)
+                        || (bi == sbi && sii >= ii) { safe = false; break; }
+                    source = Some(value);
+                } else if residue < 4 || slot.1 - residue < 4 { safe = false; break; }
+            }
+            if safe {
+                if let Some(value) = source { origins.push((id.0, Op::Mov(value))); }
+            }
+        }
+    }
+    defs.extend(origins);
+}
+
 pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
+    fold_stable_predicate_choices(cfg);
     let mut defs: HashMap<u32, Op> = HashMap::new();
     let mut def_locations: HashMap<u32, (usize, usize)> = HashMap::new();
     for (block_index, block) in cfg.blocks.iter().enumerate() {
@@ -549,6 +674,7 @@ pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
         }
     }
 
+    track_shared_pointer_spills(cfg, &mut defs);
     let mut buffers: Vec<StorageBufferAddr> = Vec::new();
     loop {
         let mut rewrites: Vec<(usize, usize, Op, Option<ValueId>)> = Vec::new();
@@ -1849,6 +1975,61 @@ mod tests {
 
     fn write_word(bytes: &mut [u8], offset: usize, word: u64) {
         bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
+    #[test]
+    fn complementary_address_writes_respect_predicate_versions() {
+        for changed in [false, true] {
+            let mut p = Program::new();
+            let base = p.emit(Op::LoadCbuf { binding: 0, byte_offset: 0x2d0 }, None);
+            let first = p.emit(Op::SelectPred { pred: Predicate { idx: 0, negate: false },
+                if_true: Value::Inst(base), if_false: Value::GprIn(8) }, None);
+            if changed {
+                p.emit_void(Op::PSetPred { dest_p: 0, dest_np: 7,
+                    pred_a: 7, neg_pred_a: false, pred_b: 7, neg_pred_b: false,
+                    pred_c: 7, neg_pred_c: false, bop_1: super::super::ir::BoolOp::And,
+                    bop_2: super::super::ir::BoolOp::And });
+            }
+            let second = p.emit(Op::SelectPred { pred: Predicate { idx: 0, negate: true },
+                if_true: Value::Inst(base), if_false: Value::Inst(first) }, None);
+            p.emit(Op::LoadGlobal { addr_lo: Value::Inst(second), offset: 32 }, Some(0));
+            let mut cfg = cfg_with_program(p);
+            let buffers = collect_storage_buffers(&mut cfg);
+            assert_eq!(buffers.len(), usize::from(!changed));
+            assert_eq!(cfg.blocks[0].program.instructions.iter().any(|i|
+                matches!(i.op, Op::LoadGlobal { .. })), changed);
+        }
+    }
+
+    #[test]
+    fn shared_pointer_origin_requires_dominating_disjoint_writes() {
+        for case in 0..5 {
+            let mut p = Program::new();
+            let lane = p.emit(Op::LocalInvocationId { component: 0 }, None);
+            let slot = p.emit(Op::IMul { a: Value::Inst(lane), b: Value::ImmU32(12) }, None);
+            let pointer = p.emit(Op::LoadCbuf { binding: 0, byte_offset: 0x310 }, None);
+            let store = Op::StoreShared { addr: Value::Inst(slot), value: Value::Inst(pointer) };
+            if case != 4 {
+                p.emit_pred(store.clone(), None,
+                    (case == 3).then_some(Predicate { idx: 0, negate: false }));
+            }
+            let other = p.emit(Op::IAdd { a: Value::Inst(slot),
+                b: Value::ImmU32(if case == 1 { 1 } else { 8 }), neg_a: false, neg_b: false }, None);
+            p.emit_void(Op::StoreShared { addr: Value::Inst(other), value: Value::Zero });
+            if case == 2 {
+                p.emit_void(Op::StoreShared { addr: Value::GprIn(4), value: Value::Zero });
+            }
+            let read = p.emit(Op::LoadShared { addr: Value::Inst(slot) }, None);
+            if case == 4 { p.emit_void(store); }
+            p.emit_void(Op::StoreGlobal { addr_lo: Value::Inst(read), offset: 0, value: Value::Zero });
+            let mut cfg = cfg_with_program(p);
+            let buffers = collect_storage_buffers(&mut cfg);
+            assert_eq!(buffers.len(), usize::from(case == 0), "case {case}");
+            assert_eq!(cfg.blocks[0].program.instructions.iter().any(|i|
+                matches!(i.op, Op::StoreGlobal { .. })), case != 0, "case {case}");
+            assert!(cfg.blocks[0].program.instructions.iter().any(|i|
+                matches!(i.op, Op::LoadShared { .. })));
+        }
     }
 
     fn cfg_with_program(program: Program) -> Cfg {
