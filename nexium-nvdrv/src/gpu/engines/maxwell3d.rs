@@ -1034,10 +1034,26 @@ fn wf_state_log() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_WATER_FORENSICS").is_some())
 }
 
+fn synthetic_counter_step() -> u32 {
+    static STEP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("NEXIUM_SYNTHETIC_COUNTER_STEP")
+            .ok()
+            .and_then(|value| {
+                let value = value.trim();
+                match value.strip_prefix("0x") {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => value.parse().ok(),
+                }
+            })
+            .unwrap_or(0x1000)
+    })
+}
+
 fn synthetic_counter_value() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static C: AtomicU32 = AtomicU32::new(0x1000);
-    C.fetch_add(0x1000, Ordering::Relaxed)
+    C.fetch_add(synthetic_counter_step(), Ordering::Relaxed)
 }
 
 fn is_short_payload_fence(query: u32) -> bool {

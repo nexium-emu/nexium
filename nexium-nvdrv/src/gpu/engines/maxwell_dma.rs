@@ -21,6 +21,15 @@ fn dma_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DMA_TRACE").is_some())
 }
 
+fn dma_trace_cpu_address() -> Option<u64> {
+    static ADDRESS: OnceLock<Option<u64>> = OnceLock::new();
+    *ADDRESS.get_or_init(|| {
+        std::env::var("NEXIUM_DMA_TRACE_CPU")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok())
+    })
+}
+
 fn dma_semaphore_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DMA_SEMAPHORE_TRACE").is_some())
@@ -1047,6 +1056,33 @@ impl MaxwellDma {
             return;
         };
         let dst_limit = dst_limit as usize;
+        if let Some(watch) = dma_trace_cpu_address() {
+            let covers = |base: u64, limit: usize| watch >= base && watch < base.wrapping_add(limit as u64);
+            if covers(src_cpu, src_limit) || covers(dst_cpu, dst_limit) {
+                log::warn!(
+                    "[dma-trace-cpu] #{} src_gpu={:#x} cpu={:#x} limit={:#x} dst_gpu={:#x} cpu={:#x} limit={:#x} flags={:#x} units={} lines={} pitch={}->{} size={}x{}->{}x{} block={:#x}->{:#x} rt_source={}",
+                    self.blit_count,
+                    src_gpu,
+                    src_cpu,
+                    src_limit,
+                    dst_gpu,
+                    dst_cpu,
+                    dst_limit,
+                    flags,
+                    self.line_length_in,
+                    self.line_count,
+                    self.pitch_in,
+                    self.pitch_out,
+                    self.src_width,
+                    self.src_height,
+                    self.dst_width,
+                    self.dst_height,
+                    self.src_block_size,
+                    self.dst_block_size,
+                    pending_rt_source.is_some()
+                );
+            }
+        }
         crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::DMA_MAP, map_started);
 
         let line_length_units = self.line_length_in as usize;

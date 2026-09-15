@@ -5453,7 +5453,9 @@ impl Renderer {
         let Some(presenter) = &self.presenter else { return Ok(false); };
         let Some(mut slot) = presenter.reserve() else { return Ok(false); };
         let mut inner = self.inner.lock();
-        let RendererInner { device, rt_cache, mem_props, queue, submit_state, submit_timeline, .. } = &mut *inner;
+        let RendererInner { device, rt_cache, mem_props, queue, cmd_pool, submit_state, submit_timeline, .. } = &mut *inner;
+        trace_rt_stats(submit_state, *submit_timeline, device, *cmd_pool, *queue,
+            rt_cache, mem_props, key, key);
         let Some((_, source, _, layout, source_format, current_stamp)) = rt_cache.color_exact_with_format(key) else {
             static MISSING: std::sync::Once = std::sync::Once::new();
             MISSING.call_once(|| log::warn!("[vulkan-present] source cache miss: {} stamp={stamp}", key.label()));

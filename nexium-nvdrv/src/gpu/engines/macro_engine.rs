@@ -39,6 +39,13 @@ fn mme_fast_lle_enabled() -> bool {
     })
 }
 
+fn mme_hle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        enabled_by_default(std::env::var("NEXIUM_MME_HLE").ok().as_deref())
+    })
+}
+
 fn mme_lle_profile_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -612,7 +619,11 @@ impl CompiledMacro {
         Self {
             code,
             hash,
-            hle: hle_macro_kind(hash),
+            hle: if mme_hle_enabled() {
+                hle_macro_kind(hash)
+            } else {
+                None
+            },
             decoded,
         }
     }
