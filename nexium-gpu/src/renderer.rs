@@ -5526,6 +5526,7 @@ impl Renderer {
             shader_compiler,
             pipeline_cache,
             vertex_attribute_divisor_supported,
+            depth_clip_control_enabled,
             ..
         } = &mut *inner;
         let mut queued = 0usize;
@@ -5534,7 +5535,9 @@ impl Renderer {
         let mut build_failures = 0usize;
         let mut not_queued = 0usize;
         for spec in &specs {
-            if pipeline_cache.get(&spec.key).is_some() {
+            if spec.depth_clip_control_enabled != *depth_clip_control_enabled
+                || pipeline_cache.get(&spec.key).is_some()
+            {
                 not_queued += 1;
                 continue;
             }
