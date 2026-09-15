@@ -1433,7 +1433,8 @@ fn prepare_and_execute(
             if raw_storage_key.is_some_and(|key| renderer.compute_raw_storage_is_resident(key)) {
                 Vec::new()
             } else {
-                read_gpu_vec(mappings, mem_read, aligned, byte_len, "raw storage buffer")?
+                read_gpu_vec(mappings, mem_read, aligned, byte_len, "raw storage buffer")
+                    .map_err(|reason| format!("{reason}; binding {index} {:?}", frontend.storage_buffers[index]))?
             };
         let resource_index = texel_buffers.len();
         let writable = frontend.writable_storage_buffers[index];
@@ -4206,16 +4207,19 @@ fn read_gpu_vec(
     if len == 0 || len > MAX_RESOURCE_BYTES {
         return Err(format!("invalid {label} snapshot size {len:#x}"));
     }
-    let (cpu_addr, available) = mapped_range(mappings, gpu_va)
-        .ok_or_else(|| format!("{label} at {gpu_va:#x} is unmapped"))?;
-    if len as u64 > available {
-        return Err(format!(
-            "{label} mapping at {gpu_va:#x} is short ({available:#x} < {len:#x})"
-        ));
-    }
     let mut bytes = vec![0u8; len];
-    if !mem_read(cpu_addr, &mut bytes) {
-        return Err(format!("could not snapshot {label} at {gpu_va:#x}"));
+    let mut offset = 0usize;
+    while offset < len {
+        let address = gpu_va.checked_add(offset as u64)
+            .ok_or_else(|| format!("{label} address overflow"))?;
+        let (cpu_addr, available) = mapped_range(mappings, address)
+            .filter(|(_, available)| *available != 0)
+            .ok_or_else(|| format!("{label} at {address:#x} is unmapped (start={gpu_va:#x}, size={len:#x})"))?;
+        let count = (len - offset).min(usize::try_from(available).unwrap_or(usize::MAX));
+        if !mem_read(cpu_addr, &mut bytes[offset..offset + count]) {
+            return Err(format!("could not snapshot {label} at {address:#x}"));
+        }
+        offset += count;
     }
     Ok(bytes)
 }
@@ -4717,6 +4721,29 @@ mod tests {
     }
 
     #[test]
+    fn compute_snapshot_crosses_discontiguous_physical_mappings() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x1000, 0x10000, 1);
+        mappings.add(0x2000, 0x1000, 0x30000, 2);
+        let read = |address, bytes: &mut [u8]| {
+            match address {
+                0x10ff0 => bytes.fill(0x12),
+                0x30000 => bytes.fill(0x34),
+                _ => return false,
+            }
+            true
+        };
+        let bytes = read_gpu_vec(&mappings, &read, 0x1ff0, 32, "test").unwrap();
+        assert_eq!(&bytes[..16], &[0x12; 16]);
+        assert_eq!(&bytes[16..], &[0x34; 16]);
+        let empty = GpuMappings::new();
+        assert!(read_gpu_vec(&empty, &read, 0x1ff0, 32, "test").is_err());
+        let mut hole = GpuMappings::new();
+        hole.add(0x1000, 0x1000, 0x10000, 1);
+        assert!(read_gpu_vec(&hole, &read, 0x1ff0, 32, "test").is_err());
+    }
+
+    #[test]
     fn raw_storage_buffers_resolve_static_indirection_topologically() {
         let mut cbuf = vec![0u8; 0x40];
         cbuf[0x20..0x28].copy_from_slice(&0x2003u64.to_le_bytes());
@@ -5089,7 +5116,8 @@ mod tests {
         let read = |cpu: u64, out: &mut [u8]| {
             let data = [1, 2, 3, 4, 5, 6, 7, 8];
             let offset = (cpu - 0x2000) as usize;
-            out.copy_from_slice(&data[offset..offset + out.len()]);
+            let Some(source) = data.get(offset..offset + out.len()) else { return false; };
+            out.copy_from_slice(source);
             true
         };
         assert_eq!(read_gpu_vec(&mappings, &read, 0x1002, 6, "test").unwrap(), [3, 4, 5, 6, 7, 8]);
