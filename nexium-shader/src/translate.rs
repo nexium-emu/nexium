@@ -375,7 +375,7 @@ fn decode_texture_sample_form(raw: u64, bindless: bool) -> Option<TextureSampleF
         || ndv
         || sparse_pred != PT
         || !matches!(tex_type, 0 | 2 | 3 | 4 | 6 | 7)
-        || (aoffi && matches!(tex_type, 4 | 6 | 7))
+        || (aoffi && matches!(tex_type, 6 | 7))
         || mask == 0
     {
         return None;
@@ -793,6 +793,11 @@ impl Translator {
                     0
                 } else {
                     signed_nibble(4)
+                }),
+                Value::ImmU32(if form.tex_type == 4 {
+                    signed_nibble(8)
+                } else {
+                    0
                 }),
             ))
         } else {
@@ -3370,6 +3375,7 @@ impl Translator {
                                 tex_id,
                                 u,
                                 v,
+                                array: None,
                                 gather_component,
                                 lane: lane as u8,
                             },
@@ -3406,6 +3412,7 @@ impl Translator {
                                 tex_id,
                                 u,
                                 v,
+                                array: None,
                                 gather_component,
                                 lane,
                             },
@@ -3455,6 +3462,14 @@ impl Translator {
                             None,
                             false,
                             Some(self.read_reg(rb)),
+                        ),
+                        7 | 8 | 9 => (
+                            ImageDimension::D2Array,
+                            self.read_reg(ra.wrapping_add(1)),
+                            Some(self.read_reg(rb)),
+                            Some(self.read_reg(ra)),
+                            enc == 7,
+                            (enc != 7).then_some(Value::Zero),
                         ),
                         10 => (
                             ImageDimension::D3,
@@ -3597,7 +3612,7 @@ impl Translator {
                             lod_bias: None,
                             explicit_lod,
                             texel_offset: None,
-                            dref: None,
+                            dref,
                             component,
                         }
                     } else if let Some((dimension, x, y, z)) = compute_fetch {
@@ -3843,9 +3858,9 @@ impl Translator {
                 } else {
                     (((raw >> 54) & 0x3) as u8, ((raw >> 56) & 0x3) as u8)
                 };
-                if self.stage == ShaderStage::Compute
+                if (self.stage == ShaderStage::Compute && bindless)
                     || mask == 0
-                    || tex_type != 2
+                    || !matches!(tex_type, 2 | 3)
                     || dc
                     || sparse_pred != PT
                     || offset_type != 0
@@ -3904,8 +3919,10 @@ impl Translator {
                 };
 
                 let coord = reg_a(raw);
-                let u = self.read_reg(coord);
-                let v = self.read_reg(coord.wrapping_add(1));
+                let arrayed = tex_type == 3;
+                let array = arrayed.then(|| self.read_reg(coord));
+                let u = self.read_reg(coord.wrapping_add(u8::from(arrayed)));
+                let v = self.read_reg(coord.wrapping_add(1 + u8::from(arrayed)));
                 let mut dst = reg_dest(raw);
                 for lane in 0..4u8 {
                     if (mask >> lane) & 1 == 0 {
@@ -3917,6 +3934,7 @@ impl Translator {
                             tex_id,
                             u,
                             v,
+                            array,
                             gather_component,
                             lane,
                         },
@@ -4555,7 +4573,7 @@ impl Translator {
                 let (y, z) = match dimension {
                     ImageDimension::D1 | ImageDimension::Buffer => (None, None),
                     ImageDimension::D2 => (Some(self.read_reg(coord.wrapping_add(1))), None),
-                    ImageDimension::D3 | ImageDimension::Cube => (
+                    ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube => (
                         Some(self.read_reg(coord.wrapping_add(1))),
                         Some(self.read_reg(coord.wrapping_add(2))),
                     ),
@@ -7634,7 +7652,7 @@ mod tests {
                         implicit_lod: false,
                         lod_bias: None,
                         explicit_lod: Some(Value::Zero),
-                        texel_offset: Some((Value::ImmU32(0), Value::ImmU32(0))),
+                        texel_offset: Some((Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(0))),
                         dref: None,
                         component: 0,
                     },
@@ -7914,6 +7932,7 @@ mod tests {
                     tex_id: 0x24,
                     u: Value::GprIn(4),
                     v: Value::GprIn(5),
+                    array: None,
                     gather_component: 2,
                     lane,
                 } if lane == expected_lane
@@ -7949,6 +7968,7 @@ mod tests {
                     tex_id,
                     u: Value::GprIn(4),
                     v: Value::GprIn(5),
+                    array: None,
                     gather_component: 3,
                     lane: actual_lane,
                 } if tex_id == expected_tex_id && actual_lane == lane as u8
@@ -7962,7 +7982,7 @@ mod tests {
         let unsupported = [
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 1, false, PT),
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, true, PT),
-            tld4_raw(false, 8, 4, 0x24, 3, 0xf, 0, 0, false, PT),
+            tld4_raw(false, 8, 4, 0x24, 4, 0xf, 0, 0, false, PT),
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, 6),
             tld4_raw(false, 8, 4, 0x24, 2, 0, 0, 0, false, PT),
         ];
@@ -7987,8 +8007,8 @@ mod tests {
         }
 
         let mut compute = Translator::new_compute();
-        assert!(!compute.translate(direct_base));
-        assert_eq!(compute.unimplemented_count, 1);
+        assert!(compute.translate(direct_base));
+        assert_eq!(compute.unimplemented_count, 0);
 
         let dynamic_bindless = tld4_raw(true, 8, 4, 12, 2, 0xf, 0, 0, false, PT);
         let mut bindless = Translator::new_fragment();
@@ -8023,6 +8043,7 @@ mod tests {
                     tex_id: 0x24,
                     u: Value::GprIn(4),
                     v: Value::GprIn(6),
+                    array: None,
                     gather_component: 1,
                     lane,
                 } if lane == expected_lane
@@ -9369,7 +9390,7 @@ mod tests {
                 Op::SampleTex {
                     implicit_lod: false,
                     explicit_lod: Some(Value::Zero),
-                    texel_offset: Some((Value::ImmU32(x), Value::ImmU32(0))),
+                    texel_offset: Some((Value::ImmU32(x), Value::ImmU32(0), Value::ImmU32(0))),
                     ..
                 } if x == expected_x
             )));
@@ -9394,14 +9415,73 @@ mod tests {
         assert!(t.program.instructions.iter().any(|inst| matches!(
             inst.op,
             Op::SampleTex {
-                texel_offset: Some((Value::ImmU32(1), Value::ImmU32(0))),
+                texel_offset: Some((Value::ImmU32(1), Value::ImmU32(0), Value::ImmU32(0))),
                 ..
             }
         )));
     }
 
     #[test]
-    fn direct_tex_3d_aoffi_fails_closed() {
+    fn botw_volume_sample_preserves_signed_xyz_offsets() {
+        let mut t = Translator::new_fragment();
+        t.write_reg(13, Op::Mov(Value::ImmU32(0xf21)), None);
+        assert!(t.translate(0xc1f8_0080_c0c7_0003));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::SampleTex {
+                u: Value::GprIn(0),
+                v: Value::GprIn(1),
+                volume: Some(Value::GprIn(2)),
+                explicit_lod: Some(Value::GprIn(12)),
+                texel_offset: Some((Value::ImmU32(1), Value::ImmU32(2), Value::ImmU32(u32::MAX))),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn botw_compute_shadow_and_gather_preserve_operands() {
+        let mut shadow = Translator::new_compute();
+        assert!(shadow.translate(0xd922_020f_f047_0202));
+        assert_eq!(shadow.unimplemented_count, 0);
+        assert!(shadow.program.instructions.iter().any(|inst| matches!(inst.op,
+            Op::SampleTexHandle {
+                dimension: ImageDimension::D2Array,
+                u: Value::GprIn(3), v: Some(Value::GprIn(4)),
+                w: Some(Value::GprIn(2)), dref: Some(Value::GprIn(5)),
+                implicit_lod: false, explicit_lod: Some(Value::Zero), ..
+            })));
+        let mut gather = Translator::new_compute();
+        assert!(gather.translate(0xc838_0146_aff7_0220));
+        assert_eq!(gather.unimplemented_count, 0);
+        assert_eq!(gather.program.instructions.iter().filter(|inst| matches!(inst.op,
+            Op::GatherTex { tex_id: 0x14, u: Value::GprIn(2), v: Value::GprIn(3),
+                array: None, gather_component: 0, .. })).count(), 3);
+    }
+
+    #[test]
+    fn botw_array_gather_preserves_layer_and_coordinates() {
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(0xc83a_0087_bff7_0400));
+        assert_eq!(t.unimplemented_count, 0);
+        let gathers: Vec<_> = t.program.instructions.iter().filter(|inst| {
+            matches!(inst.op, Op::GatherTex { .. })
+        }).collect();
+        assert_eq!(gathers.len(), 4);
+        for (lane, inst) in gathers.into_iter().enumerate() {
+            assert!(matches!(inst.op, Op::GatherTex {
+                u: Value::GprIn(5),
+                v: Value::GprIn(6),
+                array: Some(Value::GprIn(4)),
+                lane: actual,
+                ..
+            } if actual == lane as u8));
+        }
+    }
+
+    #[test]
+    fn direct_tex_3d_dynamic_aoffi_fails_closed() {
         let raw = direct_tex(1, 4, 1) | (1 << 54);
         let mut t = Translator::new();
         assert!(!t.translate(raw));

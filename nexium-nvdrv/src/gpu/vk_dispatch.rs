@@ -18541,7 +18541,8 @@ fn fragment_texture_numeric_metadata(
                     volume: None,
                     cube: None,
                     ..
-                } | nexium_shader::IrOp::TextureQueryLod { arrayed: true, .. }
+                } | nexium_shader::IrOp::GatherTex { array: Some(_), .. }
+                  | nexium_shader::IrOp::TextureQueryLod { arrayed: true, .. }
             )
         })
     });

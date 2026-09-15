@@ -121,6 +121,7 @@ pub enum ImageDimension {
     D1,
     Buffer,
     D2,
+    D2Array,
     D3,
     Cube,
 }
@@ -169,6 +170,7 @@ impl fmt::Display for ImageDimension {
             Self::D1 => "1d",
             Self::Buffer => "buffer",
             Self::D2 => "2d",
+            Self::D2Array => "2d-array",
             Self::D3 => "3d",
             Self::Cube => "cube",
         })
@@ -539,7 +541,7 @@ pub enum Op {
         implicit_lod: bool,
         lod_bias: Option<Value>,
         explicit_lod: Option<Value>,
-        texel_offset: Option<(Value, Value)>,
+        texel_offset: Option<(Value, Value, Value)>,
         dref: Option<Value>,
         component: u8,
     },
@@ -560,7 +562,7 @@ pub enum Op {
         implicit_lod: bool,
         lod_bias: Option<Value>,
         explicit_lod: Option<Value>,
-        texel_offset: Option<(Value, Value)>,
+        texel_offset: Option<(Value, Value, Value)>,
         dref: Option<Value>,
         component: u8,
     },
@@ -686,6 +688,7 @@ pub enum Op {
         tex_id: u32,
         u: Value,
         v: Value,
+        array: Option<Value>,
         gather_component: u8,
         lane: u8,
     },
@@ -1202,7 +1205,7 @@ impl Inst {
                     format!("({u}, {v})")
                 };
                 let offset = texel_offset
-                    .map(|(x, y)| format!(".offset({x}, {y})"))
+                    .map(|(x, y, z)| format!(".offset({x}, {y}, {z})"))
                     .unwrap_or_default();
                 write!(f, "TexSamp")?;
                 if let Some(site) = sample_site {
@@ -1273,8 +1276,8 @@ impl Inst {
                 } else {
                     write!(f, ".lod0")?;
                 }
-                if let Some((x, y)) = texel_offset {
-                    write!(f, ".offset({x}, {y})")?;
+                if let Some((x, y, z)) = texel_offset {
+                    write!(f, ".offset({x}, {y}, {z})")?;
                 }
                 if let Some(reference) = dref {
                     write!(f, ".dref({reference})")?;
@@ -1411,11 +1414,12 @@ impl Inst {
                 tex_id,
                 u,
                 v,
+                array,
                 gather_component,
                 lane,
             } => write!(
                 f,
-                "TexGather t[{tex_id:#x}], ({u}, {v}).{}[{lane}]",
+                "TexGather t[{tex_id:#x}], ({u}, {v}) array={array:?}.{}[{lane}]",
                 ["r", "g", "b", "a"]
                     .get(*gather_component as usize)
                     .copied()

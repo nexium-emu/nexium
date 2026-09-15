@@ -1053,6 +1053,7 @@ enum CachedTextureSample {
         value: Word,
         scalar_type: Word,
         numeric_type: TextureNumericType,
+        depth_compare: bool,
     },
 }
 
@@ -3149,7 +3150,7 @@ impl Emitter {
             let dimension = match resource.dimension {
                 ImageDimension::D1 => rspirv::spirv::Dim::Dim1D,
                 ImageDimension::Buffer => rspirv::spirv::Dim::DimBuffer,
-                ImageDimension::D2 => rspirv::spirv::Dim::Dim2D,
+                ImageDimension::D2 | ImageDimension::D2Array => rspirv::spirv::Dim::Dim2D,
                 ImageDimension::D3 => rspirv::spirv::Dim::Dim3D,
                 ImageDimension::Cube => rspirv::spirv::Dim::DimCube,
             };
@@ -3194,7 +3195,9 @@ impl Emitter {
             };
             let image_t =
                 self.b
-                    .type_image(scalar_t, dimension, 0, 0, 0, sampled, image_format, None);
+                    .type_image(scalar_t, dimension, 2,
+                        u32::from(resource.dimension == ImageDimension::D2Array),
+                        0, sampled, image_format, None);
             let sampled_image_t = (resource.kind == ComputeResourceKind::CombinedSampledImage)
                 .then(|| self.b.type_sampled_image(image_t));
             let descriptor_t = sampled_image_t.unwrap_or(image_t);
@@ -3315,7 +3318,7 @@ impl Emitter {
                     .composite_construct(self.ivec2_t, None, [x, y])
                     .unwrap()
             }
-            ImageDimension::D3 | ImageDimension::Cube => {
+            ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube => {
                 let y_value = self.lower_value(y.expect("3D image operation requires Y"));
                 let y = self.as_i32(y_value);
                 let z_value = self.lower_value(z.expect("3D image operation requires Z"));
@@ -3376,7 +3379,8 @@ impl Emitter {
         w: Option<&IrValue>,
         implicit_lod: bool,
         explicit_lod: Option<&IrValue>,
-        texel_offset: Option<&(IrValue, IrValue)>,
+        texel_offset: Option<&(IrValue, IrValue, IrValue)>,
+        dref: Option<&IrValue>,
     ) -> CachedTextureSample {
         use rspirv::spirv::ImageOperands;
 
@@ -3391,6 +3395,11 @@ impl Emitter {
                 self.b
                     .composite_construct(self.vec2_t, None, [u, v])
                     .unwrap()
+            }
+            ImageDimension::D2Array => {
+                let v = self.lower_value(v.expect("array sample requires V"));
+                let layer = self.compute_array_layer(w.expect("array sample requires layer"));
+                self.b.composite_construct(self.vec3_t, None, [u, v, layer]).unwrap()
             }
             ImageDimension::D3 | ImageDimension::Cube => {
                 let v = self.lower_value(v.expect("3D filtered sample requires V"));
@@ -3408,7 +3417,7 @@ impl Emitter {
                 .map(|lod| self.lower_value(lod))
                 .unwrap_or(self.f32_zero)
         };
-        let offset = texel_offset.map(|(x, y)| {
+        let offset = texel_offset.map(|(x, y, z)| {
             let constant = |emitter: &mut Self, value: &IrValue| {
                 let bits = match value {
                     IrValue::Zero => 0,
@@ -3423,16 +3432,32 @@ impl Emitter {
             let x = constant(self, x);
             match dimension {
                 ImageDimension::D1 => x,
-                ImageDimension::D2 => {
+                ImageDimension::D2 | ImageDimension::D2Array => {
                     let y = constant(self, y);
                     self.b.constant_composite(self.ivec2_t, [x, y])
                 }
-                ImageDimension::D3 | ImageDimension::Cube | ImageDimension::Buffer => {
+                ImageDimension::D3 => {
+                    let y = constant(self, y);
+                    let z = constant(self, z);
+                    self.b.constant_composite(self.ivec3_t, [x, y, z])
+                }
+                ImageDimension::Cube | ImageDimension::Buffer => {
                     unreachable!("validated compute sample offset dimension")
                 }
             }
         });
-        let sampled = if let Some(offset) = offset {
+        let sampled = if let Some(dref) = dref {
+            let dref = self.lower_value(dref);
+            let mut operands = ImageOperands::LOD;
+            let mut params = vec![Operand::IdRef(lod)];
+            if let Some(offset) = offset {
+                operands |= ImageOperands::CONST_OFFSET;
+                params.push(Operand::IdRef(offset));
+            }
+            self.b.image_sample_dref_explicit_lod(
+                self.f32_t, None, sampled_image, coords, dref, operands, params,
+            ).unwrap()
+        } else if let Some(offset) = offset {
             self.b
                 .image_sample_explicit_lod(
                     resource.vec4_t,
@@ -3459,6 +3484,40 @@ impl Emitter {
             value: sampled,
             scalar_type: resource.scalar_t,
             numeric_type: resource.resource.numeric_type,
+            depth_compare: dref.is_some(),
+        }
+    }
+
+    fn compute_array_layer(&mut self, layer: &IrValue) -> Word {
+        let value = self.lower_value(layer);
+        let raw = self.as_u32(value);
+        let mask = self.const_u32(0xffff);
+        let layer = self.b.bitwise_and(self.u32_t, None, raw, mask).unwrap();
+        self.b.convert_u_to_f(self.f32_t, None, layer).unwrap()
+    }
+
+    fn lower_compute_gather(
+        &mut self, tex_id: u32, u: &IrValue, v: &IrValue,
+        array: Option<&IrValue>, component: u8, lane: u8,
+    ) -> Word {
+        let handle = TextureHandleOrigin::Bound { cbuf_word_offset: tex_id };
+        let resource = self.compute_filtered_resource(handle);
+        let image = self.load_compute_sampled_image(resource);
+        let u = self.lower_value(u);
+        let v = self.lower_value(v);
+        let coords = if let Some(array) = array {
+            let layer = self.compute_array_layer(array);
+            self.b.composite_construct(self.vec3_t, None, [u, v, layer]).unwrap()
+        } else {
+            self.b.composite_construct(self.vec2_t, None, [u, v]).unwrap()
+        };
+        let component = self.b.constant_bit32(self.i32_t, component as u32);
+        let value = self.b.image_gather(resource.vec4_t, None, image, coords,
+            component, None, []).unwrap();
+        let value = self.b.composite_extract(resource.scalar_t, None, value, [lane as u32]).unwrap();
+        match resource.resource.numeric_type {
+            TextureNumericType::Float => value,
+            _ => self.b.bitcast(self.f32_t, None, value).unwrap(),
         }
     }
 
@@ -3480,7 +3539,7 @@ impl Emitter {
             let component_count = match resource.resource.dimension {
                 ImageDimension::D1 | ImageDimension::Buffer => 1,
                 ImageDimension::D2 | ImageDimension::Cube => 2,
-                ImageDimension::D3 => 3,
+                ImageDimension::D2Array | ImageDimension::D3 => 3,
             };
             if component as u32 >= component_count {
                 self.const_u32(0)
@@ -3488,7 +3547,7 @@ impl Emitter {
                 let result_t = match resource.resource.dimension {
                     ImageDimension::D1 | ImageDimension::Buffer => self.u32_t,
                     ImageDimension::D2 | ImageDimension::Cube => self.uvec2_t,
-                    ImageDimension::D3 => self.uvec3_t,
+                    ImageDimension::D2Array | ImageDimension::D3 => self.uvec3_t,
                 };
                 let dimensions = if resource.resource.dimension == ImageDimension::Buffer {
                     self.b.image_query_size(result_t, None, image).unwrap()
@@ -4944,7 +5003,11 @@ impl Emitter {
                 value,
                 scalar_type,
                 numeric_type,
+                depth_compare,
             } => {
+                if depth_compare {
+                    return if component == 3 { self.f32_one } else { value };
+                }
                 let component = self
                     .b
                     .composite_extract(scalar_type, None, value, [component.min(3) as u32])
@@ -6006,6 +6069,7 @@ impl Emitter {
                 implicit_lod,
                 explicit_lod,
                 texel_offset,
+                dref,
                 component,
                 ..
             } => Some(
@@ -6021,6 +6085,7 @@ impl Emitter {
                         *implicit_lod,
                         explicit_lod.as_ref(),
                         texel_offset.as_ref(),
+                        dref.as_ref(),
                     );
                     self.record_texture_sample_lane(*sample_site, sample, *component)
                 },
@@ -6147,7 +6212,7 @@ impl Emitter {
                     .as_ref()
                     .and_then(|site| self.texture_gradients.get(site))
                     .copied();
-                let texel_offset = texel_offset.as_ref().map(|(x, y)| {
+                let texel_offset = texel_offset.as_ref().map(|(x, y, z)| {
                     let immediate_bits = |value: &IrValue| match value {
                         IrValue::Zero => Some(0),
                         IrValue::ImmU32(bits) => Some(*bits),
@@ -6158,7 +6223,13 @@ impl Emitter {
                     let y = immediate_bits(y).expect("sample offset must be constant");
                     let x = self.b.constant_bit32(self.i32_t, x);
                     let y = self.b.constant_bit32(self.i32_t, y);
-                    self.b.constant_composite(self.ivec2_t, [x, y])
+                    if volume.is_some() {
+                        let z = immediate_bits(z).expect("sample offset must be constant");
+                        let z = self.b.constant_bit32(self.i32_t, z);
+                        self.b.constant_composite(self.ivec3_t, [x, y, z])
+                    } else {
+                        self.b.constant_composite(self.ivec2_t, [x, y])
+                    }
                 });
                 if let Some(w) = cube {
                     let tex_slot = self
@@ -6552,9 +6623,13 @@ impl Emitter {
                 tex_id,
                 u,
                 v,
+                array,
                 gather_component,
                 lane,
             } => {
+                if self.stage == Stage::Compute {
+                    Some(self.lower_compute_gather(*tex_id, u, v, array.as_ref(), *gather_component, *lane))
+                } else {
                 self.texs_ids_used.insert(*tex_id);
                 let tex_slot = self
                     .texture_slots
@@ -6586,8 +6661,17 @@ impl Emitter {
                     uv1 = self.b.f_sub(self.f32_t, None, self.f32_one, uv1).unwrap();
                 }
                 let coords = if self.sampler_arrayed {
+                    let layer = if let Some(array) = array {
+                        let value = self.lower_value(array);
+                        let raw = self.as_u32(value);
+                        let mask = self.const_u32(0xffff);
+                        let layer = self.b.bitwise_and(self.u32_t, None, raw, mask).unwrap();
+                        self.b.convert_u_to_f(self.f32_t, None, layer).unwrap()
+                    } else {
+                        self.f32_zero
+                    };
                     self.b
-                        .composite_construct(self.vec3_t, None, [uv0, uv1, self.f32_zero])
+                        .composite_construct(self.vec3_t, None, [uv0, uv1, layer])
                         .unwrap()
                 } else {
                     self.b
@@ -6632,6 +6716,7 @@ impl Emitter {
                         .composite_extract(self.f32_t, None, gathered, [(*lane).min(3) as u32])
                         .unwrap_or(self.f32_zero),
                 )
+                }
             }
             IrOp::HSetPred {
                 cmp,
@@ -9095,7 +9180,7 @@ impl Emitter {
                         volume: None,
                         cube: None,
                         ..
-                    }
+                    } | IrOp::GatherTex { array: Some(_), .. }
                 )
             })
         });
@@ -9180,7 +9265,7 @@ impl Emitter {
                         volume: None,
                         cube: None,
                         ..
-                    }
+                    } | IrOp::GatherTex { array: Some(_), .. }
                 )
             })
         });
@@ -9369,9 +9454,10 @@ impl Emitter {
                             self.ir_constant_facts.texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref()),
                             z.is_some()));
                     }
-                    IrOp::GatherTex { tex_id, .. } => {
+                    IrOp::GatherTex { tex_id, array, .. } => {
                         needs_image = true;
                         needs_sampler = true;
+                        needs_arrayed_sampler |= array.is_some();
                         tex_ids.insert(*tex_id);
                         filtered_tex_ids.insert(*tex_id);
                         record_graphics_texture_image_kind(
@@ -10787,7 +10873,7 @@ fn validate_compute_coordinates(
 ) -> Result<(), ComputeEmitError> {
     if matches!(
         dimension,
-        ImageDimension::D2 | ImageDimension::D3 | ImageDimension::Cube
+        ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube
     ) && y.is_none()
     {
         return Err(ComputeEmitError::MissingCoordinate {
@@ -10796,7 +10882,7 @@ fn validate_compute_coordinates(
             coordinate: "Y",
         });
     }
-    if matches!(dimension, ImageDimension::D3 | ImageDimension::Cube) && z.is_none() {
+    if matches!(dimension, ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube) && z.is_none() {
         return Err(ComputeEmitError::MissingCoordinate {
             handle,
             dimension,
@@ -11038,16 +11124,15 @@ fn validate_compute_options(
                             "SampleTexHandle component {component}"
                         )));
                     }
-                    if dref.is_some() {
-                        return Err(ComputeEmitError::UnsupportedOperation(
-                            "compute depth-compare sample".to_owned(),
-                        ));
-                    }
                     let resource =
                         filtered_resource(*handle).ok_or(ComputeEmitError::MissingResource {
                             handle: *handle,
                             kind: ComputeResourceKind::CombinedSampledImage,
                         })?;
+                    if dref.is_some() && (resource.numeric_type != TextureNumericType::Float
+                        || !matches!(dimension, ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::Cube)) {
+                        return Err(ComputeEmitError::UnsupportedOperation("invalid compute depth-compare sample".to_owned()));
+                    }
                     if *dimension != resource.dimension {
                         return Err(ComputeEmitError::DimensionMismatch {
                             handle: *handle,
@@ -11061,8 +11146,8 @@ fn validate_compute_options(
                         v.as_ref(),
                         w.as_ref(),
                     )?;
-                    if let Some((x, y)) = texel_offset {
-                        if !matches!(dimension, ImageDimension::D1 | ImageDimension::D2) {
+                    if let Some((x, y, z)) = texel_offset {
+                        if !matches!(dimension, ImageDimension::D1 | ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3) {
                             return Err(ComputeEmitError::UnsupportedOperation(format!(
                                 "filtered sample offset for {dimension:?}"
                             )));
@@ -11073,7 +11158,7 @@ fn validate_compute_options(
                                 IrValue::Zero | IrValue::ImmU32(_) | IrValue::ImmF32(_)
                             )
                         };
-                        if !is_constant(x) || !is_constant(y) {
+                        if !is_constant(x) || !is_constant(y) || !is_constant(z) {
                             return Err(ComputeEmitError::UnsupportedOperation(
                                 "dynamic filtered sample offset".to_owned(),
                             ));
@@ -11230,8 +11315,20 @@ fn validate_compute_options(
                 IrOp::Unimplemented { .. } => {
                     return Err(ComputeEmitError::UnimplementedIr(1));
                 }
+                IrOp::GatherTex { tex_id, array, gather_component, lane, .. } => {
+                    let handle = TextureHandleOrigin::Bound { cbuf_word_offset: *tex_id };
+                    let resource = filtered_resource(handle).ok_or(ComputeEmitError::MissingResource {
+                        handle, kind: ComputeResourceKind::CombinedSampledImage,
+                    })?;
+                    let dimension = if array.is_some() { ImageDimension::D2Array } else { ImageDimension::D2 };
+                    if dimension != resource.dimension {
+                        return Err(ComputeEmitError::DimensionMismatch { handle, instruction: dimension, actual: resource.dimension });
+                    }
+                    if *gather_component > 3 || *lane > 3 {
+                        return Err(ComputeEmitError::UnsupportedOperation("invalid compute gather component/lane".to_owned()));
+                    }
+                }
                 IrOp::SampleTex { .. }
-                | IrOp::GatherTex { .. }
                 | IrOp::TexelFetch { .. }
                 | IrOp::LoadGlobal { .. }
                 | IrOp::StoreGlobal { .. }
@@ -11243,7 +11340,6 @@ fn validate_compute_options(
                     return Err(ComputeEmitError::UnsupportedOperation(
                         match &instruction.op {
                             IrOp::SampleTex { .. } => "SampleTex",
-                            IrOp::GatherTex { .. } => "GatherTex",
                             IrOp::TexelFetch { .. } => "legacy TexelFetch",
                             IrOp::LoadGlobal { .. } => "LoadGlobal",
                             IrOp::StoreGlobal { .. } => "StoreGlobal",
@@ -16028,6 +16124,59 @@ mod tests {
     }
 
     #[test]
+    fn botw_volume_offsets_and_array_gathers_emit_valid_spirv() {
+        use rspirv::spirv::Op;
+        for gather in [false, true] {
+            let mut program = nexium_shader::IrProgram::new();
+            let op = if gather {
+                IrOp::GatherTex {
+                    tex_id: 0x44,
+                    u: IrValue::ImmF32(0.25),
+                    v: IrValue::ImmF32(0.75),
+                    array: Some(IrValue::ImmU32(0x1234_0002)),
+                    gather_component: 0,
+                    lane: 0,
+                }
+            } else {
+                IrOp::SampleTex {
+                    sample_site: None,
+                    tex_id: 0x44,
+                    u: IrValue::ImmF32(0.25),
+                    v: IrValue::ImmF32(0.75),
+                    array: None,
+                    volume: Some(IrValue::ImmF32(0.5)),
+                    cube: None,
+                    implicit_lod: false,
+                    lod_bias: None,
+                    explicit_lod: Some(IrValue::ImmF32(0.0)),
+                    texel_offset: Some((IrValue::ImmU32(1), IrValue::ImmU32(2), IrValue::ImmU32(u32::MAX))),
+                    dref: None,
+                    component: 0,
+                }
+            };
+            program.emit(op, Some(0));
+            let cfg = Cfg {
+                blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+                unimplemented: 0,
+                bindless_or_partners: Default::default(),
+            };
+            let (words, _, _, _, _) = emit_fragment_full_with_options(
+                &cfg, [0; 32], 1, 0, false, 0, 0, FragmentOptions::default(),
+            );
+            validates_with_spirv_val_if_available(&words);
+            let module = rspirv::dr::load_words(&words).unwrap();
+            let instructions: Vec<_> = module.functions.iter()
+                .flat_map(|f| &f.blocks).flat_map(|b| &b.instructions).collect();
+            let expected = if gather { Op::ImageGather } else { Op::ImageSampleExplicitLod };
+            assert!(instructions.iter().any(|i| i.class.opcode == expected));
+            if gather {
+                assert!(instructions.iter().any(|i| i.class.opcode == Op::BitwiseAnd));
+                assert!(instructions.iter().any(|i| i.class.opcode == Op::ConvertUToF));
+            }
+        }
+    }
+
+    #[test]
     fn unnormalized_filtered_sample_and_gather_query_size_and_divide_xy_only_when_marked() {
         for gather in [false, true] {
             for normalized_coords in [true, false] {
@@ -16038,6 +16187,7 @@ mod tests {
                             tex_id: 0x44,
                             u: IrValue::ImmF32(32.0),
                             v: IrValue::ImmF32(16.0),
+                            array: None,
                             gather_component: 1,
                             lane: 2,
                         },
@@ -18287,7 +18437,7 @@ mod tests {
                 implicit_lod: true,
                 lod_bias: Some(IrValue::ImmF32(1.0)),
                 explicit_lod: None,
-                texel_offset: Some((IrValue::ImmU32(u32::MAX), IrValue::ImmU32(2))),
+                texel_offset: Some((IrValue::ImmU32(u32::MAX), IrValue::ImmU32(2), IrValue::Zero)),
                 dref: None,
                 component: 2,
             },
@@ -18350,6 +18500,46 @@ mod tests {
                 && instruction.class.opcode == rspirv::spirv::Op::Constant
                 && instruction.operands.last() == Some(&Operand::LiteralBit32(0))
         }));
+    }
+
+    #[test]
+    fn compute_gathers_and_array_shadow_samples_validate() {
+        for gather in [false, true] {
+            let handle = TextureHandleOrigin::Bound { cbuf_word_offset: 0x20 };
+            let mut program = nexium_shader::IrProgram::new();
+            for lane in 0..4 {
+                program.emit(if gather {
+                    IrOp::GatherTex { tex_id: 0x20, u: IrValue::ImmF32(0.25),
+                        v: IrValue::ImmF32(0.75), array: None, gather_component: 2, lane }
+                } else {
+                    IrOp::SampleTexHandle { sample_site: Some(7), handle,
+                        dimension: ImageDimension::D2Array, u: IrValue::ImmF32(0.25),
+                        v: Some(IrValue::ImmF32(0.75)), w: Some(IrValue::ImmU32(0xabcd_0002)),
+                        implicit_lod: false, lod_bias: None, explicit_lod: Some(IrValue::Zero),
+                        texel_offset: None, dref: Some(IrValue::ImmF32(0.5)), component: lane }
+                }, Some(lane));
+            }
+            let cfg = Cfg { blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+                unimplemented: 0, bindless_or_partners: Default::default() };
+            let options = ComputeOptions { resources: vec![ComputeImageResource {
+                handle, binding: 1, kind: ComputeResourceKind::CombinedSampledImage,
+                dimension: if gather { ImageDimension::D2 } else { ImageDimension::D2Array },
+                numeric_type: TextureNumericType::Float, texel_format: None,
+            }], ..ComputeOptions::default() };
+            let emitted = emit_compute(&cfg, &options).unwrap();
+            validates_with_spirv_val_if_available(&emitted.words);
+            let module = rspirv::dr::load_words(&emitted.words).unwrap();
+            let op = if gather { rspirv::spirv::Op::ImageGather }
+                else { rspirv::spirv::Op::ImageSampleDrefExplicitLod };
+            assert_eq!(module.functions.iter().flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.instructions).filter(|i| i.class.opcode == op).count(),
+                if gather { 4 } else { 1 });
+            if !gather {
+                assert!(module.types_global_values.iter().any(|i|
+                    i.class.opcode == rspirv::spirv::Op::TypeImage
+                    && i.operands.get(3) == Some(&Operand::LiteralBit32(1))));
+            }
+        }
     }
 
     #[test]
