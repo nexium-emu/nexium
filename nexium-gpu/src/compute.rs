@@ -487,8 +487,8 @@ struct ComputeProgram {
     pipeline: vk::Pipeline,
 }
 
-const COMPUTE_UNIFORM_POOL_MAX_ITEMS: usize = 32;
-const COMPUTE_UNIFORM_POOL_MAX_BYTES: u64 = 1024 * 1024;
+const COMPUTE_UNIFORM_POOL_MAX_ITEMS: usize = 128;
+const COMPUTE_UNIFORM_POOL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const COMPUTE_RAW_STORAGE_POOL_MAX_ITEMS: usize = 512;
 const COMPUTE_RAW_STORAGE_POOL_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const COMPUTE_OUTPUT_POOL_MAX_ITEMS: usize = 8;
@@ -1821,6 +1821,7 @@ pub(crate) fn create_compute_guest_image(
     depth: u32,
     is_3d: bool,
     is_cube: bool,
+    is_array: bool,
     format: vk::Format,
     components: vk::ComponentMapping,
     mip_levels: u32,
@@ -1837,10 +1838,11 @@ pub(crate) fn create_compute_guest_image(
             "invalid compute guest cube image: extent={width}x{height}x{depth} 3d={is_3d} levels={mip_levels}"
         ));
     }
-    let array_layers = if is_cube { 6 } else { 1 };
+    let array_layers = if is_cube { 6 } else if is_array { depth.max(1) } else { 1 };
+    let image_depth = if is_3d { depth } else { 1 };
     let aspect = crate::renderer::texture_image_aspect(format);
     let mip_levels = mip_levels.max(1);
-    let max_mip_levels = u32::BITS - width.max(height).max(depth).max(1).leading_zeros();
+    let max_mip_levels = u32::BITS - width.max(height).max(image_depth).max(1).leading_zeros();
     if (is_3d && mip_levels != 1)
         || mip_levels > max_mip_levels
         || view_mip_levels == 0
@@ -1882,7 +1884,7 @@ pub(crate) fn create_compute_guest_image(
         extent: vk::Extent3D {
             width,
             height,
-            depth,
+            depth: image_depth,
         },
         mip_levels,
         array_layers,
@@ -1944,6 +1946,8 @@ pub(crate) fn create_compute_guest_image(
             vk::ImageViewType::TYPE_3D
         } else if is_cube {
             vk::ImageViewType::CUBE
+        } else if is_array {
+            vk::ImageViewType::TYPE_2D_ARRAY
         } else {
             vk::ImageViewType::TYPE_2D
         },

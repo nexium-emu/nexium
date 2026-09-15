@@ -2580,7 +2580,7 @@ struct CachedComputeVolume {
     resource: crate::compute::ComputeImageResource,
 }
 
-const COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS: usize = 32;
+const COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS: usize = 128;
 const COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -2591,6 +2591,7 @@ struct ComputeGuestImagePoolKey {
     depth: u32,
     is_3d: bool,
     is_cube: bool,
+    is_array: bool,
     format: i32,
     components: [i32; 4],
     mip_levels: u32,
@@ -16044,6 +16045,7 @@ enum ComputeSamplePlan {
         depth: u32,
         is_3d: bool,
         is_cube: bool,
+        is_array: bool,
         format: vk::Format,
         components: vk::ComponentMapping,
         mip_levels: u32,
@@ -16287,6 +16289,7 @@ fn compute_guest_image_pool_key(
     depth: u32,
     is_3d: bool,
     is_cube: bool,
+    is_array: bool,
     format: vk::Format,
     components: vk::ComponentMapping,
     mip_levels: u32,
@@ -16301,6 +16304,7 @@ fn compute_guest_image_pool_key(
         depth,
         is_3d,
         is_cube,
+        is_array,
         format: format.as_raw(),
         components: [
             components.r.as_raw(),
@@ -16475,6 +16479,7 @@ fn acquire_compute_guest_image(
     depth: u32,
     is_3d: bool,
     is_cube: bool,
+    is_array: bool,
     format: vk::Format,
     components: vk::ComponentMapping,
     mip_levels: u32,
@@ -16495,6 +16500,7 @@ fn acquire_compute_guest_image(
         depth,
         is_3d,
         is_cube,
+        is_array,
         format,
         components,
         mip_levels,
@@ -16551,6 +16557,7 @@ fn acquire_compute_guest_image(
         depth,
         is_3d,
         is_cube,
+        is_array,
         format,
         components,
         mip_levels,
@@ -17854,13 +17861,15 @@ fn execute_compute_dispatch(
         let numeric_type = sampled.sample_type.spirv_type();
         let is_3d = tic_is_volume(&sampled.tic);
         let is_cube = tic_is_cube(&sampled.tic);
-        let depth = if is_3d { sampled.tic.depth.max(1) } else { 1 };
+        let is_array = sampled.tic.texture_type == 5;
+        let depth = if is_3d || is_array { sampled.tic.depth.max(1) } else { 1 };
         let cross_access_output = compute_cross_access_output_index(&dispatch, sampled.binding);
         let live_view_compatible = sampled.tic.mip_levels() == 1
             && sampled.tic.view_base_mip() == 0
             && sampled.tic.view_mip_levels() == 1;
         let alias = if !is_3d
             && !is_cube
+            && (!is_array || depth == 1)
             && cross_access_output.is_none()
             && live_view_compatible
             && (!sampled.guest_bytes_authoritative || sampled.guest_bytes.is_none())
@@ -17987,7 +17996,7 @@ fn execute_compute_dispatch(
                     utility_slot,
                     alias,
                     Some(sampled.tic),
-                    false,
+                    is_array,
                     view_format,
                 )
             };
@@ -18013,7 +18022,7 @@ fn execute_compute_dispatch(
                 texture_requires_integer_sampler(numeric_type, stencil_alias),
             )
         } else {
-            let format = match texture_image_format_for_tic(&sampled.tic, numeric_type) {
+            let format = match compute_sample_image_format(&sampled.tic, numeric_type, sampled.tsc.depth_compare_enabled) {
                 Ok(format) => format,
                 Err(error) => return ComputeDispatchOutcome::Unsupported(error),
             };
@@ -18130,7 +18139,7 @@ fn execute_compute_dispatch(
                 };
                 if raw.is_empty()
                     || sampled.tic.is_buffer()
-                    || (tic_requires_dedicated_sampled_view(&sampled.tic) && !is_3d && !is_cube)
+                    || (tic_requires_dedicated_sampled_view(&sampled.tic) && !is_3d && !is_cube && !is_array)
                     || sampled.tic.base_layer != 0
                     || (is_3d && sampled.tic.mip_levels() != 1)
                 {
@@ -18145,7 +18154,7 @@ fn execute_compute_dispatch(
                         sampled.binding, sampled.tic.width, sampled.tic.height, sampled.tic.depth
                     ));
                 }
-                let slice_pitch = if (is_3d || is_cube)
+                let slice_pitch = if (is_3d || is_cube || is_array)
                     && (!sampled.tic.is_block_linear
                         || crate::pitch_oracle::is_pitch_dst(sampled.tic.gpu_va))
                 {
@@ -18180,6 +18189,7 @@ fn execute_compute_dispatch(
                         depth,
                         is_3d,
                         is_cube,
+                        is_array,
                         format,
                         components,
                         mip_levels: sampled.tic.mip_levels(),
@@ -18247,6 +18257,7 @@ fn execute_compute_dispatch(
                 depth,
                 is_3d,
                 is_cube,
+                is_array,
                 format,
                 components,
                 mip_levels,
@@ -18262,6 +18273,7 @@ fn execute_compute_dispatch(
                 depth,
                 is_3d,
                 is_cube,
+                is_array,
                 format,
                 components,
                 mip_levels,
@@ -18680,6 +18692,7 @@ fn execute_compute_dispatch(
                 depth,
                 is_3d,
                 is_cube,
+                is_array,
                 format,
                 components,
                 mip_levels,
@@ -18700,6 +18713,7 @@ fn execute_compute_dispatch(
                 *depth,
                 *is_3d,
                 *is_cube,
+                *is_array,
                 *format,
                 *components,
                 *mip_levels,
@@ -18740,6 +18754,7 @@ fn execute_compute_dispatch(
                 *height,
                 *depth,
                 *is_3d,
+                false,
                 false,
                 *format,
                 *components,
@@ -22193,6 +22208,14 @@ fn texture_level_upload(
     format: vk::Format,
 ) -> Vec<u8> {
     if format == vk::Format::D32_SFLOAT {
+        if tic_format == crate::texture::TicFormat::R32 {
+            return linear.to_vec();
+        }
+        if tic_format == crate::texture::TicFormat::R16 {
+            return linear.chunks_exact(2).flat_map(|word| {
+                (u16::from_le_bytes([word[0], word[1]]) as f32 / 65535.0).to_le_bytes()
+            }).collect();
+        }
         return crate::depth::unpack_texture_depth(linear, tic_format);
     }
     let native_layout = matches!(
@@ -26853,6 +26876,23 @@ fn depth_texture_image_format(
         && !tic_is_volume(tic)
         && !tic.is_buffer())
     .then_some(vk::Format::D32_SFLOAT)
+}
+
+fn compute_sample_image_format(
+    tic: &crate::texture::TicEntry,
+    numeric_type: nexium_spirv::TextureNumericType,
+    compare: bool,
+) -> Result<vk::Format, String> {
+    use crate::texture::{ComponentType, TicFormat};
+    if compare && numeric_type == nexium_spirv::TextureNumericType::Float
+        && !tic_is_volume(tic) && !tic.is_buffer()
+        && matches!((tic.format, tic.component_types[0]),
+            (TicFormat::R32, ComponentType::Float) |
+            (TicFormat::R16, ComponentType::Unorm))
+    {
+        return Ok(vk::Format::D32_SFLOAT);
+    }
+    texture_image_format_for_tic(tic, numeric_type)
 }
 
 fn texture_image_format_for_tic(
@@ -31871,6 +31911,7 @@ mod tests {
             32,
             true,
             false,
+            false,
             vk::Format::R8G8B8A8_UNORM,
             components,
             1,
@@ -31888,6 +31929,7 @@ mod tests {
                 32,
                 32,
                 true,
+                false,
                 false,
                 vk::Format::R8G8B8A8_UNORM,
                 components,
@@ -33660,6 +33702,25 @@ mod tests {
             upload(TicFormat::G24R8, vk::Format::R32_UINT),
             0xabu32.to_le_bytes().to_vec()
         );
+    }
+
+    #[test]
+    fn compute_scalar_shadow_images_preserve_depth_values() {
+        use crate::texture::{ComponentType, TicFormat};
+        use nexium_spirv::TextureNumericType::Float;
+        let mut tic = group_memo_test_tic(0x1000);
+        for (guest, component) in [(TicFormat::R32, ComponentType::Float),
+                                   (TicFormat::R16, ComponentType::Unorm)] {
+            tic.format = guest;
+            tic.component_types = [component; 4];
+            assert_eq!(super::compute_sample_image_format(&tic, Float, true).unwrap(), vk::Format::D32_SFLOAT);
+            assert_ne!(super::compute_sample_image_format(&tic, Float, false).unwrap(), vk::Format::D32_SFLOAT);
+        }
+        let floats: Vec<_> = [0.0f32, 0.25, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(texture_level_upload(&floats, TicFormat::R32, 3, 1, 1, ComponentType::Float, vk::Format::D32_SFLOAT), floats);
+        let shorts: Vec<_> = [0u16, 32768, 65535].into_iter().flat_map(u16::to_le_bytes).collect();
+        let expected: Vec<_> = [0.0f32, 32768.0 / 65535.0, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(texture_level_upload(&shorts, TicFormat::R16, 3, 1, 1, ComponentType::Unorm, vk::Format::D32_SFLOAT), expected);
     }
 
     #[test]

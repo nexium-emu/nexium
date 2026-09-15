@@ -1182,7 +1182,7 @@ fn prepare_and_execute(
             (ResourceAccess::Sampled, _) => ComputeResourceKind::SampledImage,
             (
                 ResourceAccess::FilteredSample,
-                ImageDimension::D2 | ImageDimension::D3 | ImageDimension::Cube,
+                ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube,
             ) => ComputeResourceKind::CombinedSampledImage,
             (ResourceAccess::FilteredSample, other) => {
                 return Err(
@@ -1595,7 +1595,7 @@ fn prepare_and_execute(
                 if resource.metadata.kind != ComputeResourceKind::CombinedSampledImage
                     || !matches!(
                         resource.metadata.dimension,
-                        ImageDimension::D2 | ImageDimension::D3 | ImageDimension::Cube
+                        ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube
                     )
                     || (resource.metadata.dimension == ImageDimension::Cube
                         && resource.tic.depth != 1)
@@ -2447,6 +2447,13 @@ fn collect_resource_needs(cfg: &nexium_shader::Cfg) -> Result<Vec<ResourceNeed>,
                         referenced_component,
                     )?;
                 }
+                IrOp::GatherTex { tex_id, array, gather_component, .. } => merge_need(
+                    &mut needs,
+                    TextureHandleOrigin::Bound { cbuf_word_offset: *tex_id },
+                    ResourceAccess::FilteredSample,
+                    Some(if array.is_some() { ImageDimension::D2Array } else { ImageDimension::D2 }),
+                    1u8 << *gather_component,
+                )?,
                 IrOp::TextureQueryDimension { handle, .. } => {
                     merge_need(&mut needs, *handle, ResourceAccess::Sampled, None, 0)?
                 }
@@ -2680,6 +2687,7 @@ fn image_dimension(tic: &TicEntry) -> Result<ImageDimension, String> {
         match tic.texture_type {
             0 => ImageDimension::D1,
             1 => ImageDimension::D2,
+            5 => ImageDimension::D2Array,
             7 if tic.pitch_bytes != 0 => ImageDimension::D2,
             2 => ImageDimension::D3,
             3 => ImageDimension::Cube,
@@ -2703,9 +2711,9 @@ fn image_depth(tic: &TicEntry) -> u32 {
 fn validate_image_view(tic: &TicEntry, storage: bool) -> Result<(), String> {
     validate_pitch_linear_layout(tic)?;
     let supported_type = matches!(tic.texture_type, 1 | 2)
-        || (tic.texture_type == 3 && !storage)
+        || (matches!(tic.texture_type, 3 | 5) && !storage)
         || (tic.texture_type == 7 && tic.pitch_bytes != 0);
-    let layered_2d_view = tic.texture_type == 1
+    let layered_2d_view = matches!(tic.texture_type, 1 | 5)
         && tic.is_block_linear
         && !nexium_gpu::pitch_oracle::is_pitch_dst(tic.gpu_va)
         && tic.base_layer < tic.depth.max(1);
@@ -2737,7 +2745,7 @@ fn validate_image_view(tic: &TicEntry, storage: bool) -> Result<(), String> {
     let effective_block_linear =
         tic.is_block_linear && !nexium_gpu::pitch_oracle::is_pitch_dst(tic.gpu_va);
     if mip_levels > 1
-        && (!matches!(tic.texture_type, 1 | 3)
+        && (!matches!(tic.texture_type, 1 | 3 | 5)
             || !effective_block_linear
             || tic.block_width_log2 != 0
             || tic.block_depth_log2 != 0
@@ -2798,7 +2806,7 @@ fn image_view_subresources(
             .collect());
     }
 
-    if tic.texture_type != 3
+    if !matches!(tic.texture_type, 3 | 5)
         && (tic.view_base_mip() != 0 || tic.view_mip_levels() != 1 || tic.mip_levels() != 1)
     {
         return Err(format!(
@@ -3145,6 +3153,9 @@ fn resource_size(tic: &TicEntry) -> Result<usize, String> {
     } else if effective_block_linear && tic.texture_type == 1 {
         texture_guest_size_bytes(tic, 1)
             .ok_or_else(|| "invalid Maxwell block-linear mip allocation".to_string())?
+    } else if effective_block_linear && tic.texture_type == 5 {
+        texture_guest_size_bytes(tic, tic.depth.max(1))
+            .ok_or_else(|| "invalid Maxwell block-linear array allocation".to_string())?
     } else if effective_block_linear && tic.texture_type == 3 {
         texture_guest_size_bytes(tic, 6)
             .ok_or_else(|| "invalid Maxwell block-linear cube allocation".to_string())?
@@ -3159,7 +3170,7 @@ fn resource_size(tic: &TicEntry) -> Result<usize, String> {
             tic.tile_width_spacing,
         )
     } else {
-        let layers = if tic.texture_type == 3 { 6 } else { depth };
+        let layers = match tic.texture_type { 3 => 6, 5 => tic.depth.max(1) as usize, _ => depth };
         tight_layer
             .checked_mul(layers)
             .ok_or_else(|| "Maxwell compute resource depth size overflow".to_string())?
@@ -5273,6 +5284,12 @@ mod tests {
         assert_eq!(layout.layer_stride, 3584);
         assert_eq!(texture_guest_size_bytes(&tic, 6), Some(3584 * 6));
         assert_eq!(resource_size(&tic).unwrap(), 3584 * 6);
+        let array = TicEntry { texture_type: 5, depth: 4, ..tic };
+        assert_eq!(image_dimension(&array), Ok(ImageDimension::D2Array));
+        validate_image_view(&array, false).unwrap();
+        assert!(validate_image_view(&array, true).is_err());
+        assert_eq!(resource_size(&array).unwrap(), 3584 * 4);
+        assert_eq!(image_view_subresources(&array, false).unwrap()[0].guest_size, 3584 * 4);
         let subresources = image_view_subresources(&tic, false).unwrap();
         assert_eq!(subresources.len(), 1);
         assert_eq!(
