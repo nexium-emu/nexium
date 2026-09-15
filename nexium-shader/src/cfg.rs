@@ -135,6 +135,7 @@ pub struct StorageBufferAddr {
     pub align: u32,
     pub indirect: Option<StorageBufferIndirection>,
     pub required_size: u32,
+    pub has_dynamic_offset: bool,
 }
 
 impl StorageBufferAddr {
@@ -145,6 +146,7 @@ impl StorageBufferAddr {
             align,
             indirect: None,
             required_size: 0,
+            has_dynamic_offset: false,
         }
     }
 
@@ -387,6 +389,7 @@ fn track_dfs(
                         pointer_offset,
                     }),
                     required_size: 0,
+                    has_dynamic_offset: false,
                 },
                 base_addr_lo: v,
                 relative_offset: Some(0),
@@ -524,6 +527,7 @@ fn intern_storage_buffer(
         .position(|existing| same_storage_origin(*existing, descriptor))
     {
         buffers[index].required_size = buffers[index].required_size.max(descriptor.required_size);
+        buffers[index].has_dynamic_offset |= descriptor.has_dynamic_offset;
         return index as u32;
     }
 
@@ -595,6 +599,7 @@ pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
                     continue;
                 }
                 tracked.descriptor.required_size = required_size.unwrap_or(0);
+                tracked.descriptor.has_dynamic_offset = required_size.is_none();
                 let buffer_index = intern_storage_buffer(&mut buffers, tracked.descriptor);
                 let descriptor = buffers[buffer_index as usize];
                 let op = if let (Some(value), Some((atomic_op, is_signed))) = (value, atomic) {
@@ -1909,6 +1914,7 @@ mod tests {
                     align: 8,
                     indirect: None,
                     required_size: 8,
+                    has_dynamic_offset: false,
                 },
                 StorageBufferAddr {
                     cbuf_binding: 0,
@@ -1919,6 +1925,7 @@ mod tests {
                         pointer_offset: 0,
                     }),
                     required_size: 16,
+                    has_dynamic_offset: false,
                 },
             ]
         );
@@ -2116,6 +2123,28 @@ mod tests {
     }
 
     #[test]
+    fn storage_buffer_bounds_remember_dynamic_accesses() {
+        for dynamic in [false, true] {
+            let mut program = Program::new();
+            let pointer = program.emit(Op::LoadCbuf { binding: 0, byte_offset: 0x290 }, Some(4));
+            program.emit(Op::LoadGlobal { addr_lo: Value::Inst(pointer), offset: 128 }, Some(5));
+            if dynamic {
+                let index = program.emit(Op::LocalInvocationId { component: 0 }, Some(6));
+                let address = program.emit(Op::IAdd {
+                    a: Value::Inst(pointer), b: Value::Inst(index), neg_a: false, neg_b: false,
+                }, Some(7));
+                program.emit(Op::LoadGlobal { addr_lo: Value::Inst(address), offset: 0 }, Some(8));
+            }
+            program.emit(Op::LoadGlobal { addr_lo: Value::Inst(pointer), offset: 280 }, Some(9));
+            let mut cfg = cfg_with_program(program);
+            let buffers = collect_storage_buffers(&mut cfg);
+            assert_eq!(buffers.len(), 1);
+            assert_eq!(buffers[0].required_size, 284);
+            assert_eq!(buffers[0].has_dynamic_offset, dynamic);
+        }
+    }
+
+    #[test]
     fn storage_buffer_collection_accepts_matching_predicated_pointer() {
         let mut program = Program::new();
         let predicate = Predicate {
@@ -2159,6 +2188,7 @@ mod tests {
                 align: 16,
                 indirect: None,
                 required_size: 0x70,
+                has_dynamic_offset: false,
             }]
         );
         for instruction in &cfg.blocks[0].program.instructions[2..] {

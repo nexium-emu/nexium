@@ -4674,6 +4674,7 @@ mod tests {
                 pointer_offset: 5,
             }),
             required_size: 20,
+            has_dynamic_offset: false,
         };
         let child =
             resolve_raw_storage_buffer(1, child_descriptor, &cbufs, &[parent], &mappings, &read)

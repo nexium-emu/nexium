@@ -13368,6 +13368,7 @@ fn execute_one_inner(
                                             },
                                         ),
                                         required_size,
+                                        has_dynamic_offset: true,
                                     }
                                 },
                             )
@@ -26855,6 +26856,7 @@ mod tests {
                 pointer_offset: 5,
             }),
             required_size: 16,
+            has_dynamic_offset: false,
         };
         let grandchild = nexium_shader::StorageBufferAddr {
             cbuf_binding: 0,
@@ -26865,6 +26867,7 @@ mod tests {
                 pointer_offset: 4,
             }),
             required_size: 20,
+            has_dynamic_offset: false,
         };
 
         let descriptors = [direct, child, grandchild];
