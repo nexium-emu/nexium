@@ -4389,11 +4389,38 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+fn system_ticks_from_elapsed(elapsed: std::time::Duration) -> u64 {
+    (elapsed.as_nanos() * 19_200_000 / 1_000_000_000) as u64
+}
+
+#[cfg(test)]
+mod system_tick_tests {
+    use super::system_ticks_from_elapsed;
+    use std::time::Duration;
+
+    #[test]
+    fn system_tick_remains_monotonic_past_old_overflow_boundary() {
+        let boundary = u64::MAX / 19_200_000;
+        let ticks = |ns| system_ticks_from_elapsed(Duration::from_nanos(ns));
+        assert_eq!(ticks(boundary), 18_446_744_073);
+        assert_eq!(ticks(boundary + 1), ticks(boundary));
+        assert!(ticks(boundary + 1_000) > ticks(boundary));
+    }
+
+    #[test]
+    fn system_tick_preserves_rate_and_long_uptimes() {
+        assert_eq!(system_ticks_from_elapsed(Duration::ZERO), 0);
+        assert_eq!(system_ticks_from_elapsed(Duration::from_nanos(1_250)), 24);
+        assert_eq!(system_ticks_from_elapsed(Duration::from_secs(1)), 19_200_000);
+        assert_eq!(system_ticks_from_elapsed(Duration::from_secs(86_400)), 1_658_880_000_000);
+    }
+}
+
 fn svc_get_system_tick(_kernel: &mut Kernel) -> u32 {
     use std::sync::OnceLock;
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
     let elapsed = EPOCH.get_or_init(std::time::Instant::now).elapsed();
-    let ticks = (elapsed.as_nanos() as u64).wrapping_mul(19_200_000) / 1_000_000_000;
+    let ticks = system_ticks_from_elapsed(elapsed);
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, ticks);
     }
