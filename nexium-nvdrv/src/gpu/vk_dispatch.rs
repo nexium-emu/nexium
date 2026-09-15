@@ -5958,8 +5958,8 @@ fn prepare_graphics_clear_op(
         .nvmap_id_for(rt_gpu_va)
         .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
     let (msx, msy) = msaa_samples(draw.multisample_mode);
-    let rt_key = rt_key_for_target(rt, mappings, (msx, msy))
-        .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
+    let rt_key = rt_key_for_clear(rt, mappings, (msx, msy), draw.clear_mask)
+        .ok_or_else(|| format!("RT gpu_va={:#x} unresolved: clear={:#x} target={:?}", rt_gpu_va, draw.clear_mask, rt))?;
     let rt_format = map_rt_format_for_key(rt.format, rt_key);
     let mask = draw.clear_mask;
     let want_color_clear = clear_surface_wants_color(mask);
@@ -12168,8 +12168,12 @@ fn execute_one_inner(
         .nvmap_id_for(rt_gpu_va)
         .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
     let (msx, msy) = msaa_samples(draw.multisample_mode);
-    let rt_key = rt_key_for_target(rt, mappings, (msx, msy))
-        .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
+    let rt_key = if draw.is_clear {
+        rt_key_for_clear(rt, mappings, (msx, msy), draw.clear_mask)
+    } else {
+        rt_key_for_target(rt, mappings, (msx, msy))
+    }
+        .ok_or_else(|| format!("RT gpu_va={:#x} unresolved: clear={:#x} target={:?}", rt_gpu_va, draw.clear_mask, rt))?;
     let rt_format = map_rt_format_for_key(rt.format, rt_key);
     let small_rt_tile_mode = small_rt_tile_mode_for_target(draw, rt_key, rt);
     if small_rt_gate_trace_enabled() && rt.width <= 256 && rt.height <= 1536 {
@@ -12242,10 +12246,14 @@ fn execute_one_inner(
             do_depth,
             do_stencil,
         );
+        let color_clear_key = if rt_key.is_3d || rt_key.render_layer_count() != 1 {
+            RtKey::new(nvmap_id, rt_key.width, rt_key.height, rt_key.gpu_va)
+        } else {
+            rt_key
+        };
         if let Some(rt_thread) = crate::render_thread::maybe_render_thread() {
             let cdepth = draw.clear_depth;
             let cstencil = draw.clear_stencil;
-            let (w, h) = (rt_key.width, rt_key.height);
             let r = renderer.clone();
             rt_thread.submit_named(
                 "clear",
@@ -12275,12 +12283,12 @@ fn execute_one_inner(
                     }
                     if want_color_clear {
                         if let Some(rect) = clear_scissor {
-                            let _ = r.clear_target_rect_with_format(
-                                nvmap_id, w, h, rt_gpu_va, color, rect, rt_format,
+                            let _ = r.clear_target_key_rect_with_format(
+                                color_clear_key, color, rect, rt_format,
                             );
                         } else {
-                            let _ = r.clear_target_with_format(
-                                nvmap_id, w, h, rt_gpu_va, color, rt_format,
+                            let _ = r.clear_target_key_with_format(
+                                color_clear_key, color, rt_format,
                             );
                         }
                     }
@@ -12322,21 +12330,15 @@ fn execute_one_inner(
             if !combined_cleared {
                 if want_color_clear {
                     if let Some(rect) = clear_scissor {
-                        renderer.clear_target_rect_with_format(
-                            nvmap_id,
-                            rt_key.width,
-                            rt_key.height,
-                            rt_gpu_va,
+                        renderer.clear_target_key_rect_with_format(
+                            color_clear_key,
                             color,
                             rect,
                             rt_format,
                         )?;
                     } else {
-                        renderer.clear_target_with_format(
-                            nvmap_id,
-                            rt_key.width,
-                            rt_key.height,
-                            rt_gpu_va,
+                        renderer.clear_target_key_with_format(
+                            color_clear_key,
                             color,
                             rt_format,
                         )?;
@@ -15283,6 +15285,32 @@ fn rt_key_for_target(
         key
     };
     Some(finish_render_target_key(key, rt, format))
+}
+
+fn rt_key_for_clear(
+    rt: &RenderTarget,
+    mappings: &GpuMappings,
+    samples: (u32, u32),
+    clear_mask: u32,
+) -> Option<RtKey> {
+    if !clear_surface_wants_color(clear_mask)
+        || rt.tile_mode & ((1 << 12) | (1 << 16)) != 0
+        || rt.base_layer != 0
+    {
+        return rt_key_for_target(rt, mappings, samples);
+    }
+    let layer = (clear_mask >> 10) & 0xffff;
+    if layer >= (rt.depth & 0xffff).max(1) || (layer != 0 && rt.layer_stride == 0) {
+        return None;
+    }
+    let gpu_va = (u64::from(rt.address_hi) << 32) | u64::from(rt.address_lo);
+    let offset = u64::from(rt.layer_stride).checked_mul(4)?.checked_mul(u64::from(layer))?;
+    let gpu_va = gpu_va.checked_add(offset)?;
+    let mut slice = *rt;
+    slice.address_hi = (gpu_va >> 32) as u32;
+    slice.address_lo = gpu_va as u32;
+    slice.depth = 1;
+    rt_key_for_target(&slice, mappings, samples)
 }
 
 fn zeta_rt_key(draw: &DrawCall, mappings: &GpuMappings, fallback: RtKey) -> Option<RtKey> {

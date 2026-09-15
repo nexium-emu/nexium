@@ -5627,6 +5627,19 @@ impl Renderer {
         rgba: [f32; 4],
         format: vk::Format,
     ) -> Result<(), String> {
+        self.clear_target_key_with_format(RtKey::new(nvmap_id, width, height, gpu_va), rgba, format)
+    }
+
+    pub fn clear_target_key_with_format(
+        &self,
+        key: RtKey,
+        rgba: [f32; 4],
+        format: vk::Format,
+    ) -> Result<(), String> {
+        if key.is_3d || key.render_layer_count() != 1 {
+            return Err("color clear requires one resolved 2D layer".to_string());
+        }
+        let (width, height) = (key.width, key.height);
         let clear_settle_started = std::time::Instant::now();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
@@ -5642,7 +5655,6 @@ impl Renderer {
             rt_copy_slots,
             ..
         } = &mut *inner;
-        let key = RtKey::new(nvmap_id, width, height, gpu_va);
         drain_rt_copies_before_color_recreate(
             submit_state,
             device,
@@ -5967,6 +5979,20 @@ impl Renderer {
         rect: [i32; 4],
         format: vk::Format,
     ) -> Result<(), String> {
+        self.clear_target_key_rect_with_format(RtKey::new(nvmap_id, width, height, gpu_va), rgba, rect, format)
+    }
+
+    pub fn clear_target_key_rect_with_format(
+        &self,
+        key: RtKey,
+        rgba: [f32; 4],
+        rect: [i32; 4],
+        format: vk::Format,
+    ) -> Result<(), String> {
+        if key.is_3d || key.render_layer_count() != 1 {
+            return Err("color clear requires one resolved 2D layer".to_string());
+        }
+        let (width, height) = (key.width, key.height);
         let x = rect[0].max(0) as u32;
         let y = rect[1].max(0) as u32;
         let w = rect[2].max(0) as u32;
@@ -5977,7 +6003,7 @@ impl Renderer {
         let w = w.min(width - x);
         let h = h.min(height - y);
         if x == 0 && y == 0 && w == width && h == height {
-            return self.clear_target_with_format(nvmap_id, width, height, gpu_va, rgba, format);
+            return self.clear_target_key_with_format(key, rgba, format);
         }
         let clear_settle_started = std::time::Instant::now();
         let mut inner = self.inner.lock();
@@ -5994,7 +6020,6 @@ impl Renderer {
             rt_copy_slots,
             ..
         } = &mut *inner;
-        let key = RtKey::new(nvmap_id, width, height, gpu_va);
         drain_rt_copies_before_color_recreate(
             submit_state,
             device,
