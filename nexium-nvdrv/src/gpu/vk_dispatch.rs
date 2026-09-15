@@ -14118,7 +14118,10 @@ fn execute_one_inner(
                                         key.layout_signature,
                                     )
                                 } else {
-                                    nexium_gpu::texture::texture_guest_size_bytes(&tic, layers)
+                                    nexium_gpu::texture::texture_guest_size_bytes(
+                                        &tic,
+                                        if tic.texture_type == 5 { tic.depth } else { layers },
+                                    )
                                 };
                                 key.with_guest_size_bytes(
                                     guest_size

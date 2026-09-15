@@ -1446,7 +1446,7 @@ struct RendererInner {
     sampler_cache: HashMap<crate::texture::TscEntry, vk::Sampler>,
     integer_sampler_cache: HashMap<crate::texture::TscEntry, vk::Sampler>,
     tex_cache: nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
-    tex_cache_vas: HashMap<u64, u32>,
+    tex_cache_ranges: TextureRangeIndex,
     texel_buffer_cache: HashMap<TexelBufferCacheKey, CachedTexelBuffer>,
     rt_reinterpret_cache: HashMap<RtReinterpretKey, RtReinterpretTexture>,
     compute_volume_cache: Vec<CachedComputeVolume>,
@@ -1521,6 +1521,54 @@ struct TexCacheKey {
     tile_width_spacing: u32,
     pitch_bytes: u32,
     numeric_type: u8,
+}
+
+#[derive(Default)]
+struct TextureRangeIndex {
+    by_start: BTreeMap<u64, Vec<TexCacheKey>>,
+    sizes: BTreeMap<u64, usize>,
+    cubes: HashSet<TexCacheKey>,
+}
+
+impl TextureRangeIndex {
+    fn insert(&mut self, key: TexCacheKey) {
+        let bucket = self.by_start.entry(key.gpu_va).or_default();
+        if bucket.contains(&key) { return; }
+        bucket.push(key);
+        *self.sizes.entry(key.guest_size).or_default() += 1;
+        if key.cube || key.cube_array { self.cubes.insert(key); }
+    }
+
+    fn remove(&mut self, key: TexCacheKey) {
+        let Some(bucket) = self.by_start.get_mut(&key.gpu_va) else { return; };
+        let Some(position) = bucket.iter().position(|candidate| *candidate == key) else { return; };
+        bucket.swap_remove(position);
+        if bucket.is_empty() { self.by_start.remove(&key.gpu_va); }
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.sizes.entry(key.guest_size) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 { entry.remove(); }
+        }
+        self.cubes.remove(&key);
+    }
+
+    fn clear(&mut self) {
+        self.by_start.clear();
+        self.sizes.clear();
+        self.cubes.clear();
+    }
+
+    fn overlapping(&self, gpu_va: u64, size: u64) -> Vec<TexCacheKey> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let Some((&largest, _)) = self.sizes.last_key_value() else { return Vec::new(); };
+        if size == 0 || largest == 0 { return Vec::new(); }
+        let start = gpu_va.saturating_sub(largest - 1);
+        let end = u128::from(gpu_va) + u128::from(size);
+        let upper = if end > u128::from(u64::MAX) { Unbounded } else { Excluded(end as u64) };
+        self.by_start.range((Included(start), upper))
+            .flat_map(|(_, keys)| keys.iter())
+            .filter(|key| texture_key_overlaps_gpu_range(**key, gpu_va, size))
+            .copied().collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2404,14 +2452,26 @@ struct CachedTexture {
     trusted_source_identity: Option<u64>,
     gpu_mip_overlay: bool,
     raw_cpu_hash: Option<u64>,
-    gpu_mip_mask: u32,
-    profile_cpu_snapshot_identity: Option<u64>,
+    gpu_subresources: Vec<(u32, u32)>,
+    cpu_snapshot_hash: Option<(u64, usize, u64)>,
+    invalidated: bool,
+    allocation_size: u64,
 }
 
-fn texture_rt_mip_mask(mips: &[crate::texture_mips::TextureRtMip]) -> u32 {
-    mips.iter().fold(0, |mask, mip| {
-        mask | 1u32.checked_shl(mip.level).unwrap_or(0)
-    })
+impl CachedTexture {
+    fn invalidate_content(&mut self) {
+        self.invalidated = true;
+        self.trusted_source_identity = None;
+        self.cpu_snapshot_hash = None;
+    }
+}
+
+fn can_retain_invalidated_texture(count: usize, bytes: u64, size: u64) -> bool {
+    count < 32 && bytes <= 256 * 1024 * 1024 && size <= 256 * 1024 * 1024 - bytes
+}
+
+fn texture_rt_subresources(mips: &[crate::texture_mips::TextureRtMip]) -> Vec<(u32, u32)> {
+    mips.iter().map(|mip| (mip.layer, mip.level)).collect()
 }
 
 fn texture_rt_mips_can_refresh(
@@ -2423,16 +2483,18 @@ fn texture_rt_mips_can_refresh(
     raw_cpu_hash.is_some()
         && raw_cpu_hash == cached.raw_cpu_hash
         && !mips.is_empty()
-        && cached.gpu_mip_mask & !texture_rt_mip_mask(mips) == 0
+        && cached.gpu_subresources.iter().all(|&(layer, level)| {
+            mips.iter().any(|mip| mip.layer == layer && mip.level == level)
+        })
         && cached.image != vk::Image::null()
         && cached.layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-        && key.layers == 1
+        && (key.layers == 1 || key.arrayed)
         && !key.volume
-        && !key.arrayed
         && !key.cube
         && !key.cube_array
         && mips.iter().all(|mip| {
-            mip.level < key.mip_levels
+            mip.layer < key.layers
+                && mip.level < key.mip_levels
                 && mip.level < 32
                 && mip.width == (key.width >> mip.level).max(1)
                 && mip.height == (key.height >> mip.level).max(1)
@@ -2644,6 +2706,14 @@ fn profiled_texture_snapshot_hash(
             hash
         }
     }
+}
+
+fn cached_cpu_texture_hash(
+    cached: Option<(u64, usize, u64)>,
+    snapshot: &SharedGuestSnapshot,
+) -> Option<u64> {
+    let (identity, len, hash) = cached?;
+    (snapshot.trusted_identity() == Some(identity) && snapshot.len() == len).then_some(hash)
 }
 
 fn trusted_texture_snapshot_matches(
@@ -4203,7 +4273,7 @@ impl Renderer {
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let drained: Vec<_> = inner.tex_cache.drain().map(|(_, t)| t).collect();
-        inner.tex_cache_vas.clear();
+        inner.tex_cache_ranges.clear();
         let texel_drained: Vec<_> = inner
             .texel_buffer_cache
             .drain()
@@ -4256,20 +4326,40 @@ impl Renderer {
             return;
         }
         let mut inner = self.inner.lock();
-        let keys: Vec<_> = inner
-            .tex_cache
-            .keys()
-            .filter(|key| texture_key_overlaps_gpu_range(**key, gpu_va, size))
-            .copied()
-            .collect();
+        let keys = inner.tex_cache_ranges.overlapping(gpu_va, size);
         if keys.is_empty() {
             return;
         }
+        let (mut retained_count, mut retained_bytes) = inner.tex_cache_ranges.cubes
+            .iter()
+            .filter_map(|key| inner.tex_cache.get(key))
+            .filter(|texture| texture.invalidated)
+            .fold((0usize, 0u64), |(count, bytes), texture| {
+                (count + 1, bytes.saturating_add(texture.allocation_size))
+            });
         let drained: Vec<_> = keys
             .into_iter()
             .filter_map(|key| {
+                if (key.cube || key.cube_array)
+                    && texture_update_in_place_enabled(key.volume, key.mip_levels, true)
+                {
+                    let texture = inner.tex_cache.get_mut(&key)?;
+                    if texture.invalidated {
+                        return None;
+                    }
+                    if can_retain_invalidated_texture(
+                        retained_count,
+                        retained_bytes,
+                        texture.allocation_size,
+                    ) {
+                        retained_count += 1;
+                        retained_bytes += texture.allocation_size;
+                        texture.invalidate_content();
+                        return None;
+                    }
+                }
                 let texture = inner.tex_cache.remove(&key)?;
-                release_tex_cache_va(&mut inner.tex_cache_vas, key.gpu_va);
+                inner.tex_cache_ranges.remove(key);
                 Some(texture)
             })
             .collect();
@@ -5287,7 +5377,7 @@ impl Renderer {
                 sampler_cache: HashMap::new(),
                 integer_sampler_cache: HashMap::new(),
                 tex_cache: nexium_common::fast_hash::FastMap::default(),
-                tex_cache_vas: HashMap::new(),
+                tex_cache_ranges: TextureRangeIndex::default(),
                 texel_buffer_cache: HashMap::new(),
                 rt_reinterpret_cache: HashMap::new(),
                 compute_volume_cache: Vec::new(),
@@ -8718,7 +8808,7 @@ impl Renderer {
             sampler_anisotropy_supported,
             native_bc_formats,
             tex_cache,
-            tex_cache_vas,
+            tex_cache_ranges,
             texel_buffer_cache,
             rt_reinterpret_cache,
             frame_slots,
@@ -9171,7 +9261,8 @@ impl Renderer {
                     slices,
                 );
             }
-            let force_refresh_early = force_refresh_texture(key.gpu_va);
+            let force_refresh_early = force_refresh_texture(key.gpu_va)
+                || tex_cache.get(&key).is_some_and(|texture| texture.invalidated);
             let cache_fresh = generation_gating
                 && !mip_overlay_needs_validation
                 && !force_refresh_early
@@ -9346,7 +9437,7 @@ impl Renderer {
                             if let Some(old) = tex_cache.insert(key, tex) {
                                 frame_slots[cur_idx].retired_textures.push(old);
                             } else {
-                                retain_tex_cache_va(tex_cache_vas, key.gpu_va);
+                                tex_cache_ranges.insert(key);
                             }
                         }
                         Err(error) => {
@@ -9361,11 +9452,13 @@ impl Renderer {
             if key.cube_array {
                 bound_tex_views_cube_array[slot] = tex_cache
                     .get(&key)
+                    .filter(|texture| !texture.invalidated)
                     .map(|t| t.view)
                     .unwrap_or(dummy_views_cube_array[slot][numeric_family]);
             } else if key.cube {
                 bound_tex_views_cube[slot] = tex_cache
                     .get(&key)
+                    .filter(|texture| !texture.invalidated)
                     .map(|t| t.view)
                     .unwrap_or(dummy_views_cube[slot][numeric_family]);
             } else if key.volume {
@@ -10697,7 +10790,7 @@ impl Renderer {
             sampler_anisotropy_supported,
             native_bc_formats,
             tex_cache,
-            tex_cache_vas,
+            tex_cache_ranges,
             texel_buffer_cache,
             rt_reinterpret_cache,
             frame_slots,
@@ -12032,7 +12125,8 @@ impl Renderer {
                             slices,
                         );
                     }
-                    let force_refresh_early = force_refresh_texture(key.gpu_va);
+                    let force_refresh_early = force_refresh_texture(key.gpu_va)
+                        || tex_cache.get(&key).is_some_and(|texture| texture.invalidated);
                     let group_route = group_texture_memo
                         .then(|| group_texture_route_key(call, slot))
                         .flatten();
@@ -12117,7 +12211,9 @@ impl Renderer {
                                     raw,
                                     tex_cache
                                         .get(&key)
-                                        .and_then(|texture| texture.profile_cpu_snapshot_identity),
+                                        .and_then(|texture| {
+                                            texture.cpu_snapshot_hash.map(|entry| entry.0)
+                                        }),
                                 )
                             });
                         let trusted_match = volume_slices.is_none()
@@ -12135,6 +12231,14 @@ impl Renderer {
                             (!trusted_match)
                                 .then(|| {
                                     raw_snapshot.map(|raw| {
+                                        if let Some(hash) = cached_cpu_texture_hash(
+                                            tex_cache
+                                                .get(&key)
+                                                .and_then(|texture| texture.cpu_snapshot_hash),
+                                            raw,
+                                        ) {
+                                            return hash;
+                                        }
                                         if record_stage_profile {
                                             profiled_texture_snapshot_hash(
                                                 &mut tex_raw_hash_cache,
@@ -12273,7 +12377,7 @@ impl Renderer {
                                     texture.gen = cur_gen;
                                     texture.trusted_source_identity = None;
                                     texture.raw_cpu_hash = raw_hash;
-                                    texture.gpu_mip_mask = texture_rt_mip_mask(&rt_mips);
+                                    texture.gpu_subresources = texture_rt_subresources(&rt_mips);
                                     texture.gpu_mip_overlay = true;
                                 }
                             } else {
@@ -12522,7 +12626,11 @@ impl Renderer {
                                     color_sync_checked.clear();
                                 }
                                 let mut updated_in_place = false;
-                                if texture_update_in_place_enabled(key.volume, key.mip_levels)
+                                if texture_update_in_place_enabled(
+                                    key.volume,
+                                    key.mip_levels,
+                                    key.cube || key.cube_array,
+                                )
                                     && volume_slices.is_none()
                                 {
                                     let existing = tex_cache
@@ -12549,6 +12657,7 @@ impl Renderer {
                                                     frame_slots[cur_idx].upload_buffers.push(stage);
                                                 }
                                                 if let Some(texture) = tex_cache.get_mut(&key) {
+                                                    texture.invalidated = false;
                                                     texture.layout =
                                                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
                                                     texture.hash = tex_hash;
@@ -12557,8 +12666,8 @@ impl Renderer {
                                                         trusted_source_identity;
                                                     texture.gpu_mip_overlay = !rt_mips.is_empty();
                                                     texture.raw_cpu_hash = raw_hash;
-                                                    texture.gpu_mip_mask =
-                                                        texture_rt_mip_mask(&rt_mips);
+                                                    texture.gpu_subresources =
+                                                        texture_rt_subresources(&rt_mips);
                                                 }
                                                 updated_in_place = true;
                                             }
@@ -12603,7 +12712,7 @@ impl Renderer {
                                             if let Some(old) = tex_cache.insert(key, tex) {
                                                 frame_slots[cur_idx].retired_textures.push(old);
                                             } else {
-                                                retain_tex_cache_va(tex_cache_vas, key.gpu_va);
+                                                tex_cache_ranges.insert(key);
                                             }
                                             if let Some(texture) = tex_cache.get_mut(&key) {
                                                 texture.trusted_source_identity =
@@ -12625,22 +12734,26 @@ impl Renderer {
                         }
                     }
                     rp_tex_upload += profile_elapsed(rp_upload_t0);
-                    if record_stage_profile {
-                        if let (Some(raw), Some(texture)) = (raw_snapshot, tex_cache.get_mut(&key))
-                        {
-                            texture.profile_cpu_snapshot_identity = raw.trusted_identity();
-                        }
+                    if let (Some(raw), Some(hash), Some(texture)) =
+                        (raw_snapshot, raw_hash, tex_cache.get_mut(&key))
+                    {
+                        texture.cpu_snapshot_hash = raw
+                            .trusted_identity()
+                            .map(|identity| (identity, raw.len(), hash));
                     }
                     let rp_finish_t0 = record_detail_profile.then(std::time::Instant::now);
                     let cached_binding = hot_binding.or_else(|| {
-                        tex_cache.get(&key).map(|texture| HotGenericTextureBinding {
-                            key,
-                            generation: texture.gen,
-                            trusted_source_identity: texture.trusted_source_identity,
-                            image: texture.image,
-                            view: texture.view,
-                            layout: texture.layout,
-                        })
+                        tex_cache
+                            .get(&key)
+                            .filter(|texture| !texture.invalidated)
+                            .map(|texture| HotGenericTextureBinding {
+                                key,
+                                generation: texture.gen,
+                                trusted_source_identity: texture.trusted_source_identity,
+                                image: texture.image,
+                                view: texture.view,
+                                layout: texture.layout,
+                            })
                     });
                     if hot_binding_eligible {
                         hot_generic_texture_bindings[slot] = cached_binding.filter(|binding| {
@@ -13745,7 +13858,7 @@ impl Renderer {
                             frame_slots[cur_idx]
                                 .retired_textures
                                 .extend(tex_cache.drain().map(|(_, texture)| texture));
-                            tex_cache_vas.clear();
+                            tex_cache_ranges.clear();
                             frame_slots[cur_idx]
                                 .retired_texel_buffers
                                 .extend(texel_buffer_cache.drain().map(|(_, buffer)| buffer));
@@ -14274,20 +14387,6 @@ fn record_stage_profile_record(
 fn pprof_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some())
-}
-
-fn retain_tex_cache_va(vas: &mut HashMap<u64, u32>, gpu_va: u64) {
-    *vas.entry(gpu_va).or_insert(0) += 1;
-}
-
-fn release_tex_cache_va(vas: &mut HashMap<u64, u32>, gpu_va: u64) {
-    if let std::collections::hash_map::Entry::Occupied(mut entry) = vas.entry(gpu_va) {
-        let count = entry.get_mut();
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            entry.remove();
-        }
-    }
 }
 
 fn volume_identity_enabled() -> bool {
@@ -20720,6 +20819,14 @@ pub fn exact_rt_copy_format_bpp(format: vk::Format) -> Option<usize> {
     }
 }
 
+pub fn rt_copy_formats_compatible(source: vk::Format, target: vk::Format) -> bool {
+    source == target
+        || matches!(
+            (exact_rt_copy_format_bpp(source), exact_rt_copy_format_bpp(target)),
+            (Some(source_bpp), Some(target_bpp)) if source_bpp == target_bpp
+        )
+}
+
 fn readback_format_bpp(format: vk::Format) -> usize {
     match format {
         vk::Format::R32G32B32A32_SFLOAT
@@ -26028,27 +26135,24 @@ fn copy_texture_rt_mips(
     if rt_mips.is_empty() {
         return;
     }
-    transition_image_range(
-        device,
-        cmd,
-        image,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageAspectFlags::COLOR,
-        0,
-        mip_levels,
-        0,
-        1,
-    );
     for mip in rt_mips {
+        debug_assert!(mip.level < mip_levels);
+        transition_image_range(
+            device, cmd, image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageAspectFlags::COLOR,
+            mip.level, 1, mip.layer, 1,
+        );
         if std::env::var_os("NEXIUM_RT_MIP_TRACE").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNT: AtomicU64 = AtomicU64::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) < 64 {
                 log::warn!(
-                    "[rt-mip-copy] source={} level={} extent={}x{} stamp={} format={:?}",
+                    "[rt-mip-copy] source={} level={} layer={} extent={}x{} stamp={} format={:?}",
                     mip.key.label(),
                     mip.level,
+                    mip.layer,
                     mip.width,
                     mip.height,
                     mip.stamp,
@@ -26090,31 +26194,25 @@ fn update_texture_rt_mips_only(
     mip_levels: u32,
     rt_mips: &[crate::texture_mips::TextureRtMip],
 ) {
-    transition_image_range(
-        device,
-        cmd,
-        image,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageAspectFlags::COLOR,
-        0,
-        mip_levels,
-        0,
-        1,
-    );
+    for mip in rt_mips {
+        transition_image_range(
+            device, cmd, image,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageAspectFlags::COLOR,
+            mip.level, 1, mip.layer, 1,
+        );
+    }
     copy_texture_rt_mips(device, cmd, image, mip_levels, rt_mips);
-    transition_image_range(
-        device,
-        cmd,
-        image,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        vk::ImageAspectFlags::COLOR,
-        0,
-        mip_levels,
-        0,
-        1,
-    );
+    for mip in rt_mips {
+        transition_image_range(
+            device, cmd, image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageAspectFlags::COLOR,
+            mip.level, 1, mip.layer, 1,
+        );
+    }
 }
 
 pub(crate) fn texture_image_aspect(format: vk::Format) -> vk::ImageAspectFlags {
@@ -26290,6 +26388,12 @@ fn create_texture_image(
                 &[range],
             );
         }
+        transition_image_range(
+            device, cmd, image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            aspect, 0, 1, 0, 1,
+        );
         for slice in slices {
             if slice.layer >= layers || slice.format != format {
                 continue;
@@ -26459,8 +26563,10 @@ fn create_texture_image(
             trusted_source_identity: None,
             gpu_mip_overlay: !rt_mips.is_empty(),
             raw_cpu_hash,
-            gpu_mip_mask: texture_rt_mip_mask(rt_mips),
-            profile_cpu_snapshot_identity: None,
+            gpu_subresources: texture_rt_subresources(rt_mips),
+            cpu_snapshot_hash: None,
+            invalidated: false,
+            allocation_size: req.size,
         },
         stage.and_then(|stage| stage.dedicated),
     ))
@@ -26553,20 +26659,26 @@ fn update_texture_image(
     Ok(stage.dedicated)
 }
 
-fn texture_update_in_place_value_enabled(value: Option<&str>, volume: bool, mip_levels: u32) -> bool {
+fn texture_update_in_place_value_enabled(
+    value: Option<&str>,
+    volume: bool,
+    mip_levels: u32,
+    cube: bool,
+) -> bool {
     match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("1" | "true" | "on" | "yes") => true,
         Some("0" | "false" | "off" | "no") => false,
-        _ => volume && mip_levels == 1,
+        _ => cube || (volume && mip_levels == 1),
     }
 }
 
-fn texture_update_in_place_enabled(volume: bool, mip_levels: u32) -> bool {
+fn texture_update_in_place_enabled(volume: bool, mip_levels: u32, cube: bool) -> bool {
     static SETTING: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     texture_update_in_place_value_enabled(
         SETTING.get_or_init(|| std::env::var("NEXIUM_TEXTURE_UPDATE_IN_PLACE").ok()).as_deref(),
         volume,
         mip_levels,
+        cube,
     )
 }
 
@@ -29031,6 +29143,12 @@ fn transition_image_range(
             vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::TRANSFER_READ,
         ),
+        (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::TRANSFER_WRITE,
+        ),
         (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::TRANSFER,
@@ -29474,7 +29592,7 @@ impl Drop for RendererInner {
                 destroy_texel_buffer(&self.device, dummy);
             }
         }
-        self.tex_cache_vas.clear();
+        self.tex_cache_ranges.clear();
         for (_, t) in self.tex_cache.drain() {
             unsafe {
                 self.device.destroy_image_view(t.view, None);
@@ -29850,6 +29968,25 @@ mod tests {
     }
 
     #[test]
+    fn cached_cpu_hash_rejects_replaced_resized_and_mutated_snapshots() {
+        let bytes = std::sync::Arc::new(vec![1, 2, 3, 4]);
+        let snapshot = SharedGuestSnapshot::new_trusted(bytes.clone(), 4, 17).unwrap();
+        let hash = texture_content_hash(snapshot.as_slice());
+        let cached = Some((17, 4, hash));
+        assert_eq!(super::cached_cpu_texture_hash(cached, &snapshot), Some(hash));
+        let replaced = SharedGuestSnapshot::new_trusted(bytes.clone(), 4, 18).unwrap();
+        let resized = SharedGuestSnapshot::new_trusted(bytes.clone(), 3, 17).unwrap();
+        let untrusted = SharedGuestSnapshot::new(bytes, 4).unwrap();
+        for different in [&replaced, &resized, &untrusted] {
+            assert_eq!(super::cached_cpu_texture_hash(cached, different), None);
+        }
+        let mut mutated = snapshot.clone();
+        mutated.make_mut()[0] = 9;
+        assert_eq!(super::cached_cpu_texture_hash(cached, &mutated), None);
+        assert_eq!(super::cached_cpu_texture_hash(None, &snapshot), None);
+    }
+
+    #[test]
     fn texture_hash_profile_separates_actual_work_memo_hits_and_trusted_repeats() {
         let snapshot =
             SharedGuestSnapshot::new_trusted(std::sync::Arc::new(vec![1, 2, 3, 4]), 4, 17).unwrap();
@@ -29996,11 +30133,14 @@ mod tests {
             trusted_source_identity: Some(17),
             gpu_mip_overlay: false,
             raw_cpu_hash: Some(raw_hash),
-            gpu_mip_mask: 0,
-            profile_cpu_snapshot_identity: None,
+            gpu_subresources: Vec::new(),
+            cpu_snapshot_hash: Some((17, snapshot.len(), raw_hash)),
+            invalidated: false,
+            allocation_size: 4096,
         };
         let mip = TextureRtMip {
             level: 0,
+            layer: 0,
             width: 512,
             height: 512,
             key: RtKey::new(642, 512, 512, 0x5a4970000),
@@ -30022,7 +30162,11 @@ mod tests {
                     false,
                     Some((texture.gen, texture.hash)),
                     41,
-                    texture_rt_mip_hash(raw_hash, mips),
+                    texture_rt_mip_hash(
+                        super::cached_cpu_texture_hash(texture.cpu_snapshot_hash, &snapshot)
+                            .expect("CPU hash remains reusable while GPU mip stamps change"),
+                        mips,
+                    ),
                     true,
                     trusted,
                 ),
@@ -30066,11 +30210,14 @@ mod tests {
             trusted_source_identity: Some(17),
             gpu_mip_overlay: false,
             raw_cpu_hash: Some(raw_hash),
-            gpu_mip_mask: 0,
-            profile_cpu_snapshot_identity: None,
+            gpu_subresources: Vec::new(),
+            cpu_snapshot_hash: None,
+            invalidated: false,
+            allocation_size: 4096,
         };
         let base = TextureRtMip {
             level: 0,
+            layer: 0,
             width: 512,
             height: 512,
             key: RtKey::new(642, 512, 512, 0x5a4970000),
@@ -30094,7 +30241,7 @@ mod tests {
         assert!(!eligible(&cached, None, &[base]));
         assert!(!eligible(&cached, Some(texture_content_hash(&[1; 64])), &[base]));
         cached.gpu_mip_overlay = true;
-        cached.gpu_mip_mask = super::texture_rt_mip_mask(&[base]);
+        cached.gpu_subresources = super::texture_rt_subresources(&[base]);
         cached.hash = texture_rt_mip_hash(raw_hash, &[base]);
         assert!(!sampled_texture_needs_upload(
             false,
@@ -30115,12 +30262,12 @@ mod tests {
         ));
         assert!(eligible(&cached, Some(raw_hash), &[changed]));
         assert!(eligible(&cached, Some(raw_hash), &[changed, lower]));
-        cached.gpu_mip_mask = super::texture_rt_mip_mask(&[changed, lower]);
+        cached.gpu_subresources = super::texture_rt_subresources(&[changed, lower]);
         assert!(!eligible(&cached, Some(raw_hash), &[changed]));
         assert!(!eligible(&cached, Some(raw_hash), &[lower]));
         assert!(!eligible(&cached, Some(raw_hash), &[]));
         cached.gpu_mip_overlay = false;
-        cached.gpu_mip_mask = 0;
+        cached.gpu_subresources.clear();
         cached.hash = texture_rt_mip_hash(raw_hash, &[]);
         assert!(eligible(&cached, Some(raw_hash), &[base]));
         for invalid in [
@@ -30141,6 +30288,18 @@ mod tests {
         ] {
             assert!(!eligible(&cached, Some(raw_hash), &[invalid]));
         }
+        let array_key = TexCacheKey { arrayed: true, layers: 2, ..key };
+        let second_layer = TextureRtMip { layer: 1, ..base };
+        cached.gpu_subresources = super::texture_rt_subresources(&[base, second_layer]);
+        assert!(super::texture_rt_mips_can_refresh(
+            &cached, &array_key, Some(raw_hash), &[base, second_layer]));
+        assert!(!super::texture_rt_mips_can_refresh(
+            &cached, &array_key, Some(raw_hash), &[base]));
+        assert!(!super::texture_rt_mips_can_refresh(
+            &cached, &array_key, Some(raw_hash), &[second_layer]));
+        assert!(!super::texture_rt_mips_can_refresh(
+            &cached, &key, Some(raw_hash), &[base, second_layer]));
+        cached.gpu_subresources.clear();
         cached.layout = vk::ImageLayout::UNDEFINED;
         assert!(!eligible(&cached, Some(raw_hash), &[base]));
         cached.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -30284,6 +30443,52 @@ mod tests {
             pitch_bytes: tic.pitch_bytes,
             numeric_type: 0,
         }
+    }
+
+    #[test]
+    fn texture_range_index_matches_scan_through_insert_remove_and_clear() {
+        use std::collections::HashSet;
+        let mut index = super::TextureRangeIndex::default();
+        let mut keys = HashSet::new();
+        let mut random = 7u64;
+        for i in 0..512 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let address = match i % 7 {
+                0 => u64::MAX - (random & 0xffff),
+                1 => 0x8000,
+                _ => random & 0xfffff,
+            };
+            let mut key = group_memo_test_key(address);
+            key.guest_size = random.rotate_left(17) & 0xffff;
+            key.cube = i % 3 == 0;
+            key.cube_array = i % 5 == 0;
+            index.insert(key);
+            index.insert(key);
+            keys.insert(key);
+        }
+        let check = |index: &super::TextureRangeIndex, keys: &HashSet<TexCacheKey>| {
+            for (address, size) in [(0, 0), (0, u64::MAX), (u64::MAX, 1),
+                (u64::MAX - 0x8000, 0x10000), (0x8000, 1), (0x9000, 0x8000),
+                (0x100000, 0x100000)] {
+                let actual: HashSet<_> = index.overlapping(address, size).into_iter().collect();
+                let expected: HashSet<_> = keys.iter().copied()
+                    .filter(|key| texture_key_overlaps_gpu_range(*key, address, size)).collect();
+                assert!(actual == expected, "query {address:#x}+{size:#x}");
+            }
+            assert_eq!(index.sizes.values().sum::<usize>(), keys.len());
+            assert!(index.cubes == keys.iter().copied().filter(|key| key.cube || key.cube_array).collect());
+        };
+        check(&index, &keys);
+        let removed: Vec<_> = keys.iter().copied().filter(|key| key.guest_size > 0x8000).collect();
+        for key in removed {
+            index.remove(key);
+            index.remove(key);
+            keys.remove(&key);
+        }
+        check(&index, &keys);
+        index.clear();
+        keys.clear();
+        check(&index, &keys);
     }
 
     #[test]
@@ -32767,16 +32972,62 @@ mod tests {
     }
 
     #[test]
-    fn texture_image_reuse_defaults_to_single_mip_volumes_and_honors_override() {
+    fn texture_image_reuse_defaults_to_cubes_and_single_mip_volumes() {
         let enabled = super::texture_update_in_place_value_enabled;
-        assert!(enabled(None, true, 1));
+        assert!(enabled(None, true, 1, false));
         for (volume, mips) in [(false, 1), (false, 4), (true, 0), (true, 4)] {
-            assert!(!enabled(None, volume, mips));
+            assert!(!enabled(None, volume, mips, false));
         }
+        assert!(enabled(None, false, 1, true));
+        assert!(enabled(None, false, 8, true));
         for disabled in ["0", "false", "OFF", "no"] {
-            assert!(!enabled(Some(disabled), true, 1));
+            assert!(!enabled(Some(disabled), true, 1, false));
+            assert!(!enabled(Some(disabled), false, 8, true));
         }
-        assert!(enabled(Some("true"), false, 1));
+        assert!(enabled(Some("true"), false, 1, false));
+    }
+
+    #[test]
+    fn invalidated_texture_requires_upload_even_with_matching_snapshot() {
+        let mut texture = super::CachedTexture {
+            image: vk::Image::from_raw(1),
+            view: vk::ImageView::from_raw(2),
+            memory: vk::DeviceMemory::from_raw(3),
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            hash: 42,
+            gen: 7,
+            trusted_source_identity: Some(10),
+            gpu_mip_overlay: false,
+            raw_cpu_hash: Some(42),
+            gpu_subresources: Vec::new(),
+            cpu_snapshot_hash: Some((10, 1024, 42)),
+            invalidated: false,
+            allocation_size: 4096,
+        };
+        assert!(!sampled_texture_needs_upload(
+            texture.invalidated, Some((texture.gen, texture.hash)), 7, 42, true, true,
+        ));
+        texture.invalidate_content();
+        assert!(sampled_texture_needs_upload(
+            texture.invalidated, Some((texture.gen, texture.hash)), 7, 42, true, true,
+        ));
+        assert_eq!(texture.trusted_source_identity, None);
+        assert_eq!(texture.cpu_snapshot_hash, None);
+        assert_eq!(texture.image, vk::Image::from_raw(1));
+        assert_eq!(texture.view, vk::ImageView::from_raw(2));
+        assert_eq!(texture.memory, vk::DeviceMemory::from_raw(3));
+    }
+
+    #[test]
+    fn invalidated_texture_retention_has_allocation_and_byte_limits() {
+        let admit = super::can_retain_invalidated_texture;
+        let limit = 256 * 1024 * 1024;
+        assert!(admit(0, 0, limit));
+        assert!(admit(31, limit - 4096, 4096));
+        assert!(!admit(32, 0, 4096));
+        assert!(!admit(0, limit, 4096));
+        assert!(!admit(0, 0, limit + 1));
+        assert!(!admit(0, u64::MAX, 1));
     }
 
     #[test]
