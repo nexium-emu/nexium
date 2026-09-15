@@ -1466,6 +1466,13 @@ impl AsyncGpuQueue {
                                     completed = worker_gpu
                                         .flush_small_rt_writebacks(|addr, buf| mem_write(addr, buf));
                                 }
+                                if completed
+                                    && gpu::vk_dispatch::cpu_readable_rt_writeback_mode()
+                                        == gpu::vk_dispatch::CpuReadableRtWritebackMode::Present
+                                    && gpu::vk_dispatch::has_pending_cpu_readable_rt_writebacks()
+                                {
+                                    worker_gpu.flush_cpu_readable_rt_writebacks(|addr, buf| mem_write(addr, buf));
+                                }
                                 if completed {
                                     if let Some(render_thread) =
                                         crate::render_thread::maybe_render_thread()
@@ -1509,6 +1516,13 @@ impl AsyncGpuQueue {
                                 {
                                     completed = worker_gpu
                                         .flush_small_rt_writebacks(|addr, buf| mem_write(addr, buf));
+                                }
+                                if completed
+                                    && gpu::vk_dispatch::cpu_readable_rt_writeback_mode()
+                                        == gpu::vk_dispatch::CpuReadableRtWritebackMode::Present
+                                    && gpu::vk_dispatch::has_pending_cpu_readable_rt_writebacks()
+                                {
+                                    worker_gpu.flush_cpu_readable_rt_writebacks(|addr, buf| mem_write(addr, buf));
                                 }
                                 let _ = done.send(completed);
                             }

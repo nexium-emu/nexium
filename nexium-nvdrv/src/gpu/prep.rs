@@ -350,6 +350,18 @@ impl PrepState {
                 } else {
                     true
                 };
+                if joined
+                    && !writeback_small_rts
+                    && super::vk_dispatch::cpu_readable_rt_writeback_mode()
+                        == super::vk_dispatch::CpuReadableRtWritebackMode::Kick
+                    && super::vk_dispatch::has_pending_cpu_readable_rt_writebacks()
+                {
+                    if let Some(r) = self.renderer.clone() {
+                        let kp = kickprof::start();
+                        self.writeback_cpu_readable_rts(&r, mappings, mem_write);
+                        kickprof::add(kickprof::SMALLRT, kp);
+                    }
+                }
                 self.end_ssbo_snapshot_epoch();
                 let completed = joined && submitted && writeback_completed;
                 if completed {
@@ -1326,6 +1338,24 @@ impl PrepState {
             return false;
         }
         super::vk_dispatch::writeback_small_rts(
+            renderer,
+            mappings,
+            mem_write,
+            &mut self.ssbo_snapshot_cache,
+        )
+    }
+
+    pub(crate) fn writeback_cpu_readable_rts(
+        &mut self,
+        renderer: &Arc<nexium_gpu::Renderer>,
+        mappings: &GpuMappings,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) -> bool {
+        if !self.flush_prepared_draw_packets() {
+            log::warn!("[rt-writeback] cpu-readable writeback skipped after prepared draw drain failure");
+            return false;
+        }
+        super::vk_dispatch::writeback_cpu_readable_rts(
             renderer,
             mappings,
             mem_write,

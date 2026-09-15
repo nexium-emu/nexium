@@ -2770,6 +2770,18 @@ impl GpuContext {
         state.writeback_small_rts(&renderer, &mappings, &mem_write)
     }
 
+    pub fn flush_cpu_readable_rt_writebacks(&self, mem_write: impl Fn(u64, &[u8]) -> bool) -> bool {
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
+        let mappings = self.mappings.read();
+        let Some(state) = pusher.prep.inline_state() else {
+            return false;
+        };
+        let Some(renderer) = state.renderer.clone() else {
+            return false;
+        };
+        state.writeback_cpu_readable_rts(&renderer, &mappings, &mem_write)
+    }
+
     pub(crate) fn flush_prepared_draw_packets(&self) -> bool {
         match self
             .lock_pusher(concat!("gpu/mod.rs:", line!()))

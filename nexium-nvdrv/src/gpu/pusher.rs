@@ -1218,6 +1218,17 @@ impl Pusher {
                         kickprof::add(kickprof::SMALLRT, kp);
                     }
                 }
+                if !writeback_small_rts
+                    && super::vk_dispatch::cpu_readable_rt_writeback_mode()
+                        == super::vk_dispatch::CpuReadableRtWritebackMode::Kick
+                    && super::vk_dispatch::has_pending_cpu_readable_rt_writebacks()
+                {
+                    if let Some(r) = state.renderer.clone() {
+                        let kp = kickprof::start();
+                        state.writeback_cpu_readable_rts(&r, mappings, mem_write);
+                        kickprof::add(kickprof::SMALLRT, kp);
+                    }
+                }
                 state.end_ssbo_snapshot_epoch();
                 if submitted {
                     state.schedule_kick_completion(on_complete);

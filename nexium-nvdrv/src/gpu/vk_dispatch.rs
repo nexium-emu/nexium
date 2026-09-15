@@ -5665,6 +5665,9 @@ pub(crate) fn enqueue_draws(
                 );
                 finish_ssbo_flush_boundary(ssbo_snapshot_cache);
                 packetizer.stage(render_thread, vec![prepare_clear_batch(renderer, clear)]);
+                if let Some(writeback) = small_color_clear_writeback(draw, mappings) {
+                    register_small_rts_after_prior_work(&[writeback], || {});
+                }
             } else {
                 record_enqueue_flush_reason(batch, super::pusher::kickprof::FLUSH_ENQUEUE_CLEAR);
                 completed &= flush_accum(
@@ -5694,6 +5697,8 @@ pub(crate) fn enqueue_draws(
                 if let Err(e) = clear_result {
                     log::debug!("vk_dispatch: clear failed: {}", e);
                     bump_draw_drop(3, &e);
+                } else if let Some(writeback) = small_color_clear_writeback(draw, mappings) {
+                    register_small_rts_after_prior_work(&[writeback], || {});
                 }
             }
             continue;
@@ -11281,6 +11286,17 @@ fn register_small_rts_after_prior_work(
     }
     let mut registry = small_rt_registry().lock().unwrap();
     for writeback in writebacks {
+        if rt_writeback_trace_target().is_some_and(|target| {
+            writeback.key.gpu_va <= target
+                && target < writeback.key.gpu_va.saturating_add(writeback.key.guest_size_bytes.max(1))
+        }) {
+            log::warn!(
+                "[rt-writeback-trace] register {} tile={:#x} pending={}",
+                writeback.key.label(),
+                writeback.tile_mode,
+                registry.entries.len()
+            );
+        }
         registry.entries.insert(writeback.key, writeback.tile_mode);
     }
 }
@@ -11690,8 +11706,12 @@ fn small_rt_layer_writebacks(
         return None;
     }
     let mut writes = Vec::with_capacity(layers);
+    let flip_rows = tile_mode & (1 << 12) == 0;
     for (layer, pixels) in raw.chunks_exact_mut(layer_size).enumerate() {
         for y in 0..height as usize / 2 {
+            if !flip_rows {
+                break;
+            }
             let (top, bottom) = pixels.split_at_mut((height as usize - 1 - y) * row);
             top[y * row..(y + 1) * row].swap_with_slice(&mut bottom[..row]);
         }
@@ -12001,6 +12021,74 @@ pub(crate) fn writeback_small_rts(
         std::time::Duration::from_millis(250),
         "small-rt-writeback",
     );
+    invalidate_snapshot_cache_guest_write_chunks(snapshot_cache, mappings, &writeback.written);
+    writeback.targets_written != 0
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CpuReadableRtWritebackMode {
+    Off,
+    Kick,
+    Present,
+}
+
+pub(crate) fn cpu_readable_rt_writeback_mode() -> CpuReadableRtWritebackMode {
+    static MODE: OnceLock<CpuReadableRtWritebackMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("NEXIUM_CPU_RT_WB_MODE").ok().as_deref() {
+        Some("off") | Some("0") => CpuReadableRtWritebackMode::Off,
+        Some("kick") => CpuReadableRtWritebackMode::Kick,
+        _ => CpuReadableRtWritebackMode::Present,
+    })
+}
+
+fn cpu_readable_rt(key: &RtKey, tile_mode: u32) -> bool {
+    tile_mode & (1 << 12) != 0
+        && u64::from(key.width).saturating_mul(u64::from(key.height)) > small_rt_writeback_max_pixels()
+}
+
+pub(crate) fn has_pending_cpu_readable_rt_writebacks() -> bool {
+    small_rt_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .any(|(key, tile_mode)| cpu_readable_rt(key, *tile_mode))
+}
+
+pub(crate) fn writeback_cpu_readable_rts(
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    snapshot_cache: &mut SsboSnapshotCache,
+) -> bool {
+    let pending = {
+        let mut registry = small_rt_registry().lock().unwrap();
+        registry.drain_matching(|key, tile_mode| cpu_readable_rt(key, tile_mode))
+    };
+    if pending.entries.is_empty() {
+        return false;
+    }
+    if std::env::var_os("NEXIUM_CPU_RT_WB_TRACE").is_some() {
+        for (key, tile_mode) in &pending.entries {
+            log::warn!("[cpu-rt-wb] {} tile={:#x} size={:#x}", key.label(), tile_mode, key.guest_size_bytes);
+        }
+    }
+    let pending_count = pending.entries.len();
+    let writeback = writeback_small_rt_entries(
+        renderer,
+        mappings,
+        mem_write,
+        pending,
+        std::time::Duration::from_millis(1000),
+        "cpu-readable-rt-writeback",
+    );
+    if rt_writeback_trace_target().is_some() {
+        log::warn!(
+            "[rt-writeback-trace] cpu-readable flush pending={} written={}",
+            pending_count,
+            writeback.targets_written
+        );
+    }
     invalidate_snapshot_cache_guest_write_chunks(snapshot_cache, mappings, &writeback.written);
     writeback.targets_written != 0
 }
@@ -15558,23 +15646,66 @@ impl PreparedColorTargets {
     }
 }
 
+fn small_color_clear_writeback(draw: &DrawCall, mappings: &GpuMappings) -> Option<SmallColorRtWriteback> {
+    if !draw.is_clear || !clear_surface_wants_color(draw.clear_mask) {
+        return None;
+    }
+    let slot = ((draw.clear_mask >> 6) & 0xF).min(7) as usize;
+    let rt = &draw.rt[slot];
+    let key = rt_key_for_clear(rt, mappings, msaa_samples(draw.multisample_mode), draw.clear_mask)?;
+    let tile_mode = small_rt_tile_mode_for_target(draw, key, rt)?;
+    Some(SmallColorRtWriteback { key, tile_mode })
+}
+
 fn small_rt_tile_mode_for_target(draw: &DrawCall, key: RtKey, rt: &RenderTarget) -> Option<u32> {
-    static SKIP: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-    let skip = SKIP.get_or_init(|| {
-        std::env::var("NEXIUM_NO_SMALL_RT_WB_NVMAPS")
-            .map(|value| {
-                value
-                    .split(',')
-                    .filter_map(|entry| entry.trim().parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+    static SKIP: std::sync::OnceLock<(bool, Vec<u32>)> = std::sync::OnceLock::new();
+    let (skip_all, skip) = SKIP.get_or_init(|| {
+        let value = std::env::var("NEXIUM_NO_SMALL_RT_WB_NVMAPS").unwrap_or_default();
+        (
+            value.trim().eq_ignore_ascii_case("all"),
+            value.split(',').filter_map(|entry| entry.trim().parse().ok()).collect(),
+        )
     });
-    (!draw.is_clear
+    let pixels = u64::from(rt.width).saturating_mul(u64::from(rt.height));
+    let within_limit = pixels <= small_rt_writeback_max_pixels()
+        || (rt.tile_mode & (1 << 12) != 0
+            && matches!(rt.format, 0xEE..=0xF2)
+            && pixels <= pitch_rt_writeback_max_pixels());
+    ((!draw.is_clear || clear_surface_wants_color(draw.clear_mask))
         && !key.is_3d
-        && u64::from(rt.width).saturating_mul(u64::from(rt.height)) <= 16384
+        && within_limit
+        && !skip_all
         && !skip.contains(&key.nvmap_id))
     .then_some(rt.tile_mode)
+}
+
+fn pitch_rt_writeback_max_pixels() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_PITCH_RT_WB_MAX_PIXELS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(1 << 20)
+    })
+}
+
+fn small_rt_writeback_max_pixels() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_SMALL_RT_WB_MAX_PIXELS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(16384)
+    })
+}
+
+fn rt_writeback_trace_target() -> Option<u64> {
+    static TARGET: OnceLock<Option<u64>> = OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var("NEXIUM_RT_WB_TRACE_TARGET")
+            .ok()
+            .and_then(|value| parse_env_u64(&value))
+    })
 }
 
 fn raw_rt_trace_target() -> Option<u64> {
@@ -21994,6 +22125,85 @@ mod tests {
         code[0x50] ^= 1;
         sph[3] = 0;
         assert_eq!(super::passthrough_float_layer_slot(&sph, &code), None);
+    }
+
+    #[test]
+    fn standalone_color_clear_tracks_selected_face_without_a_draw() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x20000, 0x100000, 0x20000000, 0xffff_ff10);
+        let mut draw = crate::gpu::engines::DrawCall::default();
+        draw.is_clear = true;
+        draw.clear_mask = (5 << 6) | (1 << 2);
+        draw.rt_control = 1;
+        draw.rt[5] = crate::gpu::engines::RenderTarget {
+            address_lo: 0x40000, width: 64, height: 64,
+            format: crate::gpu::formats::FMT_B10G11R11_FLOAT,
+            tile_mode: 3 << 4, ..Default::default()
+        };
+        let writeback = super::small_color_clear_writeback(&draw, &mappings).unwrap();
+        assert_eq!(writeback.key.gpu_va, 0x40000);
+        assert_eq!(writeback.tile_mode, 3 << 4);
+        assert_eq!(writeback.key.width, 64);
+        draw.clear_mask = (5 << 6) | 3;
+        assert!(super::small_color_clear_writeback(&draw, &mappings).is_none());
+        draw.clear_mask = (5 << 6) | (1 << 2);
+        draw.rt[5].width = 256;
+        draw.rt[5].height = 256;
+        assert!(super::small_color_clear_writeback(&draw, &mappings).is_none());
+        draw.rt[5].width = 0;
+        assert!(super::small_color_clear_writeback(&draw, &mappings).is_none());
+    }
+
+    #[test]
+    fn array_clear_selects_one_mapped_face_for_clear_and_writeback() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x20000, 0x100000, 0x20000000, 0xffff_ff10);
+        let mut draw = crate::gpu::engines::DrawCall::default();
+        draw.is_clear = true;
+        draw.rt[5] = crate::gpu::engines::RenderTarget {
+            address_lo: 0x40000, width: 64, height: 64, depth: 6,
+            layer_stride: 4096,
+            format: crate::gpu::formats::FMT_B10G11R11_FLOAT,
+            tile_mode: 3 << 4, ..Default::default()
+        };
+        let mut faces = std::collections::HashSet::new();
+        for layer in 0..6 {
+            draw.clear_mask = (layer << 10) | (5 << 6) | (1 << 2);
+            let writeback = super::small_color_clear_writeback(&draw, &mappings).unwrap();
+            let clear = super::prepare_graphics_clear_op(&draw, &mappings).unwrap().unwrap();
+            let color = clear.color.unwrap();
+            assert!(color.key.same_live_identity(writeback.key));
+            assert_eq!(color.key.gpu_va, 0x40000 + u64::from(layer) * 16384);
+            assert_eq!(color.key.cpu_addr, 0x20020000 + u64::from(layer) * 16384);
+            assert_eq!(color.key.render_layer_count(), 1);
+            assert!(!color.key.is_3d);
+            assert_eq!(color.key.guest_size_bytes, 16384);
+            assert_eq!(color.key.layout_signature, 1 | (3 << 16));
+            assert_ne!(color.key.mapping_epoch, 0);
+            assert!(faces.insert(color.key));
+        }
+        draw.clear_control = 0x100;
+        draw.scissor = crate::gpu::engines::maxwell3d::ScissorTest {
+            enabled: true, min_x: 4, max_x: 20, min_y: 8, max_y: 24,
+        };
+        let clear = super::prepare_graphics_clear_op(&draw, &mappings).unwrap().unwrap();
+        let color = clear.color.unwrap();
+        assert_eq!(color.rect, Some([4, 8, 16, 16]));
+        assert_eq!(color.key.gpu_va, 0x54000);
+        draw.clear_mask = (6 << 10) | (5 << 6) | (1 << 2);
+        assert!(super::small_color_clear_writeback(&draw, &mappings).is_none());
+        assert!(super::prepare_graphics_clear_op(&draw, &mappings).is_err());
+        draw.clear_mask = (6 << 10) | (5 << 6) | 1;
+        assert!(super::rt_key_for_clear(&draw.rt[5], &mappings, (1, 1), draw.clear_mask).is_some());
+        draw.clear_mask = (1 << 10) | (5 << 6) | (1 << 2);
+        draw.rt[5].layer_stride = 0;
+        assert!(super::small_color_clear_writeback(&draw, &mappings).is_none());
+        draw.rt[5].layer_stride = 0x100000;
+        assert!(super::small_color_clear_writeback(&draw, &mappings).is_none());
+        draw.rt[5].address_hi = u32::MAX;
+        draw.rt[5].address_lo = u32::MAX - 1024;
+        draw.rt[5].layer_stride = 4096;
+        assert!(super::small_color_clear_writeback(&draw, &mappings).is_none());
     }
 
     #[test]
