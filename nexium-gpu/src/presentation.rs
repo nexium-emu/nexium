@@ -37,6 +37,78 @@ pub struct Snapshot {
     pub pixels: Vec<u8>,
 }
 
+fn periodic_snapshot_due() -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static NEXT: OnceLock<Option<(std::time::Duration, Mutex<std::time::Instant>)>> = OnceLock::new();
+    let Some((interval, next)) = NEXT
+        .get_or_init(|| {
+            std::env::var("NEXIUM_SNAPSHOT_EVERY_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .map(|ms| (std::time::Duration::from_millis(ms), Mutex::new(std::time::Instant::now())))
+        })
+        .as_ref()
+    else {
+        return false;
+    };
+    let mut next = next.lock().unwrap();
+    if std::time::Instant::now() < *next {
+        return false;
+    }
+    *next = std::time::Instant::now() + *interval;
+    true
+}
+
+fn save_snapshot_bmp(snapshot: &Snapshot) {
+    let Some(dir) = std::env::var_os("NEXIUM_SNAPSHOT_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let (width, height) = (snapshot.width as usize, snapshot.height as usize);
+    if width == 0 || height == 0 || snapshot.pixels.len() < width * height * 4 {
+        return;
+    }
+    let row_bytes = width * 3;
+    let padded = (row_bytes + 3) & !3;
+    let image_size = padded * height;
+    let mut out = Vec::with_capacity(54 + image_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + image_size) as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(height as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(image_size as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+    for y in (0..height).rev() {
+        let row = &snapshot.pixels[y * width * 4..(y + 1) * width * 4];
+        for pixel in row.chunks_exact(4) {
+            out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        }
+        out.extend(std::iter::repeat(0u8).take(padded - row_bytes));
+    }
+    let name = format!(
+        "snap-{}.bmp",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let path = dir.join(name);
+    match std::fs::write(&path, out) {
+        Ok(()) => log::info!("[snapshot] saved {}", path.display()),
+        Err(error) => log::warn!("[snapshot] save failed {}: {}", path.display(), error),
+    }
+}
+
 impl PresentationTarget {
     pub unsafe fn win32(
         hwnd: isize,
@@ -698,6 +770,10 @@ impl Worker {
                 self.target.snapshots.fetch_add(1, Ordering::Relaxed);
                 *self.target.snapshot.lock() = Some(snapshot);
                 (self.target.repaint)();
+            }
+            if self.last.is_some() && periodic_snapshot_due() {
+                let snapshot = self.snapshot()?;
+                save_snapshot_bmp(&snapshot);
             }
         }
         Ok(())
