@@ -1700,12 +1700,9 @@ fn prepare_and_execute(
                     continue;
                 }
                 let (view_tic, layered) = sampled_view_tic(&resource.tic)?;
-                let guest_bytes = read_gpu_vec(
-                    mappings,
-                    mem_read,
-                    view_tic.gpu_va,
-                    size,
-                    "filtered sampled image",
+                let (guest_bytes, snapshot_identity) = read_compute_sampled_image(
+                    renderer_arc, mappings, mem_read, content_key,
+                    view_tic.gpu_va, size, "filtered sampled image",
                 )?;
                 let nvmap_id = mappings.nvmap_id_for(view_tic.gpu_va).ok_or_else(|| {
                     format!(
@@ -1732,11 +1729,11 @@ fn prepare_and_execute(
                     tic: view_tic,
                     tsc,
                     sample_type: compute_sample_type(resource.metadata.numeric_type),
-                    guest_bytes: Some(Arc::new(guest_bytes)),
+                    guest_bytes: Some(guest_bytes),
                     guest_bytes_authoritative: layered
                         || overlapping_sampled.contains(&descriptor.binding),
                     require_live: false,
-                    content_key: content_key(view_tic.gpu_va, size),
+                    content_key: snapshot_identity,
                 });
             }
             ComputeDescriptorKind::SampledImage => {
@@ -1781,8 +1778,10 @@ fn prepare_and_execute(
                     continue;
                 }
                 let (view_tic, layered) = sampled_view_tic(&resource.tic)?;
-                let guest_bytes =
-                    read_gpu_vec(mappings, mem_read, view_tic.gpu_va, size, "sampled image")?;
+                let (guest_bytes, snapshot_identity) = read_compute_sampled_image(
+                    renderer_arc, mappings, mem_read, content_key,
+                    view_tic.gpu_va, size, "sampled image",
+                )?;
                 let key = mappings.nvmap_id_for(view_tic.gpu_va).and_then(|nvmap_id| {
                     mapped_range(mappings, view_tic.gpu_va).and_then(|(cpu_addr, _)| {
                         texture_rt_key(mappings, nvmap_id, &view_tic, cpu_addr)
@@ -1793,11 +1792,11 @@ fn prepare_and_execute(
                     key,
                     tic: view_tic,
                     sample_type: compute_sample_type(resource.metadata.numeric_type),
-                    guest_bytes: Arc::new(guest_bytes),
+                    guest_bytes,
                     guest_bytes_authoritative: layered
                         || overlapping_sampled.contains(&descriptor.binding),
                     require_live: false,
-                    content_key: content_key(view_tic.gpu_va, size),
+                    content_key: snapshot_identity,
                 });
             }
             ComputeDescriptorKind::StorageImage => {
@@ -4167,6 +4166,34 @@ fn profile_invalidate_stages(
         ALIASES.swap(0, Ordering::Relaxed) as f64 / 512.0,
         BYTES.swap(0, Ordering::Relaxed) as f64 / 512.0 / 1024.0,
     );
+}
+
+fn read_compute_sampled_image(
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    content_key: &dyn Fn(u64, usize) -> Option<u64>,
+    gpu_va: u64,
+    len: usize,
+    label: &str,
+) -> Result<(Arc<Vec<u8>>, Option<u64>), String> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_COMPUTE_SNAPSHOT_CACHE")
+            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    });
+    if enabled {
+        let error = RefCell::new(None);
+        let read = |address, size| match read_gpu_vec(mappings, mem_read, address, size, label) {
+            Ok(data) => Some(data),
+            Err(reason) => { *error.borrow_mut() = Some(reason); None }
+        };
+        return vk_dispatch::fetch_compute_texture_snapshot(mappings, renderer, &read, gpu_va, len)
+            .ok_or_else(|| error.into_inner().unwrap_or_else(|| format!("could not snapshot {label}")));
+    }
+    let bytes = read_gpu_vec(mappings, mem_read, gpu_va, len, label)?;
+    Ok((Arc::new(bytes), content_key(gpu_va, len)))
 }
 
 fn read_gpu_vec(

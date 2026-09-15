@@ -42,9 +42,9 @@ const INPUT_INVALIDATION_MAX_CANDIDATES: usize = 1024;
 const RECENT_CBUF_REQUEST_CAPACITY: usize = 64;
 const PREPARED_INDEX_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PREPARED_INDEX_CACHE_MAX_ENTRIES: usize = 4096;
-const TEXTURE_SNAPSHOT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const TEXTURE_SNAPSHOT_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const TEXTURE_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4096;
-const PREPARED_TIC_PLAN_CAPACITY: usize = 512;
+const PREPARED_TIC_PLAN_CAPACITY: usize = 4096;
 type GraphicsStageCbufBinds = [(u64, u32); GRAPHICS_CBUF_SLOTS];
 type DrawSnapshot = HashMap<u64, Arc<Vec<u8>>>;
 type PackedCbufReadRequirements = ([usize; PACKED_CBUF_SLOTS], [bool; PACKED_CBUF_SLOTS]);
@@ -1362,7 +1362,7 @@ pub(crate) struct SsboSnapshotCache {
     prepared_index_max_entries: usize,
     prepared_texture_snapshots: PreparedTextureSnapshotMemo,
     prepared_texture_bounds: Option<(u64, u64, u64, u64)>,
-    prepared_tic_plans: FastMap<u64, PreparedTicPlan>,
+    prepared_tic_plans: PreparedTicPlanCache,
     input_profile: bool,
     watch_query_ranges: Vec<HostWatchRange>,
     input_sweep_kick: u64,
@@ -1966,7 +1966,7 @@ impl SsboSnapshotCache {
             prepared_index_max_entries: PREPARED_INDEX_CACHE_MAX_ENTRIES,
             prepared_texture_snapshots: PreparedTextureSnapshotMemo::new(),
             prepared_texture_bounds: None,
-            prepared_tic_plans: FastMap::default(),
+            prepared_tic_plans: PreparedTicPlanCache::default(),
             input_profile: input_cache_profile_enabled(),
             watch_query_ranges: Vec::new(),
             input_sweep_kick: 0,
@@ -4943,8 +4943,6 @@ impl SsboSnapshotCache {
     pub(crate) fn reset_epoch(&mut self) {
         self.clear_ssbo_snapshots();
         self.prepared_texture_snapshots.clear();
-        self.prepared_tic_plans
-            .retain(|_, plan| plan.cube_dependencies_resolved);
         self.hits = 0;
         self.misses = 0;
         self.bytes_read = 0;
@@ -6405,7 +6403,7 @@ fn flush_accum_with_boundary(
     let mut prepared_tic_plans = if persist_tic_plans {
         std::mem::take(&mut snapshot_cache.prepared_tic_plans)
     } else {
-        FastMap::default()
+        PreparedTicPlanCache::default()
     };
     let writeback = writeback_cube_sample_dependencies(
         batch,
@@ -7195,6 +7193,43 @@ struct PreparedTicPlan {
     cube_dependencies_resolved: bool,
 }
 
+#[derive(Default)]
+struct PreparedTicPlanCache {
+    entries: FastMap<u64, PreparedTicPlan>,
+    admission_order: VecDeque<u64>,
+}
+
+impl std::ops::Deref for PreparedTicPlanCache {
+    type Target = FastMap<u64, PreparedTicPlan>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl PreparedTicPlanCache {
+    fn get_mut(&mut self, address: &u64) -> Option<&mut PreparedTicPlan> {
+        self.entries.get_mut(address)
+    }
+
+    fn insert(&mut self, address: u64, plan: PreparedTicPlan) {
+        if !self.entries.contains_key(&address) {
+            if self.entries.len() == PREPARED_TIC_PLAN_CAPACITY {
+                if let Some(oldest) = self.admission_order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+            self.admission_order.push_back(address);
+        }
+        self.entries.insert(address, plan);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.admission_order.clear();
+    }
+}
+
 fn tic_raw_descriptor(raw: &[u8]) -> Option<[u8; 32]> {
     raw.get(..32)?.try_into().ok()
 }
@@ -7240,13 +7275,37 @@ fn derive_prepared_tic_texture_plan(
 }
 
 fn memoized_prepared_tic_plan(
-    plans: &mut FastMap<u64, PreparedTicPlan>,
+    plans: &mut PreparedTicPlanCache,
     tic_addr: u64,
     raw: [u8; 32],
     mappings: &GpuMappings,
     derive: impl FnOnce([u8; 32]) -> Option<PreparedTicTexturePlan>,
 ) -> PreparedTicPlan {
     let mapping_generation = mappings.generation();
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var_os("NEXIUM_TIC_PLAN_TRACE").is_some()) {
+        thread_local! {
+            static COUNTS: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+        }
+        let reason = match plans.get(&tic_addr) {
+            Some(plan) if plan.raw != raw => 1,
+            Some(plan) if plan.mapping_generation != mapping_generation => 2,
+            Some(_) => 0,
+            None if plans.len() >= PREPARED_TIC_PLAN_CAPACITY => 4,
+            None => 3,
+        };
+        COUNTS.with(|counts| {
+            let mut values = counts.get();
+            values[reason] += 1;
+            values[5] += 1;
+            if values[5] == 65536 {
+                log::info!("[tic-plan-cache] hit={} raw={} mapping={} new={} full={} len={}",
+                    values[0], values[1], values[2], values[3], values[4], plans.len());
+                values = [0; 6];
+            }
+            counts.set(values);
+        });
+    }
     if let Some(plan) = plans
         .get(&tic_addr)
         .filter(|plan| plan.raw == raw && plan.mapping_generation == mapping_generation)
@@ -7261,9 +7320,7 @@ fn memoized_prepared_tic_plan(
         cube_dependencies: None,
         cube_dependencies_resolved: false,
     };
-    if plans.len() < PREPARED_TIC_PLAN_CAPACITY || plans.contains_key(&tic_addr) {
-        plans.insert(tic_addr, plan.clone());
-    }
+    plans.insert(tic_addr, plan.clone());
     plan
 }
 
@@ -7320,6 +7377,15 @@ impl TextureSnapshotCache {
             self.order.clear();
             self.bytes = 0;
             self.owner = owner;
+        }
+    }
+
+    fn compact_order(&mut self) {
+        if self.order.len() > self.max_entries.saturating_mul(2).max(1) {
+            let entries = &self.entries;
+            self.order.retain(|(key, serial)| {
+                entries.get(key).is_some_and(|entry| entry.serial == *serial)
+            });
         }
     }
 
@@ -7387,6 +7453,11 @@ impl TextureSnapshotCache {
             None => return TextureSnapshotCacheLookup::Miss,
         };
         if let Some((data, trusted_identity)) = hit {
+            let serial = self.next_serial;
+            self.next_serial = self.next_serial.wrapping_add(1);
+            self.entries.get_mut(&key).unwrap().serial = serial;
+            self.order.push_back((key, serial));
+            self.compact_order();
             return TextureSnapshotCacheLookup::Hit(data, trusted_identity);
         }
         self.remove(key);
@@ -7427,11 +7498,8 @@ impl TextureSnapshotCache {
             },
         );
         self.order.push_back((key, serial));
-        let max_order = self.max_entries.saturating_mul(2).max(1);
-        while self.bytes > self.max_bytes
-            || self.entries.len() > self.max_entries
-            || self.order.len() > max_order
-        {
+        self.compact_order();
+        while self.bytes > self.max_bytes || self.entries.len() > self.max_entries {
             let Some((old_key, old_serial)) = self.order.pop_front() else {
                 break;
             };
@@ -8196,6 +8264,27 @@ fn snapshot_tic_descriptor_once(
         return Some((data.clone(), false));
     }
     read_guest(tic_addr, 32).map(|data| (data, true))
+}
+
+pub(crate) fn fetch_compute_texture_snapshot(
+    mappings: &GpuMappings,
+    renderer: &Arc<nexium_gpu::Renderer>,
+    read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+    gpu_va: u64,
+    len: usize,
+) -> Option<(Arc<Vec<u8>>, Option<u64>)> {
+    let cache_key = mappings.cpu_range_for(gpu_va)
+        .filter(|(_, available)| *available >= len as u64)
+        .and_then(|(cpu_va, _)| {
+            let nvmap_id = mappings.nvmap_id_for(gpu_va)?;
+            let mapping_epoch = mappings.mapping_epoch_for(gpu_va)?;
+            Some(TextureSnapshotCacheKey { mapping_epoch, gpu_va, len, cpu_va, nvmap_id })
+        });
+    if cache_key.is_none() || !nexium_memory::fastmem::write_watch_available() {
+        return read_guest(gpu_va, len).map(|data| (Arc::new(data), None));
+    }
+    fetch_texture_snapshot(read_guest, gpu_va, len, cache_key, Some(renderer))
+        .map(|(data, _, _, _, identity)| (data, identity))
 }
 
 fn fetch_texture_snapshot(
@@ -9425,7 +9514,7 @@ fn prepare_draw_batch_async(
     let mut prepared_tic_plans = if persist_tic_plans {
         std::mem::take(&mut snapshot_cache.prepared_tic_plans)
     } else {
-        FastMap::default()
+        PreparedTicPlanCache::default()
     };
     let mut fermi_exact_snapshot_lease_by_token = HashMap::new();
     let mut fermi_exact_snapshot_leases = Vec::new();
@@ -11608,7 +11697,7 @@ fn collect_cube_sample_ranges_from_tic_addresses(
     tic_addresses: impl IntoIterator<Item = u64>,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-    prepared_tic_plans: &mut FastMap<u64, PreparedTicPlan>,
+    prepared_tic_plans: &mut PreparedTicPlanCache,
 ) -> CubeSampleDependencies {
     let mut ranges = Vec::new();
     let mut texture_bases = Vec::new();
@@ -11841,10 +11930,10 @@ fn writeback_cube_sample_dependencies(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
-    prepared_tic_plans: &mut FastMap<u64, PreparedTicPlan>,
+    prepared_tic_plans: &mut PreparedTicPlanCache,
     before_readback: impl FnOnce() -> bool,
 ) -> SmallRtWritebackResult {
-    if small_rt_registry().lock().unwrap().entries.is_empty() {
+    if !cube_rt_sync_enabled() || small_rt_registry().lock().unwrap().entries.is_empty() {
         return SmallRtWritebackResult::default();
     }
     let mut tic_addresses = cube_sample_tic_addresses(batch).peekable();
@@ -21456,7 +21545,7 @@ mod tests {
         FragmentTextureNumericMetadata, GpuMappings, GraphicsTextureLayout, GuestRange,
         GuestWriteChunk, HostWatchRange, IndirectTableKey, InputInvalidationSpan, InputRangeKey,
         InputSnapshotIdentity, InputSourceKey, PreparedDrawPacketQueue, PreparedDrawPacketizer,
-        PreparedTicPlan, RtBatchUsage, RtSignatureBoundaryProfile, SmallRtRegistry,
+        PreparedTicPlanCache, RtBatchUsage, RtSignatureBoundaryProfile, SmallRtRegistry,
         SsboSnapshotCache, SsboSnapshotCacheKey, TextureSnapshotCache, TextureSnapshotCacheKey,
         TextureSnapshotCacheLookup, AURORA_STORAGE_BUFFER_SIZE, AURORA_VERTEX_BUFFER_SIZE,
         FRAGMENT_CBUF_BASE, GRAPHICS_CBUF_SLOTS, INPUT_INVALIDATION_MAX_CANDIDATES,
@@ -27379,7 +27468,7 @@ mod tests {
     fn tic_derived_plan_exact_raw_hits_without_derivation() {
         let mappings = crate::gpu::GpuMappings::new();
         let raw = prepared_tic_plan_raw_with_view(0x4000, 3, 0);
-        let mut plans = FastMap::default();
+        let mut plans = PreparedTicPlanCache::default();
 
         let first = memoized_prepared_tic_plan(&mut plans, 0x1000, raw, &mappings, |raw| {
             derive_prepared_tic_texture_plan(raw, &mappings)
@@ -27409,7 +27498,7 @@ mod tests {
         let mappings = crate::gpu::GpuMappings::new();
         let first_raw = prepared_tic_plan_raw(0x4000);
         let second_raw = prepared_tic_plan_raw(0x8000);
-        let mut plans = FastMap::default();
+        let mut plans = PreparedTicPlanCache::default();
 
         memoized_prepared_tic_plan(&mut plans, 0x1000, first_raw, &mappings, |raw| {
             derive_prepared_tic_texture_plan(raw, &mappings)
@@ -27439,7 +27528,7 @@ mod tests {
         mappings.add(TIC_GPU_VA, 0x1000, TIC_CPU_VA, 1);
         mappings.add(BASE_GPU_VA, 0x1000, CPU_VA, 2);
         let raw = prepared_tic_plan_raw_with_view(BASE_GPU_VA, 3, 0);
-        let mut plans = FastMap::default();
+        let mut plans = PreparedTicPlanCache::default();
         let mem_read = |cpu_va: u64, out: &mut [u8]| {
             if cpu_va != TIC_CPU_VA || out.len() != raw.len() {
                 return false;
@@ -27508,7 +27597,7 @@ mod tests {
             out.copy_from_slice(raw.borrow().as_slice());
             true
         };
-        let mut plans = FastMap::default();
+        let mut plans = PreparedTicPlanCache::default();
 
         let first = collect_cube_sample_ranges_from_tic_addresses(
             [TIC_GPU_VA],
@@ -27555,7 +27644,7 @@ mod tests {
             out.copy_from_slice(&raw);
             true
         };
-        let mut cached_plans = FastMap::default();
+        let mut cached_plans = PreparedTicPlanCache::default();
 
         let first = collect_cube_sample_ranges_from_tic_addresses(
             [TIC_GPU_VA],
@@ -27574,7 +27663,7 @@ mod tests {
             &mem_read,
             &mut cached_plans,
         );
-        let mut uncached_plans = FastMap::default();
+        let mut uncached_plans = PreparedTicPlanCache::default();
         let uncached = collect_cube_sample_ranges_from_tic_addresses(
             [TIC_GPU_VA],
             &mappings,
@@ -27601,7 +27690,7 @@ mod tests {
         let mappings = crate::gpu::GpuMappings::new();
         let invalid_raw = [0u8; 32];
         let valid_raw = prepared_tic_plan_raw(0x4000);
-        let mut plans = FastMap::default();
+        let mut plans = PreparedTicPlanCache::default();
 
         let invalid =
             memoized_prepared_tic_plan(&mut plans, 0x1000, invalid_raw, &mappings, |raw| {
@@ -27623,9 +27712,9 @@ mod tests {
     }
 
     #[test]
-    fn tic_derived_plan_capacity_does_not_admit_new_addresses() {
+    fn tic_derived_plan_capacity_evicts_oldest_and_memoizes_new_addresses() {
         let mappings = crate::gpu::GpuMappings::new();
-        let mut plans: FastMap<u64, PreparedTicPlan> = FastMap::default();
+        let mut plans: PreparedTicPlanCache = PreparedTicPlanCache::default();
         for tic_addr in 0..PREPARED_TIC_PLAN_CAPACITY as u64 {
             let raw = [tic_addr as u8; 32];
             memoized_prepared_tic_plan(&mut plans, tic_addr, raw, &mappings, |_| None);
@@ -27641,15 +27730,28 @@ mod tests {
         }
 
         assert_eq!(plans.len(), PREPARED_TIC_PLAN_CAPACITY);
-        assert!(!plans.contains_key(&overflow_addr));
-        assert_eq!(derivations.get(), 2);
-        memoized_prepared_tic_plan(&mut plans, 0, [0; 32], &mappings, |_| {
+        assert!(plans.contains_key(&overflow_addr));
+        assert!(!plans.contains_key(&0));
+        assert_eq!(derivations.get(), 1);
+        assert_eq!(plans.admission_order.len(), PREPARED_TIC_PLAN_CAPACITY);
+        memoized_prepared_tic_plan(&mut plans, 1, [1; 32], &mappings, |_| {
             panic!("retained TIC plan re-derived at capacity")
         });
+        memoized_prepared_tic_plan(&mut plans, 1, [0xbb; 32], &mappings, |_| None);
+        memoized_prepared_tic_plan(
+            &mut plans,
+            overflow_addr + 1,
+            [0xcc; 32],
+            &mappings,
+            |_| None,
+        );
+        assert!(!plans.contains_key(&1));
+        assert!(plans.contains_key(&2));
+        assert_eq!(plans.admission_order.len(), PREPARED_TIC_PLAN_CAPACITY);
     }
 
     #[test]
-    fn tic_plan_cache_retains_cube_results_across_epoch_reset() {
+    fn tic_plan_cache_retains_descriptor_metadata_across_epoch_reset() {
         let mappings = crate::gpu::GpuMappings::new();
         let raw = prepared_tic_plan_raw(0x4000);
         let mut cache = SsboSnapshotCache::default();
@@ -27672,16 +27774,28 @@ mod tests {
         );
         assert_eq!(cache.prepared_tic_plans.len(), 2);
         cache.reset_epoch();
-        assert_eq!(cache.prepared_tic_plans.len(), 1);
+        assert_eq!(cache.prepared_tic_plans.len(), 2);
         assert!(cache.prepared_tic_plans.contains_key(&0x1000));
+        assert_eq!(
+            cache.prepared_tic_plans.admission_order.iter().copied().collect::<Vec<_>>(),
+            vec![0x1000, 0x2000],
+        );
+        memoized_prepared_tic_plan(
+            &mut cache.prepared_tic_plans,
+            0x2000,
+            raw,
+            &mappings,
+            |_| panic!("unchanged metadata re-derived across submission boundary"),
+        );
         cache.clear();
         assert!(cache.prepared_tic_plans.is_empty());
+        assert!(cache.prepared_tic_plans.admission_order.is_empty());
     }
 
     #[test]
     fn tic_derived_plan_short_raw_bypasses_memo() {
         let mappings = crate::gpu::GpuMappings::new();
-        let mut plans = FastMap::default();
+        let mut plans = PreparedTicPlanCache::default();
         let derivations = std::cell::Cell::new(0usize);
         let prepared = tic_raw_descriptor(&[0x5a; 31]).map(|raw| {
             memoized_prepared_tic_plan(&mut plans, 0x1000, raw, &mappings, |_| {
@@ -27953,6 +28067,26 @@ mod tests {
             cache.get(key, 7, 12, 14),
             TextureSnapshotCacheLookup::Stale
         ));
+    }
+
+    #[test]
+    fn texture_snapshot_cache_keeps_recently_read_entries() {
+        let key = |gpu_va| TextureSnapshotCacheKey {
+            mapping_epoch: 1, gpu_va, len: 4, cpu_va: gpu_va + 0x1000, nvmap_id: 2,
+        };
+        let mut cache = TextureSnapshotCache::new(8, 2);
+        cache.insert(key(0x4000), 1, 2, 3, 4, Arc::new(vec![1; 4]));
+        cache.insert(key(0x5000), 1, 2, 3, 5, Arc::new(vec![2; 4]));
+        for _ in 0..32 {
+            assert!(matches!(cache.get(key(0x4000), 1, 2, 3), TextureSnapshotCacheLookup::Hit(_, 4)));
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.order.len() <= 4);
+        cache.insert(key(0x6000), 1, 2, 3, 6, Arc::new(vec![3; 4]));
+        assert!(matches!(cache.get(key(0x5000), 1, 2, 3), TextureSnapshotCacheLookup::Miss));
+        assert!(matches!(cache.get(key(0x4000), 1, 2, 3), TextureSnapshotCacheLookup::Hit(_, 4)));
+        assert!(matches!(cache.get(key(0x6000), 1, 2, 3), TextureSnapshotCacheLookup::Hit(_, 6)));
+        assert_eq!(cache.bytes, 8);
     }
 
     #[test]
