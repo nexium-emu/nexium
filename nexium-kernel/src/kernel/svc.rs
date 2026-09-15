@@ -2495,7 +2495,7 @@ fn svc_guest_probe(kernel: &mut Kernel) -> u32 {
     let x3 = cpu.get_register(3);
     if action.log_hits {
         log::warn!(
-            "[guest-probe] hit pc={:#x} kind={} arg={:#x} lr={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} sp={:#x} thread={:?}",
+            "[guest-probe] hit pc={:#x} kind={} arg={:#x} lr={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x} sp={:#x} thread={:?}",
             probe_pc,
             kind,
             arg,
@@ -2504,9 +2504,12 @@ fn svc_guest_probe(kernel: &mut Kernel) -> u32 {
             x1,
             x2,
             x3,
+            cpu.get_register(4),
+            cpu.get_register(5),
             sp,
             kernel.threads.current_handle()
         );
+        guest_probe_mem_dump(kernel, cpu, probe_pc);
     }
     if action.log_hits && std::env::var_os("NEXIUM_GUEST_PROBE_DUMP").is_some() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2623,11 +2626,288 @@ fn svc_guest_probe(kernel: &mut Kernel) -> u32 {
             cpu.set_register(0, allocation);
             cpu.set_register(22, allocation);
         }
+        "bl" => {
+            cpu.set_register(30, probe_pc.wrapping_add(4));
+            cpu.set_pc(arg);
+        }
+        "blr" => {
+            let target = cpu.get_register(arg as u32 & 31);
+            cpu.set_register(30, probe_pc.wrapping_add(4));
+            cpu.set_pc(target);
+        }
+        "st" => {
+            if !guest_probe_emulate_store(kernel, cpu, arg as u32) {
+                log::warn!("[guest-probe] cannot emulate store {:#010x} at {:#x}", arg, probe_pc);
+            }
+        }
+        "b" => {
+            cpu.set_pc(arg);
+        }
+        "ld" => {
+            if !guest_probe_emulate_load(kernel, cpu, arg as u32) {
+                log::warn!("[guest-probe] cannot emulate load {:#010x} at {:#x}", arg, probe_pc);
+            }
+        }
+        "cb" => {
+            let insn = arg as u32;
+            let value = cpu.get_register(insn & 31);
+            let value = if insn & 0x8000_0000 != 0 { value } else { value as u32 as u64 };
+            let taken = (value == 0) == (insn & 0x0100_0000 == 0);
+            if taken {
+                let imm = (((insn >> 5) & 0x7ffff) as i64) << 45 >> 45;
+                cpu.set_pc(probe_pc.wrapping_add((imm * 4) as u64));
+            }
+        }
         other => {
             log::warn!("[guest-probe] unknown action kind {}", other);
         }
     }
     0
+}
+
+fn guest_probe_emulate_load(kernel: &Kernel, cpu: &mut nexium_cpu::Cpu, insn: u32) -> bool {
+    let base_index = (insn >> 5) & 31;
+    let base = if base_index == 31 { cpu.get_sp() } else { cpu.get_register(base_index) };
+    let rt = insn & 31;
+    let imm12 = ((insn >> 10) & 0xfff) as u64;
+    let (size, signed, wide) = match insn & 0xffc0_0000 {
+        0xf940_0000 => (8, false, true),
+        0xb940_0000 => (4, false, false),
+        0xb980_0000 => (4, true, true),
+        0x7940_0000 => (2, false, false),
+        0x7980_0000 => (2, true, true),
+        0x79c0_0000 => (2, true, false),
+        0x3940_0000 => (1, false, false),
+        0x3980_0000 => (1, true, true),
+        0x39c0_0000 => (1, true, false),
+        _ => return false,
+    };
+    let address = base.wrapping_add(imm12 * size as u64);
+    let mut bytes = [0u8; 8];
+    if kernel.address_space.read(address, &mut bytes[..size]).is_err() {
+        return false;
+    }
+    let raw = u64::from_le_bytes(bytes);
+    let value = if signed {
+        let shift = 64 - size * 8;
+        let extended = ((raw << shift) as i64 >> shift) as u64;
+        if wide { extended } else { extended as u32 as u64 }
+    } else {
+        raw
+    };
+    if rt != 31 {
+        cpu.set_register(rt, value);
+    }
+    true
+}
+
+fn guest_probe_emulate_store(kernel: &Kernel, cpu: &mut nexium_cpu::Cpu, insn: u32) -> bool {
+    let reg = |index: u32| if index == 31 { 0 } else { cpu.get_register(index) };
+    let base_index = (insn >> 5) & 31;
+    let base = if base_index == 31 { cpu.get_sp() } else { cpu.get_register(base_index) };
+    let rt = insn & 31;
+    let (address, writeback, payload): (u64, Option<u64>, Vec<u8>) = match insn & 0xffc0_0000 {
+        0xa980_0000 | 0xa900_0000 | 0xa880_0000 => {
+            let imm = (((insn >> 15) & 0x7f) as i64) << 57 >> 57;
+            let offset = (imm * 8) as u64;
+            let rt2 = (insn >> 10) & 31;
+            let mut bytes = reg(rt).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&reg(rt2).to_le_bytes());
+            match insn & 0xffc0_0000 {
+                0xa980_0000 => (base.wrapping_add(offset), Some(base.wrapping_add(offset)), bytes),
+                0xa880_0000 => (base, Some(base.wrapping_add(offset)), bytes),
+                _ => (base.wrapping_add(offset), None, bytes),
+            }
+        }
+        0xf900_0000 => {
+            let offset = (((insn >> 10) & 0xfff) as u64) * 8;
+            (base.wrapping_add(offset), None, reg(rt).to_le_bytes().to_vec())
+        }
+        0xb900_0000 => {
+            let offset = (((insn >> 10) & 0xfff) as u64) * 4;
+            (base.wrapping_add(offset), None, (reg(rt) as u32).to_le_bytes().to_vec())
+        }
+        0x7900_0000 => {
+            let offset = (((insn >> 10) & 0xfff) as u64) * 2;
+            (base.wrapping_add(offset), None, (reg(rt) as u16).to_le_bytes().to_vec())
+        }
+        0x3900_0000 => {
+            let offset = ((insn >> 10) & 0xfff) as u64;
+            (base.wrapping_add(offset), None, vec![reg(rt) as u8])
+        }
+        0xf800_0000 | 0xb800_0000 if insn & 0x0020_0c00 == 0x0020_0800 => {
+            let rm = (insn >> 16) & 31;
+            let option = (insn >> 13) & 7;
+            let scale = (insn >> 12) & 1;
+            let size = if insn & 0x4000_0000 != 0 { 3 } else { 2 };
+            let index = match option {
+                2 => reg(rm) as u32 as u64,
+                3 => reg(rm),
+                6 => reg(rm) as u32 as i32 as i64 as u64,
+                7 => reg(rm),
+                _ => return false,
+            };
+            let offset = if scale != 0 { index << size } else { index };
+            let bytes = if size == 3 { reg(rt).to_le_bytes().to_vec() } else { (reg(rt) as u32).to_le_bytes().to_vec() };
+            (base.wrapping_add(offset), None, bytes)
+        }
+        0xf800_0000 if insn & 0x0020_0000 == 0 => {
+            let imm = (((insn >> 12) & 0x1ff) as i64) << 55 >> 55;
+            let offset = imm as u64;
+            match (insn >> 10) & 3 {
+                3 => (base.wrapping_add(offset), Some(base.wrapping_add(offset)), reg(rt).to_le_bytes().to_vec()),
+                1 => (base, Some(base.wrapping_add(offset)), reg(rt).to_le_bytes().to_vec()),
+                0 => (base.wrapping_add(offset), None, reg(rt).to_le_bytes().to_vec()),
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    if kernel.address_space.write(address, &payload).is_err() {
+        return false;
+    }
+    if let Some(value) = writeback {
+        if base_index == 31 {
+            cpu.set_sp(value);
+        } else {
+            cpu.set_register(base_index, value);
+        }
+    }
+    true
+}
+
+fn guest_probe_mem_specs() -> &'static [(u32, u64, Vec<u64>, usize)] {
+    use std::sync::OnceLock;
+    static SPECS: OnceLock<Vec<(u32, u64, Vec<u64>, usize)>> = OnceLock::new();
+    SPECS.get_or_init(|| {
+        std::env::var("NEXIUM_GUEST_PROBE_MEM")
+            .ok()
+            .map(|spec| {
+                spec.split(',')
+                    .filter_map(parse_guest_probe_mem_spec)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn parse_guest_probe_hex(s: &str) -> Option<u64> {
+    let s = s.trim();
+    match s.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => s.parse::<u64>().ok(),
+    }
+}
+
+fn parse_guest_probe_mem_spec(item: &str) -> Option<(u32, u64, Vec<u64>, usize)> {
+    let (path, len) = item.trim().rsplit_once(':')?;
+    let len = parse_guest_probe_hex(len)? as usize;
+    let mut steps = path.split('>');
+    let first = steps.next()?.trim();
+    let (reg, off) = match first.split_once('+') {
+        Some((reg, off)) => (reg.trim(), parse_guest_probe_hex(off)?),
+        None => (first, 0),
+    };
+    let reg = if let Some(abs) = reg.strip_prefix('@') {
+        let _ = off;
+        return Some((31, parse_guest_probe_hex(abs)?, steps.map(|s| parse_guest_probe_hex(s.trim())).collect::<Option<Vec<u64>>>()?, len.min(256)));
+    } else {
+        reg.trim_start_matches(['x', 'X']).parse::<u32>().ok()?
+    };
+    if reg > 30 {
+        return None;
+    }
+    let derefs = steps
+        .map(|s| parse_guest_probe_hex(s.trim()))
+        .collect::<Option<Vec<u64>>>()?;
+    Some((reg, off, derefs, len.min(256)))
+}
+
+fn guest_probe_poke_specs() -> &'static [(u32, u64, Vec<u64>, Vec<u8>)] {
+    use std::sync::OnceLock;
+    static SPECS: OnceLock<Vec<(u32, u64, Vec<u64>, Vec<u8>)>> = OnceLock::new();
+    SPECS.get_or_init(|| {
+        std::env::var("NEXIUM_GUEST_PROBE_POKE")
+            .ok()
+            .map(|spec| {
+                spec.split(',')
+                    .filter_map(|item| {
+                        let (path, bytes) = item.trim().rsplit_once('=')?;
+                        let bytes = (0..bytes.len() / 2)
+                            .map(|i| u8::from_str_radix(&bytes[i * 2..i * 2 + 2], 16))
+                            .collect::<Result<Vec<u8>, _>>()
+                            .ok()?;
+                        let (reg, off, derefs, _) =
+                            parse_guest_probe_mem_spec(&format!("{}:1", path))?;
+                        Some((reg, off, derefs, bytes))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn guest_probe_poke(kernel: &Kernel, cpu: &nexium_cpu::Cpu, probe_pc: u64) {
+    for (reg, off, derefs, bytes) in guest_probe_poke_specs() {
+        let mut addr = if *reg == 31 { *off } else { cpu.get_register(*reg).wrapping_add(*off) };
+        let mut readable = true;
+        for step in derefs {
+            let mut word = [0u8; 8];
+            if kernel.address_space.read(addr, &mut word).is_err() {
+                readable = false;
+                break;
+            }
+            addr = u64::from_le_bytes(word).wrapping_add(*step);
+        }
+        if !readable || kernel.address_space.write(addr, bytes).is_err() {
+            log::warn!("[guest-probe-poke] pc={:#x} -> {:#x} failed", probe_pc, addr);
+        }
+    }
+}
+
+fn guest_probe_mem_dump(kernel: &Kernel, cpu: &nexium_cpu::Cpu, probe_pc: u64) {
+    guest_probe_poke(kernel, cpu, probe_pc);
+    for (reg, off, derefs, len) in guest_probe_mem_specs() {
+        let mut addr = if *reg == 31 { *off } else { cpu.get_register(*reg).wrapping_add(*off) };
+        let mut readable = true;
+        for step in derefs {
+            let mut bytes = [0u8; 8];
+            if kernel.address_space.read(addr, &mut bytes).is_err() {
+                readable = false;
+                break;
+            }
+            addr = u64::from_le_bytes(bytes).wrapping_add(*step);
+        }
+        let mut buf = vec![0u8; *len];
+        if !readable || kernel.address_space.read(addr, &mut buf).is_err() {
+            log::warn!(
+                "[guest-probe-mem] pc={:#x} x{}+{:#x} -> {:#x} unreadable",
+                probe_pc,
+                reg,
+                off,
+                addr
+            );
+            continue;
+        }
+        let hex = buf
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text: String = buf
+            .iter()
+            .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '.' })
+            .collect();
+        log::warn!(
+            "[guest-probe-mem] pc={:#x} x{}+{:#x} -> {:#x} {} |{}|",
+            probe_pc,
+            reg,
+            off,
+            addr,
+            hex,
+            text
+        );
+    }
 }
 
 fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
