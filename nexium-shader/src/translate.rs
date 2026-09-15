@@ -621,7 +621,6 @@ impl Translator {
                 | Opcode::PRET
                 | Opcode::RET
                 | Opcode::RTT
-                | Opcode::SSY
                 | Opcode::SYNC
         );
         regular_cc || immediate_cc || r2p_cc || control_ambiguity
@@ -10090,6 +10089,17 @@ mod tests {
                 }) if *actual == source
             ));
         }
+    }
+
+    #[test]
+    fn botw_reconvergence_setup_preserves_condition_code() {
+        let mut t = Translator::new();
+        for raw in [0x5ce0800000c73aff, 0xe290000064000000,
+                    0x5b5c038000d7130d, 0x5c1200000ff71815,
+                    0x50a0038000070d07] {
+            assert!(t.translate(raw), "{raw:#x}");
+        }
+        assert_eq!(t.unimplemented_count, 0);
     }
 
     #[test]
