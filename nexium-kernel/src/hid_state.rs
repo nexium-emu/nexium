@@ -161,6 +161,71 @@ pub struct HidState {
     last_tick: Option<std::time::Instant>,
 }
 
+fn injected_input() -> Option<ControllerInput> {
+    use std::sync::{Mutex, OnceLock};
+    static STATE: OnceLock<Option<(std::path::PathBuf, Mutex<(std::time::Instant, Option<ControllerInput>)>)>> = OnceLock::new();
+    let (path, cache) = STATE
+        .get_or_init(|| {
+            std::env::var_os("NEXIUM_HID_INJECT").map(|value| {
+                let stale = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                (std::path::PathBuf::from(value), Mutex::new((stale, None)))
+            })
+        })
+        .as_ref()?;
+    let mut cache = cache.lock().ok()?;
+    if cache.0.elapsed() >= std::time::Duration::from_millis(25) {
+        cache.0 = std::time::Instant::now();
+        cache.1 = std::fs::read_to_string(path).ok().and_then(|text| parse_injected_input(&text));
+    }
+    cache.1
+}
+
+fn parse_injected_input(text: &str) -> Option<ControllerInput> {
+    let mut input = ControllerInput::default();
+    let mut any = false;
+    for token in text.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        any = true;
+        let axis = |value: &str| value.parse::<f32>().ok().map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i32);
+        match key {
+            "lx" => input.stick_l_x = axis(value)?,
+            "ly" => input.stick_l_y = axis(value)?,
+            "rx" => input.stick_r_x = axis(value)?,
+            "ry" => input.stick_r_y = axis(value)?,
+            "buttons" => {
+                for name in value.split(',').filter(|name| !name.is_empty()) {
+                    input.buttons |= match name.to_ascii_uppercase().as_str() {
+                        "A" => NPAD_BUTTON_A,
+                        "B" => NPAD_BUTTON_B,
+                        "X" => NPAD_BUTTON_X,
+                        "Y" => NPAD_BUTTON_Y,
+                        "L" => NPAD_BUTTON_L,
+                        "R" => NPAD_BUTTON_R,
+                        "ZL" => NPAD_BUTTON_ZL,
+                        "ZR" => NPAD_BUTTON_ZR,
+                        "PLUS" => NPAD_BUTTON_PLUS,
+                        "MINUS" => NPAD_BUTTON_MINUS,
+                        "DUP" => NPAD_BUTTON_UP,
+                        "DDOWN" => NPAD_BUTTON_DOWN,
+                        "DLEFT" => NPAD_BUTTON_LEFT,
+                        "DRIGHT" => NPAD_BUTTON_RIGHT,
+                        "LS" => NPAD_BUTTON_STICK_L,
+                        "RS" => NPAD_BUTTON_STICK_R,
+                        _ => 0,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    let active = input.buttons != 0
+        || input.stick_l_x != 0
+        || input.stick_l_y != 0
+        || input.stick_r_x != 0
+        || input.stick_r_y != 0;
+    (any && active).then_some(input)
+}
+
 impl HidState {
     pub fn new() -> Self {
         let mut s = Self {
@@ -204,6 +269,7 @@ impl HidState {
     pub fn maybe_tick(&mut self, input: ControllerInput) {
         const VSYNC: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
         let now = std::time::Instant::now();
+        let input = injected_input().unwrap_or(input);
         let force = input.buttons != self.input.buttons
             || input.stick_l_x != self.input.stick_l_x
             || input.stick_l_y != self.input.stick_l_y
@@ -249,6 +315,7 @@ impl HidState {
     }
 
     pub fn tick(&mut self, input: ControllerInput) {
+        let input = injected_input().unwrap_or(input);
         self.input = input;
         self.sampling_number = self.sampling_number.wrapping_add(1);
         let sampling = self.sampling_number;
