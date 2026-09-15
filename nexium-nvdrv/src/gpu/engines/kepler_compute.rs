@@ -300,8 +300,10 @@ impl KeplerCompute {
             }
         }
         let dump_invocations = compute_dump_invocations();
+        let dump_program = compute_dump_program();
         let target_dump = !self.target_dumped
-            && compute_dump_program().is_some_and(|program| program == program_start)
+            && (dump_program.is_some() || dump_invocations.is_some())
+            && dump_program.is_none_or(|program| program == program_start)
             && dump_invocations
                 .is_none_or(|expected| expected == launch_invocations(&self.launch_description));
         let sampled_launch_diagnostics = self.launch_count < 16
