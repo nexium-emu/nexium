@@ -12725,7 +12725,7 @@ fn execute_one_inner(
         use std::sync::OnceLock;
         static OFF: OnceLock<bool> = OnceLock::new();
         !*OFF.get_or_init(|| std::env::var_os("NEXIUM_NO_DUAL_VS").is_some())
-            && (vsa_prog.enabled || vsa_prog.address_lo != 0)
+            && vsa_prog.is_enabled(0)
             && vsa_prog.address_lo != vs_prog.address_lo
     };
     let vsa_key = if vsa_active { vsa_prog.address_lo } else { 0 };
