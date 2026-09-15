@@ -363,6 +363,18 @@ fn resolve_raw_storage_buffer(
     Ok(ResolvedRawStorageBuffer { base, size })
 }
 
+fn raw_storage_snapshot_size(
+    declared_size: usize,
+    descriptor: nexium_shader::StorageBufferAddr,
+    writable: bool,
+) -> usize {
+    if !writable && !descriptor.has_dynamic_offset && descriptor.required_size != 0 {
+        declared_size.min(descriptor.required_size as usize)
+    } else {
+        declared_size
+    }
+}
+
 fn raw_storage_cache_key(
     mappings: &GpuMappings,
     gpu_va: u64,
@@ -1312,7 +1324,9 @@ fn prepare_and_execute(
         )?;
         resolved_storage_buffers.push(storage);
         let base = storage.base;
-        let size = storage.size;
+        let size = raw_storage_snapshot_size(
+            storage.size, *descriptor, frontend.writable_storage_buffers[index],
+        );
         let align = u64::from(descriptor.align.max(1));
         let aligned = base & !(align - 1);
         let slack = (base - aligned) as usize;
@@ -4974,6 +4988,23 @@ mod tests {
         assert_eq!(needs[0].access, ResourceAccess::Atomic);
         assert_eq!(needs[0].instruction_dimension, Some(ImageDimension::Buffer));
         assert_eq!(needs[0].referenced_components, 0xf);
+    }
+
+    #[test]
+    fn bounded_readonly_snapshot_avoids_unused_unmapped_tail() {
+        let mut descriptor = nexium_shader::StorageBufferAddr::direct(0, 0x290, 16);
+        descriptor.required_size = 284;
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x1000, 0x2000, 1);
+        let read = |_: u64, bytes: &mut [u8]| { bytes.fill(0x5a); true };
+        let size = raw_storage_snapshot_size(0x750, descriptor, false);
+        assert_eq!(size, 284);
+        assert_eq!(read_gpu_vec(&mappings, &read, 0x1a00, size, "test").unwrap(), vec![0x5a; 284]);
+        assert!(read_gpu_vec(&mappings, &read, 0x1a00, 0x750, "test").is_err());
+        assert_eq!(raw_storage_snapshot_size(0x750, descriptor, true), 0x750);
+        assert_eq!(raw_storage_snapshot_size(128, descriptor, false), 128);
+        descriptor.has_dynamic_offset = true;
+        assert_eq!(raw_storage_snapshot_size(0x750, descriptor, false), 0x750);
     }
 
     #[test]
