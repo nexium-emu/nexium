@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod opt;
+mod selection_tails;
 
 use std::collections::HashMap;
 
@@ -10015,6 +10016,8 @@ impl Emitter {
                 }
             }
         }
+        selection_tails::repair(&mut module)
+            .unwrap_or_else(|error| panic!("nexium-spirv: cannot structure shared tail: {error}"));
         let words = opt::dedup_constants(module.assemble());
         dump_spirv_words(&words, self.stage, multi_exit);
         if !phi_preds_consistent(&words) {
@@ -12245,7 +12248,7 @@ mod tests {
         m
     }
 
-    fn validates_with_spirv_val_if_available(words: &[u32]) {
+    pub(crate) fn validates_with_spirv_val_if_available(words: &[u32]) {
         static NEXT_VALIDATION_FILE: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
         let serial = NEXT_VALIDATION_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
