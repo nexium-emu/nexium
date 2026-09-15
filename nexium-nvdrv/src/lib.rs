@@ -4329,10 +4329,7 @@ impl Nvdrv {
                 if out.len() < 16 {
                     out.resize(16, 0);
                 }
-                let ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
+                let ns = gpu::clock::nanoseconds();
                 out[0..8].copy_from_slice(&ns.to_le_bytes());
                 log::debug!("nvhost-ctrl-gpu:GetGpuTime → {}ns", ns);
             }
@@ -7353,6 +7350,18 @@ mod tests {
             inline_in_data: Vec::new(),
             out_size,
         }
+    }
+
+    #[test]
+    fn gpu_time_ioctl_uses_the_report_clock_epoch() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-ctrl-gpu").unwrap();
+        let before = gpu::clock::nanoseconds();
+        let result = nvdrv.dispatch_ioctl(request(fd, 0x8008_471c, Vec::new(), 8));
+        let after = gpu::clock::nanoseconds();
+        let reported = u64::from_le_bytes(result.data[..8].try_into().unwrap());
+        assert!(reported >= before);
+        assert!(reported <= after);
     }
 
     fn test_nvmap_handle(id: u32, size: u32, address: u64) -> NvmapHandle {

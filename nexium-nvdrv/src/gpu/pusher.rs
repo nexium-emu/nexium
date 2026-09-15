@@ -895,8 +895,6 @@ const NON_PULLER_METHODS: u32 = 0x40;
 
 const POISON_SENTINEL: u32 = 0xBEEF_2929;
 
-pub(crate) static GPU_SEM_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 pub(crate) fn gpu_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_NVDRV_PROFILE").is_some())

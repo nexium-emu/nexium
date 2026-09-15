@@ -1,3 +1,4 @@
+pub(crate) mod clock;
 pub(crate) mod completion;
 pub mod engines;
 pub mod flat_allocator;

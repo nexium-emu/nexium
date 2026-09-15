@@ -651,7 +651,7 @@ impl PrepState {
                 );
                 if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
                     if long {
-                        let ts = super::pusher::GPU_SEM_TICK.fetch_add(1, AtomicOrdering::Relaxed);
+                        let ts = super::clock::report_timestamp();
                         let mut buf = [0u8; 16];
                         buf[0..8].copy_from_slice(&(payload as u64).to_le_bytes());
                         buf[8..16].copy_from_slice(&ts.to_le_bytes());
@@ -850,8 +850,7 @@ impl PrepState {
                         );
                         if let Some(cpu) = mappings.cpu_address_for(write.gpu_va) {
                             let ok = if write.long {
-                                let ts = super::pusher::GPU_SEM_TICK
-                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                let ts = super::clock::report_timestamp();
                                 let mut buf = [0u8; 16];
                                 buf[0..8].copy_from_slice(&(write.payload as u64).to_le_bytes());
                                 buf[8..16].copy_from_slice(&ts.to_le_bytes());
