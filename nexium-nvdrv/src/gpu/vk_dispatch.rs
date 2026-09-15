@@ -14857,7 +14857,9 @@ fn execute_one_inner(
                 & shader_mask,
         }
     });
-    if mask_all_mrt_outputs || (fs_writes_depth && fs_output_map == 0) {
+    if mask_all_mrt_outputs || draw.rt_control & 0xf == 0
+        || (fs_sph.is_some() && fs_output_map == 0)
+    {
         for attachment in &mut attachments {
             attachment.color_write_mask = vk::ColorComponentFlags::empty();
         }
