@@ -1177,6 +1177,7 @@ impl EmulationHandle {
                 let mut loop_iter: u64 = 0;
                 let mut last_loop_log = std::time::Instant::now();
                 let mut last_stats_update = std::time::Instant::now();
+                let mut last_cpu_snapshot = std::time::Instant::now();
                 let mut last_halts: u64 = 0;
                 let mut preempt_count: u64 = 0;
                 loop {
@@ -1861,25 +1862,28 @@ impl EmulationHandle {
                             st.cycle_count = cycle_count;
                             drop(st);
 
-                            let mut snap = cpu_snapshot_clone.lock();
-                            snap.pc = cpu.get_pc();
-                            snap.sp = cpu.get_register(31);
-                            snap.tpidrro_el0 = cpu.get_tpidrro_el0();
-                            for i in 0..31 {
-                                snap.x[i] = cpu.get_register(i as u32);
-                            }
-                            let mut instr_buf = vec![0u8; 64];
-                            if guard.address_space.read(snap.pc, &mut instr_buf).is_ok() {
-                                snap.instruction_bytes = instr_buf;
-                            }
-                            snap.threads = guard.thread_wait_tree();
-                            let mem_req = *mem_request_clone.lock();
-                            if mem_req != 0 {
-                                snap.mem_request_address = mem_req;
-                                let mut mem_buf = vec![0u8; 256];
-                                if guard.address_space.read(mem_req, &mut mem_buf).is_ok() {
-                                    snap.mem_address = mem_req;
-                                    snap.mem_data = mem_buf;
+                            if last_cpu_snapshot.elapsed() >= std::time::Duration::from_millis(16) {
+                                last_cpu_snapshot = std::time::Instant::now();
+                                let mut snap = cpu_snapshot_clone.lock();
+                                snap.pc = cpu.get_pc();
+                                snap.sp = cpu.get_register(31);
+                                snap.tpidrro_el0 = cpu.get_tpidrro_el0();
+                                for i in 0..31 {
+                                    snap.x[i] = cpu.get_register(i as u32);
+                                }
+                                let mut instr_buf = vec![0u8; 64];
+                                if guard.address_space.read(snap.pc, &mut instr_buf).is_ok() {
+                                    snap.instruction_bytes = instr_buf;
+                                }
+                                snap.threads = guard.thread_wait_tree();
+                                let mem_req = *mem_request_clone.lock();
+                                if mem_req != 0 {
+                                    snap.mem_request_address = mem_req;
+                                    let mut mem_buf = vec![0u8; 256];
+                                    if guard.address_space.read(mem_req, &mut mem_buf).is_ok() {
+                                        snap.mem_address = mem_req;
+                                        snap.mem_data = mem_buf;
+                                    }
                                 }
                             }
                         }
