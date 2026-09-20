@@ -3,11 +3,7 @@ use crate::kernel::Kernel;
 use nexium_ipc::IpcCtx;
 
 pub fn get_current_time(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u64 {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    secs.saturating_sub(946_684_800)
+    crate::services::time::unix_time_seconds() as u64
 }
 
 pub fn set_current_time(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _posix_time: u64) {}
