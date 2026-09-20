@@ -32,6 +32,14 @@ fn classify_submit_fence_wait(
     }
 }
 
+pub fn kick_timeline_enabled() -> bool {
+    nexium_common::timeline::enabled()
+}
+
+pub fn timeline_us() -> u64 {
+    nexium_common::timeline::us()
+}
+
 fn gpfifo_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -895,6 +903,7 @@ fn ioctl_profile_record(device: NvDevice, cmd: u16, result: u32, elapsed_ns: u64
 
 pub type AsyncMemoryRead = Arc<dyn Fn(u64, &mut [u8]) -> bool + Send + Sync>;
 pub type AsyncMemoryWrite = Arc<dyn Fn(u64, &[u8]) -> bool + Send + Sync>;
+pub type PresentPrepared = Box<dyn FnOnce() + Send>;
 pub type AsyncMemoryCopy = Arc<dyn Fn(u64, u64, usize) -> bool + Send + Sync>;
 
 #[derive(Clone, Copy)]
@@ -913,6 +922,7 @@ enum AsyncGpuSubmission {
         job: crate::render_thread::RenderJob,
         pending: Arc<std::sync::atomic::AtomicUsize>,
         limit: usize,
+        on_prepared: Option<PresentPrepared>,
     },
     Barrier(crossbeam::channel::Sender<bool>),
     Shutdown,
@@ -1324,6 +1334,7 @@ impl AsyncGpuQueue {
                         .as_deref(),
                     Some("1") | Some("true") | Some("on") | Some("yes")
                 ));
+        let flush_small_rts = defer_small_rts && gpu::eager_small_rt_writeback_enabled();
         if defer_small_rts {
             log::info!("nexium-nvdrv: async GPU small-RT writeback deferred to queue barriers");
         }
@@ -1423,6 +1434,7 @@ impl AsyncGpuQueue {
                                 job,
                                 pending,
                                 limit,
+                                on_prepared,
                             },
                             Some(pending_guard),
                         ) => {
@@ -1445,22 +1457,22 @@ impl AsyncGpuQueue {
                                 pending_guard.complete();
                             });
                             let job = if pipeline {
-                                match worker_gpu.prep_present(job, defer_small_rts) {
+                                match worker_gpu.prep_present(job, flush_small_rts, on_prepared) {
                                     Ok(()) => None,
-                                    Err(job) => {
+                                    Err((job, on_prepared)) => {
                                         log::error!(
                                             "[gpu-prep] prep lane unavailable; preserving present on render FIFO"
                                         );
-                                        Some(job)
+                                        Some((job, on_prepared))
                                     }
                                 }
                             } else {
-                                Some(job)
+                                Some((job, on_prepared))
                             };
-                            if let Some(job) = job {
+                            if let Some((job, on_prepared)) = job {
                                 let mut completed = worker_gpu.flush_prepared_draw_packets();
                                 if completed
-                                    && defer_small_rts
+                                    && flush_small_rts
                                     && gpu::vk_dispatch::has_pending_small_rt_writebacks()
                                 {
                                     completed = worker_gpu
@@ -1474,6 +1486,9 @@ impl AsyncGpuQueue {
                                     worker_gpu.flush_cpu_readable_rt_writebacks(|addr, buf| mem_write(addr, buf));
                                 }
                                 if completed {
+                                    if let Some(on_prepared) = on_prepared {
+                                        on_prepared();
+                                    }
                                     if let Some(render_thread) =
                                         crate::render_thread::maybe_render_thread()
                                     {
@@ -1493,7 +1508,7 @@ impl AsyncGpuQueue {
                         (AsyncGpuSubmission::Barrier(done), None) => {
                             gpu::watchdog::phase(gpu::watchdog::Phase::Barrier, 0);
                             if pipeline {
-                                match worker_gpu.prep_drain_barrier(done, defer_small_rts) {
+                                match worker_gpu.prep_drain_barrier(done, flush_small_rts) {
                                     gpu::prep::PrepBarrierDispatch::Queued => {}
                                     gpu::prep::PrepBarrierDispatch::Inline => {
                                         log::error!(
@@ -1511,7 +1526,7 @@ impl AsyncGpuQueue {
                             } else {
                                 let mut completed = worker_gpu.flush_prepared_draw_packets();
                                 if completed
-                                    && defer_small_rts
+                                    && flush_small_rts
                                     && gpu::vk_dispatch::has_pending_small_rt_writebacks()
                                 {
                                     completed = worker_gpu
@@ -1544,7 +1559,7 @@ impl AsyncGpuQueue {
         let worker = match worker {
             Ok(worker) => worker,
             Err(error) => {
-                let _ = gpu.shutdown_prep_thread(defer_small_rts);
+                let _ = gpu.shutdown_prep_thread(flush_small_rts);
                 panic!("spawn GPU submit thread: {error}");
             }
         };
@@ -1555,7 +1570,7 @@ impl AsyncGpuQueue {
             pending,
             capacity,
             profile,
-            defer_small_rts,
+            defer_small_rts: flush_small_rts,
             #[cfg(test)]
             hard_kicks,
             failed,
@@ -2212,7 +2227,11 @@ impl Nvdrv {
         }
     }
 
-    pub fn try_queue_ordered_present<F>(&self, present: F) -> AsyncPresentSubmit
+    pub fn try_queue_ordered_present<F>(
+        &self,
+        present: F,
+        on_prepared: Option<PresentPrepared>,
+    ) -> AsyncPresentSubmit
     where
         F: FnOnce() + Send + 'static,
     {
@@ -2222,6 +2241,7 @@ impl Nvdrv {
                 job: Box::new(present),
                 pending: Arc::clone(&self.async_present_pending),
                 limit,
+                on_prepared,
             }) {
                 AsyncPresentSubmit::Enqueued
             } else {
@@ -2230,6 +2250,9 @@ impl Nvdrv {
         }
         let submit: Box<dyn FnOnce(&'static str, crate::render_thread::RenderJob) + Send> =
             Box::new(move |label, job| {
+                if let Some(on_prepared) = on_prepared {
+                    on_prepared();
+                }
                 if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
                     render_thread.submit_named(label, job);
                 } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
@@ -5087,6 +5110,16 @@ impl Nvdrv {
                             .fetch_add(entries.len() as u64, Ordering::Relaxed);
                         let (syncpt_id, syncpt_value) =
                             self.reserve_channel_submit(req.fd, submit_flags, submit_fence_value);
+                        if kick_timeline_enabled() {
+                            log::warn!(
+                                "[ktl] us={} submit fd={} syncpt={} target={} entries={}",
+                                timeline_us(),
+                                req.fd,
+                                syncpt_id,
+                                syncpt_value,
+                                entries.len()
+                            );
+                        }
                         let async_enabled = self.gpu_async.is_some();
                         let queued = self.gpu_async.as_ref().is_some_and(|queue| {
                             queue.submit(AsyncGpuSubmission::Inline {
@@ -5231,6 +5264,16 @@ impl Nvdrv {
                             .fetch_add(entries.len() as u64, Ordering::Relaxed);
                         let (syncpt_id, syncpt_value) =
                             self.reserve_channel_submit(req.fd, submit_flags, submit_fence_value);
+                        if kick_timeline_enabled() {
+                            log::warn!(
+                                "[ktl] us={} submit fd={} syncpt={} target={} entries={}",
+                                timeline_us(),
+                                req.fd,
+                                syncpt_id,
+                                syncpt_value,
+                                entries.len()
+                            );
+                        }
                         let async_enabled = self.gpu_async.is_some();
                         let queued = self.gpu_async.as_ref().is_some_and(|queue| {
                             queue.submit(AsyncGpuSubmission::Inline {
@@ -6485,6 +6528,7 @@ mod tests {
             job: Box::new(move || job_presented.store(true, Ordering::Release)),
             pending: Arc::clone(&present_pending),
             limit: 1,
+            on_prepared: None,
         }));
 
         frames.close();

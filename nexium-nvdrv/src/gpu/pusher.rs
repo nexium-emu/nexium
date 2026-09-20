@@ -375,7 +375,16 @@ pub(crate) mod kickprof {
     pub const VKF_CUBE_DRAIN: usize = 180;
     pub const VKF_CUBE_READ: usize = 181;
     pub const VKF_CUBE_POST: usize = 182;
-    pub const COUNT: usize = 183;
+    pub const OVERLAY: usize = 183;
+    pub const KC_LANDING: usize = 184;
+    pub const CUBE_OVERLAY: usize = 185;
+    pub const KICK_BEGIN: usize = 186;
+    pub const KICK_END: usize = 187;
+    pub const DRAWS_PRE: usize = 188;
+    pub const BLK_LOCK: usize = 189;
+    pub const BLK_RESERVE: usize = 190;
+    pub const BLK_SEND: usize = 191;
+    pub const COUNT: usize = 192;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -561,6 +570,15 @@ pub(crate) mod kickprof {
         "vkfcubedrain",
         "vkfcuberead",
         "vkfcubepost",
+        "overlay",
+        "kclanding",
+        "cubeoverlay",
+        "kickbegin",
+        "kickend",
+        "drawspre",
+        "blklock",
+        "blkreserve",
+        "blksend",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
@@ -715,6 +733,27 @@ pub(crate) mod kickprof {
         if enabled() {
             CALLS[phase].fetch_add(amount, Ordering::Relaxed);
         }
+    }
+
+    pub fn take_kick_stage_report() -> String {
+        static LAST_NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
+        static LAST_CALLS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
+        let mut rows = Vec::with_capacity(COUNT);
+        for phase in 0..COUNT {
+            let ns = NS[phase].load(Ordering::Relaxed);
+            let calls = CALLS[phase].load(Ordering::Relaxed);
+            let delta_ns = ns.wrapping_sub(LAST_NS[phase].swap(ns, Ordering::Relaxed));
+            let delta_calls = calls.wrapping_sub(LAST_CALLS[phase].swap(calls, Ordering::Relaxed));
+            if delta_ns >= 200_000 {
+                rows.push((delta_ns, delta_calls, NAMES[phase]));
+            }
+        }
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.iter()
+            .take(10)
+            .map(|(ns, calls, name)| format!("{name}={:.2}/n{calls}", *ns as f64 / 1e6))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[inline]
@@ -1147,8 +1186,20 @@ impl Pusher {
 
     pub(crate) fn prep_kick_begin(&mut self) {
         self.flush_engine_event_batch();
+        if crate::kick_timeline_enabled() {
+            static KICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            log::warn!(
+                "[ktl] us={} kick begin n={}",
+                crate::timeline_us(),
+                KICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+        }
         match &mut self.prep {
-            super::prep::PrepLane::Inline(state) => state.begin_ssbo_snapshot_epoch(),
+            super::prep::PrepLane::Inline(state) => {
+                let kp = kickprof::start();
+                state.begin_ssbo_snapshot_epoch();
+                kickprof::add(kickprof::KICK_BEGIN, kp);
+            }
             super::prep::PrepLane::Threaded(handle) => {
                 handle.begin_kick();
                 if handle
@@ -1207,14 +1258,16 @@ impl Pusher {
         self.flush_engine_event_batch();
         match &mut self.prep {
             super::prep::PrepLane::Inline(state) => {
+                let kp_end = kickprof::start();
                 let kp_tail = kickprof::start();
-                state.resolve_pending_compute(mappings, mem_write);
+                state.land_or_resolve_pending_compute(mappings, mem_write);
                 kickprof::add(kickprof::RESOLVE_TAIL, kp_tail);
                 if hard_after {
                     state.record_flush_reason(kickprof::FLUSH_HARD_TAIL);
                 }
                 state.flush_vk_with_boundary(mappings, mem_read, mem_write, hard_after);
                 let submitted = state.finish_prepared_draw_packet_tail(hard_after);
+                state.post_compute_overlay_retire();
                 if writeback_small_rts {
                     if let Some(r) = state.renderer.clone() {
                         let kp = kickprof::start();
@@ -1236,6 +1289,14 @@ impl Pusher {
                 state.end_ssbo_snapshot_epoch();
                 if submitted {
                     state.schedule_kick_completion(on_complete);
+                }
+                kickprof::add(kickprof::KICK_END, kp_end);
+                if crate::kick_timeline_enabled() {
+                    log::warn!(
+                        "[ktl] us={} kick end stages: {}",
+                        crate::timeline_us(),
+                        kickprof::take_kick_stage_report()
+                    );
                 }
             }
             super::prep::PrepLane::Threaded(handle) => {

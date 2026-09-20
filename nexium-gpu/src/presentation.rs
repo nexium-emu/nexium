@@ -37,6 +37,70 @@ pub struct Snapshot {
     pub pixels: Vec<u8>,
 }
 
+fn present_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("NEXIUM_PRESENT_PROFILE").is_some_and(|value| value != "0")
+    })
+}
+
+struct PresentPhase {
+    sum_ns: AtomicU64,
+    max_ns: AtomicU64,
+    count: AtomicU64,
+}
+
+impl PresentPhase {
+    const fn new() -> Self {
+        Self {
+            sum_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn add(&self, elapsed: Duration) {
+        let ns = elapsed.as_nanos() as u64;
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn take(&self) -> String {
+        let count = self.count.swap(0, Ordering::Relaxed);
+        let sum = self.sum_ns.swap(0, Ordering::Relaxed);
+        let max = self.max_ns.swap(0, Ordering::Relaxed);
+        let mean = if count == 0 { 0.0 } else { sum as f64 / count as f64 / 1e6 };
+        format!("{mean:.2}/{:.2}x{count}", max as f64 / 1e6)
+    }
+}
+
+struct PresentProfile {
+    reserve: PresentPhase,
+    fence: PresentPhase,
+    submit_wait: PresentPhase,
+    acquire: PresentPhase,
+    pace: PresentPhase,
+    queue_present: PresentPhase,
+    period: PresentPhase,
+    slots_out: PresentPhase,
+    recv_timeouts: AtomicU64,
+}
+
+static PRESENT_SLOTS_OUT: AtomicU64 = AtomicU64::new(0);
+
+static PRESENT_PROFILE: PresentProfile = PresentProfile {
+    reserve: PresentPhase::new(),
+    fence: PresentPhase::new(),
+    submit_wait: PresentPhase::new(),
+    acquire: PresentPhase::new(),
+    pace: PresentPhase::new(),
+    queue_present: PresentPhase::new(),
+    period: PresentPhase::new(),
+    slots_out: PresentPhase::new(),
+    recv_timeouts: AtomicU64::new(0),
+};
+
 fn periodic_snapshot_due() -> bool {
     use std::sync::{Mutex, OnceLock};
     static NEXT: OnceLock<Option<(std::time::Duration, Mutex<std::time::Instant>)>> = OnceLock::new();
@@ -247,6 +311,7 @@ pub(crate) struct FrameSlot {
     pub fence: vk::Fence,
     pub generation: u64,
     parameters: PresentParameters,
+    release: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl FrameSlot {
@@ -269,6 +334,7 @@ impl FrameSlot {
                 transform: 0,
                 present_at: Instant::now(),
             },
+            release: None,
         };
         unsafe {
             slot.pool = device
@@ -464,9 +530,21 @@ impl Presenter {
 
     pub fn reserve(&self) -> Option<FrameSlot> {
         let free = self.free.lock();
+        let started = present_profile_enabled().then(Instant::now);
+        if started.is_some() {
+            PRESENT_PROFILE.slots_out.add(Duration::from_millis(
+                PRESENT_SLOTS_OUT.load(Ordering::Relaxed),
+            ));
+        }
         while !self.target.stopped.load(Ordering::Acquire) {
             match free.recv_timeout(Duration::from_millis(20)) {
-                Ok(slot) => return Some(slot),
+                Ok(slot) => {
+                    PRESENT_SLOTS_OUT.fetch_add(1, Ordering::Relaxed);
+                    if let Some(started) = started {
+                        PRESENT_PROFILE.reserve.add(started.elapsed());
+                    }
+                    return Some(slot);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return None,
             }
@@ -475,6 +553,7 @@ impl Presenter {
     }
 
     pub fn recycle(&self, slot: FrameSlot) {
+        PRESENT_SLOTS_OUT.fetch_sub(1, Ordering::Relaxed);
         let _ = self.recycle.send(slot);
     }
 
@@ -482,8 +561,14 @@ impl Presenter {
         self.target.fail(error);
     }
 
-    pub fn submit(&self, mut slot: FrameSlot, parameters: PresentParameters) -> Result<(), String> {
+    pub fn submit(
+        &self,
+        mut slot: FrameSlot,
+        parameters: PresentParameters,
+        release: Option<Box<dyn std::any::Any + Send>>,
+    ) -> Result<(), String> {
         slot.parameters = parameters;
+        slot.release = release;
         self.pending.send(slot).map_err(|e| {
             unsafe {
                 let _ = e.0.device.wait_for_fences(&[e.0.fence], true, u64::MAX);
@@ -546,6 +631,7 @@ struct Worker {
     pipeline: vk::Pipeline,
     samplers: [vk::Sampler; 2],
     last: Option<FrameSlot>,
+    last_present_profile: Option<Instant>,
 }
 
 impl Worker {
@@ -592,6 +678,7 @@ impl Worker {
             pipeline: vk::Pipeline::null(),
             samplers: [vk::Sampler::null(); 2],
             last: None,
+            last_present_profile: None,
         };
         #[cfg(windows)]
         unsafe {
@@ -723,17 +810,27 @@ impl Worker {
         while !self.target.stopped.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire) {
             let mut incoming = match receiver.recv_timeout(Duration::from_millis(8)) {
                 Ok(slot) => Some(slot),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    PRESENT_PROFILE.recv_timeouts.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             let state = *self.target.state.lock();
+            let mut pending_release = None;
             if let Some(slot) = incoming.take() {
+                let started = present_profile_enabled().then(Instant::now);
                 unsafe {
                     self.device
                         .wait_for_fences(&[slot.fence], true, u64::MAX)
                         .map_err(err)?;
                 }
-                if let Some(previous) = self.last.replace(slot) {
+                if let Some(started) = started {
+                    PRESENT_PROFILE.fence.add(started.elapsed());
+                }
+                if let Some(mut previous) = self.last.replace(slot) {
+                    pending_release = previous.release.take();
+                    PRESENT_SLOTS_OUT.fetch_sub(1, Ordering::Relaxed);
                     let _ = recycle.send(previous);
                 }
                 let (_, size) = self.last.as_ref().unwrap().parameters.mapping(
@@ -751,6 +848,7 @@ impl Worker {
                 } else {
                     self.wait_present_time(self.last.as_ref().unwrap().parameters.present_at);
                 }
+                drop(pending_release);
             } else if self.last.is_some()
                 && state.visible
                 && state.width != 0
@@ -1026,7 +1124,13 @@ impl Worker {
     }
 
     fn present(&mut self, mut state: SurfaceState) -> Result<(), String> {
+        let profile = present_profile_enabled();
+        let started = profile.then(Instant::now);
         self.wait_submission()?;
+        if let Some(started) = started {
+            PRESENT_PROFILE.submit_wait.add(started.elapsed());
+        }
+        let started = profile.then(Instant::now);
         let (index, suboptimal) = loop {
             if !state.visible
                 || state.width == 0
@@ -1064,6 +1168,9 @@ impl Worker {
             }
             state = *self.target.state.lock();
         };
+        if let Some(started) = started {
+            PRESENT_PROFILE.acquire.add(started.elapsed());
+        }
         let image = &mut self.images[index as usize];
         let release_retired = !self.present_fences && image.pending_present;
         let present_fence = image.present_fence;
@@ -1209,7 +1316,12 @@ impl Worker {
             }
         }
         self.fence_pending = true;
+        let started = profile.then(Instant::now);
         self.wait_present_time(slot.parameters.present_at);
+        if let Some(started) = started {
+            PRESENT_PROFILE.pace.add(started.elapsed());
+        }
+        let started = profile.then(Instant::now);
         let swaps = [self.swapchain];
         let indices = [index];
         let fences = [present_fence];
@@ -1225,12 +1337,35 @@ impl Worker {
             let _sequence = self.queue_lock();
             unsafe { self.swap_api.queue_present(self.queue, &present) }
         };
+        if let Some(started) = started {
+            PRESENT_PROFILE.queue_present.add(started.elapsed());
+            if let Some(previous) = self.last_present_profile.replace(Instant::now()) {
+                PRESENT_PROFILE.period.add(previous.elapsed());
+            }
+        }
         self.images[index as usize].pending_present = matches!(
             result,
             Ok(_) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_SURFACE_LOST_KHR)
         );
         if result.is_ok() {
+            if nexium_common::timeline::enabled() {
+                log::warn!("[ktl] us={} present", nexium_common::timeline::us());
+            }
             let count = self.target.presented.fetch_add(1, Ordering::Relaxed) + 1;
+            if profile && count % 60 == 0 {
+                log::warn!(
+                    "[present-profile] presents=60 ms mean/max x n: reserve={} fence={} submitwait={} acquire={} pace={} qpresent={} period={} slots_out={} recv_timeouts={}",
+                    PRESENT_PROFILE.reserve.take(),
+                    PRESENT_PROFILE.fence.take(),
+                    PRESENT_PROFILE.submit_wait.take(),
+                    PRESENT_PROFILE.acquire.take(),
+                    PRESENT_PROFILE.pace.take(),
+                    PRESENT_PROFILE.queue_present.take(),
+                    PRESENT_PROFILE.period.take(),
+                    PRESENT_PROFILE.slots_out.take(),
+                    PRESENT_PROFILE.recv_timeouts.swap(0, Ordering::Relaxed),
+                );
+            }
             if count % 300 == 0 {
                 log::info!(
                     "[vulkan-present] presented={count} snapshots={}",

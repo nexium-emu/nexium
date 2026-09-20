@@ -801,18 +801,10 @@ impl Fermi2D {
         let Some((src_cpu, limit)) = mappings.cpu_range_for(src_va) else {
             return;
         };
-        let Some((kw, kh, bpp, mut raw)) = renderer.readback_target_raw(nvmap, src_va) else {
+        let Some((kw, kh, bpp, raw)) = renderer.readback_target_raw(nvmap, src_va) else {
             return;
         };
         let width_bytes = (kw as usize) * bpp;
-        if kh >= 2 && raw.len() >= width_bytes * kh as usize {
-            let h = kh as usize;
-            for y in 0..h / 2 {
-                let (top, bot) = raw.split_at_mut((h - 1 - y) * width_bytes);
-                top[y * width_bytes..(y + 1) * width_bytes]
-                    .swap_with_slice(&mut bot[..width_bytes]);
-            }
-        }
         let tiled = super::maxwell_dma::swizzle_block_linear(
             &raw,
             width_bytes,

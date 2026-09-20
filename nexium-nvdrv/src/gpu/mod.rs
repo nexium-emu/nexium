@@ -2050,6 +2050,15 @@ impl GpuContext {
     }
 
     pub(crate) fn record_syncpoint_completion(&self, fd: u32, syncpt_id: u32, threshold: u32) {
+        if crate::kick_timeline_enabled() {
+            log::warn!(
+                "[ktl] us={} complete fd={} syncpt={} threshold={}",
+                crate::timeline_us(),
+                fd,
+                syncpt_id,
+                threshold
+            );
+        }
         self.pending_syncpoint_events
             .lock()
             .push_back(PendingSyncpointEvent::Completion {
@@ -2089,20 +2098,24 @@ impl GpuContext {
         &self,
         job: crate::render_thread::RenderJob,
         flush_small_rts: bool,
-    ) -> Result<(), crate::render_thread::RenderJob> {
+        on_prepared: Option<crate::PresentPrepared>,
+    ) -> Result<(), (crate::render_thread::RenderJob, Option<crate::PresentPrepared>)> {
         let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
         match &mut pusher.prep {
             prep::PrepLane::Threaded(handle) => {
                 match handle.send_recover(prep::PrepEvent::Present {
                     job,
                     flush_small_rts,
+                    on_prepared,
                 }) {
                     Ok(()) => Ok(()),
-                    Err(prep::PrepEvent::Present { job, .. }) => Err(job),
+                    Err(prep::PrepEvent::Present {
+                        job, on_prepared, ..
+                    }) => Err((job, on_prepared)),
                     Err(_) => unreachable!("prep present returned a different event"),
                 }
             }
-            prep::PrepLane::Inline(_) => Err(job),
+            prep::PrepLane::Inline(_) => Err((job, on_prepared)),
         }
     }
 
@@ -2505,6 +2518,14 @@ impl GpuContext {
                     log::warn!("[syncpt-orphan] rejected increment id=0 count={}", count);
                 }
                 continue;
+            }
+            if crate::kick_timeline_enabled() {
+                log::warn!(
+                    "[ktl] us={} incr syncpt={} count={}",
+                    crate::timeline_us(),
+                    id,
+                    count
+                );
             }
             events.push_back(PendingSyncpointEvent::Increment {
                 syncpt_id: id,

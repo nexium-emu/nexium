@@ -30,6 +30,15 @@ fn dma_trace_cpu_address() -> Option<u64> {
     })
 }
 
+fn dma_trace_gpu_address() -> Option<u64> {
+    static ADDRESS: OnceLock<Option<u64>> = OnceLock::new();
+    *ADDRESS.get_or_init(|| {
+        std::env::var("NEXIUM_DMA_TRACE_GPU")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok())
+    })
+}
+
 fn dma_semaphore_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DMA_SEMAPHORE_TRACE").is_some())
@@ -783,7 +792,7 @@ impl MaxwellDma {
             return;
         };
         let bh_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
-        if let Some((kw, kh, bpp, mut raw)) = renderer.readback_target_raw(nvmap, src_gpu) {
+        if let Some((kw, kh, bpp, raw)) = renderer.readback_target_raw(nvmap, src_gpu) {
             if jumbo_dbg() {
                 let (nz, ck) = sample_stats(&raw);
                 log::warn!(
@@ -798,14 +807,6 @@ impl MaxwellDma {
                 );
             }
             let width_bytes = (kw as usize) * bpp;
-            if kh >= 2 && raw.len() >= width_bytes * kh as usize {
-                let h = kh as usize;
-                for y in 0..h / 2 {
-                    let (top, bot) = raw.split_at_mut((h - 1 - y) * width_bytes);
-                    top[y * width_bytes..(y + 1) * width_bytes]
-                        .swap_with_slice(&mut bot[..width_bytes]);
-                }
-            }
             let tiled = swizzle_block_linear(
                 &raw,
                 width_bytes,
@@ -890,7 +891,7 @@ impl MaxwellDma {
             }
             return;
         };
-        let Some(mut rgba) = renderer.readback_target(nvmap, kw, kh) else {
+        let Some(rgba) = renderer.readback_target(nvmap, kw, kh) else {
             if jumbo_dbg() {
                 log::warn!(
                     "[jumbo] stage MISS readback-none src={:#x} nvmap={} {}x{}",
@@ -915,14 +916,6 @@ impl MaxwellDma {
             );
         }
         let width_bytes = (kw as usize) * 4;
-        if kh >= 2 && rgba.len() >= width_bytes * kh as usize {
-            let h = kh as usize;
-            for y in 0..h / 2 {
-                let (top, bot) = rgba.split_at_mut((h - 1 - y) * width_bytes);
-                top[y * width_bytes..(y + 1) * width_bytes]
-                    .swap_with_slice(&mut bot[..width_bytes]);
-            }
-        }
         let tiled = swizzle_block_linear(
             &rgba,
             width_bytes,
@@ -1056,9 +1049,15 @@ impl MaxwellDma {
             return;
         };
         let dst_limit = dst_limit as usize;
-        if let Some(watch) = dma_trace_cpu_address() {
+        let gpu_watch = dma_trace_gpu_address();
+        if let Some(watch) = dma_trace_cpu_address().or(gpu_watch) {
             let covers = |base: u64, limit: usize| watch >= base && watch < base.wrapping_add(limit as u64);
-            if covers(src_cpu, src_limit) || covers(dst_cpu, dst_limit) {
+            let watched = if gpu_watch.is_some() && dma_trace_cpu_address().is_none() {
+                covers(src_gpu, src_limit) || covers(dst_gpu, dst_limit)
+            } else {
+                covers(src_cpu, src_limit) || covers(dst_cpu, dst_limit)
+            };
+            if watched {
                 log::warn!(
                     "[dma-trace-cpu] #{} src_gpu={:#x} cpu={:#x} limit={:#x} dst_gpu={:#x} cpu={:#x} limit={:#x} flags={:#x} units={} lines={} pitch={}->{} size={}x{}->{}x{} block={:#x}->{:#x} rt_source={}",
                     self.blit_count,

@@ -414,6 +414,15 @@ pub struct ResidentVertexChunk {
     pub data: std::sync::Arc<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeOverlay {
+    pub dst_offset: u64,
+    pub len: u64,
+    pub serial: u64,
+    pub resource_index: u32,
+    pub src_offset: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResidentVertexRange {
     pub binding: u32,
@@ -421,6 +430,7 @@ pub struct ResidentVertexRange {
     pub cpu_va: u64,
     pub len: usize,
     pub chunks: Vec<ResidentVertexChunk>,
+    pub compute_overlays: Vec<ComputeOverlay>,
 }
 
 impl ResidentVertexRange {
@@ -812,6 +822,7 @@ mod tests {
             cpu_va: chunk - 2,
             len: 4,
             chunks: vec![resident_chunk(0, 0x11), resident_chunk(1, 0x22)],
+            compute_overlays: Vec::new(),
         };
         assert!(range.has_exact_coverage());
         assert_eq!(

@@ -84,6 +84,12 @@ pub(crate) fn unpack_texture_depth(bytes: &[u8], format: crate::texture::TicForm
     if format == TicFormat::Z32 {
         return bytes.to_vec();
     }
+    if format == TicFormat::Z16 {
+        return bytes
+            .chunks_exact(2)
+            .flat_map(|word| (u16::from_le_bytes([word[0], word[1]]) as f32 / 65535.0).to_le_bytes())
+            .collect();
+    }
     let high_depth = matches!(format, TicFormat::G24R8 | TicFormat::Z24S8);
     let mut out = Vec::with_capacity(bytes.len());
     for word in bytes.chunks_exact(4) {

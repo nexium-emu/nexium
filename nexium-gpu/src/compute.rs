@@ -276,6 +276,7 @@ pub struct ComputeOutputRtAlias {
 
 #[derive(Clone, Debug)]
 pub struct ComputeDispatch {
+    pub serial: u64,
     pub program_key: u64,
     pub spirv: Arc<[u32]>,
     pub spirv_hash: u64,
@@ -1282,7 +1283,7 @@ fn create_compute_raw_storage_buffer(
         mem_props,
         data.len().max(16) as u64,
         Some(data),
-        vk::BufferUsageFlags::STORAGE_BUFFER,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
         None,
         false,
         true,

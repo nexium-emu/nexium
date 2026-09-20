@@ -19,6 +19,7 @@ pub enum TicFormat {
     R16G16,
     R32,
     G24R8,
+    Z16,
     Z32,
     Z24S8,
     X8Z24,
@@ -125,6 +126,7 @@ impl TicFormat {
             0x2A => TicFormat::X8Z24,
             0x2B => TicFormat::S8Z24,
             0x2F => TicFormat::Z32,
+            0x3A => TicFormat::Z16,
             0x2D => TicFormat::Unknown(0x2D),
             0x40 => TicFormat::Astc(4, 4),
             0x50 => TicFormat::Astc(5, 4),
@@ -140,7 +142,16 @@ impl TicFormat {
             0x45 => TicFormat::Astc(10, 10),
             0x54 => TicFormat::Astc(12, 10),
             0x46 => TicFormat::Astc(12, 12),
-            other => TicFormat::Unknown(other),
+            other => {
+                static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+                if let Ok(mut seen) = SEEN.lock() {
+                    if !seen.contains(&other) {
+                        seen.push(other);
+                        log::warn!("[tic] unknown texture format code {:#x}", other);
+                    }
+                }
+                TicFormat::Unknown(other)
+            }
         }
     }
 
@@ -165,7 +176,7 @@ impl TicFormat {
             | TicFormat::A1B5G5R5
             | TicFormat::B5G6R5
             | TicFormat::A4B4G4R4 => 2,
-            TicFormat::R16 | TicFormat::R8G8 => 2,
+            TicFormat::R16 | TicFormat::Z16 | TicFormat::R8G8 => 2,
             TicFormat::R16G16 => 4,
             TicFormat::R8 => 1,
             TicFormat::BC1 | TicFormat::BC4 | TicFormat::Etc2Rgb | TicFormat::Etc2RgbA1 => 8,
@@ -2076,7 +2087,7 @@ pub fn decode_to_rgba8_typed(
                 out[i * 4 + 3] = 0xFF;
             }
         }
-        TicFormat::R16 => {
+        TicFormat::R16 | TicFormat::Z16 => {
             for i in 0..pixels.min(src.len() / 2) {
                 let v = src[i * 2 + 1];
                 out[i * 4] = v;

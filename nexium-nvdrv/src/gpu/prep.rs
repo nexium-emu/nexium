@@ -61,6 +61,7 @@ pub(crate) enum PrepEvent {
     Present {
         job: crate::render_thread::RenderJob,
         flush_small_rts: bool,
+        on_prepared: Option<crate::PresentPrepared>,
     },
     DrainBarrier {
         done: crossbeam::channel::Sender<bool>,
@@ -160,6 +161,8 @@ fn deferred_compute_draw_resolve_enabled() -> bool {
 struct ComputeMemoryBarrier {
     cpu_ranges: Arc<[(u64, u64)]>,
     gpu_ranges: Arc<[(u64, u64)]>,
+    spans: Arc<[super::engines::maxwell_compute::PendingComputeWritebackSpan]>,
+    revision: u64,
     armed: std::cell::Cell<bool>,
 }
 
@@ -180,6 +183,8 @@ impl ComputeMemoryBarrier {
         Self {
             cpu_ranges: cpu_ranges.into(),
             gpu_ranges: gpu_ranges.into(),
+            spans: spans.to_vec().into(),
+            revision: 0,
             armed: std::cell::Cell::new(!spans.is_empty()),
         }
     }
@@ -242,6 +247,7 @@ impl ComputeBarrierCache {
         let revision = (revision, mappings.generation());
         if self.revision != Some(revision) {
             self.barrier = ComputeMemoryBarrier::new(spans, mappings);
+            self.barrier.revision = revision.0;
             self.revision = Some(revision);
         }
         self.barrier.clone()
@@ -400,6 +406,23 @@ impl PrepState {
         }
     }
 
+    pub(crate) fn post_compute_overlay_retire(&self) {
+        let retired = super::engines::maxwell_compute::take_retired_compute_serials();
+        if retired.is_empty() {
+            return;
+        }
+        let (Some(render_thread), Some(renderer)) = (
+            crate::render_thread::maybe_render_thread(),
+            self.renderer.clone(),
+        ) else {
+            return;
+        };
+        render_thread.submit_named(
+            "compute-overlay-retire",
+            Box::new(move || renderer.retire_compute_overlay_serials(&retired)),
+        );
+    }
+
     pub(crate) fn schedule_kick_completion(&self, on_complete: Option<Box<dyn FnOnce() + Send>>) {
         let Some(on_complete) = on_complete else {
             return;
@@ -433,6 +456,7 @@ impl PrepState {
                 true
             }
             PrepEvent::KickBegin => {
+                self.drain_landed_compute(mappings);
                 self.begin_ssbo_snapshot_epoch();
                 true
             }
@@ -456,13 +480,14 @@ impl PrepState {
                 let joined = self.join_small_rt_writeback(mappings);
                 super::watchdog::phase(super::watchdog::Phase::KickEnd, u64::from(hard_after));
                 let kp_tail = kickprof::start();
-                self.resolve_pending_compute(mappings, mem_write);
+                self.land_or_resolve_pending_compute(mappings, mem_write);
                 kickprof::add(kickprof::RESOLVE_TAIL, kp_tail);
                 if hard_after {
                     self.record_flush_reason(kickprof::FLUSH_HARD_TAIL);
                 }
                 self.flush_vk_with_boundary(mappings, mem_read, mem_write, hard_after);
                 let submitted = self.finish_prepared_draw_packet_tail(hard_after);
+                self.post_compute_overlay_retire();
                 let writeback_completed = if !joined {
                     false
                 } else if writeback_small_rts
@@ -496,11 +521,19 @@ impl PrepState {
                 if completed {
                     self.schedule_kick_completion(on_complete);
                 }
+                if crate::kick_timeline_enabled() {
+                    log::warn!(
+                        "[ktl] us={} kick end stages: {}",
+                        crate::timeline_us(),
+                        kickprof::take_kick_stage_report()
+                    );
+                }
                 completed
             }
             PrepEvent::Present {
                 job,
                 flush_small_rts,
+                on_prepared,
             } => {
                 let kp_wb = super::pusher::kickprof::start();
                 let joined = self.join_small_rt_writeback(mappings);
@@ -545,9 +578,23 @@ impl PrepState {
                 } else {
                     true
                 };
+                if completed
+                    && super::vk_dispatch::cpu_readable_rt_writeback_mode()
+                        == super::vk_dispatch::CpuReadableRtWritebackMode::Present
+                    && super::vk_dispatch::has_pending_cpu_readable_rt_writebacks()
+                {
+                    if let Some(renderer) = self.renderer.clone() {
+                        let kp = super::pusher::kickprof::start();
+                        self.writeback_cpu_readable_rts(&renderer, mappings, mem_write);
+                        super::pusher::kickprof::add(super::pusher::kickprof::SMALLRT, kp);
+                    }
+                }
                 super::pusher::kickprof::add(super::pusher::kickprof::PRES_WB, kp_wb);
                 if completed {
                     let kp_submit = super::pusher::kickprof::start();
+                    if let Some(on_prepared) = on_prepared {
+                        on_prepared();
+                    }
                     if let Some(rt) = crate::render_thread::maybe_render_thread() {
                         rt.submit_named("async-present-readback", job);
                     } else {
@@ -749,8 +796,6 @@ impl PrepState {
             }
             PrepEvent::SemRelease(writes) => {
                 super::watchdog::phase(super::watchdog::Phase::Semaphore, writes.len() as u64);
-                self.resolve_pending_compute(mappings, mem_write);
-                self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
                 let can_complete_asynchronously =
                     super::completion::async_semaphore_completion_enabled()
                         && self
@@ -764,7 +809,61 @@ impl PrepState {
                         && writes
                             .iter()
                             .all(|write| write.can_complete_asynchronously());
-                if can_complete_asynchronously {
+                let defer_synthetic_writes = !can_complete_asynchronously
+                    && !writes.is_empty()
+                    && writes
+                        .iter()
+                        .all(|write| !write.requires_renderer_completion())
+                    && super::engines::maxwell_compute::has_pending_writebacks()
+                    && self.compute_landing_possible();
+                if can_complete_asynchronously || defer_synthetic_writes {
+                    self.land_or_resolve_pending_compute(mappings, mem_write);
+                } else {
+                    self.resolve_pending_compute(mappings, mem_write);
+                }
+                self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
+                if defer_synthetic_writes {
+                    for write in &writes {
+                        self.ssbo_snapshot_cache.invalidate_gpu_write(
+                            mappings,
+                            write.gpu_va,
+                            if write.long { 16 } else { 4 },
+                        );
+                    }
+                    let renderer = self.renderer.as_ref().unwrap().clone();
+                    let memory = self.guest_memory.as_ref().unwrap().clone();
+                    let count = writes.len();
+                    let scheduled = super::completion::submit_renderer_completion(
+                        renderer,
+                        move || {
+                            for write in writes {
+                                let written = if write.long {
+                                    let mut buf = [0u8; 16];
+                                    buf[0..8].copy_from_slice(&u64::from(write.payload).to_le_bytes());
+                                    buf[8..16]
+                                        .copy_from_slice(&super::clock::report_timestamp().to_le_bytes());
+                                    memory.write_gpu(write.gpu_va, &buf)
+                                } else {
+                                    memory.write_gpu(write.gpu_va, &write.payload.to_le_bytes())
+                                };
+                                if written.is_none() {
+                                    log::warn!(
+                                        "pusher: deferred report gpu_va={:#x} not mapped; payload={:#x} dropped",
+                                        write.gpu_va,
+                                        write.payload
+                                    );
+                                }
+                            }
+                        },
+                    );
+                    if scheduled {
+                        stats
+                            .fence_releases
+                            .fetch_add(count as u64, AtomicOrdering::Relaxed);
+                    } else {
+                        log::error!("[gpu-sync] deferred report scheduling failed; payloads dropped");
+                    }
+                } else if can_complete_asynchronously {
                     let mut pending = Vec::with_capacity(writes.len());
                     for write in writes {
                         self.ssbo_snapshot_cache.invalidate_gpu_write(
@@ -886,6 +985,8 @@ impl PrepState {
                 mut replay_constbuf_writes,
                 constbuf_trace,
             } => {
+                self.drain_landed_compute(mappings);
+                let kp_pre = kickprof::start();
                 let compute_spans =
                     super::engines::maxwell_compute::pending_writeback_spans_snapshot();
                 let memory_barrier = self.compute_barrier_cache.get(
@@ -906,8 +1007,11 @@ impl PrepState {
                         self.invalidate_compute_snapshots(&memory_barrier, mappings);
                     }
                 }
-                self.ssbo_snapshot_cache
-                    .set_compute_pending_cpu_ranges(memory_barrier.cpu_ranges.clone());
+                self.ssbo_snapshot_cache.set_compute_pending(
+                    memory_barrier.cpu_ranges.clone(),
+                    memory_barrier.spans.clone(),
+                    memory_barrier.revision,
+                );
                 let barrier_renderer = self.renderer.clone();
                 let resolve_memory = || {
                     if let Some(renderer) = &barrier_renderer {
@@ -929,6 +1033,7 @@ impl PrepState {
                 let mut compute_probe =
                     super::vk_dispatch::ComputeGraphicsProbe::new(&compute_spans);
                 let mut committed_constbuf_writes = 0;
+                kickprof::add(kickprof::DRAWS_PRE, kp_pre);
                 if let Some(r) = self.renderer.clone() {
                     if replay_constbuf_writes.is_empty() {
                         let kp = kickprof::start();
@@ -1652,8 +1757,11 @@ impl PrepState {
         if memory_barrier.armed.get() {
             self.invalidate_compute_snapshots(&memory_barrier, mappings);
         }
-        self.ssbo_snapshot_cache
-            .set_compute_pending_cpu_ranges(memory_barrier.cpu_ranges.clone());
+        self.ssbo_snapshot_cache.set_compute_pending(
+            memory_barrier.cpu_ranges.clone(),
+            memory_barrier.spans.clone(),
+            memory_barrier.revision,
+        );
         let barrier_renderer = self.renderer.clone();
         let resolve_memory = || {
             if let Some(renderer) = &barrier_renderer {
@@ -1710,6 +1818,7 @@ impl PrepState {
         draw_prof_record(1, batch_len as u64, dp);
     }
 
+    #[track_caller]
     pub(crate) fn resolve_pending_compute(
         &mut self,
         mappings: &GpuMappings,
@@ -1718,6 +1827,46 @@ impl PrepState {
         let _ = self.resolve_pending_compute_report(mappings, mem_write);
     }
 
+    pub(crate) fn drain_landed_compute(&mut self, mappings: &GpuMappings) {
+        for span in super::engines::maxwell_compute::drain_landed_writebacks() {
+            self.ssbo_snapshot_cache
+                .invalidate_gpu_write(mappings, span.gpu_va, span.len);
+        }
+    }
+
+    #[track_caller]
+    pub(crate) fn compute_landing_possible(&self) -> bool {
+        super::engines::maxwell_compute::compute_landing_enabled()
+            && crate::render_thread::maybe_render_thread().is_some()
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.timeline_sync_available())
+            && self
+                .guest_memory
+                .as_ref()
+                .is_some_and(super::GuestMemoryAccess::is_available)
+    }
+
+    #[track_caller]
+    pub(crate) fn land_or_resolve_pending_compute(
+        &mut self,
+        mappings: &GpuMappings,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        if !super::engines::maxwell_compute::has_pending_writebacks() {
+            return;
+        }
+        if self.compute_landing_possible() {
+            let renderer = self.renderer.clone().unwrap();
+            let memory = self.guest_memory.clone().unwrap();
+            super::engines::maxwell_compute::schedule_pending_landings(renderer, memory);
+        } else {
+            self.resolve_pending_compute(mappings, mem_write);
+        }
+    }
+
+    #[track_caller]
     pub(crate) fn resolve_pending_compute_report(
         &mut self,
         mappings: &GpuMappings,
@@ -2523,6 +2672,8 @@ mod tests {
     fn compute_span() -> crate::gpu::engines::maxwell_compute::PendingComputeWritebackSpan {
         crate::gpu::engines::maxwell_compute::PendingComputeWritebackSpan {
             dispatch_id: 1,
+            serial: 1,
+            resource_index: 0,
             binding: 0,
             raw: true,
             gpu_va: 0x1000,

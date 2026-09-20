@@ -14,6 +14,7 @@ pub struct TextureRtMip {
     pub layout: vk::ImageLayout,
     pub format: vk::Format,
     pub stamp: u64,
+    pub src_layer: u32,
 }
 
 impl TextureRtMip {
@@ -22,7 +23,7 @@ impl TextureRtMip {
             src_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 mip_level: 0,
-                base_array_layer: 0,
+                base_array_layer: self.src_layer,
                 layer_count: 1,
             },
             dst_subresource: vk::ImageSubresourceLayers {
@@ -41,12 +42,23 @@ impl TextureRtMip {
     }
 }
 
+pub fn texture_rt_mip_layers(tic: &TicEntry) -> u32 {
+    match tic.texture_type {
+        5 => tic.depth,
+        3 => 6,
+        8 => tic.depth.max(1).saturating_mul(6),
+        _ => 1,
+    }
+}
+
 pub fn texture_rt_mip_candidate(tic: &TicEntry) -> bool {
     ((tic.texture_type == 1 && tic.depth == 1)
-        || (tic.texture_type == 5 && tic.depth > 0))
+        || (tic.texture_type == 5 && tic.depth > 0)
+        || tic.texture_type == 3
+        || (tic.texture_type == 8 && tic.depth > 0))
         && tic.base_layer == 0
         && tic.view_base_mip() == 0
-        && (tic.view_mip_levels() > 1 || tic.texture_type == 5)
+        && (tic.view_mip_levels() > 1 || matches!(tic.texture_type, 3 | 5 | 8))
         && tic.is_block_linear
         && !tic.is_sparse
         && tic.pitch_bytes == 0
@@ -62,6 +74,7 @@ pub fn texture_rt_mip_candidate(tic: &TicEntry) -> bool {
                 | TicFormat::Z24S8
                 | TicFormat::X8Z24
                 | TicFormat::S8Z24
+                | TicFormat::Z16
                 | TicFormat::Z32
         )
 }
@@ -90,7 +103,7 @@ pub fn find_texture_rt_mips(
     let Some(layout) = block_linear_mip_layout(tic) else {
         return Vec::new();
     };
-    let layers = if tic.texture_type == 5 { tic.depth } else { 1 };
+    let layers = texture_rt_mip_layers(tic);
     if base_key.guest_size_bytes < layout.guest_size_bytes(layers) as u64 {
         return Vec::new();
     }
@@ -104,19 +117,45 @@ pub fn find_texture_rt_mips(
             let Some(cpu_addr) = base_key.cpu_addr.checked_add(offset) else {
                 continue;
             };
+            let padded_width =
+                ((mip.width as usize * tic.format.src_bpp() + 63) & !63) / tic.format.src_bpp();
             let want = RtKey::with_cpu(base_key.nvmap_id, mip.width, mip.height, gpu_va, cpu_addr)
                 .with_mapping_epoch(base_key.mapping_epoch)
                 .with_guest_size_bytes(mip.guest_size as u64)
                 .with_block_linear_layout(0, mip.block_height_log2, 0, 0);
-            let padded_width =
-                ((mip.width as usize * tic.format.src_bpp() + 63) & !63) / tic.format.src_bpp();
             let padded = RtKey {
                 width: padded_width as u32,
                 ..want
             };
-            let source = rt_cache
+            let mut src_layer = 0;
+            let mut source = rt_cache
                 .find_drawn_color_for_exact_alias(want)
                 .or_else(|| rt_cache.find_drawn_color_for_exact_alias(padded));
+            if source.is_none() && layers > 1 {
+                let level_va = tic.gpu_va.checked_add(mip.guest_offset as u64);
+                let level_cpu = base_key.cpu_addr.checked_add(mip.guest_offset as u64);
+                if let Some((level_va, level_cpu)) = level_va.zip(level_cpu) {
+                    let layered = RtKey::with_cpu(
+                        base_key.nvmap_id,
+                        mip.width,
+                        mip.height,
+                        level_va,
+                        level_cpu,
+                    )
+                    .with_mapping_epoch(base_key.mapping_epoch)
+                    .with_guest_size_bytes(mip.guest_size as u64)
+                    .with_block_linear_layout(0, mip.block_height_log2, 0, 0)
+                    .with_array_layers(layers, layout.layer_stride as u64);
+                    let layered_padded = RtKey {
+                        width: padded_width as u32,
+                        ..layered
+                    };
+                    source = rt_cache
+                        .find_drawn_color_for_exact_alias(layered)
+                        .or_else(|| rt_cache.find_drawn_color_for_exact_alias(layered_padded));
+                    src_layer = layer;
+                }
+            }
             let Some((key, image, image_layout, source_format, stamp)) = source else {
                 continue;
             };
@@ -135,6 +174,7 @@ pub fn find_texture_rt_mips(
             out.push(TextureRtMip {
                 level: mip.level,
                 layer,
+                src_layer,
                 width: mip.width,
                 height: mip.height,
                 key,
@@ -144,6 +184,151 @@ pub fn find_texture_rt_mips(
                 stamp,
             });
         }
+    }
+    if layers > 1 {
+        for mip in layout.levels.iter().take(tic.view_mip_levels() as usize) {
+            let found = out.iter().filter(|entry| entry.level == mip.level).count() as u32;
+            if found != 0 && found != layers {
+                static PARTIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if PARTIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    log::warn!(
+                        "[rt-mips] partial layered level {} type={} level={} found={} layers={}",
+                        base_key.label(),
+                        tic.texture_type,
+                        mip.level,
+                        found,
+                        layers
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+fn rt_mip_memo_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_RT_MIP_MEMO").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+#[derive(Clone)]
+struct TextureRtMipMemoEntry {
+    structure_generation: u64,
+    found: Vec<(u32, u32, u32, u32, u32, RtKey)>,
+}
+
+#[derive(Default)]
+pub struct TextureRtMipMemo {
+    entries: std::collections::HashMap<(u64, u64, u32, u32, u32), TextureRtMipMemoEntry>,
+    hits: u64,
+    misses: u64,
+}
+
+const TEXTURE_RT_MIP_MEMO_CAPACITY: usize = 4096;
+
+fn rt_mip_memo() -> &'static std::sync::Mutex<TextureRtMipMemo> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<TextureRtMipMemo>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(TextureRtMipMemo::default()))
+}
+
+fn resolve_memo_mip(
+    rt_cache: &RtCache,
+    format: vk::Format,
+    entry: (u32, u32, u32, u32, u32, RtKey),
+) -> Option<TextureRtMip> {
+    let (level, layer, src_layer, width, height, key) = entry;
+    let (image, layout, source_format, extent, stamp) = rt_cache.resolve_drawn_color_exact(key)?;
+    if stamp == 0
+        || image == vk::Image::null()
+        || layout == vk::ImageLayout::UNDEFINED
+        || extent.width != key.width
+        || extent.height != key.height
+        || !crate::renderer::rt_copy_formats_compatible(source_format, format)
+    {
+        return None;
+    }
+    Some(TextureRtMip {
+        level,
+        layer,
+        src_layer,
+        width,
+        height,
+        key,
+        image,
+        layout,
+        format,
+        stamp,
+    })
+}
+
+pub fn rt_mip_memo_stats() -> (u64, u64, usize) {
+    let mut memo = rt_mip_memo().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stats = (memo.hits, memo.misses, memo.entries.len());
+    memo.hits = 0;
+    memo.misses = 0;
+    stats
+}
+
+pub fn find_texture_rt_mips_memo(
+    rt_cache: &RtCache,
+    texture_identity: u64,
+    tic: &TicEntry,
+    base_key: RtKey,
+    format: vk::Format,
+) -> Vec<TextureRtMip> {
+    if !rt_mip_memo_enabled() || !texture_rt_mip_candidate(tic) {
+        return find_texture_rt_mips(rt_cache, tic, base_key, format);
+    }
+    let memo_key = (
+        texture_identity,
+        base_key.cpu_addr ^ (base_key.mapping_epoch.rotate_left(32)),
+        base_key.nvmap_id,
+        format.as_raw() as u32,
+        tic.view_mip_levels(),
+    );
+    let generation = rt_cache.structure_generation();
+    let mut memo = rt_mip_memo().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = memo.entries.get(&memo_key) {
+        if entry.structure_generation == generation {
+            let resolved: Option<Vec<TextureRtMip>> = entry
+                .found
+                .iter()
+                .map(|found| resolve_memo_mip(rt_cache, format, *found))
+                .collect();
+            if let Some(resolved) = resolved {
+                memo.hits += 1;
+                return resolved;
+            }
+        }
+    }
+    memo.misses += 1;
+    let out = find_texture_rt_mips(rt_cache, tic, base_key, format);
+    if memo.entries.len() >= TEXTURE_RT_MIP_MEMO_CAPACITY {
+        memo.entries.clear();
+    }
+    memo.entries.insert(
+        memo_key,
+        TextureRtMipMemoEntry {
+            structure_generation: generation,
+            found: out
+                .iter()
+                .map(|mip| (mip.level, mip.layer, mip.src_layer, mip.width, mip.height, mip.key))
+                .collect(),
+        },
+    );
+    if (memo.hits + memo.misses) % 65536 == 0 && crate::renderer::record_stage_profile_enabled() {
+        log::warn!(
+            "[rt-mip-memo] hits={} misses={} entries={}",
+            memo.hits,
+            memo.misses,
+            memo.entries.len()
+        );
     }
     out
 }

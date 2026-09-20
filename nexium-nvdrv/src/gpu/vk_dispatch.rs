@@ -1324,9 +1324,69 @@ struct SphMemoEntry {
     output_map: u32,
 }
 
+fn compute_overlay_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_COMPUTE_OVERLAY").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn compute_overlays_for_range(
+    spans: &[super::engines::maxwell_compute::PendingComputeWritebackSpan],
+    lo: u64,
+    hi: u64,
+) -> Option<Vec<nexium_gpu::draw::ComputeOverlay>> {
+    let mut overlays = Vec::new();
+    let mut covered: Vec<(u64, u64)> = Vec::new();
+    for span in spans.iter().rev() {
+        let span_end = span.cpu_addr.saturating_add(span.len as u64);
+        let overlap_lo = lo.max(span.cpu_addr);
+        let overlap_hi = hi.min(span_end);
+        if overlap_lo >= overlap_hi {
+            continue;
+        }
+        if !span.raw || span.serial == 0 || span.resource_index == u32::MAX {
+            return None;
+        }
+        let mut pieces = vec![(overlap_lo, overlap_hi)];
+        for &(covered_lo, covered_hi) in &covered {
+            let mut next = Vec::new();
+            for (piece_lo, piece_hi) in pieces {
+                if piece_hi <= covered_lo || piece_lo >= covered_hi {
+                    next.push((piece_lo, piece_hi));
+                    continue;
+                }
+                if piece_lo < covered_lo {
+                    next.push((piece_lo, covered_lo));
+                }
+                if piece_hi > covered_hi {
+                    next.push((covered_hi, piece_hi));
+                }
+            }
+            pieces = next;
+        }
+        for (piece_lo, piece_hi) in pieces {
+            overlays.push(nexium_gpu::draw::ComputeOverlay {
+                dst_offset: piece_lo - lo,
+                len: piece_hi - piece_lo,
+                serial: span.serial,
+                resource_index: span.resource_index,
+                src_offset: piece_lo - span.cpu_addr,
+            });
+        }
+        covered.push((overlap_lo, overlap_hi));
+    }
+    Some(overlays)
+}
+
 pub(crate) struct SsboSnapshotCache {
     mirror: MirrorPageCache,
     compute_pending_cpu_ranges: Arc<[(u64, u64)]>,
+    compute_pending_spans: Arc<[super::engines::maxwell_compute::PendingComputeWritebackSpan]>,
+    compute_pending_revision: u64,
     cbuf_slot_states: [Vec<CbufSlotState>; PACKED_CBUF_SLOTS],
     input_mutation_epoch: u64,
     resource_mutation_epoch: u64,
@@ -1785,6 +1845,8 @@ impl HostWatchRange {
     }
 }
 
+const HOST_WATCH_COALESCE_GAP: u64 = 64 * 1024;
+
 fn coalesce_host_watch_ranges(ranges: &mut Vec<HostWatchRange>) {
     ranges.sort_unstable();
     let mut merged_len = 0usize;
@@ -1793,7 +1855,7 @@ fn coalesce_host_watch_ranges(ranges: &mut Vec<HostWatchRange>) {
         if merged_len != 0 {
             let previous = &mut ranges[merged_len - 1];
             let previous_end = previous.cpu_addr.saturating_add(previous.len as u64);
-            if range.cpu_addr <= previous_end {
+            if range.cpu_addr <= previous_end.saturating_add(HOST_WATCH_COALESCE_GAP) {
                 let merged_end = previous_end.max(range.cpu_addr.saturating_add(range.len as u64));
                 previous.len =
                     usize::try_from(merged_end - previous.cpu_addr).unwrap_or(usize::MAX);
@@ -1931,6 +1993,8 @@ impl SsboSnapshotCache {
         Self {
             mirror: MirrorPageCache::new(),
             compute_pending_cpu_ranges: Arc::from(Vec::new()),
+            compute_pending_spans: Arc::from(Vec::new()),
+            compute_pending_revision: 0,
             cbuf_slot_states: std::array::from_fn(|_| Vec::new()),
             input_mutation_epoch: 0,
             resource_mutation_epoch: 0,
@@ -4316,9 +4380,9 @@ impl SsboSnapshotCache {
         if last_key - first_key + 1 > MAX_RESIDENT_CHUNKS {
             return None;
         }
-        let _barrier_bypass = self
-            .exact_compute_barrier_for_resident_range(cpu_addr, range_end, mem_read)
-            .then(super::prep::compute_barrier_bypass);
+        let (barrier_bypass, compute_overlays) =
+            self.exact_compute_barrier_for_resident_range(cpu_addr, range_end, mem_read);
+        let _barrier_bypass = barrier_bypass.then(super::prep::compute_barrier_bypass);
         let mut forward_spans = std::mem::take(&mut self.mirror.span_scratch);
         forward_spans.clear();
         let mut chunks = Vec::with_capacity((last_key - first_key + 1) as usize);
@@ -4352,6 +4416,7 @@ impl SsboSnapshotCache {
             cpu_va: cpu_addr,
             len,
             chunks,
+            compute_overlays,
         })
     }
 
@@ -4360,26 +4425,46 @@ impl SsboSnapshotCache {
         cpu_addr: u64,
         range_end: u64,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-    ) -> bool {
+    ) -> (bool, Vec<nexium_gpu::draw::ComputeOverlay>) {
         if self.compute_pending_cpu_ranges.is_empty() || !exact_compute_barrier_enabled() {
-            return false;
+            return (false, Vec::new());
         }
         let pending = self.compute_pending_cpu_ranges.clone();
         let exact = pending
             .iter()
             .find(|&&(base, size)| base < range_end && cpu_addr < base.saturating_add(size));
-        if let Some(&(base, _)) = exact {
-            let mut probe = [0u8; 1];
-            let _ = mem_read(base.max(cpu_addr), &mut probe);
-            for &(base, size) in pending.iter() {
-                self.mirror.mark_dirty(base, size as usize);
+        let Some(&(base, _)) = exact else {
+            return (true, Vec::new());
+        };
+        if compute_overlay_enabled()
+            && self.compute_pending_revision
+                == super::engines::maxwell_compute::pending_writeback_revision()
+        {
+            if let Some(overlays) =
+                compute_overlays_for_range(&self.compute_pending_spans, cpu_addr, range_end)
+            {
+                let bytes = overlays.iter().map(|overlay| overlay.len as usize).sum();
+                super::pusher::kickprof::count_sized(super::pusher::kickprof::OVERLAY, 1, bytes);
+                return (true, overlays);
             }
         }
-        true
+        let mut probe = [0u8; 1];
+        let _ = mem_read(base.max(cpu_addr), &mut probe);
+        for &(base, size) in pending.iter() {
+            self.mirror.mark_dirty(base, size as usize);
+        }
+        (true, Vec::new())
     }
 
-    pub(crate) fn set_compute_pending_cpu_ranges(&mut self, ranges: Arc<[(u64, u64)]>) {
+    pub(crate) fn set_compute_pending(
+        &mut self,
+        ranges: Arc<[(u64, u64)]>,
+        spans: Arc<[super::engines::maxwell_compute::PendingComputeWritebackSpan]>,
+        revision: u64,
+    ) {
         self.compute_pending_cpu_ranges = ranges;
+        self.compute_pending_spans = spans;
+        self.compute_pending_revision = revision;
     }
 
     pub(crate) fn mirror_mark_cpu(&mut self, cpu_addr: u64, len: usize) {
@@ -5157,6 +5242,7 @@ fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
             | nexium_gpu::texture::TicFormat::R16G16
             | nexium_gpu::texture::TicFormat::R32
             | nexium_gpu::texture::TicFormat::Z32
+            | nexium_gpu::texture::TicFormat::Z16
             | nexium_gpu::texture::TicFormat::Z24S8
             | nexium_gpu::texture::TicFormat::G24R8
             | nexium_gpu::texture::TicFormat::B10G11R11
@@ -5164,10 +5250,23 @@ fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
     )
 }
 
+fn tic_depth_array_alias_format(format: nexium_gpu::texture::TicFormat) -> bool {
+    matches!(
+        format,
+        nexium_gpu::texture::TicFormat::Z16
+            | nexium_gpu::texture::TicFormat::Z32
+            | nexium_gpu::texture::TicFormat::Z24S8
+            | nexium_gpu::texture::TicFormat::X8Z24
+            | nexium_gpu::texture::TicFormat::S8Z24
+            | nexium_gpu::texture::TicFormat::G24R8
+    )
+}
+
 pub(crate) fn tic_can_alias_render_target_view(tic: &nexium_gpu::texture::TicEntry) -> bool {
     let supported_shape = match tic.texture_type {
         0 => tic.height == 1 && tic.depth == 1,
-        1 | 4 | 5 | 7 => tic.depth == 1,
+        1 | 4 | 7 => tic.depth == 1,
+        5 => tic.depth == 1 || tic_depth_array_alias_format(tic.format),
         2 => tic.depth != 0,
         _ => false,
     };
@@ -9190,6 +9289,17 @@ impl PreparedDrawBatch {
 
 const PREPARED_DRAW_PACKET_MAX_BATCHES: usize = 64;
 
+fn prepared_draw_packet_max_batches() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_PREPARED_PACKET_BATCHES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| (1..=PREPARED_DRAW_PACKET_MAX_BATCHES).contains(limit))
+            .unwrap_or(PREPARED_DRAW_PACKET_MAX_BATCHES)
+    })
+}
+
 struct PreparedDrawPacketQueue<T> {
     batches: Vec<T>,
     ring_upper_bytes: u64,
@@ -9214,12 +9324,13 @@ impl<T> PreparedDrawPacketQueue<T> {
             .ring_upper_bytes
             .checked_add(batch_ring_upper_bytes)
             .is_none_or(|total| total > nexium_gpu::renderer::GRAPHICS_RING_SAFE_BATCH_BYTES);
-        let flush_before = !self.batches.is_empty()
-            && (self.batches.len() >= PREPARED_DRAW_PACKET_MAX_BATCHES || exceeds_ring);
+        let max_batches = prepared_draw_packet_max_batches();
+        let flush_before =
+            !self.batches.is_empty() && (self.batches.len() >= max_batches || exceeds_ring);
         let ready = flush_before.then(|| self.take());
         self.ring_upper_bytes = self.ring_upper_bytes.saturating_add(batch_ring_upper_bytes);
         self.batches.push(batch);
-        if self.batches.len() >= PREPARED_DRAW_PACKET_MAX_BATCHES {
+        if self.batches.len() >= max_batches {
             return Some(self.take());
         }
         ready
@@ -11693,6 +11804,25 @@ fn cube_sample_tic_addresses(batch: &[Maxwell3dDrawCall]) -> impl Iterator<Item 
     })
 }
 
+fn cube_overlay_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_CUBE_OVERLAY").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn tic_alias_layer_count(tic: &nexium_gpu::texture::TicEntry, fallback: u32) -> u32 {
+    match tic.texture_type {
+        5 => tic.depth,
+        3 => 6,
+        8 => tic.depth.max(1).saturating_mul(6),
+        _ => fallback,
+    }
+}
+
 fn collect_cube_sample_ranges_from_tic_addresses(
     tic_addresses: impl IntoIterator<Item = u64>,
     mappings: &GpuMappings,
@@ -11733,6 +11863,15 @@ fn collect_cube_sample_ranges_from_tic_addresses(
             seen_tic_addresses.insert(tic_addr);
         } else if nexium_gpu::texture::TicEntry::parse(&raw).is_some() {
             seen_tic_addresses.insert(tic_addr);
+        }
+        if let Some(texture) = plan.texture {
+            if matches!(texture.tic.texture_type, 3 | 8)
+                && cube_overlay_enabled()
+                && nexium_gpu::texture_mips::texture_rt_mip_candidate(&texture.tic)
+            {
+                super::pusher::kickprof::count(super::pusher::kickprof::CUBE_OVERLAY, 1);
+                continue;
+            }
         }
         let Some(dependencies) = plan.cube_dependencies else {
             continue;
@@ -11854,15 +11993,7 @@ fn small_rt_layer_writebacks(
         return None;
     }
     let mut writes = Vec::with_capacity(layers);
-    let flip_rows = tile_mode & (1 << 12) == 0;
     for (layer, pixels) in raw.chunks_exact_mut(layer_size).enumerate() {
-        for y in 0..height as usize / 2 {
-            if !flip_rows {
-                break;
-            }
-            let (top, bottom) = pixels.split_at_mut((height as usize - 1 - y) * row);
-            top[y * row..(y + 1) * row].swap_with_slice(&mut bottom[..row]);
-        }
         let data = if tile_mode & (1 << 12) != 0 {
             pixels.to_vec()
         } else {
@@ -11893,6 +12024,22 @@ fn process_small_rt_readbacks(
     );
     restore_small_rt_batch(unresolved);
     result
+}
+
+fn dump_rt_writeback_layer(key: RtKey, address: u64, data: &[u8]) {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("NEXIUM_RT_WB_DUMP_DIR").map(std::path::PathBuf::from)) else {
+        return;
+    };
+    if key.width < 64 || key.height < 64 {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let _ = std::fs::create_dir_all(dir);
+    let name = format!("rt_{:04}_{}_{}x{}_{:x}.bin", seq, key.nvmap_id, key.width, key.height, address);
+    let _ = std::fs::write(dir.join(name), data);
 }
 
 fn resolve_small_rt_readbacks(
@@ -11947,6 +12094,7 @@ fn resolve_small_rt_readbacks(
         let mut write = GuestWriteResult { complete: true, written: Vec::new() };
         for (address, data) in layers {
             bytes_to_write += data.len();
+            dump_rt_writeback_layer(key, address, &data);
             let layer = write_guest_strict(mappings, mem_write, address, &data);
             write.complete &= layer.complete;
             write.written.extend(layer.written);
@@ -12276,9 +12424,8 @@ pub(crate) fn cpu_readable_rt_writeback_mode() -> CpuReadableRtWritebackMode {
     })
 }
 
-fn cpu_readable_rt(key: &RtKey, tile_mode: u32) -> bool {
+fn cpu_readable_rt(_key: &RtKey, tile_mode: u32) -> bool {
     tile_mode & (1 << 12) != 0
-        && u64::from(key.width).saturating_mul(u64::from(key.height)) > small_rt_writeback_max_pixels()
 }
 
 pub(crate) fn has_pending_cpu_readable_rt_writebacks() -> bool {
@@ -12305,7 +12452,7 @@ pub(crate) fn writeback_cpu_readable_rts(
     }
     if std::env::var_os("NEXIUM_CPU_RT_WB_TRACE").is_some() {
         for (key, tile_mode) in &pending.entries {
-            log::warn!("[cpu-rt-wb] {} tile={:#x} size={:#x}", key.label(), tile_mode, key.guest_size_bytes);
+            log::warn!("[cpu-rt-wb] {} tile={:#x} size={:#x} cpu={:#x}", key.label(), tile_mode, key.guest_size_bytes, key.cpu_addr);
         }
     }
     let pending_count = pending.entries.len();
@@ -12494,7 +12641,7 @@ fn execute_one_inner(
         .ok_or_else(|| format!("RT gpu_va={:#x} unresolved: clear={:#x} target={:?}", rt_gpu_va, draw.clear_mask, rt))?;
     let rt_format = map_rt_format_for_key(rt.format, rt_key);
     let small_rt_tile_mode = small_rt_tile_mode_for_target(draw, rt_key, rt);
-    if small_rt_gate_trace_enabled() && rt.width <= 256 && rt.height <= 1536 {
+    if small_rt_gate_trace_enabled() && rt_key.width <= 256 && rt_key.height <= 1536 {
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(RtKey, bool)>>> = OnceLock::new();
@@ -12506,10 +12653,12 @@ fn execute_one_inner(
             .insert(entry)
         {
             log::warn!(
-                "[small-rt-gate] key={} rtdims={}x{} vol={} is_3d={} clear={} tile={:#x} registered={}",
+                "[small-rt-gate] key={} rtdims={}x{} fmt={:#x}/{:?} vol={} is_3d={} clear={} tile={:#x} registered={}",
                 rt_key.label(),
                 rt.width,
                 rt.height,
+                rt.format,
+                rt_format,
                 render_target_volume_depth(rt),
                 rt_key.is_3d,
                 draw.is_clear,
@@ -14440,7 +14589,7 @@ fn execute_one_inner(
                                 } else {
                                     nexium_gpu::texture::texture_guest_size_bytes(
                                         &tic,
-                                        if tic.texture_type == 5 { tic.depth } else { layers },
+                                        tic_alias_layer_count(&tic, layers),
                                     )
                                 };
                                 key.with_guest_size_bytes(
@@ -14872,6 +15021,12 @@ fn execute_one_inner(
             .min(7);
         attachments[location]
     });
+    let raster_key = raster_target_key(
+        rt_key,
+        depth_key,
+        compact_attachments.iter().take(color_rt_keys.len().max(1).min(8))
+            .any(|attachment| !attachment.color_write_mask.is_empty()),
+    );
     let blend_state = BlendState {
         enabled: compact_attachments[0].enabled,
         src_factor: compact_attachments[0].src_factor,
@@ -15342,11 +15497,11 @@ fn execute_one_inner(
             draw.viewport.scale_z, draw.viewport.translate_z),
         vp_rect: guest_viewport_rect(
             draw,
-            rt_key.width as f32,
-            rt_key.height as f32,
-            signed_viewport_nvmap(rt_key.nvmap_id),
+            raster_key.width as f32,
+            raster_key.height as f32,
+            signed_viewport_nvmap(raster_key.nvmap_id),
         ),
-        scissor: scissor_rect(draw, rt_key.width, rt_key.height),
+        scissor: scissor_rect(draw, raster_key.width, raster_key.height),
         state: DrawState {
             topology,
             vertex_count: eff_vertex_count,
@@ -15898,10 +16053,10 @@ fn small_rt_tile_mode_for_target(draw: &DrawCall, key: RtKey, rt: &RenderTarget)
             value.split(',').filter_map(|entry| entry.trim().parse().ok()).collect(),
         )
     });
-    let pixels = u64::from(rt.width).saturating_mul(u64::from(rt.height));
+    let pixels = u64::from(key.width).saturating_mul(u64::from(key.height));
     let within_limit = pixels <= small_rt_writeback_max_pixels()
         || (rt.tile_mode & (1 << 12) != 0
-            && matches!(rt.format, 0xEE..=0xF2)
+            && matches!(rt.format, 0xD5 | 0xEA | 0xEE..=0xF2)
             && pixels <= pitch_rt_writeback_max_pixels());
     ((!draw.is_clear || clear_surface_wants_color(draw.clear_mask))
         && !key.is_3d
@@ -16981,6 +17136,10 @@ fn signed_viewport_nvmap(nvmap_id: u32) -> bool {
     static IDS: OnceLock<Vec<u64>> = OnceLock::new();
     IDS.get_or_init(|| parse_env_u64_list("NEXIUM_SIGNED_VIEWPORT_NVMAPS"))
         .contains(&(nvmap_id as u64))
+}
+
+fn raster_target_key(color: RtKey, depth: Option<RtKey>, color_writes: bool) -> RtKey {
+    if color_writes { color } else { depth.unwrap_or(color) }
 }
 
 fn scissor_rect(draw: &DrawCall, rt_w: u32, rt_h: u32) -> Option<[i32; 4]> {
@@ -19613,7 +19772,7 @@ fn tic_numeric_type(
                 TextureNumericType::Float
             };
         }
-        TicFormat::Z24S8 | TicFormat::X8Z24 | TicFormat::S8Z24 | TicFormat::Z32 => {
+        TicFormat::Z24S8 | TicFormat::X8Z24 | TicFormat::S8Z24 | TicFormat::Z32 | TicFormat::Z16 => {
             return TextureNumericType::Float;
         }
         _ => {}
@@ -22446,7 +22605,7 @@ mod tests {
             let pixels = nexium_gpu::texture::unswizzle_block_linear(data, 2, 2, 4, 0);
             let values = pixels.chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>();
             let base = face as u32 * 4;
-            assert_eq!(values, [base + 2, base + 3, base, base + 1]);
+            assert_eq!(values, [base, base + 1, base + 2, base + 3]);
         }
         raw.pop();
         assert!(super::small_rt_layer_writebacks(mip_key, 0, 2, 2, 4, &mut raw).is_none());
@@ -22740,6 +22899,7 @@ mod tests {
                 serial: 1,
                 data: Arc::new(vec![0; nexium_gpu::draw::RESIDENT_CHUNK_SIZE]),
             }],
+            compute_overlays: Vec::new(),
         };
         assert!(resident_vertex_binding_covered(
             std::slice::from_ref(&range),
@@ -22800,6 +22960,56 @@ mod tests {
         assert_eq!(key.base_layer, 0);
         assert_eq!(key.layout_signature, 2 | (256 << 8));
         assert_eq!(key.guest_size_bytes, 0x4000);
+    }
+
+    #[test]
+    fn pitch_linear_mask_targets_are_registered_for_cpu_writeback() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x7000, 0x40_0000, 0x1000_0000, 9);
+        let draw = crate::gpu::engines::DrawCall::default();
+        for (format, width, height, expected_width) in [
+            (crate::gpu::formats::FMT_R8G8_UNORM, 512, 256, 256),
+            (crate::gpu::formats::FMT_A8B8G8R8_UNORM, 2048, 512, 512),
+            (crate::gpu::formats::FMT_R16_UNORM, 512, 256, 256),
+            (crate::gpu::formats::FMT_R16G16B16A16_UNORM, 512, 64, 64),
+        ] {
+            let rt = crate::gpu::engines::RenderTarget {
+                address_lo: 0x7000,
+                width,
+                height,
+                tile_mode: 1 << 12,
+                format,
+                ..Default::default()
+            };
+            let key = rt_key_for_target(&rt, &mappings, (1, 1)).unwrap();
+            assert_eq!(key.width, expected_width);
+            let tile = super::small_rt_tile_mode_for_target(&draw, key, &rt).unwrap();
+            assert!(super::cpu_readable_rt(&key, tile));
+        }
+    }
+
+    #[test]
+    fn large_mask_writeback_keeps_layout_format_and_size_limits() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x7000, 0x80_0000, 0x1000_0000, 9);
+        let draw = crate::gpu::engines::DrawCall::default();
+        for (format, width, height, tile_mode) in [
+            (crate::gpu::formats::FMT_R8G8_UNORM, 256, 256, 0),
+            (crate::gpu::formats::FMT_A8B8G8R8_UNORM, 512, 512, 0),
+            (crate::gpu::formats::FMT_R16G16B16A16_FLOAT, 2048, 256, 1 << 12),
+            (crate::gpu::formats::FMT_A8B8G8R8_UNORM, 8192, 1024, 1 << 12),
+        ] {
+            let rt = crate::gpu::engines::RenderTarget {
+                address_lo: 0x7000,
+                width,
+                height,
+                tile_mode,
+                format,
+                ..Default::default()
+            };
+            let key = rt_key_for_target(&rt, &mappings, (1, 1)).unwrap();
+            assert!(super::small_rt_tile_mode_for_target(&draw, key, &rt).is_none());
+        }
     }
 
     #[test]
@@ -24472,6 +24682,21 @@ mod tests {
     }
 
     #[test]
+    fn depth_only_scissor_ignores_dormant_color_dimensions() {
+        let color = RtKey::new(1, 1280, 720, 0x1000);
+        let depth = RtKey::new(1, 896, 896, 0x2000);
+        let mut draw = crate::gpu::engines::DrawCall::default();
+        draw.scissor.enabled = true;
+        draw.scissor.max_x = 896;
+        draw.scissor.max_y = 896;
+        let raster = super::raster_target_key(color, Some(depth), false);
+        assert_eq!(super::scissor_rect(&draw, raster.width, raster.height), Some([0, 0, 896, 896]));
+        let raster = super::raster_target_key(color, Some(depth), true);
+        assert_eq!(super::scissor_rect(&draw, raster.width, raster.height), Some([0, 0, 896, 720]));
+        assert_eq!(super::raster_target_key(color, None, false), color);
+    }
+
+    #[test]
     fn full_color_depth_clear_coalescing_requires_matching_disjoint_2d_targets() {
         let color = RtKey::with_cpu(7, 1600, 900, 0x5000_0000, 0x1000_0000);
         let depth = RtKey::with_cpu(7, 1600, 900, 0x6000_0000, 0x2000_0000);
@@ -24992,6 +25217,38 @@ mod tests {
                 },
                 HostWatchRange {
                     cpu_addr: 0x20_000,
+                    len: 0x1000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn host_watch_ranges_bridge_small_gaps_only() {
+        let mut ranges = vec![
+            HostWatchRange {
+                cpu_addr: 0x1000,
+                len: 0x1000,
+            },
+            HostWatchRange {
+                cpu_addr: 0x3000,
+                len: 0x1000,
+            },
+            HostWatchRange {
+                cpu_addr: 0x4000 + super::HOST_WATCH_COALESCE_GAP + 0x1000,
+                len: 0x1000,
+            },
+        ];
+        coalesce_host_watch_ranges(&mut ranges);
+        assert_eq!(
+            ranges,
+            vec![
+                HostWatchRange {
+                    cpu_addr: 0x1000,
+                    len: 0x3000,
+                },
+                HostWatchRange {
+                    cpu_addr: 0x4000 + super::HOST_WATCH_COALESCE_GAP + 0x1000,
                     len: 0x1000,
                 },
             ]

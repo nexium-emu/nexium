@@ -49,11 +49,36 @@ fn run_completion_after_wait(
     wait_for_predecessor: impl FnOnce() -> bool,
     completion: impl FnOnce(),
 ) -> bool {
+    let started = std::time::Instant::now();
     if !wait_for_predecessor() {
         return false;
     }
+    record_gpu_lag(started.elapsed());
     completion();
     true
+}
+
+fn record_gpu_lag(waited: Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WAITS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    static MAX_NS: AtomicU64 = AtomicU64::new(0);
+    if !crate::gpu::pusher::kickprof::rate_enabled() {
+        return;
+    }
+    let ns = waited.as_nanos() as u64;
+    TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
+    MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    let waits = WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if waits % 256 == 0 {
+        let total = TOTAL_NS.swap(0, Ordering::Relaxed);
+        let max = MAX_NS.swap(0, Ordering::Relaxed);
+        log::warn!(
+            "[gpu-lag] completions=256 mean_ms={:.3} max_ms={:.3}",
+            total as f64 / 256.0 / 1_000_000.0,
+            max as f64 / 1_000_000.0
+        );
+    }
 }
 
 pub(crate) fn submit_renderer_completion(

@@ -102,6 +102,9 @@ impl AcquiredBufferSlotGuard {
 
 impl Drop for AcquiredBufferSlotGuard {
     fn drop(&mut self) {
+        if nexium_nvdrv::kick_timeline_enabled() {
+            log::warn!("[ktl] us={} release slot={}", nexium_nvdrv::timeline_us(), self.slot);
+        }
         let mut queues = self.queues.lock();
         let Some(queue) = queues.get_mut(&self.binder_id) else {
             return;
@@ -8571,6 +8574,14 @@ fn igbp_handle_transact(
                 }
                 std::thread::sleep(std::time::Duration::from_micros(100));
             };
+            if nexium_nvdrv::kick_timeline_enabled() {
+                log::warn!(
+                    "[ktl] us={} dequeue slot={:?} waited_ms={:.1}",
+                    nexium_nvdrv::timeline_us(),
+                    slot,
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             log::trace!(
                 "IGBP::DequeueBuffer binder={} â†’ slot={} (free={} deq={} queued={})",
                 binder_id,
@@ -8737,6 +8748,15 @@ fn igbp_handle_transact(
                 (r, slot_count, has_buf, slot_acquired, pace_until)
             });
             let (gb_opt, slot_count, has_buf, slot_acquired, pace_until) = gb_opt;
+            if nexium_nvdrv::kick_timeline_enabled() {
+                log::warn!(
+                    "[ktl] us={} queue slot={} interval={} acquired={}",
+                    nexium_nvdrv::timeline_us(),
+                    slot,
+                    swap_interval,
+                    slot_acquired
+                );
+            }
             if !slot_acquired {
                 log::warn!(
                     "IGBP::QueueBuffer rejected invalid slot transition binder={} slot={}",
@@ -8899,12 +8919,17 @@ fn igbp_handle_transact(
                         let present_metadata = std::sync::Arc::clone(&kernel.present_metadata);
                         let present_delivery_lanes =
                             std::sync::Arc::clone(&kernel.present_delivery_lanes);
+                        let slot_guard = std::sync::Arc::new(AcquiredBufferSlotGuard::new(
+                            present_bufferqueues,
+                            binder_id,
+                            slot,
+                        ));
+                        let on_prepared = present_prep_release(&slot_guard);
+                        let closure_guard = (present_release_mode() != PresentRelease::Prep)
+                            .then(|| std::sync::Arc::clone(&slot_guard));
+                        drop(slot_guard);
                         let queued = kernel.nvdrv.try_queue_ordered_present(move || {
-                            let _slot_guard = AcquiredBufferSlotGuard::new(
-                                present_bufferqueues,
-                                binder_id,
-                                slot,
-                            );
+                            let slot_guard = closure_guard;
                             let exact_present_source = try_select_ordered_present_source(
                                 &maxwell_dma_for_ordered,
                                 |maxwell_dma| {
@@ -9018,6 +9043,7 @@ fn igbp_handle_transact(
                                 exact_present_source.map(|(_, token)| (token.source, token.source_stamp, token.source_may_advance))
                                     .or_else(|| direct_present.map(|(key, stamp)| (key, stamp, false))),
                                 present_width, present_height, transform, queue_crop, pace_until, &stats,
+                                present_display_release(slot_guard.as_ref()),
                             ) {
                                 return;
                             }
@@ -9068,7 +9094,7 @@ fn igbp_handle_transact(
                                 queue_crop,
                                 pace_until,
                             );
-                        });
+                        }, on_prepared);
                         match queued {
                             nexium_nvdrv::AsyncPresentSubmit::Enqueued => {
                                 note_ordered_present_profile(
@@ -9417,7 +9443,8 @@ fn igbp_handle_transact(
                             None
                         }
                     };
-                    let slot_guard = AcquiredBufferSlotGuard::new(bufferqueues, binder_id, slot);
+                    let slot_guard =
+                        std::sync::Arc::new(AcquiredBufferSlotGuard::new(bufferqueues, binder_id, slot));
                     let present_id = kernel.allocate_present_id();
                     let present_metadata = std::sync::Arc::clone(&kernel.present_metadata);
                     let present_delivery_lanes =
@@ -9494,6 +9521,7 @@ fn igbp_handle_transact(
                             exact_present_source.map(|(_, token)| (token.source, token.source_stamp, token.source_may_advance))
                                 .or_else(|| direct_present.map(|(key, stamp)| (key, stamp, false))),
                             pw, ph, transform, queue_crop, pace_until, &stats,
+                            present_display_release(Some(&_slot_guard)),
                         ) || submit_ordered_gpu_present(
                             move |read_rect| {
                                 if let Some((_, token)) = exact_present_source {
@@ -10343,6 +10371,38 @@ fn present_read_rect(width: u32, height: u32) -> Option<[u32; 4]> {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresentRelease {
+    Display,
+    Prep,
+    Closure,
+}
+
+fn present_release_mode() -> PresentRelease {
+    static MODE: std::sync::OnceLock<PresentRelease> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("NEXIUM_PRESENT_RELEASE").ok().as_deref() {
+        Some("prep") => PresentRelease::Prep,
+        Some("closure") | Some("0") => PresentRelease::Closure,
+        _ => PresentRelease::Display,
+    })
+}
+
+fn present_display_release(
+    guard: Option<&std::sync::Arc<AcquiredBufferSlotGuard>>,
+) -> Option<Box<dyn std::any::Any + Send>> {
+    let guard = guard?;
+    (present_release_mode() == PresentRelease::Display)
+        .then(|| Box::new(std::sync::Arc::clone(guard)) as Box<dyn std::any::Any + Send>)
+}
+
+fn present_prep_release(
+    guard: &std::sync::Arc<AcquiredBufferSlotGuard>,
+) -> Option<nexium_nvdrv::PresentPrepared> {
+    let guard = std::sync::Arc::clone(guard);
+    (present_release_mode() == PresentRelease::Prep)
+        .then(|| Box::new(move || drop(guard)) as nexium_nvdrv::PresentPrepared)
+}
+
 fn submit_native_gpu_present(
     renderer: &nexium_gpu::Renderer,
     source: Option<(nexium_gpu::rt_cache::RtKey, u64, bool)>,
@@ -10352,8 +10412,12 @@ fn submit_native_gpu_present(
     crop: Option<(u32, u32, u32, u32)>,
     present_at: Option<std::time::Instant>,
     stats: &nexium_nvdrv::PipelineStats,
+    release: Option<Box<dyn std::any::Any + Send>>,
 ) -> bool {
     if legacy_present_enabled() { return false; }
+    if nexium_nvdrv::kick_timeline_enabled() {
+        log::warn!("[ktl] us={} presentjob", nexium_nvdrv::timeline_us());
+    }
     let Some((key, stamp, may_advance)) = source else { return false; };
     let parameters = nexium_gpu::presentation::PresentParameters {
         read_rect: present_read_rect(width, height),
@@ -10362,7 +10426,7 @@ fn submit_native_gpu_present(
         transform,
         present_at: present_at.unwrap_or_else(std::time::Instant::now),
     };
-    match renderer.present_image(key, stamp, may_advance, parameters) {
+    match renderer.present_image(key, stamp, may_advance, parameters, release) {
         Ok(true) => {
             use std::sync::atomic::Ordering;
             stats.frames_submitted.fetch_add(1, Ordering::Relaxed);

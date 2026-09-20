@@ -485,6 +485,7 @@ fn is_image_resource_descriptor(descriptor: &ComputeDescriptor) -> bool {
 
 const MAX_TRANSLATION_CACHE_ENTRIES: usize = 128;
 
+#[derive(Clone)]
 enum PendingComputeId {
     Ready(u64),
     Deferred(crossbeam::channel::Receiver<Option<u64>>),
@@ -575,13 +576,136 @@ fn compute_offload_enabled() -> bool {
 
 struct PendingComputeWriteback {
     id: PendingComputeId,
+    serial: u64,
     output_targets: Vec<OutputTarget>,
     texel_targets: Vec<TexelTarget>,
+    landed: Option<crossbeam::channel::Receiver<()>>,
+}
+
+struct LandingRecord {
+    id: PendingComputeId,
+    output_targets: Vec<OutputTarget>,
+    texel_targets: Vec<TexelTarget>,
+    done: crossbeam::channel::Sender<()>,
+}
+
+pub(crate) fn compute_landing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_COMPUTE_LANDING").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+pub(crate) fn schedule_pending_landings(
+    renderer: std::sync::Arc<nexium_gpu::Renderer>,
+    memory: crate::gpu::GuestMemoryAccess,
+) -> usize {
+    let landing_records: Vec<LandingRecord> = {
+        let mut pending = pending_writebacks()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pending
+            .iter_mut()
+            .filter(|record| record.landed.is_none())
+            .map(|record| {
+                let (done, landed) = crossbeam::channel::bounded(1);
+                record.landed = Some(landed);
+                LandingRecord {
+                    id: record.id.clone(),
+                    output_targets: record.output_targets.clone(),
+                    texel_targets: record.texel_targets.clone(),
+                    done,
+                }
+            })
+            .collect()
+    };
+    let count = landing_records.len();
+    if count == 0 {
+        return 0;
+    }
+    crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::KC_LANDING, count as u64);
+    let job_renderer = std::sync::Arc::clone(&renderer);
+    crate::gpu::completion::submit_renderer_completion(renderer, move || {
+        land_records(&job_renderer, &memory, landing_records);
+    });
+    count
+}
+
+fn land_records(
+    renderer: &nexium_gpu::Renderer,
+    memory: &crate::gpu::GuestMemoryAccess,
+    records: Vec<LandingRecord>,
+) {
+    let writer = memory.writer();
+    for record in records {
+        if let Some(writer) = writer.as_ref() {
+            let mem_write = |address: u64, bytes: &[u8]| writer(address, bytes);
+            if let Some(id) = record.id.wait() {
+                match renderer.take_pending_compute(id) {
+                    Ok(result) => {
+                        let mappings = memory.read_mappings();
+                        if let Err(error) = write_back_outputs(
+                            result,
+                            &record.output_targets,
+                            &record.texel_targets,
+                            renderer,
+                            &mappings,
+                            &mem_write,
+                        ) {
+                            log::error!("[compute-landing] id={} {}", id, error);
+                        }
+                    }
+                    Err(error) => log::error!("[compute-landing] id={} {}", id, error),
+                }
+            }
+        } else {
+            log::error!("[compute-landing] guest memory writer unavailable; outputs dropped");
+        }
+        let _ = record.done.send(());
+    }
+    renderer.release_unreferenced_compute_raw_storage();
+}
+
+pub(crate) fn drain_landed_writebacks() -> Vec<PendingComputeWritebackSpan> {
+    let mut pending = pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut landed = Vec::new();
+    let mut index = 0;
+    while index < pending.len() {
+        let done = pending[index]
+            .landed
+            .as_ref()
+            .is_some_and(|landed| landed.try_recv().is_ok());
+        if done {
+            landed.push(pending.remove(index));
+        } else {
+            index += 1;
+        }
+    }
+    if landed.is_empty() {
+        return Vec::new();
+    }
+    PENDING_WRITEBACK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    drop(pending);
+    retire_compute_serials(
+        landed
+            .iter()
+            .map(|record| record.serial)
+            .filter(|serial| *serial != 0)
+            .collect(),
+    );
+    pending_writeback_target_spans(&landed)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingComputeWritebackSpan {
     pub(crate) dispatch_id: u64,
+    pub(crate) serial: u64,
+    pub(crate) resource_index: u32,
     pub(crate) binding: u32,
     pub(crate) raw: bool,
     pub(crate) gpu_va: u64,
@@ -620,6 +744,35 @@ fn push_pending_writeback(record: PendingComputeWriteback) {
     let mut pending = pending_writebacks().lock().unwrap_or_else(|error| error.into_inner());
     pending.push(record);
     PENDING_WRITEBACK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+fn retired_compute_serials() -> &'static Mutex<Vec<u64>> {
+    static RETIRED: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
+    RETIRED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn retire_compute_serials(serials: Vec<u64>) {
+    if serials.is_empty() {
+        return;
+    }
+    retired_compute_serials()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .extend(serials);
+}
+
+pub(crate) fn take_retired_compute_serials() -> Vec<u64> {
+    std::mem::take(
+        &mut *retired_compute_serials()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+    )
+}
+
+static NEXT_COMPUTE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_compute_serial() -> u64 {
+    NEXT_COMPUTE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn lazy_compute_enabled() -> bool {
@@ -723,6 +876,8 @@ fn pending_writeback_target_spans(
                 .iter()
                 .map(|target| PendingComputeWritebackSpan {
                     dispatch_id: record.id.preview(),
+                    serial: record.serial,
+                    resource_index: u32::MAX,
                     binding: target.binding,
                     raw: false,
                     gpu_va: target.gpu_va,
@@ -736,6 +891,8 @@ fn pending_writeback_target_spans(
                 .iter()
                 .map(|target| PendingComputeWritebackSpan {
                     dispatch_id: record.id.preview(),
+                    serial: record.serial,
+                    resource_index: u32::try_from(target.resource_index).unwrap_or(u32::MAX),
                     binding: target.binding,
                     raw: target.raw,
                     gpu_va: target.gpu_va,
@@ -778,8 +935,31 @@ pub(crate) fn resolve_pending_writebacks_report(
     let trace = std::env::var_os("NEXIUM_KC_RESOLVE_TRACE").is_some();
     let caller = std::panic::Location::caller();
     let record_count = records.len();
+    let retired_serials: Vec<u64> = records
+        .iter()
+        .map(|record| record.serial)
+        .filter(|serial| *serial != 0)
+        .collect();
     for record in records {
         let wait_started = std::time::Instant::now();
+        if let Some(landed) = &record.landed {
+            if landed
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+            {
+                log::error!("[compute-landing] wait for a scheduled landing timed out");
+            }
+            if trace {
+                log::warn!(
+                    "[kc-resolve] caller={}:{} records={} landed wait_ms={:.3}",
+                    caller.file(),
+                    caller.line(),
+                    record_count,
+                    wait_started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            continue;
+        }
         let waited = record.id.wait();
         if trace {
             log::warn!(
@@ -821,6 +1001,7 @@ pub(crate) fn resolve_pending_writebacks_report(
         }
     }
     renderer.release_unreferenced_compute_raw_storage();
+    retire_compute_serials(retired_serials);
     crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_RESOLVE, kp);
     spans
 }
@@ -1931,7 +2112,17 @@ fn prepare_and_execute(
     }
 
     let program_key = renderer_program_key(code_sha256, module.spirv_hash);
+    let serial = if code_override.is_none()
+        && lazy_compute_enabled()
+        && compute_offload_enabled()
+        && crate::render_thread::maybe_render_thread().is_some()
+    {
+        next_compute_serial()
+    } else {
+        0
+    };
     let dispatch = ComputeDispatch {
+        serial,
         program_key,
         spirv: Arc::clone(&module.spirv),
         spirv_hash: module.spirv_hash,
@@ -2054,8 +2245,10 @@ fn prepare_and_execute(
             );
             push_pending_writeback(PendingComputeWriteback {
                     id: PendingComputeId::Deferred(id_rx),
+                    serial,
                     output_targets,
                     texel_targets,
+                    landed: None,
                 });
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_EXEC, kp_exec);
             return Ok(());
@@ -2091,8 +2284,10 @@ fn prepare_and_execute(
             }
             push_pending_writeback(PendingComputeWriteback {
                     id: PendingComputeId::Ready(id),
+                    serial,
                     output_targets,
                     texel_targets,
+                    landed: None,
                 });
             Ok(())
         }
@@ -2921,7 +3116,7 @@ fn texture_numeric_type(tic: &TicEntry, referenced_components: u8) -> TextureNum
     }
     if matches!(
         tic.format,
-        TicFormat::Z24S8 | TicFormat::X8Z24 | TicFormat::S8Z24 | TicFormat::Z32
+        TicFormat::Z24S8 | TicFormat::X8Z24 | TicFormat::S8Z24 | TicFormat::Z32 | TicFormat::Z16
     ) {
         return TextureNumericType::Float;
     }
@@ -4683,6 +4878,8 @@ mod tests {
     fn reported_span(gpu_va: u64) -> PendingComputeWritebackSpan {
         PendingComputeWritebackSpan {
             dispatch_id: 1,
+            serial: 1,
+            resource_index: 0,
             binding: 2,
             raw: true,
             gpu_va,
@@ -4845,6 +5042,7 @@ mod tests {
         let records = vec![
             PendingComputeWriteback {
                 id: PendingComputeId::Ready(1),
+                serial: 11,
                 output_targets: vec![OutputTarget {
                     resource_index: 0,
                     binding: 7,
@@ -4864,9 +5062,11 @@ mod tests {
                     raw: false,
                     raw_storage_key: None,
                 }],
+                landed: None,
             },
             PendingComputeWriteback {
                 id: PendingComputeId::Ready(2),
+                serial: 12,
                 output_targets: Vec::new(),
                 texel_targets: vec![TexelTarget {
                     resource_index: 0,
@@ -4877,6 +5077,7 @@ mod tests {
                     raw: true,
                     raw_storage_key: None,
                 }],
+                landed: None,
             },
         ];
 
@@ -4885,6 +5086,8 @@ mod tests {
             vec![
                 PendingComputeWritebackSpan {
                     dispatch_id: 1,
+                    serial: 11,
+                    resource_index: u32::MAX,
                     binding: 7,
                     raw: false,
                     gpu_va: 0x1000,
@@ -4893,6 +5096,8 @@ mod tests {
                 },
                 PendingComputeWritebackSpan {
                     dispatch_id: 1,
+                    serial: 11,
+                    resource_index: 1,
                     binding: 8,
                     raw: false,
                     gpu_va: 0x2000,
@@ -4901,6 +5106,8 @@ mod tests {
                 },
                 PendingComputeWritebackSpan {
                     dispatch_id: 2,
+                    serial: 12,
+                    resource_index: 0,
                     binding: 9,
                     raw: true,
                     gpu_va: 0x3000,

@@ -652,6 +652,7 @@ fn execute_draw_groups(
     let profile = render_profile_enabled();
     let started = profile.then(std::time::Instant::now);
     let busy_started = crate::gpu::pusher::kickprof::rate_start();
+    let timeline_started = crate::kick_timeline_enabled().then(std::time::Instant::now);
     crate::gpu::watchdog::render_phase("draw-groups", group_count as u64);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::gpu::vk_dispatch::execute_prepared_draw_batches(draws)
@@ -661,6 +662,14 @@ fn execute_draw_groups(
         log::error!("[render-job] grouped draw batch panicked; worker continuing");
     }
     crate::gpu::pusher::kickprof::add_render_busy(busy_started, group_count as u64);
+    if let Some(timeline_started) = timeline_started {
+        log::warn!(
+            "[ktl] us={} rbatch groups={} ms={:.2}",
+            crate::timeline_us(),
+            group_count,
+            timeline_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     if let Some(started) = started {
         let elapsed = started.elapsed();
         if elapsed >= std::time::Duration::from_millis(10) {
@@ -755,8 +764,21 @@ fn render_worker(
                     RenderWork::Draw(draw)
                 } else {
                     crate::gpu::watchdog::render_phase("idle-recv", 0);
+                    let idle_started = crate::kick_timeline_enabled().then(Instant::now);
                     match rx.recv() {
-                        Ok(work) => work,
+                        Ok(work) => {
+                            if let Some(idle_started) = idle_started {
+                                let waited = idle_started.elapsed();
+                                if waited >= Duration::from_micros(300) {
+                                    log::warn!(
+                                        "[ktl] us={} ridle ms={:.2}",
+                                        crate::timeline_us(),
+                                        waited.as_secs_f64() * 1000.0
+                                    );
+                                }
+                            }
+                            work
+                        }
                         Err(_) => break,
                     }
                 }
@@ -1008,9 +1030,13 @@ impl RenderThread {
         let cost = DrawWorkCost::for_draws(&draws);
         let blocked_started = crate::gpu::pusher::kickprof::rate_start();
         crate::gpu::watchdog::phase(crate::gpu::watchdog::Phase::RenderWait, cost.groups as u64);
+        let phase_started = crate::gpu::pusher::kickprof::start();
         let mut draw_tail = self.draw_tail.lock().unwrap();
+        crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_LOCK, phase_started);
         self.pending.fetch_add(cost.groups, Ordering::AcqRel);
+        let phase_started = crate::gpu::pusher::kickprof::start();
         let reserved = self.draw_work_budget.reserve_blocking(cost, label);
+        crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_RESERVE, phase_started);
         let submitted = if !reserved {
             self.pending.fetch_sub(cost.groups, Ordering::Release);
             if hard_after {
@@ -1019,7 +1045,9 @@ impl RenderThread {
             false
         } else {
             let work = RenderWork::DrawGroup(draws);
+            let phase_started = crate::gpu::pusher::kickprof::start();
             let sent = self.tx.send(work).is_ok();
+            crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_SEND, phase_started);
             if sent {
                 if hard_after {
                     *draw_tail = None;
@@ -1068,12 +1096,20 @@ impl RenderThread {
             .and_then(|draw| (!hard_after).then(|| draw.hard_after_handle()));
         let cost = DrawWorkCost::for_draws(&draws);
         let blocked_started = crate::gpu::pusher::kickprof::rate_start();
+        let phase_started = crate::gpu::pusher::kickprof::start();
         let mut draw_tail = self.draw_tail.lock().unwrap();
+        crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_LOCK, phase_started);
         self.pending.fetch_add(1, Ordering::AcqRel);
 
         if cost.groups != 0 {
             self.pending.fetch_add(cost.groups, Ordering::AcqRel);
-            if !self.draw_work_budget.reserve_blocking(cost, label) {
+            let phase_started = crate::gpu::pusher::kickprof::start();
+            let reserved = self.draw_work_budget.reserve_blocking(cost, label);
+            crate::gpu::pusher::kickprof::add(
+                crate::gpu::pusher::kickprof::BLK_RESERVE,
+                phase_started,
+            );
+            if !reserved {
                 self.pending.fetch_sub(cost.groups, Ordering::Release);
                 self.pending.fetch_sub(1, Ordering::Release);
                 if hard_after {
@@ -1081,7 +1117,10 @@ impl RenderThread {
                 }
                 return false;
             }
-            if self.tx.send(RenderWork::DrawGroup(draws)).is_err() {
+            let phase_started = crate::gpu::pusher::kickprof::start();
+            let sent = self.tx.send(RenderWork::DrawGroup(draws));
+            crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_SEND, phase_started);
+            if sent.is_err() {
                 self.draw_work_budget.release(cost);
                 self.pending.fetch_sub(cost.groups, Ordering::Release);
                 self.pending.fetch_sub(1, Ordering::Release);
