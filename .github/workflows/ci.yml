@@ -286,9 +286,12 @@ jobs:
         run: |
           set -euo pipefail
           STAGE=target/android-apk
+          "$BUILD_TOOLS/aapt2" compile --dir android/res -o "$STAGE/res.zip"
           "$BUILD_TOOLS/aapt2" link -o "$STAGE/base.apk" \
             --manifest android/AndroidManifest.xml \
             -I "$ANDROID_JAR" \
+            -R "$STAGE/res.zip" \
+            --auto-add-overlay \
             --min-sdk-version "$MIN_SDK" \
             --target-sdk-version "$TARGET_SDK"
           (cd "$STAGE" && jar --update --file base.apk \

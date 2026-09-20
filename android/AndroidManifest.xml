@@ -12,6 +12,8 @@
 
     <application
         android:label="NeXium"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:hasCode="false"
         android:extractNativeLibs="true"
         android:isGame="true">
