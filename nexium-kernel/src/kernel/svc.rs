@@ -505,6 +505,7 @@ fn initialize_audio_voice(st: &mut AudioRendererState, vid: usize, wb_index: u16
     st.voice_wb_progress_frames[vid] = 0;
     st.voice_frac_q15[vid] = 0;
     st.voice_prev_gain[vid] = 0.0;
+    st.voice_prev_routing[vid] = [[0.0; 2]; 2];
     st.voice_biquad_state[vid] = [[[0.0; 2]; 2]; 2];
     st.voice_hist[vid] = [0.0; 6];
     st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
@@ -6633,6 +6634,8 @@ fn dispatch_service_v2(
             voice_wb_progress_frames: Vec::new(),
             voice_frac_q15: Vec::new(),
             voice_prev_gain: Vec::new(),
+            voice_prev_routing: Vec::new(),
+            routing: Default::default(),
             voice_biquad_state: Vec::new(),
             voice_hist: Vec::new(),
             voice_adpcm_states: Vec::new(),
@@ -6754,6 +6757,8 @@ fn dispatch_service_v2(
                 voice_wb_progress_frames: Vec::new(),
                 voice_frac_q15: Vec::new(),
                 voice_prev_gain: Vec::new(),
+                voice_prev_routing: Vec::new(),
+                routing: Default::default(),
                 voice_biquad_state: Vec::new(),
                 voice_hist: Vec::new(),
                 voice_adpcm_states: Vec::new(),
@@ -6791,7 +6796,6 @@ fn dispatch_service_v2(
                     audren_behavior::SupportTags::WaveBufferVer2,
                     revision_num,
                 );
-                let voice_drop_param = st.voice_drop_param;
                 let frame = kernel.audio_renderer_frame_counter;
 
                 let mut in_behavior_sz: u64 = 0;
@@ -6922,11 +6926,33 @@ fn dispatch_service_v2(
                     st.voice_wb_progress_frames.resize(voice_count_seen, 0);
                     st.voice_frac_q15.resize(voice_count_seen, 0);
                     st.voice_prev_gain.resize(voice_count_seen, 0.0);
+                    st.voice_prev_routing.resize(voice_count_seen, [[0.0; 2]; 2]);
                     st.voice_biquad_state
                         .resize(voice_count_seen, [[[0.0f32; 2]; 2]; 2]);
                     st.voice_hist.resize(voice_count_seen, [0.0f32; 6]);
                     st.voice_adpcm_states
                         .resize(voice_count_seen, AudioAdpcmDecodeState::default());
+                }
+
+                if let Some(ib) = in_buf {
+                    let channels_offset = 0x40 + in_behavior_sz + in_mempools_sz;
+                    let mixes_offset = channels_offset + in_channels_sz + in_voices_sz + in_effects_sz;
+                    let read_section = |offset: u64, size: u64| {
+                        let mut data = Vec::new();
+                        if size <= 4 * 1024 * 1024 && offset.checked_add(size).is_some_and(|end| end <= ib.size) {
+                            data.resize(size as usize, 0);
+                            if kernel.address_space.read(ib.addr.wrapping_add(offset), &mut data).is_err() {
+                                data.clear();
+                            }
+                        }
+                        data
+                    };
+                    st.routing.update(
+                        &read_section(channels_offset, in_channels_sz),
+                        &read_section(mixes_offset, in_mixes_sz),
+                        &read_section(mixes_offset + in_mixes_sz, in_sinks_sz),
+                        revision_num >= 7,
+                    );
                 }
 
                 const TARGET_FRAMES: usize = AUDIO_RENDER_BLOCK_FRAMES;
@@ -7117,6 +7143,7 @@ fn dispatch_service_v2(
                                 || wb_count == 0
                                 || wb_index >= 4
                             {
+                                st.voice_prev_routing[vid] = [[0.0; 2]; 2];
                                 if let Some(g) = st.voice_prev_gain.get_mut(vid) {
                                     *g = 0.0;
                                 }
@@ -7343,8 +7370,12 @@ fn dispatch_service_v2(
 
                             let phist = st.voice_hist.get(vid).copied().unwrap_or([0.0f32; 6]);
                             let mut frac_q15 = initial_frac_q15;
-                            let master = voice_drop_param.clamp(0.0, 4.0);
-                            let gain = volume * master * 0.5;
+                            let gain = volume;
+                            let routing = st.routing.voice_gains(&v, channel_count as usize);
+                            let mut ramped_routing = st.voice_prev_routing[vid];
+                            let routing_step: [[f32; 2]; 2] = std::array::from_fn(|channel| {
+                                std::array::from_fn(|side| (routing[channel][side] - ramped_routing[channel][side]) / TARGET_FRAMES as f32)
+                            });
                             let smp_l = |i: isize| -> f32 {
                                 if i < 0 {
                                     phist[0]
@@ -7397,13 +7428,18 @@ fn dispatch_service_v2(
                                         );
                                     }
                                 }
-                                out_stereo[i * 2] += ol * ramped_gain;
-                                out_stereo[i * 2 + 1] += orr * ramped_gain;
+                                for side in 0..2 {
+                                    out_stereo[i * 2 + side] += (ol * ramped_routing[0][side] + orr * ramped_routing[1][side]) * ramped_gain;
+                                    for channel in 0..2 {
+                                        ramped_routing[channel][side] += routing_step[channel][side];
+                                    }
+                                }
                                 ramped_gain += gain_ramp;
                                 let no = frac_q15 + step;
                                 read_idx += (no >> 15) as usize;
                                 frac_q15 = no & 0x7fff;
                             }
+                            st.voice_prev_routing[vid] = routing;
                             if let Some(g) = st.voice_prev_gain.get_mut(vid) {
                                 *g = gain;
                             }
