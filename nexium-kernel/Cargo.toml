@@ -50,3 +50,4 @@ windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 default = ["backend-dynarmic", "backend-rustarmic"]
 backend-dynarmic = ["nexium-cpu/backend-dynarmic"]
 backend-rustarmic = ["nexium-cpu/backend-rustarmic"]
+backend-nce = ["nexium-cpu/backend-nce"]

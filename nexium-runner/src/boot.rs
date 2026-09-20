@@ -66,6 +66,26 @@ fn stuck_backtrace_due() -> bool {
     due
 }
 
+fn core_status_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var_os("NEXIUM_CORE_STATUS").is_some())
+}
+
+fn resolve_cpu_backend(requested: nexium_cpu::CpuBackendKind) -> nexium_cpu::CpuBackendKind {
+    let wants_nce = matches!(requested, nexium_cpu::CpuBackendKind::Nce);
+    if !nexium_memory::fastmem::request_direct_mode(wants_nce) {
+        log::warn!(
+            "cpu backend {}: the fastmem arena was already initialised in the other mapping mode; restart the app to switch",
+            requested.label()
+        );
+    }
+    if wants_nce && !nexium_cpu::nce_runtime_available() {
+        log::warn!("NCE requested but unavailable on this host; falling back to Dynarmic");
+        return nexium_cpu::CpuBackendKind::Dynarmic;
+    }
+    requested
+}
+
 fn cpu_slice_cycles() -> u64 {
     static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -792,6 +812,7 @@ impl EmulationHandle {
                     return Err(format!("NRO file not found: {}", cur_nro_path));
                 }
 
+                let cpu_backend = resolve_cpu_backend(cpu_backend);
                 let mut config = BootConfig::new(&cur_nro_path);
                 config.loader_path = Some(initial_loader_argv.clone());
                 config.argv_override = chained_argv.take();
@@ -883,6 +904,7 @@ impl EmulationHandle {
                                         return;
                                     }
                                 };
+                                cpu_aux.set_core_id(core_id as u64);
                                 let strict_null_memory = matches!(
                                     backend_aux,
                                     nexium_core::cpu::CpuBackendKind::Rustarmic
@@ -895,6 +917,8 @@ impl EmulationHandle {
                                 let mut pc_trace = PcTrace::from_env();
                                 let mut aux_cycles = 0u64;
                                 let mut aux_svcs = 0u32;
+                                let mut aux_faults = 0u64;
+                                let mut aux_status = std::time::Instant::now();
                                 let spin_yield_n: u32 = std::env::var("NEXIUM_SPIN_YIELD")
                                     .ok()
                                     .and_then(|v| v.parse::<u32>().ok())
@@ -947,8 +971,41 @@ impl EmulationHandle {
                                     let run = cpu_mut().unwrap().run_with_count(200_000);
                                     let event = run.event;
                                     aux_cycles = aux_cycles.saturating_add(run.retired);
-                                    if pc_trace.is_some()
-                                        || matches!(event, nexium_core::cpu::CpuEvent::Svc(_))
+                                    if core_status_enabled()
+                                        && aux_status.elapsed() >= std::time::Duration::from_secs(5)
+                                    {
+                                        aux_status = std::time::Instant::now();
+                                        let cpu = cpu_ref().unwrap();
+                                        log::warn!(
+                                            "[core{}-status] pc={:#x} event={:?} svcs={} x0={:#x} x1={:#x} lr={:#x}{}",
+                                            core_id,
+                                            cpu.get_pc(),
+                                            event,
+                                            aux_svcs,
+                                            cpu.get_register(0),
+                                            cpu.get_register(1),
+                                            cpu.get_register(30),
+                                            cpu.nce_stats()
+                                                .map(|stats| format!(" {}", stats))
+                                                .unwrap_or_default()
+                                        );
+                                    }
+                                    if let nexium_core::cpu::CpuEvent::Exception(code) = event {
+                                        aux_faults = aux_faults.saturating_add(1);
+                                        if aux_faults <= 4 || aux_faults % 100_000 == 0 {
+                                            let cpu = cpu_ref().unwrap();
+                                            log::error!(
+                                                "[core{}] guest exception {:#x} at pc={:#x} lr={:#x} sp={:#x} (count {})",
+                                                core_id,
+                                                code,
+                                                cpu.get_pc(),
+                                                cpu.get_register(30),
+                                                cpu.get_sp(),
+                                                aux_faults
+                                            );
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_micros(200));
+                                    }
                                     {
                                         let mut k = kernel_aux.lock();
                                         k.threads.save_current_ctx(cpu_ref().unwrap());
@@ -1144,6 +1201,10 @@ impl EmulationHandle {
                 let max_cycles = u64::MAX;
                 let mut cycle_count = 0u64;
                 let mut svc_count = 0u32;
+                let mut skipped_fault_logs = 0u32;
+                let mut recent_svcs: std::collections::VecDeque<u16> = std::collections::VecDeque::new();
+                let mut last_status = std::time::Instant::now();
+                let mut last_status_svcs = 0u32;
                 let forced_snapshot_period = std::env::var("NEXIUM_THREAD_SNAPSHOT_PERIOD")
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
@@ -1496,6 +1557,45 @@ impl EmulationHandle {
                         let run = cpu.run_with_count(cpu_slice);
                         let event = run.event;
                         let pc_after = cpu.get_pc();
+                        if skipped_fault_logs < 8 {
+                            if let Some(fault) = cpu.take_fault() {
+                                skipped_fault_logs += 1;
+                                log::warn!(
+                                    "[guest-fault] skipped {} at pc={:#x} addr={:#x} lr={:#x} sp={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x}",
+                                    if fault.is_write { "write" } else { "read" },
+                                    fault.pc,
+                                    fault.addr,
+                                    fault.lr,
+                                    fault.sp,
+                                    fault.regs[0],
+                                    fault.regs[1],
+                                    fault.regs[2],
+                                    fault.regs[3],
+                                    fault.regs[8]
+                                );
+                            }
+                        }
+                        if core_status_enabled()
+                            && last_status.elapsed() >= std::time::Duration::from_secs(5)
+                        {
+                            last_status = std::time::Instant::now();
+                            let delta = svc_count.wrapping_sub(last_status_svcs);
+                            last_status_svcs = svc_count;
+                            log::warn!(
+                                "[core0-status] pc={:#x} event={:?} svcs+{} recent={:?} x0={:#x} x1={:#x} x8={:#x} lr={:#x}{}",
+                                pc_after,
+                                event,
+                                delta,
+                                recent_svcs,
+                                cpu.get_register(0),
+                                cpu.get_register(1),
+                                cpu.get_register(8),
+                                cpu.get_register(30),
+                                cpu.nce_stats()
+                                    .map(|stats| format!(" {}", stats))
+                                    .unwrap_or_default()
+                            );
+                        }
                         let mut guard = boot_ctx.kernel.lock();
                         guard.threads.save_current_ctx(cpu);
                         cycle_count += run.retired;
@@ -2016,6 +2116,10 @@ impl EmulationHandle {
                             }
                             nexium_core::cpu::CpuEvent::Svc(imm) => {
                                 svc_count += 1;
+                                if recent_svcs.len() >= 16 {
+                                    recent_svcs.pop_front();
+                                }
+                                recent_svcs.push_back(imm);
                                 last_svc_cycle = cycle_count;
                                 last_svc_ms.store(now_millis(), Ordering::Relaxed);
                                 log::trace!("SVC {:#04x} (count: {})", imm, svc_count);
@@ -2129,6 +2233,34 @@ impl EmulationHandle {
                                     (cycle_count - last_svc_cycle) / 1_000_000,
                                     pc_before
                                 );
+                                log::warn!("[no-svc] recent svcs: {:?}", recent_svcs);
+                                let mut code = [0u8; 160];
+                                let window_start = pc_before.saturating_sub(96);
+                                if guard.address_space.read(window_start, &mut code).is_ok() {
+                                    let words: Vec<String> = code
+                                        .chunks_exact(4)
+                                        .map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+                                        .collect();
+                                    log::warn!(
+                                        "[no-svc] code@{:#x}: {}",
+                                        window_start,
+                                        words.join(" ")
+                                    );
+                                }
+                                let regs: Vec<String> = (0..10u32)
+                                    .chain([19u32, 20, 21, 22, 29, 30])
+                                    .map(|i| format!("x{}={:#x}", i, cpu.get_register(i)))
+                                    .collect();
+                                log::warn!(
+                                    "[no-svc] pc_after={:#x} sp={:#x} {} event={:?}",
+                                    pc_after,
+                                    cpu.get_sp(),
+                                    regs.join(" "),
+                                    event
+                                );
+                                if let Some(stats) = cpu.nce_stats() {
+                                    log::warn!("[no-svc] {}", stats);
+                                }
                             }
                         }
 

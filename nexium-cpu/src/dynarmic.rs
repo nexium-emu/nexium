@@ -34,6 +34,7 @@ impl DynarmicCpu {
     pub fn new() -> Result<Self, String> {
         configure_dynarmic_fast_paths();
         let force_no_fastmem = env_flag("NEXIUM_DYNARMIC_NO_FASTMEM")
+            || nexium_memory::fastmem::direct_va_base().is_some()
             || ((std::env::var("NEXIUM_WATCH_WRITE_CPU").is_ok()
                 || std::env::var("NEXIUM_WATCH_WRITE_GPU").is_ok())
                 && !env_flag("NEXIUM_WATCH_PAGE_PROTECT")

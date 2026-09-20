@@ -3260,12 +3260,17 @@ fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
             } else {
                 0x03
             };
+            let hidden_from_rtld = r.name.starts_with("codepatch") || r.name == "exit_stub";
             return SynthMemInfo {
                 addr: r.base,
                 size: r.size,
                 mem_type,
                 attr: 0,
-                perm: r.perm.bits() as u32,
+                perm: if hidden_from_rtld {
+                    0
+                } else {
+                    r.perm.bits() as u32
+                },
             };
         }
     }

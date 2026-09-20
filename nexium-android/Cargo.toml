@@ -11,11 +11,11 @@ crate-type = ["cdylib"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 nexium-common.workspace = true
-nexium-core = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
-nexium-cpu = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
-nexium-kernel = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
+nexium-core = { workspace = true, default-features = false, features = ["backend-dynarmic", "backend-nce"] }
+nexium-cpu = { workspace = true, default-features = false, features = ["backend-dynarmic", "backend-nce"] }
+nexium-kernel = { workspace = true, default-features = false, features = ["backend-dynarmic", "backend-nce"] }
 nexium-loader.workspace = true
-nexium-runner = { path = "../nexium-runner", default-features = false, features = ["backend-dynarmic"] }
+nexium-runner = { path = "../nexium-runner", default-features = false, features = ["backend-dynarmic", "backend-nce"] }
 
 log = "0.4"
 android_logger = "0.15"

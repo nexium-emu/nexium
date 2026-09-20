@@ -319,7 +319,9 @@ impl App {
             };
             return;
         };
-        match EmulationHandle::new(path_str, nexium_cpu::CpuBackendKind::Dynarmic, None) {
+        let backend = self.settings.cpu_backend();
+        log::info!("cpu backend: {}", backend.label());
+        match EmulationHandle::new(path_str, backend, None) {
             Ok(handle) => {
                 log::info!("emulation started: {}", title);
                 self.emulation = Some(handle);
@@ -538,6 +540,12 @@ impl App {
                         self.ui_dirty = true;
                     }
                     8 => {
+                        self.settings.nce = !self.settings.nce;
+                        self.settings.apply_runtime();
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                    9 => {
                         self.settings.docked = !self.settings.docked;
                         nexium_core::hid_state::set_docked(self.settings.docked);
                         self.settings.save();
@@ -960,6 +968,17 @@ impl App {
                     "On (restart game)"
                 } else {
                     "Off (restart game)"
+                }
+                .to_string(),
+            ),
+            (
+                "Native execution (NCE)".to_string(),
+                if self.settings.nce && self.settings.fastmem {
+                    "On (restart app)"
+                } else if self.settings.nce {
+                    "Needs fastmem (restart app)"
+                } else {
+                    "Off (restart app)"
                 }
                 .to_string(),
             ),

@@ -36,6 +36,85 @@ pub struct BootContext {
     pub cpu: Option<Cpu>,
 }
 
+fn map_extras_and_exit_stub(
+    address_space: &AddressSpace,
+    env_base: u64,
+    exit_stub_va: u64,
+    nce: bool,
+) -> Result<(), String> {
+    const EXTRAS_SIZE: u64 = 0x110000;
+    if !nce {
+        address_space
+            .map(env_base, EXTRAS_SIZE, Perm::RW, "extras")
+            .map_err(|e| format!("Failed to map extras: {:?}", e))?;
+        let svc_exit_insn: u32 = 0xD400_00E1;
+        return address_space
+            .write(exit_stub_va, &svc_exit_insn.to_le_bytes())
+            .map_err(|e| format!("Failed to write exit stub: {:?}", e));
+    }
+    let stub_page = exit_stub_va & !0xFFF;
+    address_space
+        .map(env_base, stub_page - env_base, Perm::RW, "extras_env")
+        .map_err(|e| format!("Failed to map extras_env: {:?}", e))?;
+    address_space
+        .map(stub_page, 0x1000, Perm::RX, "exit_stub")
+        .map_err(|e| format!("Failed to map exit_stub: {:?}", e))?;
+    address_space
+        .map(
+            stub_page + 0x1000,
+            env_base + EXTRAS_SIZE - (stub_page + 0x1000),
+            Perm::RW,
+            "extras_rest",
+        )
+        .map_err(|e| format!("Failed to map extras_rest: {:?}", e))?;
+    let brk_exit_insn =
+        nexium_cpu::nce_patch::a64::brk(nexium_cpu::nce_layout::EXIT_STUB_BRK_IMM as u32);
+    address_space
+        .write(exit_stub_va, &brk_exit_insn.to_le_bytes())
+        .map_err(|e| format!("Failed to write exit stub: {:?}", e))
+}
+
+fn apply_nce_patch(
+    address_space: &AddressSpace,
+    name: &str,
+    text: &[u8],
+    text_va: u64,
+    patch_base: u64,
+) -> Result<u64, String> {
+    let words = nexium_cpu::nce_patch::words_from_bytes(text);
+    let out = nexium_cpu::nce_patch::patch_module(
+        &words,
+        text_va,
+        patch_base,
+        nexium_cpu::nce_host_counter_hz(),
+    )
+    .map_err(|e| format!("NCE patch of {} failed: {}", name, e))?;
+    let section_len = nexium_cpu::nce_patch::page_align(out.section.len()) as u64;
+    address_space
+        .write(text_va, &nexium_cpu::nce_patch::bytes_from_words(&out.text))
+        .map_err(|e| format!("Failed to write patched {} text: {:?}", name, e))?;
+    address_space
+        .map(patch_base, section_len, Perm::RX, format!("codepatch_{}", name))
+        .map_err(|e| format!("Failed to map {} patch section: {:?}", name, e))?;
+    address_space
+        .write(patch_base, &out.section)
+        .map_err(|e| format!("Failed to write {} patch section: {:?}", name, e))?;
+    nexium_cpu::nce_register_post_handlers(&out.post_handlers);
+    log::info!(
+        "  nce patch {}: text@{:#x} section@{:#x} size={:#x} svc={} mrs={} msr={} counter={} exclusive={}",
+        name,
+        text_va,
+        patch_base,
+        section_len,
+        out.svc_count,
+        out.mrs_count,
+        out.msr_count,
+        out.counter_count,
+        out.exclusive_count
+    );
+    Ok(section_len)
+}
+
 impl BootContext {
     pub fn new(config: BootConfig) -> Result<Self, String> {
         match Loader::load_any(&config.nro_path)? {
@@ -50,12 +129,20 @@ impl BootContext {
         log::info!("Creating address space");
         let address_space = Arc::new(AddressSpace::new());
 
-        let code_base: u64 = 0x1_0000_0000;
-        let heap_base: u64 = 0x4_0000_0000;
-        let stack_base: u64 = 0x8_0000_0000;
-        let env_base: u64 = 0x10_0000_0000;
-        let tls_base: u64 = 0x10_0000_1000;
-        let exit_stub_va: u64 = 0x10_0000_2000;
+        let nce = matches!(config.cpu_backend, nexium_cpu::CpuBackendKind::Nce);
+        let direct_base = nexium_memory::fastmem::direct_va_base().unwrap_or(0);
+        if nce && direct_base == 0 {
+            return Err("NCE backend requires the direct-mapped fastmem arena".to_string());
+        }
+        if direct_base != 0 {
+            log::info!("guest address space is direct-mapped at {:#x}", direct_base);
+        }
+        let code_base: u64 = direct_base + 0x1_0000_0000;
+        let heap_base: u64 = direct_base + 0x4_0000_0000;
+        let stack_base: u64 = direct_base + 0x8_0000_0000;
+        let env_base: u64 = direct_base + 0x10_0000_0000;
+        let tls_base: u64 = env_base + 0x1000;
+        let exit_stub_va: u64 = env_base + 0x2000;
 
         log::info!("Mapping memory regions");
 
@@ -121,15 +208,7 @@ impl BootContext {
             "  Mapping extras (env+tls+exit_stub+tls_pool) @ {:#x} (size 0x110000)",
             env_base
         );
-        address_space
-            .map(env_base, 0x110000, Perm::RW, "extras")
-            .map_err(|e| format!("Failed to map extras: {:?}", e))?;
-
-        log::info!("  Writing exit stub SVC instruction @ {:#x}", exit_stub_va);
-        let svc_exit_insn: u32 = 0xD400_00E1;
-        address_space
-            .write(exit_stub_va, &svc_exit_insn.to_le_bytes())
-            .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
+        map_extras_and_exit_stub(&address_space, env_base, exit_stub_va, nce)?;
 
         log::info!(
             "  Writing NRO ({} bytes) at {:#x} from mmap (split at {:#x})",
@@ -154,6 +233,15 @@ impl BootContext {
                     .write(code_base + split, &bytes[split_idx..])
                     .map_err(|e| format!("Failed to write NRO data: {:?}", e))?;
             }
+        }
+
+        if nce {
+            let text_range = nro.text.mmap_range.clone();
+            let text_va = code_base + text_range.start as u64;
+            let text_len = text_range.len() & !3;
+            let text = bytes[text_range.start..text_range.start + text_len].to_vec();
+            let patch_base = code_base + code_size;
+            apply_nce_patch(&address_space, "nro", &text, text_va, patch_base)?;
         }
 
         let tls_pool_base: u64 = env_base + 0x10000;
@@ -250,8 +338,16 @@ impl BootContext {
         };
         let space: u64 = 1u64 << bits;
 
+        let nce = matches!(config.cpu_backend, nexium_cpu::CpuBackendKind::Nce);
+        let direct_base = nexium_memory::fastmem::direct_va_base().unwrap_or(0);
+        if nce && direct_base == 0 {
+            return Err("NCE backend requires the direct-mapped fastmem arena".to_string());
+        }
+        if direct_base != 0 {
+            log::info!("guest address space is direct-mapped at {:#x}", direct_base);
+        }
         let arena_limit: u64 = nexium_memory::fastmem::arena_size();
-        let window: u64 = space.min(arena_limit);
+        let window: u64 = direct_base + space.min(arena_limit);
         let alias_size: u64 = if bits == 39 {
             0x10_0000_0000
         } else {
@@ -259,7 +355,7 @@ impl BootContext {
         };
         let heap_size: u64 = 0xCC00_0000;
         let stack_region_size: u64 = 0x8000_0000;
-        let code_base: u64 = 0x800_0000;
+        let code_base: u64 = direct_base + 0x800_0000;
         let code_span: u64 = 0x1_0000_0000;
         let mut alias_size = alias_size;
         let mut cursor = code_base + code_span;
@@ -305,6 +401,7 @@ impl BootContext {
             code_base,
             code_size
         );
+        let mut patch_cursor = code_base + code_size;
         for m in &app.modules {
             let base = code_base + m.load_offset;
             let image = m.nso.image_size as u64;
@@ -345,12 +442,29 @@ impl BootContext {
                 static_size,
                 mutable_size
             );
+            if nce {
+                let text_off = m.nso.text.mem_offset as usize;
+                let text_len = (m.nso.text.decompressed_size as usize) & !3;
+                let text = &m.nso.module_image[text_off..text_off + text_len];
+                let section_len =
+                    apply_nce_patch(&address_space, &m.name, text, base + text_off as u64, patch_cursor)?;
+                patch_cursor += section_len;
+            }
         }
+        let code_size = if nce {
+            patch_cursor - code_base
+        } else {
+            code_size
+        };
 
         let compatibility_guest_probe_enabled =
             crate::kernel::svc::install_compatibility_guest_probes(&address_space, app.title_id);
 
         for (&pc, (kind, arg)) in crate::kernel::svc::guest_probe_actions() {
+            if nce {
+                log::warn!("[guest-probe] pc={:#x} kind={} ignored: SVC probes are not supported under NCE", pc, kind);
+                continue;
+            }
             let insn: u32 = 0xD400_0FE1;
             match address_space.write(pc, &insn.to_le_bytes()) {
                 Ok(()) => log::warn!(
@@ -381,14 +495,7 @@ impl BootContext {
             "  Mapping extras (env+tls+exit_stub+tls_pool) @ {:#x} (size 0x110000)",
             env_base
         );
-        address_space
-            .map(env_base, 0x110000, Perm::RW, "extras")
-            .map_err(|e| format!("Failed to map extras: {:?}", e))?;
-
-        let svc_exit_insn: u32 = 0xD400_00E1;
-        address_space
-            .write(exit_stub_va, &svc_exit_insn.to_le_bytes())
-            .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
+        map_extras_and_exit_stub(&address_space, env_base, exit_stub_va, nce)?;
 
         let tls_pool_base: u64 = env_base + 0x10000;
         let mut kernel = Kernel::new(

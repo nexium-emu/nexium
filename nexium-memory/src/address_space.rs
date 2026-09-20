@@ -76,12 +76,14 @@ impl Region {
     }
 
     fn reserved(base: u64, len: usize, perm: Perm, name: String) -> Self {
-        if base
-            .checked_add(len as u64)
-            .is_some_and(|end| end <= crate::fastmem::arena_size())
+        let (window_lo, window_hi) = crate::fastmem::va_window();
+        if base >= window_lo
+            && base
+                .checked_add(len as u64)
+                .is_some_and(|end| end <= window_hi)
         {
-            if let Some(arena) = crate::fastmem::base() {
-                let buf = unsafe { NonNull::new_unchecked(arena.add(base as usize)) };
+            if let Some(ptr) = crate::fastmem::host_ptr(base) {
+                let buf = unsafe { NonNull::new_unchecked(ptr) };
                 return Self {
                     base,
                     buf,

@@ -59,7 +59,7 @@ impl CpuSystem {
                     return Err("Rustarmic backend not compiled in".to_string());
                 }
             }
-            CpuBackendKind::Dynarmic => Cpu::new(self.backend)?,
+            CpuBackendKind::Dynarmic | CpuBackendKind::Nce => Cpu::new(self.backend)?,
         };
         cpu.set_core_id(core_id);
         let leases = self.address_space.host_region_leases();

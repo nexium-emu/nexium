@@ -2,6 +2,10 @@
 pub mod dynarmic;
 #[cfg(feature = "backend-rustarmic")]
 pub mod rustarmic;
+#[cfg(nce_runtime)]
+pub mod nce;
+pub mod nce_layout;
+pub mod nce_patch;
 pub mod system;
 
 pub use system::{CpuCore, CpuSystem, CpuSystemConfig};
@@ -10,6 +14,45 @@ pub use system::{CpuCore, CpuSystem, CpuSystemConfig};
 use dynarmic::DynarmicCpu;
 #[cfg(feature = "backend-rustarmic")]
 use rustarmic::RustarmicCpu;
+#[cfg(nce_runtime)]
+use nce::NceCpu;
+
+pub fn nce_runtime_available() -> bool {
+    #[cfg(nce_runtime)]
+    {
+        return nce::supported();
+    }
+    #[cfg(not(nce_runtime))]
+    {
+        false
+    }
+}
+
+pub fn nce_register_post_handlers(entries: &[(u64, u64)]) {
+    #[cfg(nce_runtime)]
+    {
+        nce::register_post_handlers(entries);
+    }
+    #[cfg(not(nce_runtime))]
+    {
+        let _ = entries;
+    }
+}
+
+pub fn nce_host_counter_hz() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let value: u64;
+        unsafe {
+            std::arch::asm!("mrs {0}, cntfrq_el0", out(reg) value, options(nomem, nostack, preserves_flags));
+        }
+        return value;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        nce_layout::GUEST_CNTFRQ_HZ
+    }
+}
 
 use nexium_memory::Perm;
 
@@ -67,6 +110,8 @@ pub enum CpuThreadContext {
     Dynarmic(dynarmic_sys::DynarmicContext),
     #[cfg(feature = "backend-rustarmic")]
     Rustarmic(rustarmic::RustarmicThreadContext),
+    #[cfg(nce_runtime)]
+    Nce(nce::NceThreadContext),
 }
 
 impl std::fmt::Debug for CpuThreadContext {
@@ -76,6 +121,8 @@ impl std::fmt::Debug for CpuThreadContext {
             Self::Dynarmic(_) => f.write_str("Dynarmic"),
             #[cfg(feature = "backend-rustarmic")]
             Self::Rustarmic(_) => f.write_str("Rustarmic"),
+            #[cfg(nce_runtime)]
+            Self::Nce(_) => f.write_str("Nce"),
         }
     }
 }
@@ -99,6 +146,7 @@ pub struct CpuRunResult {
 pub enum CpuBackendKind {
     Dynarmic,
     Rustarmic,
+    Nce,
 }
 
 impl Default for CpuBackendKind {
@@ -123,6 +171,7 @@ impl CpuBackendKind {
         match self {
             CpuBackendKind::Dynarmic => "Dynarmic (C++)",
             CpuBackendKind::Rustarmic => "Rustarmic (Rust JIT)",
+            CpuBackendKind::Nce => "NCE (native execution)",
         }
     }
 
@@ -132,6 +181,8 @@ impl CpuBackendKind {
         v.push(CpuBackendKind::Dynarmic);
         #[cfg(feature = "backend-rustarmic")]
         v.push(CpuBackendKind::Rustarmic);
+        #[cfg(nce_runtime)]
+        v.push(CpuBackendKind::Nce);
         v
     }
 
@@ -139,6 +190,7 @@ impl CpuBackendKind {
         match self {
             CpuBackendKind::Dynarmic => cfg!(feature = "backend-dynarmic"),
             CpuBackendKind::Rustarmic => cfg!(feature = "backend-rustarmic"),
+            CpuBackendKind::Nce => cfg!(nce_runtime),
         }
     }
 }
@@ -148,6 +200,8 @@ pub enum Cpu {
     Dynarmic(DynarmicCpu),
     #[cfg(feature = "backend-rustarmic")]
     Rustarmic(RustarmicCpu),
+    #[cfg(nce_runtime)]
+    Nce(NceCpu),
 }
 
 macro_rules! dispatch {
@@ -157,6 +211,8 @@ macro_rules! dispatch {
             Cpu::Dynarmic($cpu) => $call,
             #[cfg(feature = "backend-rustarmic")]
             Cpu::Rustarmic($cpu) => $call,
+            #[cfg(nce_runtime)]
+            Cpu::Nce($cpu) => $call,
         }
     };
 }
@@ -177,8 +233,23 @@ impl Cpu {
         RustarmicCpu::new_with_engine_config(config).map(Cpu::Rustarmic)
     }
 
+    #[cfg(nce_runtime)]
+    pub fn new_nce() -> Result<Self, String> {
+        NceCpu::new().map(Cpu::Nce)
+    }
+
     pub fn new(backend: CpuBackendKind) -> Result<Self, String> {
         match backend {
+            CpuBackendKind::Nce => {
+                #[cfg(nce_runtime)]
+                {
+                    return Self::new_nce();
+                }
+                #[cfg(not(nce_runtime))]
+                {
+                    return Err("NCE backend is only available on aarch64 Android/Linux builds with --features backend-nce".into());
+                }
+            }
             CpuBackendKind::Dynarmic => {
                 #[cfg(feature = "backend-dynarmic")]
                 {
@@ -239,6 +310,8 @@ impl Cpu {
             }
             #[cfg(feature = "backend-rustarmic")]
             Cpu::Rustarmic(cpu) => cpu.set_core_id(core_id),
+            #[cfg(nce_runtime)]
+            Cpu::Nce(cpu) => cpu.set_core_id(core_id),
         }
     }
     pub fn get_pc(&self) -> u64 {
@@ -278,6 +351,11 @@ impl Cpu {
                 *context = Some(CpuThreadContext::Rustarmic(cpu.save_thread_context()));
                 Ok(())
             }
+            #[cfg(nce_runtime)]
+            Cpu::Nce(cpu) => {
+                *context = Some(CpuThreadContext::Nce(cpu.save_thread_context()));
+                Ok(())
+            }
         }
     }
 
@@ -289,6 +367,11 @@ impl Cpu {
             }
             #[cfg(feature = "backend-rustarmic")]
             (Cpu::Rustarmic(cpu), CpuThreadContext::Rustarmic(context)) => {
+                cpu.restore_thread_context(context);
+                Ok(())
+            }
+            #[cfg(nce_runtime)]
+            (Cpu::Nce(cpu), CpuThreadContext::Nce(context)) => {
                 cpu.restore_thread_context(context);
                 Ok(())
             }
@@ -306,6 +389,11 @@ impl Cpu {
                 cpu.reset_thread_context();
                 Ok(())
             }
+            #[cfg(nce_runtime)]
+            Cpu::Nce(cpu) => {
+                cpu.reset_thread_context();
+                Ok(())
+            }
         }
     }
 
@@ -318,6 +406,11 @@ impl Cpu {
             }
             #[cfg(feature = "backend-rustarmic")]
             Cpu::Rustarmic(cpu) => {
+                let (event, retired) = cpu.run_with_count(cycle_count);
+                CpuRunResult { event, retired }
+            }
+            #[cfg(nce_runtime)]
+            Cpu::Nce(cpu) => {
                 let (event, retired) = cpu.run_with_count(cycle_count);
                 CpuRunResult { event, retired }
             }
@@ -365,5 +458,14 @@ impl Cpu {
 
     pub fn invalidate_range(&mut self, va: u64, len: u64) {
         dispatch!(self, cpu => cpu.invalidate_range(va, len))
+    }
+
+    pub fn nce_stats(&self) -> Option<String> {
+        match self {
+            #[cfg(nce_runtime)]
+            Cpu::Nce(cpu) => Some(cpu.stats()),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
     }
 }

@@ -21,6 +21,67 @@ pub fn arena_size() -> u64 {
     1u64 << arena_bits()
 }
 
+static DIRECT_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn direct_mode_requested() -> bool {
+    match DIRECT_MODE.load(Ordering::Acquire) {
+        1 => true,
+        2 => false,
+        _ => {
+            let requested = std::env::var("NEXIUM_NCE")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false);
+            DIRECT_MODE.store(if requested { 1 } else { 2 }, Ordering::Release);
+            requested
+        }
+    }
+}
+
+pub fn request_direct_mode(enabled: bool) -> bool {
+    if ARENA.get().is_some() {
+        return direct_mode_requested() == enabled;
+    }
+    DIRECT_MODE.store(if enabled { 1 } else { 2 }, Ordering::Release);
+    true
+}
+
+pub fn direct_va_base() -> Option<u64> {
+    let base = arena();
+    if base.is_null() || !direct_mode_requested() {
+        None
+    } else {
+        Some(base as u64)
+    }
+}
+
+pub fn direct_va_range() -> Option<(u64, u64)> {
+    let base = direct_va_base()?;
+    Some((base, base + arena_size()))
+}
+
+pub fn va_offset(va: u64) -> Option<u64> {
+    match direct_va_base() {
+        Some(base) => va.checked_sub(base).filter(|offset| *offset < arena_size()),
+        None => (va < arena_size()).then_some(va),
+    }
+}
+
+pub fn va_window() -> (u64, u64) {
+    match direct_va_base() {
+        Some(base) => (base, base + arena_size()),
+        None => (0, arena_size()),
+    }
+}
+
+pub fn host_ptr(va: u64) -> Option<*mut u8> {
+    let base = arena();
+    if base.is_null() {
+        return None;
+    }
+    let offset = va_offset(va)?;
+    Some(unsafe { base.add(offset as usize) })
+}
+
 #[cfg(windows)]
 mod sys {
     const MEM_RESERVE: u32 = 0x2000;
@@ -398,6 +459,15 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
     if base.is_null() {
         return None;
     }
+    let Some(offset) = va_offset(va) else {
+        log::warn!(
+            "fastmem: region va={:#x} len={:#x} outside arena; using heap",
+            va,
+            len
+        );
+        return None;
+    };
+    let va = offset;
     let end = va.checked_add(len as u64)?;
     if end > arena_size() {
         log::warn!(
@@ -787,16 +857,15 @@ pub fn take_guest_probe_event() -> Option<u64> {
 }
 
 pub fn watch_arm(va: u64, len: u64) -> bool {
-    let base = arena();
-    if base.is_null() {
-        return false;
-    }
     let lo = va & !0xFFF;
     let hi = (va + len + 0xFFF) & !0xFFF;
-    if hi > arena_size() {
+    let (window_lo, window_hi) = va_window();
+    if lo < window_lo || hi > window_hi {
         return false;
     }
-    let ptr = unsafe { base.add(lo as usize) };
+    let Some(ptr) = host_ptr(lo) else {
+        return false;
+    };
     if !sys::protect(ptr, (hi - lo) as usize, true) {
         return false;
     }
@@ -810,7 +879,8 @@ pub fn watch_arm(va: u64, len: u64) -> bool {
 pub fn watch_mark(va: u64, len: u64) -> bool {
     let lo = va & !0xFFF;
     let hi = (va + len + 0xFFF) & !0xFFF;
-    if hi <= lo || hi > arena_size() {
+    let (window_lo, window_hi) = va_window();
+    if hi <= lo || lo < window_lo || hi > window_hi {
         return false;
     }
     WATCH_LO.store(lo, Ordering::SeqCst);
@@ -842,11 +912,9 @@ pub fn watch_exact_range() -> Option<(u64, u64)> {
 
 pub fn watch_reprotect() -> bool {
     if let Some((lo, hi)) = watch_range() {
-        let base = arena();
-        if base.is_null() {
+        let Some(ptr) = host_ptr(lo) else {
             return false;
-        }
-        let ptr = unsafe { base.add(lo as usize) };
+        };
         return sys::protect(ptr, (hi - lo) as usize, true);
     }
     false
@@ -854,9 +922,7 @@ pub fn watch_reprotect() -> bool {
 
 pub fn watch_disarm() {
     if let Some((lo, hi)) = watch_range() {
-        let base = arena();
-        if !base.is_null() {
-            let ptr = unsafe { base.add(lo as usize) };
+        if let Some(ptr) = host_ptr(lo) {
             sys::protect(ptr, (hi - lo) as usize, false);
         }
     }
@@ -873,16 +939,13 @@ pub fn watch_write_through(addr: u64, size: usize, value: u64) -> bool {
     if addr < lo || addr + size as u64 > hi {
         return false;
     }
-    let base = arena();
-    if base.is_null() {
+    let (Some(ptr), Some(dst)) = (host_ptr(lo), host_ptr(addr)) else {
         return false;
-    }
-    let ptr = unsafe { base.add(lo as usize) };
+    };
     if !sys::protect(ptr, (hi - lo) as usize, false) {
         return false;
     }
     unsafe {
-        let dst = base.add(addr as usize);
         let bytes = value.to_le_bytes();
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, size.min(8));
     }

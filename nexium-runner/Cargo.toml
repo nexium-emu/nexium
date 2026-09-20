@@ -23,3 +23,4 @@ ringbuf = { workspace = true }
 default = ["backend-dynarmic", "backend-rustarmic"]
 backend-dynarmic = ["nexium-core/backend-dynarmic", "nexium-cpu/backend-dynarmic", "nexium-kernel/backend-dynarmic"]
 backend-rustarmic = ["nexium-core/backend-rustarmic", "nexium-cpu/backend-rustarmic", "nexium-kernel/backend-rustarmic"]
+backend-nce = ["nexium-core/backend-nce", "nexium-cpu/backend-nce", "nexium-kernel/backend-nce"]
