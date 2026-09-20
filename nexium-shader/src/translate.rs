@@ -435,6 +435,18 @@ pub struct Translator {
     pub bindless_or_partners: HashMap<u32, u32>,
 }
 
+fn flow_test_cmp(test: u64) -> Option<ICmp> {
+    match test {
+        1 | 9 => Some(ICmp::Lt),
+        2 | 10 => Some(ICmp::Eq),
+        3 | 11 => Some(ICmp::Le),
+        4 | 12 => Some(ICmp::Gt),
+        5 | 13 => Some(ICmp::Ne),
+        6 | 14 => Some(ICmp::Ge),
+        _ => None,
+    }
+}
+
 impl Translator {
     pub fn new() -> Self {
         Self::with_offset(0)
@@ -929,7 +941,7 @@ impl Translator {
     fn emit_fset(&mut self, raw: u64, src_b: Value, pred: Option<Predicate>) {
         let dest = reg_dest(raw);
         let src_a = self.read_reg(reg_a(raw));
-        self.write_reg(
+        let id = self.write_reg(
             dest,
             Op::FSet {
                 cmp: FComp::from_bits(fset_cmp(raw)),
@@ -946,6 +958,9 @@ impl Translator {
             },
             pred,
         );
+        if raw & (1 << 47) != 0 && pred.is_none() {
+            self.cc_source = Some(Value::Inst(id));
+        }
     }
 
     fn half_swizzle(bits: u8) -> HalfSwizzle {
@@ -2125,6 +2140,25 @@ impl Translator {
             dest_np: PT,
         }, None, None);
         true
+    }
+
+    pub(crate) fn emit_bra_flow_predicate(&mut self, raw: u64) {
+        let predicate = decoded_pred(raw);
+        let (cmp, src_a) = match (flow_test_cmp(raw & 0x1f), self.cc_source) {
+            (Some(cmp), Some(source)) => (cmp, source),
+            _ => (ICmp::T, Value::Zero),
+        };
+        self.program.emit_pred(Op::ISetPred {
+            cmp,
+            signed: true,
+            bop: BoolOp::And,
+            src_a,
+            src_b: Value::Zero,
+            src_pred: predicate.map_or(PT, |pred| pred.idx),
+            src_pred_inv: predicate.is_some_and(|pred| pred.negate),
+            dest_p: 8,
+            dest_np: PT,
+        }, None, None);
     }
 
     pub fn translate(&mut self, raw: u64) -> bool {

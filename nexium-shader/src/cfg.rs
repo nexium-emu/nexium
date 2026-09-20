@@ -825,6 +825,18 @@ fn bra_target(pc: usize, raw: u64) -> usize {
     (pc as i64 + signed as i64 + 8) as usize
 }
 
+fn bra_flow_conditional(raw: u64) -> bool {
+    !matches!(raw & 0x1f, 0 | 15)
+}
+
+fn flow_branch_predicate(raw: u64) -> Option<Predicate> {
+    if bra_flow_conditional(raw) {
+        Some(Predicate { idx: 8, negate: false })
+    } else {
+        decoded_pred(raw)
+    }
+}
+
 fn signed_24(raw: u64) -> i32 {
     let value = ((raw >> 20) & 0x00FF_FFFF) as u32;
     if value & 0x0080_0000 != 0 {
@@ -1079,7 +1091,7 @@ fn discover_sync_targets(
                     Opcode::BRA | Opcode::JMP => {
                         let target = bra_target(offset, raw);
                         push_flow_state(&mut worklist, target, &stack, bytes.len());
-                        if decoded_pred(raw).is_some() {
+                        if decoded_pred(raw).is_some() || bra_flow_conditional(raw) {
                             push_flow_state(&mut worklist, next, &stack, bytes.len());
                         }
                         break;
@@ -1146,7 +1158,7 @@ fn discover_leaders(
                     if target < bytes.len() && leaders.insert(target) {
                         worklist.push(target);
                     }
-                    if pred.is_some() {
+                    if pred.is_some() || bra_flow_conditional(raw) {
                         if next < bytes.len() && leaders.insert(next) {
                             worklist.push(next);
                         }
@@ -1302,6 +1314,11 @@ where
                     t.unimplemented_count += 1;
                     t.program.emit_void(Op::Unimplemented { opcode: Opcode::EXIT, raw });
                 }
+                if decode_one(raw).is_some_and(|decoded| matches!(decoded.opcode, Opcode::BRA | Opcode::JMP))
+                    && bra_flow_conditional(raw)
+                {
+                    t.emit_bra_flow_predicate(raw);
+                }
             }
             if term_off + 8 <= bytes.len() && matches!(info.branch, BranchKind::Exit) {
                 let raw = u64::from_le_bytes(bytes[term_off..term_off + 8].try_into().unwrap());
@@ -1401,7 +1418,7 @@ fn discover_topology(
                     Opcode::BRA | Opcode::JMP => {
                         let target_off = bra_target(offset, raw);
                         let target = *offset_to_block.get(&target_off).unwrap_or(&(i as u32));
-                        match decoded_pred(raw) {
+                        match flow_branch_predicate(raw) {
                             None => branch = BranchKind::Unconditional { target },
                             Some(pred) => branch = BranchKind::Conditional { target, pred },
                         }
@@ -3360,5 +3377,36 @@ mod tests {
         a.extend_from_slice(&nop.to_le_bytes());
         let b = a.clone();
         assert!(merge_dual_vertex_sass(&a, &b).is_none());
+    }
+    #[test]
+    fn bra_with_condition_code_test_branches_on_flow_predicate() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0u8; 8]);
+        bytes.extend_from_slice(&0x5881_8380_0FF7_02FFu64.to_le_bytes());
+        bytes.extend_from_slice(&0xE240_0000_0100_000Du64.to_le_bytes());
+        bytes.extend_from_slice(&enc_fmul_reg(3, 2, 2).to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        bytes.extend_from_slice(&enc_exit().to_le_bytes());
+
+        let cfg = build_cfg(&bytes);
+        assert_eq!(cfg.blocks.len(), 3);
+        assert!(matches!(
+            cfg.blocks[0].branch,
+            BranchKind::Conditional {
+                target: 2,
+                pred: Predicate { idx: 8, negate: false }
+            }
+        ));
+        assert!(matches!(cfg.blocks[1].branch, BranchKind::FallThrough));
+        let flow = cfg.blocks[0]
+            .program
+            .instructions
+            .iter()
+            .find(|i| matches!(i.op, Op::ISetPred { dest_p: 8, .. }))
+            .expect("expected flow predicate for BRA CC.NEU");
+        assert!(matches!(
+            flow.op,
+            Op::ISetPred { cmp: crate::ir::ICmp::Ne, src_pred: 0, src_pred_inv: false, src_a: Value::Inst(_), .. }
+        ));
     }
 }
