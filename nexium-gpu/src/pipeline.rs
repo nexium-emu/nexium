@@ -1,6 +1,8 @@
 use ash::vk;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::io::Write;
 
 fn cache_path(device_tag: &str) -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")?;
@@ -64,6 +66,7 @@ impl CurrentPipeline {
 }
 
 const SPEC_VERSION: u32 = 55;
+const MAX_SPEC_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
     &[(0x59b9_0e74_4b2a_7537, 0xe505_d075_601e_e633)];
@@ -81,7 +84,7 @@ fn cache_save_due(
     !builds_in_flight && (dirty || specs_dirty) && idle >= CACHE_SAVE_IDLE_INTERVAL
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
     pub key: PipelineKey,
     pub vs_spirv: Vec<u32>,
@@ -117,6 +120,66 @@ pub struct PipelineSpec {
 struct SpecFile {
     version: u32,
     specs: Vec<PipelineSpec>,
+}
+
+#[derive(serde::Serialize)]
+struct BorrowedSpecFile<'a> {
+    version: u32,
+    specs: Vec<&'a PipelineSpec>,
+}
+
+struct LimitedSpecWriter<W> {
+    writer: W,
+    remaining: u64,
+}
+
+impl<W: Write> Write for LimitedSpecWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(std::io::Error::other("shader specs cache size limit"));
+        }
+        let written = self.writer.write(bytes)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+fn write_spec_snapshot(path: &std::path::Path, specs: &[Arc<PipelineSpec>]) {
+    let file = BorrowedSpecFile {
+        version: SPEC_VERSION,
+        specs: specs.iter().map(Arc::as_ref).collect(),
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("specs.tmp");
+    let output = match std::fs::File::create(&tmp) {
+        Ok(output) => output,
+        Err(error) => {
+            log::warn!("shader specs temp create failed: {:?}", error);
+            return;
+        }
+    };
+    let mut writer = LimitedSpecWriter {
+        writer: std::io::BufWriter::new(output),
+        remaining: MAX_SPEC_CACHE_BYTES,
+    };
+    let serialized = postcard::to_io(&file, &mut writer);
+    if serialized.is_err() || writer.flush().is_err() {
+        log::warn!("shader specs save failed or exceeded {} bytes; preserving previous cache", MAX_SPEC_CACHE_BYTES);
+        drop(writer);
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    let bytes = MAX_SPEC_CACHE_BYTES - writer.remaining;
+    drop(writer);
+    if std::fs::rename(&tmp, path).is_ok() {
+        log::info!("shader specs saved ({} bytes)", bytes);
+    }
 }
 
 fn specs_path(device_tag: &str) -> Option<PathBuf> {
@@ -655,10 +718,10 @@ pub struct PipelineCache {
     worker: Option<CompileWorker>,
     failed: HashSet<PipelineKey>,
     cache_lock: std::sync::Arc<std::sync::RwLock<()>>,
-    specs: HashMap<PipelineKey, PipelineSpec>,
+    specs: HashMap<PipelineKey, Arc<PipelineSpec>>,
     specs_dirty: bool,
     specs_saved_count: usize,
-    specs_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    specs_tx: Option<std::sync::mpsc::SyncSender<Vec<Arc<PipelineSpec>>>>,
 }
 
 impl PipelineCache {
@@ -734,11 +797,11 @@ impl PipelineCache {
             .ok();
 
         let specs_disk_path = specs_path(device_tag);
-        let specs: HashMap<PipelineKey, PipelineSpec> = specs_disk_path
+        let specs: HashMap<PipelineKey, Arc<PipelineSpec>> = specs_disk_path
             .as_ref()
             .and_then(|p| {
                 let meta = std::fs::metadata(p).ok()?;
-                if meta.len() > 512 * 1024 * 1024 {
+                if meta.len() > MAX_SPEC_CACHE_BYTES {
                     log::warn!(
                         "shader specs file too large ({} bytes), ignoring",
                         meta.len()
@@ -768,27 +831,19 @@ impl PipelineCache {
                     None
                 }
             })
-            .map(|f| f.specs.into_iter().map(|s| (s.key, s)).collect())
+            .map(|f| f.specs.into_iter().map(|s| (s.key, Arc::new(s))).collect())
             .unwrap_or_default();
         let specs_count = specs.len();
         log::info!("shader specs loaded: {}", specs_count);
 
-        let (specs_tx, specs_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (specs_tx, specs_rx) = std::sync::mpsc::sync_channel::<Vec<Arc<PipelineSpec>>>(1);
         let specs_writer_path = specs_disk_path.clone();
         std::thread::Builder::new()
             .name("nexium-speccache".to_string())
             .spawn(move || {
-                while let Ok(data) = specs_rx.recv() {
-                    let Some(path) = specs_writer_path.as_ref() else {
-                        continue;
-                    };
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let tmp = path.with_extension("specs.tmp");
-                    if std::fs::write(&tmp, &data).is_ok() {
-                        let _ = std::fs::rename(&tmp, path);
-                        log::info!("shader specs saved ({} bytes)", data.len());
+                while let Ok(specs) = specs_rx.recv() {
+                    if let Some(path) = specs_writer_path.as_ref() {
+                        write_spec_snapshot(path, &specs);
                     }
                 }
             })
@@ -879,7 +934,7 @@ impl PipelineCache {
     }
 
     pub fn register_spec(&mut self, spec: PipelineSpec) {
-        if self.specs.insert(spec.key, spec).is_none() {
+        if self.specs.insert(spec.key, Arc::new(spec)).is_none() {
             self.specs_dirty = true;
             self.last_change = std::time::Instant::now();
         }
@@ -904,24 +959,19 @@ impl PipelineCache {
     }
 
     pub fn prewarm_specs(&self) -> Vec<PipelineSpec> {
-        self.specs.values().cloned().collect()
+        self.specs.values().map(|spec| spec.as_ref().clone()).collect()
     }
 
     fn save_specs(&mut self) {
         if !self.specs_dirty || self.specs.len() == self.specs_saved_count {
             return;
         }
-        let file = SpecFile {
-            version: SPEC_VERSION,
-            specs: self.specs.values().cloned().collect(),
-        };
-        if let Ok(bytes) = postcard::to_allocvec(&file) {
+        let Some(tx) = &self.specs_tx else { return; };
+        let snapshot = self.specs.values().cloned().collect();
+        if tx.try_send(snapshot).is_ok() {
             self.specs_saved_count = self.specs.len();
-            if let Some(tx) = &self.specs_tx {
-                let _ = tx.send(bytes);
-            }
+            self.specs_dirty = false;
         }
-        self.specs_dirty = false;
     }
 
     fn integrate_completed(&mut self, device: &ash::Device, key: PipelineKey, pipe: vk::Pipeline) {
@@ -1182,6 +1232,40 @@ mod tests {
         cache_save_due, known_driver_hostile_pipeline, CurrentPipeline, PipelineKey,
         CACHE_SAVE_IDLE_INTERVAL,
     };
+
+    #[test]
+    fn streamed_spec_snapshot_preserves_disk_format() {
+        let spec = super::PipelineSpec {
+            vs_spirv: vec![0x07230203, 0x00010000, 0, u32::MAX],
+            fs_spirv: vec![7, 3, 1],
+            bindings: vec![(0, 16, 1)],
+            attrs: vec![(0, 0, 109, 4)],
+            ..Default::default()
+        };
+        let borrowed = super::BorrowedSpecFile {
+            version: super::SPEC_VERSION,
+            specs: vec![&spec],
+        };
+        let mut streamed = Vec::new();
+        postcard::to_io(&borrowed, &mut streamed).unwrap();
+        let file = super::SpecFile { version: super::SPEC_VERSION, specs: vec![spec] };
+        assert_eq!(streamed, postcard::to_allocvec(&file).unwrap());
+        let decoded: super::SpecFile = postcard::from_bytes(&streamed).unwrap();
+        assert_eq!(decoded.specs[0].vs_spirv, file.specs[0].vs_spirv);
+        assert_eq!(decoded.specs[0].attrs, file.specs[0].attrs);
+    }
+
+    #[test]
+    fn spec_writer_never_exceeds_reader_size_limit() {
+        use std::io::Write;
+        let mut writer = super::LimitedSpecWriter { writer: Vec::new(), remaining: 5 };
+        writer.write_all(&[1, 2, 3]).unwrap();
+        assert!(writer.write_all(&[4, 5, 6]).is_err());
+        assert_eq!(writer.writer, [1, 2, 3]);
+        writer.write_all(&[4, 5]).unwrap();
+        assert!(writer.write_all(&[6]).is_err());
+        assert_eq!(writer.writer.len(), 5);
+    }
 
     #[test]
     fn current_pipeline_requires_exact_key_and_resets() {
