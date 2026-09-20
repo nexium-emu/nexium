@@ -11182,7 +11182,7 @@ impl Renderer {
                 .map_err(|e| format!("begin_command_buffer(batch): {:?}", e))?;
         }
         let mut post_submit_texture_probes = Vec::with_capacity(group_preps.len());
-        let mut color_sync_checked = Vec::<RtKey>::new();
+        let mut color_sync_checked = Vec::<(RtKey, vk::Format)>::new();
         let mut descriptor_ssbo_infos =
             Vec::<vk::DescriptorBufferInfo>::with_capacity(crate::descriptor::MAX_SSBO as usize);
         let mut descriptor_ssbo_bindings =
@@ -11315,7 +11315,7 @@ impl Renderer {
             let mut pass_dirty = vec![false; color_bind.len()];
             let mut pass_trace_calls: Vec<&crate::draw::Maxwell3dDrawCall> = Vec::new();
             let mut had_pass = false;
-            let mut group_color_sync_clean = Vec::<RtKey>::new();
+            let mut group_color_sync_clean = Vec::<(RtKey, vk::Format)>::new();
             let mut recorded_texture_memo_epoch = None;
             for (draw_index, (call, prep)) in preps.iter().enumerate() {
                 let call = *call;
@@ -11751,12 +11751,16 @@ impl Renderer {
                                     );
                                 }
                             }
-                            let color_sync_known_clean = group_color_sync_clean.contains(&sk)
-                                || color_sync_checked.contains(&sk);
+                            let sampled_format = pending.map_or(vk::Format::UNDEFINED, |(_, tic, _, _)| {
+                                rt_alias_view_format(sk, tic, vk::Format::UNDEFINED)
+                            });
+                            let sync_key = (sk, sampled_format);
+                            let color_sync_known_clean = group_color_sync_clean.contains(&sync_key)
+                                || color_sync_checked.contains(&sync_key);
                             let color_needs_sync = if color_sync_known_clean {
                                 false
                             } else {
-                                sampled_color_needs_sync(rt_cache, sk)
+                                sampled_color_needs_sync(rt_cache, sk, sampled_format)
                             };
                             let mut pass_finished = false;
                             if pass_open
@@ -11800,6 +11804,7 @@ impl Renderer {
                                     rt_cache,
                                     &mut frame_slots[cur_idx],
                                     sk,
+                                    sampled_format,
                                 )?
                             } else {
                                 false
@@ -11826,11 +11831,11 @@ impl Renderer {
                                 }
                             }
                             if color_sync_clean_across_group(sk, &color_keys, &color_formats) {
-                                if !group_color_sync_clean.contains(&sk) {
-                                    group_color_sync_clean.push(sk);
+                                if !group_color_sync_clean.contains(&sync_key) {
+                                    group_color_sync_clean.push(sync_key);
                                 }
-                            } else if !color_sync_checked.contains(&sk) {
-                                color_sync_checked.push(sk);
+                            } else if !color_sync_checked.contains(&sync_key) {
+                                color_sync_checked.push(sync_key);
                             }
                             if let Some(alias) = depth_self_read_only {
                                 if let Some(alias_slot) = rt_aliases.get_mut(slot) {
@@ -24048,12 +24053,12 @@ fn snapshot_feedback_alias(
     Ok((snap_image, snap_view, snap_format))
 }
 
-fn sampled_color_needs_sync(rt_cache: &RtCache, key: RtKey) -> bool {
+fn sampled_color_needs_sync(rt_cache: &RtCache, key: RtKey, format: vk::Format) -> bool {
     if rt_texture_options().no_alias_sync {
         return false;
     }
     color_alias_sync_pair(rt_cache, key).is_some()
-        || color_region_sync_pair(rt_cache, key).is_some()
+        || color_region_sync_pair(rt_cache, key, format).is_some()
 }
 
 fn preflight_configured_color_rts<F>(
@@ -24158,9 +24163,9 @@ where
         rt_cache.mark_guest_uploaded(key);
         trace_configured_rt_preflight(key, target.format, "uploaded");
     }
-    for (key, _) in prepared {
+    for (key, format) in prepared {
         sync_sampled_color_alias(device, cmd, rt_cache, mem_props, frame_slot, key)?;
-        sync_sampled_color_region(device, cmd, rt_cache, frame_slot, key)?;
+        sync_sampled_color_region(device, cmd, rt_cache, frame_slot, key, format)?;
     }
     Ok(())
 }
@@ -24277,7 +24282,11 @@ fn color_alias_sync_pair(rt_cache: &RtCache, key: RtKey) -> Option<ColorAliasSyn
     best
 }
 
-fn color_region_sync_pair(rt_cache: &RtCache, key: RtKey) -> Option<ColorRegionSync> {
+fn color_region_sync_pair(
+    rt_cache: &RtCache,
+    key: RtKey,
+    format: vk::Format,
+) -> Option<ColorRegionSync> {
     let options = rt_texture_options();
     if options.no_region_sync || !color_sync_supports_key(key) {
         return None;
@@ -24293,13 +24302,11 @@ fn color_region_sync_pair(rt_cache: &RtCache, key: RtKey) -> Option<ColorRegionS
     if !color_sync_supports_key(region.key) || region.layout == vk::ImageLayout::UNDEFINED {
         return None;
     }
-    let (dst_format, dst_stamp) = rt_cache
+    let cached = rt_cache
         .color_exact_with_format(key)
-        .map(|(_, _, _, _, format, stamp)| (format, stamp))
-        .unwrap_or((region.format, 0));
-    if region.stamp <= dst_stamp || !rt_formats_compatible(region.format, dst_format) {
-        return None;
-    }
+        .map(|(_, _, _, _, format, stamp)| (format, stamp));
+    let (dst_format, dst_stamp) =
+        color_region_sync_destination(format, region.format, region.stamp, cached)?;
     Some(ColorRegionSync {
         src_key: region.key,
         src_image: region.image,
@@ -24311,6 +24318,22 @@ fn color_region_sync_pair(rt_cache: &RtCache, key: RtKey) -> Option<ColorRegionS
         src_x: region.src_x,
         src_y: region.src_y,
     })
+}
+
+fn color_region_sync_destination(
+    requested: vk::Format,
+    source: vk::Format,
+    source_stamp: u64,
+    cached: Option<(vk::Format, u64)>,
+) -> Option<(vk::Format, u64)> {
+    let (cached_format, cached_stamp) = cached.unwrap_or((source, 0));
+    let format = if requested == vk::Format::UNDEFINED {
+        cached_format
+    } else {
+        requested
+    };
+    (source_stamp > cached_stamp && rt_formats_compatible(source, format))
+        .then_some((format, cached_stamp))
 }
 
 fn rt_alias_formats_syncable(src: vk::Format, dst: vk::Format) -> bool {
@@ -24589,12 +24612,13 @@ fn sync_sampled_color_region(
     rt_cache: &mut RtCache,
     frame_slot: &mut FrameSlot,
     key: RtKey,
+    format: vk::Format,
 ) -> Result<bool, String> {
     let options = rt_texture_options();
     if options.no_alias_sync {
         return Ok(false);
     }
-    let Some(sync) = color_region_sync_pair(rt_cache, key) else {
+    let Some(sync) = color_region_sync_pair(rt_cache, key, format) else {
         return Ok(false);
     };
     let (dst_image, dst_prev, dst_format) = {
@@ -33218,6 +33242,37 @@ mod tests {
         assert_eq!(key.gpu_va, 0x1234_5000);
         assert_eq!((key.width, key.height, key.depth), (640, 480, 1));
         assert!(!key.is_3d);
+    }
+
+    #[test]
+    fn sampled_region_format_replaces_older_incompatible_backing() {
+        let old = Some((vk::Format::R16_UNORM, 10));
+        assert_eq!(
+            super::color_region_sync_destination(vk::Format::R8_UNORM, vk::Format::R8_UNORM, 11, old),
+            Some((vk::Format::R8_UNORM, 10)),
+        );
+        assert_eq!(
+            super::color_region_sync_destination(vk::Format::R16_UNORM, vk::Format::R8_UNORM, 11, old),
+            None,
+        );
+        for stamp in [9, 10] {
+            assert_eq!(
+                super::color_region_sync_destination(vk::Format::R8_UNORM, vk::Format::R8_UNORM, stamp, old),
+                None,
+            );
+        }
+        assert_eq!(
+            super::color_region_sync_destination(vk::Format::R8_UINT, vk::Format::R8_UNORM, 11, old),
+            Some((vk::Format::R8_UINT, 10)),
+        );
+        assert_eq!(
+            super::color_region_sync_destination(vk::Format::UNDEFINED, vk::Format::R8_UNORM, 11, old),
+            None,
+        );
+        assert_eq!(
+            super::color_region_sync_destination(vk::Format::R16_UNORM, vk::Format::R8_UNORM, 11, None),
+            None,
+        );
     }
 
     #[test]
