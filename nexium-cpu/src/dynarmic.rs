@@ -37,7 +37,7 @@ impl DynarmicCpu {
             || nexium_memory::fastmem::direct_va_base().is_some()
             || ((std::env::var("NEXIUM_WATCH_WRITE_CPU").is_ok()
                 || std::env::var("NEXIUM_WATCH_WRITE_GPU").is_ok())
-                && !env_flag("NEXIUM_WATCH_PAGE_PROTECT")
+                && !watch_page_protect_enabled()
                 && !env_flag("NEXIUM_WATCH_INLINE"));
         let emu: dynarmic_sys::Dynarmic<'static, ()> =
             match (nexium_memory::fastmem::base(), force_no_fastmem) {
@@ -124,7 +124,7 @@ impl DynarmicCpu {
         let fault_for_unmapped = last_fault.clone();
         let continue_flag = continue_on_null.clone();
         let skip_counter = null_skip_count.clone();
-        let watch_write_callbacks = env_flag("NEXIUM_WATCH_PAGE_PROTECT");
+        let watch_write_callbacks = watch_page_protect_enabled();
         emu.set_unmapped_mem_callback(move |dyn_, addr, size, value| {
             if let Some((lo, hi)) = nexium_memory::fastmem::watch_range() {
                 if addr >= lo && addr < hi {
@@ -566,7 +566,7 @@ impl DynarmicCpu {
     }
 
     fn apply_watch_range(&self) {
-        let page_protect = env_flag("NEXIUM_WATCH_PAGE_PROTECT");
+        let page_protect = watch_page_protect_enabled();
         let desired = if page_protect {
             nexium_memory::fastmem::watch_range()
         } else {
@@ -609,8 +609,53 @@ impl DynarmicCpu {
     }
 }
 
+struct CpuEnvMemo {
+    watch_arm_delay_ms: Option<u64>,
+    watch_page_protect: bool,
+    pc_until_target: Option<(u64, String)>,
+}
+
+fn cpu_env_memo_enabled_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn cpu_env_memo() -> Option<&'static CpuEnvMemo> {
+    static SETTINGS: std::sync::OnceLock<Option<CpuEnvMemo>> = std::sync::OnceLock::new();
+    SETTINGS
+        .get_or_init(|| {
+            cpu_env_memo_enabled_value(std::env::var("NEXIUM_CPU_ENV_MEMO").ok().as_deref())
+                .then(|| {
+                    let settings = CpuEnvMemo {
+                        watch_arm_delay_ms: read_watch_arm_delay_ms(),
+                        watch_page_protect: env_flag("NEXIUM_WATCH_PAGE_PROTECT"),
+                        pc_until_target: read_pc_until_target(),
+                    };
+                    log::info!("dynarmic: startup environment memo enabled");
+                    settings
+                })
+        })
+        .as_ref()
+}
+
+fn watch_page_protect_enabled() -> bool {
+    cpu_env_memo()
+        .map(|settings| settings.watch_page_protect)
+        .unwrap_or_else(|| env_flag("NEXIUM_WATCH_PAGE_PROTECT"))
+}
+
 fn pc_until_target() -> Option<(u64, String)> {
+    if let Some(settings) = cpu_env_memo() {
+        return settings.pc_until_target.clone();
+    }
+    read_pc_until_target()
+}
+
+fn read_pc_until_target() -> Option<(u64, String)> {
     let spec = std::env::var("NEXIUM_PC_UNTIL").ok()?;
+    parse_pc_until_target(&spec)
+}
+
+fn parse_pc_until_target(spec: &str) -> Option<(u64, String)> {
     let item = spec.split(',').next()?.trim();
     if item.is_empty() {
         return None;
@@ -834,8 +879,11 @@ fn perm_to_dyn(p: Perm) -> u32 {
 }
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
+    env_flag_value(std::env::var(name).ok().as_deref())
+}
+
+fn env_flag_value(value: Option<&str>) -> bool {
+    value
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
 }
@@ -921,9 +969,18 @@ fn delayed_cpu_watch() -> Option<(u64, u64)> {
 }
 
 fn watch_arm_delay_ms() -> Option<u64> {
-    std::env::var("NEXIUM_WATCH_ARM_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+    if let Some(settings) = cpu_env_memo() {
+        return settings.watch_arm_delay_ms;
+    }
+    read_watch_arm_delay_ms()
+}
+
+fn read_watch_arm_delay_ms() -> Option<u64> {
+    parse_watch_arm_delay_ms(std::env::var("NEXIUM_WATCH_ARM_DELAY_MS").ok().as_deref())
+}
+
+fn parse_watch_arm_delay_ms(value: Option<&str>) -> Option<u64> {
+    value.and_then(|v| v.parse::<u64>().ok())
 }
 
 fn parse_pc_until_u64(s: &str) -> Option<u64> {
@@ -1015,11 +1072,61 @@ fn watch_value_ne(size: usize, value: u64, filter: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_profile_due, dynarmic_fast_paths_default, DynarmicCpu};
+    use super::{
+        cache_profile_due, cpu_env_memo_enabled_value, dynarmic_fast_paths_default, env_flag_value,
+        parse_pc_until_target, parse_watch_arm_delay_ms, DynarmicCpu,
+    };
     use crate::CpuEvent;
     use nexium_memory::{AddressSpace, Perm};
     use std::ffi::OsStr;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn cpu_environment_memo_requires_exact_opt_in() {
+        for value in [None, Some(""), Some("0"), Some("true"), Some("false"), Some(" 1"), Some("1 ")] {
+            assert!(!cpu_env_memo_enabled_value(value), "{value:?}");
+        }
+        assert!(cpu_env_memo_enabled_value(Some("1")));
+    }
+
+    #[test]
+    fn watch_page_flag_preserves_empty_and_untrimmed_values() {
+        for (value, expected) in [
+            (None, false), (Some(""), true), (Some("0"), false),
+            (Some("false"), false), (Some("FaLsE"), false), (Some("1"), true),
+            (Some("off"), true), (Some(" 0"), true), (Some("false "), true),
+        ] {
+            assert_eq!(env_flag_value(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn watch_arm_delay_preserves_decimal_only_and_no_trimming() {
+        for (value, expected) in [
+            (None, None), (Some(""), None), (Some("0"), Some(0)),
+            (Some("+12"), Some(12)), (Some("0012"), Some(12)),
+            (Some(" 12"), None), (Some("12 "), None), (Some("-1"), None),
+            (Some("0x10"), None), (Some("18446744073709551615"), Some(u64::MAX)),
+            (Some("18446744073709551616"), None),
+        ] {
+            assert_eq!(parse_watch_arm_delay_ms(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn pc_until_target_preserves_first_item_last_colon_and_numeric_fallback() {
+        for (value, expected) in [
+            ("", None), (" ,second:7", None), ("broken:not-hex", None),
+            ("0", Some((0, "0"))), (" 123 ", Some((123, "123"))),
+            (" 0Xff ", Some((255, "0Xff"))), ("deadBEEF", Some((0xdead_beef, "deadBEEF"))),
+            ("first:16,second:32", Some((16, "first"))),
+            (" video:decode : 0x40 ,ignored", Some((64, "video:decode"))),
+            (": 0x20", Some((32, ""))), ("limit:0xffffffffffffffff", Some((u64::MAX, "limit"))),
+            ("bad:0x10000000000000000", None),
+        ] {
+            assert_eq!(parse_pc_until_target(value), expected.map(|(pc, label)| (pc, label.to_string())), "{value:?}");
+        }
+    }
 
     #[test]
     fn dynarmic_fast_paths_default_on_preserves_explicit_rollback() {
