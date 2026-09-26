@@ -4772,13 +4772,23 @@ impl Nvdrv {
                 if state.initialized {
                     return IoctlOutcome::error(0x8);
                 }
+                let supported_range = (va_start == 0 && va_end == 0 && va_split == 0)
+                    || (va_start == 0x0400_0000
+                        && va_end == 1u64 << 37
+                        && va_split == 1u64 << 34);
                 if !state.allocations.is_empty()
-                    || va_start != 0
-                    || va_end != 0
-                    || va_split != 0
+                    || !supported_range
                     || (big_page_size != 0
                         && (!big_page_size.is_power_of_two() || (big_page_size & 0x30000) == 0))
                 {
+                    log::warn!(
+                        "nvhost-as-gpu:AllocAsEx rejected big_page_size={:#x} va_start={:#x} va_end={:#x} va_split={:#x} allocations={}",
+                        big_page_size,
+                        va_start,
+                        va_end,
+                        va_split,
+                        state.allocations.len(),
+                    );
                     return IoctlOutcome::error(0xB);
                 }
                 if big_page_size != 0 {
@@ -8316,6 +8326,32 @@ mod tests {
         );
         assert!(nvdrv.gpu.alloc_va_fixed_exclusive(target, 0x10000));
         assert!(nvdrv.gpu.free_va(target, 0x10000));
+    }
+
+    #[test]
+    fn alloc_as_ex_accepts_explicit_default_range() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let mut input = vec![0u8; 40];
+        input[8..12].copy_from_slice(&0x10000u32.to_le_bytes());
+        input[16..24].copy_from_slice(&0x0400_0000u64.to_le_bytes());
+        input[24..32].copy_from_slice(&(1u64 << 37).to_le_bytes());
+        input[32..40].copy_from_slice(&(1u64 << 34).to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4028_4109, input, 0))
+                .result,
+            0
+        );
+        assert!(nvdrv.as_gpu_states[&fd].initialized);
+        let regions = nvdrv.dispatch_ioctl(request(fd, 0xc040_4108, vec![0; 64], 64));
+        assert_eq!(regions.result, 0);
+        let region_u64 = |offset: usize| {
+            u64::from_le_bytes(regions.data[offset..offset + 8].try_into().unwrap())
+        };
+        assert_eq!(region_u64(16), 0x0400_0000);
+        assert_eq!(region_u64(40), 1u64 << 34);
+        assert_eq!(region_u64(40) + region_u64(56) * 0x10000, 1u64 << 37);
     }
 
     #[test]
