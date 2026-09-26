@@ -517,6 +517,8 @@ pub struct RtCache {
     present_flip_y: HashMap<RtKey, bool>,
     drawn_counter: u64,
     structure_generation: u64,
+    color_sampling_generation: u64,
+    color_sampling_versions: Option<HashMap<u32, u64>>,
     frame_draws: HashMap<RtKey, u32>,
     frame_real_draws: HashMap<RtKey, u32>,
     depth_frame_draws: HashMap<RtKey, u32>,
@@ -807,6 +809,8 @@ impl RtCache {
             present_flip_y: HashMap::default(),
             drawn_counter: 0,
             structure_generation: 0,
+            color_sampling_generation: 0,
+            color_sampling_versions: (cfg!(test) || crate::texture_mips::resolved_rt_mip_memo_enabled()).then(HashMap::default),
             frame_draws: HashMap::default(),
             frame_real_draws: HashMap::default(),
             depth_frame_draws: HashMap::default(),
@@ -967,6 +971,7 @@ impl RtCache {
     }
 
     fn insert_color_image(&mut self, key: RtKey, image: GpuImage) {
+        self.note_color_sampling_changed(key.nvmap_id);
         self.structure_generation = self.structure_generation.wrapping_add(1);
         let format = image.format;
         debug_assert!(!self.cache.contains_key(&key));
@@ -989,6 +994,7 @@ impl RtCache {
     }
 
     fn rekey_color_state(&mut self, stored: RtKey, key: RtKey) -> bool {
+        self.note_color_sampling_changed(key.nvmap_id);
         if stored != key {
             return false;
         }
@@ -1127,6 +1133,7 @@ impl RtCache {
     }
 
     fn remove_color_image(&mut self, key: RtKey) -> Option<(RtKey, GpuImage)> {
+        self.note_color_sampling_changed(key.nvmap_id);
         self.structure_generation = self.structure_generation.wrapping_add(1);
         let indexed_key = self
             .color_guest_range_index
@@ -1359,6 +1366,7 @@ impl RtCache {
     }
 
     pub fn mark_drawn(&mut self, key: RtKey) -> u64 {
+        self.note_color_sampling_changed(key.nvmap_id);
         self.clear_stamp.remove(&key);
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
@@ -1393,6 +1401,7 @@ impl RtCache {
     }
 
     pub fn mark_synced_sample(&mut self, key: RtKey) -> u64 {
+        self.note_color_sampling_changed(key.nvmap_id);
         self.clear_stamp.remove(&key);
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
@@ -1402,6 +1411,7 @@ impl RtCache {
     }
 
     pub fn mark_synced_sample_from(&mut self, key: RtKey, source_stamp: u64) -> u64 {
+        self.note_color_sampling_changed(key.nvmap_id);
         debug_assert_ne!(source_stamp, 0);
         self.clear_stamp.remove(&key);
         self.drawn_counter = self.drawn_counter.max(source_stamp);
@@ -1412,6 +1422,7 @@ impl RtCache {
     }
 
     pub fn mark_guest_uploaded(&mut self, key: RtKey) {
+        self.note_color_sampling_changed(key.nvmap_id);
         let canonical = self
             .cache
             .get_key_value(&key)
@@ -1426,6 +1437,7 @@ impl RtCache {
     }
 
     pub fn mark_guest_written(&mut self, key: RtKey) {
+        self.note_color_sampling_changed(key.nvmap_id);
         let stale: Vec<_> = self
             .cache
             .keys()
@@ -1453,6 +1465,7 @@ impl RtCache {
     }
 
     pub fn mark_all_guest_written(&mut self) {
+        self.color_sampling_generation = self.color_sampling_generation.wrapping_add(1);
         let stale_color = self.cache.keys().copied().collect::<Vec<_>>();
         for key in stale_color {
             self.drawn_stamp.remove(&key);
@@ -1497,6 +1510,7 @@ impl RtCache {
         let (stale_color, stale_depth) =
             self.guest_range_hits_memoized(cpu_addr, cpu_end, gpu_ranges);
         for stale_key in stale_color {
+            self.note_color_sampling_changed(stale_key.nvmap_id);
             self.drawn_stamp.remove(&stale_key);
             self.clear_stamp.remove(&stale_key);
             self.guest_stale_color.insert(stale_key);
@@ -1512,6 +1526,21 @@ impl RtCache {
 
     pub fn color_is_guest_stale(&self, key: RtKey) -> bool {
         self.guest_stale_color.contains(&key)
+    }
+
+    fn note_color_sampling_changed(&mut self, nvmap_id: u32) {
+        let Some(versions) = self.color_sampling_versions.as_mut() else { return; };
+        if versions.len() >= 4096 && !versions.contains_key(&nvmap_id) {
+            versions.clear();
+            self.color_sampling_generation = self.color_sampling_generation.wrapping_add(1);
+        }
+        let version = versions.entry(nvmap_id).or_default();
+        *version = version.wrapping_add(1);
+    }
+
+    pub(crate) fn color_sampling_generation(&self, nvmap_id: u32) -> (u64, u64) {
+        (self.color_sampling_generation, self.color_sampling_versions.as_ref()
+            .and_then(|versions| versions.get(&nvmap_id)).copied().unwrap_or(0))
     }
 
     pub fn structure_generation(&self) -> u64 {
@@ -1615,6 +1644,7 @@ impl RtCache {
     }
 
     pub fn mark_cleared(&mut self, key: RtKey, full_target: bool) {
+        self.note_color_sampling_changed(key.nvmap_id);
         self.drawn_counter += 1;
         self.clear_stamp.insert(key, self.drawn_counter);
         if full_target {
@@ -2065,6 +2095,7 @@ impl RtCache {
         key: RtKey,
         device: &ash::Device,
     ) -> Result<&mut GpuImage, String> {
+        self.note_color_sampling_changed(key.nvmap_id);
         if self.cache.contains_key(&key) {
             return Ok(self.cache.get_mut(&key).unwrap());
         }
@@ -2072,6 +2103,7 @@ impl RtCache {
     }
 
     pub fn get_existing(&mut self, key: RtKey) -> Option<&mut GpuImage> {
+        self.note_color_sampling_changed(key.nvmap_id);
         self.cache.get_mut(&key)
     }
 
@@ -2367,6 +2399,7 @@ impl RtCache {
         device: &ash::Device,
         format: vk::Format,
     ) -> Result<&mut GpuImage, String> {
+        self.note_color_sampling_changed(key.nvmap_id);
         if let Some(image) = self.get_or_create_color_image(key, device, format)? {
             destroy_gpu_image(device, image);
         }
@@ -2380,6 +2413,7 @@ impl RtCache {
         format: vk::Format,
         retired: &mut Vec<GpuImage>,
     ) -> Result<&mut GpuImage, String> {
+        self.note_color_sampling_changed(key.nvmap_id);
         if let Some(image) = self.get_or_create_color_image(key, device, format)? {
             retired.push(image);
         }
@@ -3430,7 +3464,9 @@ impl RtCache {
 
     pub fn set_color_layout(&mut self, key: RtKey, layout: vk::ImageLayout) {
         if let Some(img) = self.cache.get_mut(&key) {
+            let changed = img.layout != layout;
             img.layout = layout;
+            if changed { self.note_color_sampling_changed(key.nvmap_id); }
         }
     }
 
@@ -3593,6 +3629,7 @@ impl RtCache {
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
+        self.color_sampling_generation = self.color_sampling_generation.wrapping_add(1);
         if let Some(pipeline) = self.depth_pack_pipeline.take() {
             pipeline.destroy(device);
         }

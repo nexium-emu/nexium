@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
-const BUNDLE_VERSION: u32 = 70;
+const BUNDLE_VERSION: u32 = 76;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -115,11 +115,9 @@ pub struct BundleStore {
 }
 
 fn bundles_path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
     let title = nexium_common::title::title_key().unwrap_or_else(|| "default".to_string());
     Some(
-        PathBuf::from(base)
-            .join("NeXium")
+        nexium_common::paths::root()
             .join("shader_cache")
             .join(format!("{}.bundles", title)),
     )

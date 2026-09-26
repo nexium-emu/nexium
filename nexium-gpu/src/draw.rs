@@ -168,6 +168,20 @@ pub struct StorageBufferSnapshot {
     pub logical_size: usize,
     pub data_offset: usize,
     pub data: std::sync::Arc<Vec<u8>>,
+    pub readonly_noalias: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphicsStorageReadback {
+    pub binding: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphicsStorageReadbackRequest {
+    pub bindings: Vec<u32>,
+    pub aliases: Vec<(u32, u32)>,
+    pub sender: std::sync::mpsc::Sender<Result<Vec<GraphicsStorageReadback>, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -662,6 +676,7 @@ pub struct Maxwell3dDrawCall {
     pub poly_offset_units: f32,
     pub poly_offset_factor: f32,
     pub ssbo_data: Vec<StorageBufferSnapshot>,
+    pub storage_readback: Option<GraphicsStorageReadbackRequest>,
     pub present_flip_y: bool,
 }
 
@@ -905,6 +920,7 @@ mod tests {
             logical_size: 4,
             data_offset: 0,
             data: std::sync::Arc::new(vec![1, 2, 3, 4]),
+            readonly_noalias: false,
         };
         let cloned = snapshot.clone();
 

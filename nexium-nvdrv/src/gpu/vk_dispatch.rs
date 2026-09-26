@@ -475,6 +475,426 @@ fn collect_graphics_cbuf_reads(
     reads
 }
 
+fn static_readonly_ssbo_mask(
+    descriptors: &[nexium_shader::StorageBufferAddr],
+    vs_cfg: &nexium_shader::Cfg,
+    fs_cfg: &nexium_shader::Cfg,
+) -> u8 {
+    let mut mask = 0u8;
+    for (index, descriptor) in descriptors.iter().enumerate().take(8) {
+        if descriptor.is_direct()
+            && !descriptor.has_dynamic_offset
+            && descriptor.required_size != 0
+        {
+            mask |= 1 << index;
+        }
+    }
+    for instruction in vs_cfg
+        .blocks
+        .iter()
+        .chain(&fs_cfg.blocks)
+        .flat_map(|block| &block.program.instructions)
+    {
+        match instruction.op {
+            nexium_shader::IrOp::StoreStorage { .. }
+            | nexium_shader::IrOp::StorageAtomic { .. }
+            | nexium_shader::IrOp::StoreGlobal { .. }
+            | nexium_shader::IrOp::GlobalAtomic { .. }
+            | nexium_shader::IrOp::ImageWrite { .. }
+            | nexium_shader::IrOp::ImageAtomic { .. } => return 0,
+            _ => {}
+        }
+    }
+    mask
+}
+
+#[derive(Clone, Copy, Default)]
+struct GraphicsSsboWrites {
+    mask: u8,
+    unknown: bool,
+}
+
+fn graphics_ssbo_writes(vs: &nexium_shader::Cfg, fs: &nexium_shader::Cfg) -> GraphicsSsboWrites {
+    let mut writes = GraphicsSsboWrites::default();
+    for instruction in vs.blocks.iter().chain(&fs.blocks).flat_map(|block| &block.program.instructions) {
+        match instruction.op {
+            nexium_shader::IrOp::StoreStorage { buffer_index, .. }
+            | nexium_shader::IrOp::StorageAtomic { buffer_index, .. } if buffer_index < 8 => {
+                writes.mask |= 1 << buffer_index;
+            }
+            nexium_shader::IrOp::StoreStorage { .. }
+            | nexium_shader::IrOp::StorageAtomic { .. }
+            | nexium_shader::IrOp::StoreGlobal { .. }
+            | nexium_shader::IrOp::GlobalAtomic { .. }
+            | nexium_shader::IrOp::ImageWrite { .. }
+            | nexium_shader::IrOp::ImageAtomic { .. } => writes.unknown = true,
+            _ => {}
+        }
+    }
+    writes
+}
+
+fn retained_ssbo_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| explicit_env_switch_value_enabled(std::env::var("NEXIUM_RETAINED_SSBO").ok().as_deref()))
+}
+
+fn graphics_ssbo_writeback_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_GRAPHICS_SSBO_WRITEBACK").is_ok_and(|value| value == "1")
+    })
+}
+
+fn graphics_ssbo_clobber_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_GRAPHICS_SSBO_CLOBBER_TRACE").is_ok_and(|value| value == "1")
+    })
+}
+
+#[derive(Clone, Copy)]
+struct GraphicsStorageWatch {
+    offset: usize,
+    len: usize,
+    limit: u64,
+}
+
+fn graphics_ssbo_watch() -> Option<GraphicsStorageWatch> {
+    static WATCH: OnceLock<Option<GraphicsStorageWatch>> = OnceLock::new();
+    *WATCH.get_or_init(|| {
+        let spec = std::env::var("NEXIUM_GRAPHICS_SSBO_WATCH").ok()?;
+        let parsed = (|| {
+            let (offset, len) = spec.trim().split_once(':')?;
+            let offset = usize::try_from(parse_env_u64(offset.trim())?).ok()?;
+            let len = usize::try_from(parse_env_u64(len.trim())?).ok()?;
+            offset.checked_add(len)?;
+            let limit = std::env::var("NEXIUM_GRAPHICS_SSBO_WATCH_LIMIT").ok()
+                .and_then(|value| parse_env_u64(value.trim())).unwrap_or(256);
+            (len != 0).then_some(GraphicsStorageWatch { offset, len, limit })
+        })();
+        if parsed.is_none() {
+            log::warn!("[graphics-ssbo-watch] invalid byte offset:length {spec:?}");
+        }
+        parsed
+    })
+}
+
+#[derive(Clone)]
+struct GraphicsStorageWritebackTarget {
+    binding: u32,
+    gpu_addr: u64,
+    cpu_addr: u64,
+    len: usize,
+    mapping_generation: u64,
+    mapping_epoch: u64,
+    trace_seed: Option<Arc<Vec<u8>>>,
+}
+
+const GRAPHICS_STORAGE_READBACK_ERROR: &str = "graphics storage readback:";
+
+fn graphics_storage_writeback_targets(
+    writes: GraphicsSsboWrites,
+    descriptors: &[nexium_shader::StorageBufferAddr],
+    resolved: &[Option<ResolvedStorageBufferDescriptor>],
+    snapshots: &[StorageBufferSnapshot],
+    snapshot_reads: &[(u64, usize, bool)],
+    mappings: &GpuMappings,
+) -> Result<Vec<GraphicsStorageWritebackTarget>, String> {
+    if !graphics_ssbo_writeback_enabled() || (writes.mask == 0 && !writes.unknown) {
+        return Ok(Vec::new());
+    }
+    let unsupported = |reason: String| format!("{GRAPHICS_STORAGE_READBACK_ERROR} {reason}");
+    if writes.unknown {
+        return Err(unsupported("unbounded global/image storage writer is unsupported".into()));
+    }
+    if descriptors.len() > 8 || descriptors.len() != snapshots.len()
+        || descriptors.len() != resolved.len()
+        || descriptors.len() != snapshot_reads.len()
+        || u16::from(writes.mask) >> descriptors.len() != 0
+    {
+        return Err(unsupported("writable binding metadata is incomplete".into()));
+    }
+    let mut spans = Vec::with_capacity(descriptors.len());
+    for (index, (&descriptor, &resolved)) in descriptors.iter().zip(resolved).enumerate() {
+        let span = resolved.and_then(|resolved| ssbo_alias_span(descriptor, resolved, mappings))
+            .ok_or_else(|| unsupported(format!("binding {index} has no complete declared alias bound")))?;
+        spans.push(span);
+    }
+    let mut targets = Vec::new();
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        if writes.mask & (1 << index) == 0 {
+            continue;
+        }
+        let resolved = resolved[index].ok_or_else(|| unsupported(format!("binding {index} is unresolved")))?;
+        let descriptor = descriptors[index];
+        let span = spans[index];
+        if descriptor.indirect.is_some() || resolved.descriptor_size < 16
+            || descriptor.required_size > resolved.descriptor_size
+            || snapshot.binding != index as u32
+            || snapshot.guest_addr != span.gpu_addr
+            || snapshot.data_offset != 0
+            || snapshot.logical_size != span.len
+            || snapshot.data.len() != span.len
+            || !snapshot_reads[index].2
+            || span.len == 0
+        {
+            return Err(unsupported(format!("binding {index} requires a complete, declared, direct storage payload")));
+        }
+        for (other, &other_span) in spans.iter().enumerate() {
+            if other == index || !span.overlaps(other_span) {
+                continue;
+            }
+            if span.gpu_addr != other_span.gpu_addr || span.cpu_addr != other_span.cpu_addr
+                || span.len != other_span.len
+            {
+                return Err(unsupported(format!(
+                    "non-identical storage alias: writer binding {index} gpu={:#x} cpu={:#x} len={:#x} overlaps binding {other} gpu={:#x} cpu={:#x} len={:#x}",
+                    span.gpu_addr, span.cpu_addr, span.len,
+                    other_span.gpu_addr, other_span.cpu_addr, other_span.len,
+                )));
+            }
+            let alias = &snapshots[other];
+            if !snapshot_reads[other].2 || alias.guest_addr != span.gpu_addr
+                || alias.data_offset != 0 || alias.logical_size != span.len
+                || alias.data.len() != span.len || alias.data.as_slice() != snapshot.data.as_slice()
+            {
+                return Err(unsupported(format!(
+                    "exact storage alias bindings {index}/{other} gpu={:#x} cpu={:#x} len={:#x} have incomplete or inconsistent seed bytes",
+                    span.gpu_addr, span.cpu_addr, span.len,
+                )));
+            }
+        }
+        let (cpu_addr, remaining) = mappings.cpu_range_for(span.gpu_addr)
+            .ok_or_else(|| unsupported(format!("binding {index} has no exact GPU mapping")))?;
+        let mapping_epoch = mappings.mapping_epoch_for(span.gpu_addr)
+            .ok_or_else(|| unsupported(format!("binding {index} has no mapping epoch")))?;
+        if cpu_addr != span.cpu_addr || remaining < span.len as u64
+            || span.gpu_addr.checked_add(span.len as u64).is_none()
+            || cpu_addr.checked_add(span.len as u64).is_none()
+        {
+            return Err(unsupported(format!("binding {index} write target exceeds its mapped span")));
+        }
+        targets.push(GraphicsStorageWritebackTarget {
+            binding: index as u32,
+            gpu_addr: span.gpu_addr,
+            cpu_addr,
+            len: span.len,
+            mapping_generation: mappings.generation(),
+            mapping_epoch,
+            trace_seed: (graphics_ssbo_clobber_trace_enabled() || graphics_ssbo_watch().is_some())
+                .then(|| Arc::clone(&snapshot.data)),
+        });
+    }
+    Ok(targets)
+}
+
+fn graphics_storage_writeback_aliases(
+    targets: &[GraphicsStorageWritebackTarget],
+    snapshots: &[StorageBufferSnapshot],
+) -> Vec<(u32, u32)> {
+    let mut aliases = Vec::new();
+    for snapshot in snapshots {
+        if !targets.iter().any(|target| {
+            target.gpu_addr == snapshot.guest_addr && target.len == snapshot.logical_size
+        }) {
+            continue;
+        }
+        let canonical = snapshots.iter()
+            .filter(|other| other.guest_addr == snapshot.guest_addr
+                && other.logical_size == snapshot.logical_size)
+            .map(|other| other.binding).min().unwrap();
+        if snapshot.binding != canonical {
+            aliases.push((snapshot.binding, canonical));
+        }
+    }
+    aliases
+}
+
+fn trace_graphics_storage_clobber(
+    target: &GraphicsStorageWritebackTarget,
+    result: &[u8],
+    vs: u64,
+    fs: u64,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) {
+    if !graphics_ssbo_clobber_trace_enabled() { return; }
+    let Some(seed) = target.trace_seed.as_ref() else { return };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BUFFERS: AtomicU64 = AtomicU64::new(0);
+    static READ_FAILURES: AtomicU64 = AtomicU64::new(0);
+    static DETAILS: AtomicU64 = AtomicU64::new(0);
+    static CPU_CHANGED: AtomicU64 = AtomicU64::new(0);
+    static GPU_CHANGED: AtomicU64 = AtomicU64::new(0);
+    static CPU_ONLY: AtomicU64 = AtomicU64::new(0);
+    static BOTH_CHANGED: AtomicU64 = AtomicU64::new(0);
+    static CONFLICTS: AtomicU64 = AtomicU64::new(0);
+    let buffer = BUFFERS.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut current = vec![0u8; target.len];
+    if seed.len() != target.len || result.len() != target.len
+        || !mem_read(target.cpu_addr, &mut current)
+    {
+        let failures = READ_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures <= 8 {
+            log::warn!("[graphics-ssbo-clobber] buffer={buffer} read_failed={failures} vs={vs:#x} fs={fs:#x} binding={} gpu={:#x} cpu={:#x} bytes={}", target.binding, target.gpu_addr, target.cpu_addr, target.len);
+        }
+        return;
+    }
+    let mut cpu_changed = 0u64;
+    let mut gpu_changed = 0u64;
+    let mut cpu_only = 0u64;
+    let mut both_changed = 0u64;
+    let mut conflicts = 0u64;
+    for ((&old, &now), &gpu) in seed.iter().zip(&current).zip(result) {
+        let cpu_diff = now != old;
+        let gpu_diff = gpu != old;
+        cpu_changed += u64::from(cpu_diff);
+        gpu_changed += u64::from(gpu_diff);
+        cpu_only += u64::from(cpu_diff && !gpu_diff);
+        both_changed += u64::from(cpu_diff && gpu_diff);
+        conflicts += u64::from(cpu_diff && now != gpu);
+    }
+    for (word, ((old, now), gpu)) in seed.chunks(4).zip(current.chunks(4)).zip(result.chunks(4)).enumerate() {
+        if old == now { continue; }
+        let detail = DETAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        if detail > 32 { break; }
+        let bits = |bytes: &[u8]| {
+            let mut word = [0u8; 4];
+            word[..bytes.len()].copy_from_slice(bytes);
+            u32::from_le_bytes(word)
+        };
+        let class = if gpu == old { "cpu_changed_gpu_unchanged" } else { "both_changed" };
+        log::warn!("[graphics-ssbo-clobber-diff] detail={detail} buffer={buffer} vs={vs:#x} fs={fs:#x} binding={} gpu={:#x} cpu={:#x} byte_offset={:#x} word_offset={:#x} word_bytes={} class={class} seed={:#010x} current={:#010x} result={:#010x} cpu_changed_bytes={cpu_changed} gpu_changed_bytes={gpu_changed} cpu_only_bytes={cpu_only} both_changed_bytes={both_changed} conflicting_bytes={conflicts}", target.binding, target.gpu_addr, target.cpu_addr, word * 4, word, old.len(), bits(old), bits(now), bits(gpu));
+    }
+    CPU_CHANGED.fetch_add(cpu_changed, Ordering::Relaxed);
+    GPU_CHANGED.fetch_add(gpu_changed, Ordering::Relaxed);
+    CPU_ONLY.fetch_add(cpu_only, Ordering::Relaxed);
+    BOTH_CHANGED.fetch_add(both_changed, Ordering::Relaxed);
+    CONFLICTS.fetch_add(conflicts, Ordering::Relaxed);
+    if buffer <= 8 || buffer % 1024 == 0 {
+        log::info!("[graphics-ssbo-clobber] buffers={buffer} vs={vs:#x} fs={fs:#x} read_failures={} cpu_changed_bytes={} gpu_changed_bytes={} cpu_changed_gpu_unchanged_bytes={} both_changed_bytes={} conflicting_bytes={}", READ_FAILURES.load(Ordering::Relaxed), CPU_CHANGED.load(Ordering::Relaxed), GPU_CHANGED.load(Ordering::Relaxed), CPU_ONLY.load(Ordering::Relaxed), BOTH_CHANGED.load(Ordering::Relaxed), CONFLICTS.load(Ordering::Relaxed));
+    }
+}
+
+fn trace_graphics_storage_watch(
+    target: &GraphicsStorageWritebackTarget,
+    result: &[u8],
+    vs: u64,
+    fs: u64,
+) {
+    let Some(watch) = graphics_ssbo_watch() else { return };
+    let Some(seed) = target.trace_seed.as_ref() else { return };
+    if seed.len() != target.len || result.len() != target.len || watch.offset >= target.len {
+        return;
+    }
+    let end = watch.offset.saturating_add(watch.len).min(target.len);
+    let changed_bytes = seed[watch.offset..end].iter().zip(&result[watch.offset..end])
+        .filter(|(old, new)| old != new).count();
+    static FIRST_OBSERVED: OnceLock<Mutex<std::collections::HashSet<(u64, u64, u32)>>> = OnceLock::new();
+    let first = FIRST_OBSERVED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock().map(|mut observed| {
+            observed.len() < 64 && observed.insert((vs, fs, target.binding))
+        }).unwrap_or(false);
+    if changed_bytes == 0 && !first { return; }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CHANGED_BUFFERS: AtomicU64 = AtomicU64::new(0);
+    let changed = if changed_bytes != 0 {
+        CHANGED_BUFFERS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        CHANGED_BUFFERS.load(Ordering::Relaxed)
+    };
+    if changed > watch.limit {
+        if changed_bytes != 0 && changed == watch.limit.saturating_add(1) {
+            log::info!("[graphics-ssbo-watch] changed-buffer log limit={} reached", watch.limit);
+        }
+        if !first { return; }
+    }
+    let mut words = Vec::new();
+    let mut changed_words = 0;
+    for offset in ((watch.offset & !3)..end).step_by(4) {
+        let word_end = offset.saturating_add(4).min(target.len);
+        let overlap_start = offset.max(watch.offset);
+        let overlap_end = word_end.min(end);
+        let word_changed = seed[overlap_start..overlap_end] != result[overlap_start..overlap_end];
+        changed_words += usize::from(word_changed);
+        if !word_changed && !first { continue; }
+        let mut old = [0u8; 4];
+        let mut new = [0u8; 4];
+        old[..word_end - offset].copy_from_slice(&seed[offset..word_end]);
+        new[..word_end - offset].copy_from_slice(&result[offset..word_end]);
+        let old = u32::from_le_bytes(old);
+        let new = u32::from_le_bytes(new);
+        words.push(format!("{offset:#x}:{old:#010x}({:e})->{new:#010x}({:e})", f32::from_bits(old), f32::from_bits(new)));
+    }
+    log::info!("[graphics-ssbo-watch] first={first} changed={changed} vs={vs:#x} fs={fs:#x} binding={} gpu={:#x} cpu={:#x} bytes={} watch={:#x}..{end:#x} changed_bytes={changed_bytes} changed_words={changed_words} observed_words={} words=[{}]", target.binding, target.gpu_addr, target.cpu_addr, target.len, watch.offset, words.len(), words.join(" "));
+}
+
+fn publish_graphics_storage_readback(
+    targets: &[GraphicsStorageWritebackTarget],
+    readbacks: Vec<nexium_gpu::draw::GraphicsStorageReadback>,
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    snapshot_cache: &mut SsboSnapshotCache,
+    vs: u64,
+    fs: u64,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+) -> Result<usize, String> {
+    if readbacks.len() != targets.len() {
+        return Err(format!("expected {} buffers, received {}", targets.len(), readbacks.len()));
+    }
+    for target in targets {
+        let matching = readbacks.iter().filter(|readback| readback.binding == target.binding).collect::<Vec<_>>();
+        if matching.len() != 1 || matching[0].data.len() != target.len {
+            return Err(format!("binding {} returned duplicate/missing/incomplete bytes", target.binding));
+        }
+        if mappings.generation() != target.mapping_generation
+            || mappings.mapping_epoch_for(target.gpu_addr) != Some(target.mapping_epoch)
+            || !mappings.cpu_range_for(target.gpu_addr).is_some_and(|(cpu, remaining)| {
+                cpu == target.cpu_addr && remaining >= target.len as u64
+            })
+        {
+            return Err(format!("binding {} mapping changed during GPU readback", target.binding));
+        }
+    }
+    for target in targets {
+        if target.trace_seed.is_some() {
+            let readback = readbacks.iter().find(|readback| readback.binding == target.binding).unwrap();
+            trace_graphics_storage_clobber(target, &readback.data, vs, fs, mem_read);
+            trace_graphics_storage_watch(target, &readback.data, vs, fs);
+        }
+    }
+    let mut bytes_written = 0;
+    for target in targets {
+        let readback = readbacks.iter().find(|readback| readback.binding == target.binding).unwrap();
+        let wrote = mem_write(target.cpu_addr, &readback.data);
+        let chunk = GuestWriteChunk {
+            gpu_va: target.gpu_addr,
+            cpu_addr: target.cpu_addr,
+            data_offset: 0,
+            len: target.len,
+        };
+        invalidate_snapshot_cache_guest_write_chunks(snapshot_cache, mappings, std::slice::from_ref(&chunk));
+        let aliases = mappings.gpu_regions_for_cpu_range(target.cpu_addr, target.len as u64);
+        renderer.invalidate_compute_raw_storage_range(target.cpu_addr, target.len as u64, &aliases);
+        renderer.invalidate_render_target_range(target.cpu_addr, target.len as u64, &aliases);
+        for range in guest_write_alias_ranges(mappings, std::slice::from_ref(&chunk)) {
+            nexium_gpu::tex_invalidate::bump_region(range.start, range.end - range.start);
+            renderer.invalidate_texture_range(range.start, range.end - range.start);
+        }
+        if !wrote {
+            return Err(format!("binding {} guest write failed at {:#x}+{:#x}", target.binding, target.cpu_addr, target.len));
+        }
+        bytes_written += target.len;
+    }
+    Ok(bytes_written)
+}
+
+fn retained_ssbo_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RETAINED_SSBO_PROFILE").is_some())
+}
+
 fn packed_cbuf_slot(data: &[u8], logical_slot: usize) -> Option<&[u8]> {
     if logical_slot >= PACKED_CBUF_SLOTS {
         return None;
@@ -588,6 +1008,39 @@ struct ResolvedStorageBufferDescriptor {
     direct_descriptor: Option<[u8; 16]>,
 }
 
+#[derive(Clone, Copy)]
+struct SsboAliasSpan {
+    gpu_addr: u64,
+    cpu_addr: u64,
+    len: usize,
+}
+
+impl SsboAliasSpan {
+    fn overlaps(self, other: Self) -> bool {
+        byte_ranges_overlap(self.gpu_addr, self.len, other.gpu_addr, other.len)
+            || byte_ranges_overlap(self.cpu_addr, self.len, other.cpu_addr, other.len)
+    }
+}
+
+fn ssbo_alias_span(
+    descriptor: nexium_shader::StorageBufferAddr,
+    resolved: ResolvedStorageBufferDescriptor,
+    mappings: &GpuMappings,
+) -> Option<SsboAliasSpan> {
+    if descriptor.indirect.is_some() || resolved.descriptor_size == 0 {
+        return None;
+    }
+    let gpu_addr = resolved.actual_base & !(u64::from(descriptor.align.max(1)) - 1);
+    let slack = usize::try_from(resolved.actual_base - gpu_addr).ok()?;
+    let len = slack.checked_add(
+        (resolved.descriptor_size as usize).max(descriptor.required_size.max(16) as usize),
+    )?;
+    let (cpu_addr, remaining) = mappings.cpu_range_for(gpu_addr).or_else(|| {
+        mappings.cpu_address_for_any32(gpu_addr).map(|(_, cpu, remaining)| (cpu, remaining))
+    })?;
+    (len as u64 <= remaining).then_some(SsboAliasSpan { gpu_addr, cpu_addr, len })
+}
+
 fn read_storage_descriptor_bytes(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -676,6 +1129,13 @@ pub(crate) struct SsboSnapshotCacheKey {
     pub(crate) logical_size: usize,
     pub(crate) data_offset: usize,
     pub(crate) read_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RetainedSsboState {
+    cpu_addr: u64,
+    mapping_generation: u64,
+    observed_write_serial: u64,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -1393,6 +1853,10 @@ pub(crate) struct SsboSnapshotCache {
     last_packed_cbuf: Option<(CbufPackKey, nexium_gpu::draw::GraphicsCbufPayload)>,
     entries: FastMap<SsboSnapshotCacheKey, Arc<Vec<u8>>>,
     full_watch_ranges: FastMap<SsboSnapshotCacheKey, HostWatchRange>,
+    retained_ssbos: FastMap<SsboSnapshotCacheKey, RetainedSsboState>,
+    retained_ssbo_hits: u64,
+    retained_ssbo_misses: u64,
+    retained_ssbo_bytes_avoided: u64,
     input_entries: FastMap<InputRangeKey, InputRangeEntry>,
     input_sources: FastMap<InputSourceKey, InputRangeKey>,
     input_cbuf_covering: FastMap<(u64, u64), Vec<InputRangeKey>>,
@@ -1507,6 +1971,27 @@ fn resident_cache_value_enabled(value: Option<&str>) -> bool {
             || value.eq_ignore_ascii_case("false")
             || value.eq_ignore_ascii_case("off")
             || value.eq_ignore_ascii_case("no")
+    })
+}
+
+fn stream_prepared_draws_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("NEXIUM_STREAM_PREPARED").ok();
+        explicit_env_switch_value_enabled(value.as_deref()) || value.as_deref() == Some("eager")
+    })
+}
+
+fn streamed_draw_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let limit = std::env::var("NEXIUM_STREAM_DRAW_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| (16..=MAX_ACCUMULATED_DRAWS).contains(limit))
+            .unwrap_or(128);
+        log::info!("[draw-stream] max_draws={}", limit);
+        limit
     })
 }
 
@@ -2001,6 +2486,10 @@ impl SsboSnapshotCache {
             last_packed_cbuf: None,
             entries: FastMap::default(),
             full_watch_ranges: FastMap::default(),
+            retained_ssbos: FastMap::default(),
+            retained_ssbo_hits: 0,
+            retained_ssbo_misses: 0,
+            retained_ssbo_bytes_avoided: 0,
             input_entries: FastMap::default(),
             input_sources: FastMap::default(),
             input_cbuf_covering: FastMap::default(),
@@ -2111,7 +2600,96 @@ impl SsboSnapshotCache {
         cpu_addr: u64,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> Option<Arc<Vec<u8>>> {
-        let requires_full_watch = is_exact_full_aurora_ssbo_snapshot(&key);
+        self.read_or_insert_watched(key, cpu_addr, false, mem_read)
+    }
+
+    fn read_retained_ssbo(
+        &mut self,
+        key: SsboSnapshotCacheKey,
+        cpu_addr: u64,
+        mapping_generation: u64,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<Arc<Vec<u8>>> {
+        self.retained_ssbos.retain(|key, _| self.entries.contains_key(key));
+        let observed_before = nexium_memory::fastmem::observed_write_serial();
+        if let Some(state) = self.retained_ssbos.get(&key).copied() {
+            if state.cpu_addr != cpu_addr
+                || state.mapping_generation != mapping_generation
+                || (state.observed_write_serial != observed_before
+                    && nexium_memory::fastmem::observed_write_pages_changed_since(
+                        cpu_addr, key.read_len, state.observed_write_serial,
+                    ) != 0)
+            {
+                self.entries.remove(&key);
+                self.full_watch_ranges.remove(&key);
+                self.retained_ssbos.remove(&key);
+            }
+        }
+        const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+        let retained_bytes: usize = self.retained_ssbos.keys().map(|key| key.read_len).sum();
+        if !self.retained_ssbos.contains_key(&key)
+            && key.read_len > MAX_RETAINED_BYTES.saturating_sub(retained_bytes)
+        {
+            return self.read_or_insert(key, cpu_addr, mem_read);
+        }
+        let cached_data = if retained_ssbo_profile_enabled() && self.retained_ssbos.contains_key(&key) {
+            self.entries.get(&key).cloned()
+        } else {
+            None
+        };
+        let data = self.read_or_insert_watched(key, cpu_addr, true, mem_read)?;
+        if self.entries.get(&key).is_some_and(|entry| Arc::ptr_eq(entry, &data)) {
+            if nexium_memory::fastmem::observed_write_serial() == observed_before
+                || nexium_memory::fastmem::observed_write_pages_changed_since(
+                    cpu_addr, key.read_len, observed_before,
+                ) == 0
+            {
+                self.retained_ssbos.insert(key, RetainedSsboState {
+                    cpu_addr,
+                    mapping_generation,
+                    observed_write_serial: observed_before,
+                });
+            } else {
+                self.entries.remove(&key);
+                self.full_watch_ranges.remove(&key);
+                self.retained_ssbos.remove(&key);
+            }
+        }
+        if retained_ssbo_profile_enabled() {
+            if cached_data.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &data)) {
+                self.retained_ssbo_hits += 1;
+                self.retained_ssbo_bytes_avoided += key.read_len as u64;
+            } else {
+                self.retained_ssbo_misses += 1;
+            }
+        }
+        Some(data)
+    }
+
+    fn invalidate_retained_ssbo_writers(&mut self, writes: Option<&[SsboAliasSpan]>) {
+        self.retained_ssbos.retain(|key, state| {
+            let span = SsboAliasSpan {
+                gpu_addr: key.guest_addr.saturating_add(key.data_offset as u64),
+                cpu_addr: state.cpu_addr,
+                len: key.read_len,
+            };
+            let keep = writes.is_some_and(|writes| !writes.iter().any(|write| span.overlaps(*write)));
+            if !keep {
+                self.entries.remove(key);
+                self.full_watch_ranges.remove(key);
+            }
+            keep
+        });
+    }
+
+    fn read_or_insert_watched(
+        &mut self,
+        key: SsboSnapshotCacheKey,
+        cpu_addr: u64,
+        retain: bool,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<Arc<Vec<u8>>> {
+        let requires_full_watch = retain || is_exact_full_aurora_ssbo_snapshot(&key);
         let full_watch_range = requires_full_watch
             .then(|| HostWatchRange::write_watch(cpu_addr, key.read_len))
             .flatten();
@@ -3419,8 +3997,10 @@ impl SsboSnapshotCache {
     }
 
     pub(crate) fn refresh_ssbo_guest_writes(&mut self) {
+        self.retained_ssbos.retain(|key, _| self.entries.contains_key(key));
         self.entries.retain(|key, _| {
-            !is_exact_full_aurora_ssbo_snapshot(key) || self.full_watch_ranges.contains_key(key)
+            (!is_exact_full_aurora_ssbo_snapshot(key) && !self.retained_ssbos.contains_key(key))
+                || self.full_watch_ranges.contains_key(key)
         });
         let mut ranges = std::mem::take(&mut self.watch_query_ranges);
         ranges.clear();
@@ -3438,6 +4018,15 @@ impl SsboSnapshotCache {
                 nexium_memory::fastmem::WriteWatchResult::Unavailable => {
                     dirty_spans.push((range.cpu_addr, range.len));
                 }
+            }
+        }
+        let observed_serial = nexium_memory::fastmem::observed_write_serial();
+        for (key, state) in self.retained_ssbos.iter_mut() {
+            if state.observed_write_serial != observed_serial {
+                nexium_memory::fastmem::observed_write_spans_since(
+                    state.cpu_addr, key.read_len, state.observed_write_serial, &mut dirty_spans,
+                );
+                state.observed_write_serial = observed_serial;
             }
         }
         if !dirty_spans.is_empty() {
@@ -4758,6 +5347,7 @@ impl SsboSnapshotCache {
     pub(crate) fn clear_ssbo_snapshots(&mut self) {
         self.entries.clear();
         self.full_watch_ranges.clear();
+        self.retained_ssbos.clear();
         self.watch_query_ranges.clear();
         self.ssbo_gpu_bounds = (u64::MAX, 0);
         self.ssbo_cpu_bounds = (u64::MAX, 0);
@@ -4806,10 +5396,13 @@ impl SsboSnapshotCache {
 
     pub(crate) fn retain_watchable_full_aurora_snapshots(&mut self) {
         let watched = &self.full_watch_ranges;
-        self.entries
-            .retain(|key, _| is_exact_full_aurora_ssbo_snapshot(key) && watched.contains_key(key));
+        self.entries.retain(|key, _| {
+            (is_exact_full_aurora_ssbo_snapshot(key) || self.retained_ssbos.contains_key(key))
+                && watched.contains_key(key)
+        });
         self.full_watch_ranges
             .retain(|key, _| self.entries.contains_key(key));
+        self.retained_ssbos.retain(|key, _| self.entries.contains_key(key));
     }
 
     fn invalidate_cpu_write(&mut self, write: HostWatchRange) {
@@ -5049,6 +5642,16 @@ impl SsboSnapshotCache {
     }
 
     pub(crate) fn profile_epoch(&self) {
+        if retained_ssbo_profile_enabled() && self.input_sweep_kick % 64 == 0 {
+            log::warn!(
+                "[retained-ssbo] kicks={} hits={} misses={} bytes_avoided={} retained_bytes={}",
+                self.input_sweep_kick,
+                self.retained_ssbo_hits,
+                self.retained_ssbo_misses,
+                self.retained_ssbo_bytes_avoided,
+                self.retained_ssbos.keys().map(|key| key.read_len).sum::<usize>(),
+            );
+        }
         if nvprof_enabled() && (self.hits != 0 || self.misses != 0) {
             log::warn!(
                 "[nvprof] ssbo_cache hits={} misses={} bytes_read={}",
@@ -5641,39 +6244,38 @@ pub(crate) fn enqueue_draws(
     let mut rt_signature_memo: Option<(RtBindingSignature, u64)> = None;
     let mut derived_state_cache = DrawDerivedStateCache::new(draw_derived_cache_enabled());
     for draw in draws {
+        let mut storage_writeback_targets = Vec::new();
         trace_depth_target_request(draw, mappings);
         if let Some(probe) = compute_probe.as_deref_mut() {
             probe.record_request(draw);
         }
-        if !draw.is_clear {
-            if render_enable_needs_ordered_read(draw) {
-                derived_state_cache.clear();
-                record_enqueue_flush_reason(
-                    batch,
-                    super::pusher::kickprof::FLUSH_ENQUEUE_RENDER_ENABLE,
-                );
-                completed &= flush_accum(
-                    batch,
-                    renderer,
-                    mappings,
-                    mem_read,
-                    mem_write,
-                    ssbo_snapshot_cache,
-                    packetizer,
-                );
-                finish_ssbo_flush_boundary(ssbo_snapshot_cache);
-            }
-            if !render_enabled(draw, mappings, mem_read) {
-                derived_state_cache.clear();
-                bump_draw_drop(
-                    0,
-                    &format!(
-                        "re mode={} addr={:#x}",
-                        draw.render_enable_mode, draw.render_enable_addr
-                    ),
-                );
-                continue;
-            }
+        if render_enable_needs_ordered_read(draw) {
+            derived_state_cache.clear();
+            record_enqueue_flush_reason(
+                batch,
+                super::pusher::kickprof::FLUSH_ENQUEUE_RENDER_ENABLE,
+            );
+            completed &= flush_accum(
+                batch,
+                renderer,
+                mappings,
+                mem_read,
+                mem_write,
+                ssbo_snapshot_cache,
+                packetizer,
+            );
+            finish_ssbo_flush_boundary(ssbo_snapshot_cache);
+        }
+        if !render_enabled(draw, mappings, mem_read) {
+            derived_state_cache.clear();
+            bump_draw_drop(
+                0,
+                &format!(
+                    "re mode={} addr={:#x}",
+                    draw.render_enable_mode, draw.render_enable_addr
+                ),
+            );
+            continue;
         }
         if vertex_memory_store_candidate(draw) {
             let address = draw
@@ -5840,7 +6442,9 @@ pub(crate) fn enqueue_draws(
                     ssbo_snapshot_cache,
                     &mut derived_state_cache,
                     &mut batch.resident_cbuf_arena,
+                    &mut storage_writeback_targets,
                     mem_read,
+                    mem_write,
                 );
                 batch.rollback(resident_checkpoint);
                 if let Err(e) = clear_result {
@@ -5905,7 +6509,9 @@ pub(crate) fn enqueue_draws(
             ssbo_snapshot_cache,
             &mut derived_state_cache,
             &mut batch.resident_cbuf_arena,
+            &mut storage_writeback_targets,
             mem_read,
+            mem_write,
         ) {
             Ok(None) => {
                 batch.rollback(resident_checkpoint);
@@ -5957,7 +6563,9 @@ pub(crate) fn enqueue_draws(
                         ssbo_snapshot_cache,
                         &mut derived_state_cache,
                         &mut batch.resident_cbuf_arena,
+                        &mut storage_writeback_targets,
                         mem_read,
+                        mem_write,
                     ) {
                         Ok(Some(rebuilt)) => rebuilt,
                         Ok(None) => {
@@ -5966,6 +6574,10 @@ pub(crate) fn enqueue_draws(
                         }
                         Err(e) => {
                             batch.rollback(retry_checkpoint);
+                            if e.starts_with(GRAPHICS_STORAGE_READBACK_ERROR) {
+                                log::error!("[graphics-ssbo-writeback] {}", e);
+                                return false;
+                            }
                             record_enqueue_flush_reason(
                                 batch,
                                 super::pusher::kickprof::FLUSH_ENQUEUE_PREP_FAIL,
@@ -5997,8 +6609,65 @@ pub(crate) fn enqueue_draws(
                 if let Some(probe) = compute_probe.as_deref_mut() {
                     probe.record_call(&call, mappings);
                 }
+                let storage_readback = if storage_writeback_targets.is_empty() {
+                    None
+                } else {
+                    if !completed {
+                        log::error!("[graphics-ssbo-writeback] prior draw submission failed; writer not submitted");
+                        batch.clear();
+                        return false;
+                    }
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    call.storage_readback = Some(nexium_gpu::draw::GraphicsStorageReadbackRequest {
+                        bindings: storage_writeback_targets.iter().map(|target| target.binding).collect(),
+                        aliases: graphics_storage_writeback_aliases(&storage_writeback_targets, &call.ssbo_data),
+                        sender,
+                    });
+                    Some((receiver, call.vs_gpu_va, call.fs_gpu_va))
+                };
                 batch.push(call);
-                if batch.len() >= MAX_ACCUMULATED_DRAWS {
+                if let Some((receiver, vs, fs)) = storage_readback {
+                    derived_state_cache.clear();
+                    if !flush_accum(
+                        batch, renderer, mappings, mem_read, mem_write,
+                        ssbo_snapshot_cache, packetizer,
+                    ) {
+                        log::error!("[graphics-ssbo-writeback] vs={vs:#x} fs={fs:#x} writer submission failed");
+                        batch.clear();
+                        return false;
+                    }
+                    let started = std::time::Instant::now();
+                    let result = receiver.recv_timeout(std::time::Duration::from_secs(30))
+                        .map_err(|error| format!("GPU completion receive failed: {error}"))
+                        .and_then(|result| result)
+                        .and_then(|readbacks| publish_graphics_storage_readback(
+                            &storage_writeback_targets, readbacks, renderer, mappings,
+                            ssbo_snapshot_cache, vs, fs, mem_read, mem_write,
+                        ));
+                    let bytes_written = match result {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            log::error!("[graphics-ssbo-writeback] vs={vs:#x} fs={fs:#x} {error}");
+                            ssbo_snapshot_cache.clear();
+                            return false;
+                        }
+                    };
+                    vertex_store_cache.clear();
+                    rt_signature_memo = None;
+                    finish_ssbo_flush_boundary(ssbo_snapshot_cache);
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static WRITERS: AtomicU64 = AtomicU64::new(0);
+                    static BYTES: AtomicU64 = AtomicU64::new(0);
+                    let writers = WRITERS.fetch_add(1, Ordering::Relaxed) + 1;
+                    let bytes = BYTES.fetch_add(bytes_written as u64, Ordering::Relaxed) + bytes_written as u64;
+                    if writers <= 8 || writers % 256 == 0 {
+                        log::info!("[graphics-ssbo-writeback] writers={writers} total_bytes={bytes} vs={vs:#x} fs={fs:#x} buffers={} bytes={bytes_written} wait_publish_ms={:.3}", storage_writeback_targets.len(), started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    continue;
+                }
+                let stream_ready = stream_prepared_draws_enabled()
+                    && batch.len() >= streamed_draw_limit();
+                if batch.len() >= MAX_ACCUMULATED_DRAWS || stream_ready {
                     derived_state_cache.clear();
                     record_enqueue_flush_reason(
                         batch,
@@ -6019,6 +6688,10 @@ pub(crate) fn enqueue_draws(
             Err(e) => {
                 batch.rollback(resident_checkpoint);
                 derived_state_cache.clear();
+                if e.starts_with(GRAPHICS_STORAGE_READBACK_ERROR) {
+                    log::error!("[graphics-ssbo-writeback] {}", e);
+                    return false;
+                }
                 record_enqueue_flush_reason(
                     batch,
                     super::pusher::kickprof::FLUSH_ENQUEUE_PREP_FAIL,
@@ -6165,6 +6838,7 @@ fn prepare_graphics_clear_op(
         nvmap_id,
         rt,
         rt_gpu_va,
+        rt_key,
         clear_scissor,
         clear.color.as_ref().map_or([0.0; 4], |color| color.rgba),
         clear.color.is_some(),
@@ -6266,6 +6940,7 @@ fn render_enabled(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> bool {
+    let mut predicate_values = None;
     let enabled = match draw.render_enable_override {
         1 => true,
         2 => false,
@@ -6288,8 +6963,9 @@ fn render_enabled(
                 }
                 let initial = u64::from_le_bytes(b[0..8].try_into().unwrap());
                 let current = u64::from_le_bytes(b[16..24].try_into().unwrap());
+                predicate_values = Some((initial, current));
                 match draw.render_enable_mode {
-                    2 => initial != 0,
+                    2 => (initial as u32) != 0 && (initial >> 32) != 0,
                     3 => initial == current,
                     4 => initial != current,
                     _ => true,
@@ -6303,8 +6979,92 @@ fn render_enabled(
     };
     if !enabled {
         log_render_enable_skip(draw);
+        trace_render_enable_skipped_draw(draw, predicate_values);
     }
     enabled
+}
+
+fn trace_render_enable_skipped_draw(draw: &DrawCall, predicate_values: Option<(u64, u64)>) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    if draw.is_clear {
+        return;
+    }
+    static CONFIG: OnceLock<Option<(usize, Option<std::path::PathBuf>)>> = OnceLock::new();
+    let Some((limit, trigger_file)) = CONFIG.get_or_init(|| {
+        std::env::var_os("NEXIUM_RENDER_ENABLE_SKIP_TRACE")?;
+        let limit = std::env::var("NEXIUM_RENDER_ENABLE_SKIP_TRACE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(512)
+            .min(4096);
+        let trigger_file = std::env::var_os("NEXIUM_RENDER_ENABLE_SKIP_TRACE_TRIGGER_FILE")
+            .map(std::path::PathBuf::from);
+        Some((limit, trigger_file))
+    }) else {
+        return;
+    };
+    if let Some(path) = trigger_file {
+        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicU64 = AtomicU64::new(0);
+        if !ACTIVE.load(Ordering::Relaxed) {
+            if CHECKS.fetch_add(1, Ordering::Relaxed) & 0x3f == 0 && path.is_file() {
+                ACTIVE.store(true, Ordering::Relaxed);
+                log::warn!("[render-enable-skip] trigger activated by {}", path.display());
+            } else {
+                return;
+            }
+        }
+    }
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let sequence = LOGGED.fetch_add(1, Ordering::Relaxed);
+    if sequence >= *limit as u64 {
+        if sequence == *limit as u64 {
+            log::warn!("[render-enable-skip] trace limit reached ({limit})");
+        }
+        return;
+    }
+    let predicate = predicate_values.map_or_else(
+        || "n/a".to_string(),
+        |(initial, current)| format!("{initial:#018x}->{current:#018x}"),
+    );
+    let render_targets = draw
+        .rt
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, rt)| {
+            let address = (u64::from(rt.address_hi) << 32) | u64::from(rt.address_lo);
+            (address != 0).then(|| {
+                format!("{slot}:{address:#x}/{}x{}/fmt{:#x}", rt.width, rt.height, rt.format)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let vs = draw
+        .program_region_gpu_va
+        .wrapping_add(u64::from(draw.shader_programs[1].address_lo));
+    let depth = (u64::from(draw.zeta.address_hi) << 32) | u64::from(draw.zeta.address_lo);
+    log::warn!(
+        "[render-enable-skip] #{} mode={} override={} addr={:#x} initial_current={} vs={:#x} fs={:#x} v={} i={} indexed={} instances={} rtctl={:#x} rts=[{}] depth={:#x}/{}x{}/fmt{:#x}/enabled{}",
+        sequence,
+        draw.render_enable_mode,
+        draw.render_enable_override,
+        draw.render_enable_addr,
+        predicate,
+        vs,
+        draw.fs_shader_gpu_va,
+        draw.vertex_count,
+        draw.index_count,
+        draw.indexed,
+        draw.instance_count,
+        draw.rt_control,
+        render_targets,
+        depth,
+        draw.zeta.width,
+        draw.zeta.height,
+        draw.zeta.format,
+        draw.zeta_enable,
+    );
 }
 
 fn log_render_enable_miss(draw: &DrawCall, reason: &str) {
@@ -6322,6 +7082,14 @@ fn log_render_enable_miss(draw: &DrawCall, reason: &str) {
 }
 
 fn log_render_enable_skip(draw: &DrawCall) {
+    if draw.is_clear && clear_trace_enabled() {
+        let rt = &draw.rt[((draw.clear_mask >> 6) & 0xf).min(7) as usize];
+        log::warn!(
+            "[cleartrace-skip] rt_va={:#x} mask={:#x} re_mode={} re_override={} re_addr={:#x}",
+            (u64::from(rt.address_hi) << 32) | u64::from(rt.address_lo),
+            draw.clear_mask, draw.render_enable_mode, draw.render_enable_override, draw.render_enable_addr,
+        );
+    }
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
         log::debug!(
@@ -6911,9 +7679,9 @@ fn flush_batch(
             );
         }
         match rt_thread {
-            Some(_) => {
+            Some(rt) => {
                 let kp_prep = super::pusher::kickprof::start();
-                prepared_chunks.push(prepare_draw_batch_async(
+                let prepared = prepare_draw_batch_async(
                     chunk,
                     renderer,
                     mappings,
@@ -6923,8 +7691,13 @@ fn flush_batch(
                     &mut prepared_texture_snapshots,
                     chunk_bytes,
                     false,
-                ));
+                );
                 super::pusher::kickprof::add(super::pusher::kickprof::VKF_PREP, kp_prep);
+                if stream_prepared_draws_enabled() {
+                    packetizer.stage(rt, vec![prepared]);
+                } else {
+                    prepared_chunks.push(prepared);
+                }
             }
             None => {
                 if let Err(e) =
@@ -9471,6 +10244,14 @@ impl PreparedDrawPacketizer {
                 }
             }
         }
+        if stream_prepared_draws_enabled()
+            && !self.pending.is_empty()
+        {
+            let ready = self.pending.take();
+            if !Self::submit(render_thread, ready) {
+                self.submit_failed = true;
+            }
+        }
     }
 
     pub(crate) fn drain_hard(&mut self) -> bool {
@@ -10478,6 +11259,8 @@ struct ShaderBundle {
     graphics_cbuf_requirements: PackedCbufReadRequirements,
     cbuf_used: u32,
     ssbo_descs: Vec<nexium_shader::StorageBufferAddr>,
+    static_readonly_ssbo_mask: u8,
+    ssbo_writes: GraphicsSsboWrites,
 }
 
 fn bundle_content_key(
@@ -11198,7 +11981,7 @@ fn fragment_sprite_batch_mirror(layout: &GraphicsTextureLayout) -> bool {
                     .filter_map(|part| part.trim().parse::<u32>().ok())
                     .collect()
             })
-            .unwrap_or_else(|| vec![1528])
+            .unwrap_or_default()
     });
     layout
         .fs_tic_ids
@@ -11296,41 +12079,41 @@ fn indirect_table_fingerprint(
 
 #[allow(clippy::type_complexity)]
 fn shader_bundle_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<ShaderKey, std::sync::Arc<ShaderBundle>>> {
+) -> &'static std::sync::Mutex<FastMap<ShaderKey, std::sync::Arc<ShaderBundle>>> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<ShaderKey, std::sync::Arc<ShaderBundle>>>,
+        std::sync::Mutex<FastMap<ShaderKey, std::sync::Arc<ShaderBundle>>>,
     > = OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| std::sync::Mutex::new(FastMap::default()))
 }
 
 fn fragment_texture_numeric_metadata_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<u64, std::sync::Arc<FragmentTextureNumericMetadata>>,
+    FastMap<u64, std::sync::Arc<FragmentTextureNumericMetadata>>,
 > {
     use std::sync::OnceLock;
     static CACHE: OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<u64, std::sync::Arc<FragmentTextureNumericMetadata>>,
+            FastMap<u64, std::sync::Arc<FragmentTextureNumericMetadata>>,
         >,
     > = OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| std::sync::Mutex::new(FastMap::default()))
 }
 
 fn vertex_texture_numeric_metadata_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<u64, std::sync::Arc<FragmentTextureNumericMetadata>>,
+    FastMap<u64, std::sync::Arc<FragmentTextureNumericMetadata>>,
 > {
     use std::sync::OnceLock;
     static CACHE: OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<u64, std::sync::Arc<FragmentTextureNumericMetadata>>,
+            FastMap<u64, std::sync::Arc<FragmentTextureNumericMetadata>>,
         >,
     > = OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| std::sync::Mutex::new(FastMap::default()))
 }
 
-fn shader_failed_set() -> &'static std::sync::Mutex<std::collections::HashSet<ShaderKey>> {
+fn shader_failed_set() -> &'static std::sync::Mutex<FastSet<ShaderKey>> {
     use std::sync::OnceLock;
-    static FAILED: OnceLock<std::sync::Mutex<std::collections::HashSet<ShaderKey>>> =
+    static FAILED: OnceLock<std::sync::Mutex<FastSet<ShaderKey>>> =
         OnceLock::new();
     FAILED.get_or_init(|| {
         let prev = std::panic::take_hook();
@@ -11348,7 +12131,7 @@ fn shader_failed_set() -> &'static std::sync::Mutex<std::collections::HashSet<Sh
             }
             prev(info);
         }));
-        std::sync::Mutex::new(std::collections::HashSet::new())
+        std::sync::Mutex::new(FastSet::default())
     })
 }
 
@@ -12576,8 +13359,11 @@ fn execute_one(
     ssbo_snapshot_cache: &mut SsboSnapshotCache,
     derived_state_cache: &mut DrawDerivedStateCache,
     resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
+    storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
+    storage_writeback_targets.clear();
     let started = super::pusher::kickprof::start();
     let result = execute_one_inner(
         draw,
@@ -12589,7 +13375,9 @@ fn execute_one(
         ssbo_snapshot_cache,
         derived_state_cache,
         resident_cbuf_arena,
+        storage_writeback_targets,
         mem_read,
+        mem_write,
     );
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_BUILD, started);
     result
@@ -12605,7 +13393,9 @@ fn execute_one_inner(
     ssbo_snapshot_cache: &mut SsboSnapshotCache,
     derived_state_cache: &mut DrawDerivedStateCache,
     resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
+    storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
     let mut enq_phase_started = super::pusher::kickprof::start();
     let mut enq_pre_sub = enq_phase_started;
@@ -12707,6 +13497,7 @@ fn execute_one_inner(
             nvmap_id,
             rt,
             rt_gpu_va,
+            rt_key,
             clear_scissor,
             color,
             want_color_clear,
@@ -13792,8 +14583,28 @@ fn execute_one_inner(
                 shader_failed_set().lock().unwrap().insert(shader_key);
                 return Err("shader previously failed to emit".to_string());
             }
+            let ssbo_descs = collect_graphics_storage_buffers(&mut vs_cfg, &mut fs_cfg)?;
+            let static_readonly_ssbo_mask =
+                static_readonly_ssbo_mask(&ssbo_descs, &vs_cfg, &fs_cfg);
+            let ssbo_writes = graphics_ssbo_writes(&vs_cfg, &fs_cfg);
             'translate: {
-                if let Some(rec) = l2_store.get(content_key) {
+                if let Some(rec) = l2_store.get(content_key).filter(|rec| {
+                    let matches = ssbo_descs.iter().map(|d| {
+                        (
+                            d.cbuf_binding,
+                            d.cbuf_offset,
+                            d.align,
+                            d.indirect.map(|indirect| {
+                                (indirect.parent_buffer_index, indirect.pointer_offset)
+                            }),
+                            d.required_size,
+                        )
+                    }).eq(rec.ssbo_descs.iter().copied());
+                    if !matches {
+                        log::warn!("[bundle-cache] storage layout mismatch; regenerating vs={vs_addr:#x} fs={fs_addr:#x}");
+                    }
+                    matches
+                }) {
                     bundle_l2_stat(true);
                     let vs_input_locations = nexium_spirv::scan_input_locations(&rec.vs_spirv);
                     let b = std::sync::Arc::new(ShaderBundle {
@@ -13819,29 +14630,9 @@ fn execute_one_inner(
                             &rec.graphics_cbuf_reads,
                         ),
                         cbuf_used: rec.cbuf_used,
-                        ssbo_descs: rec
-                            .ssbo_descs
-                            .iter()
-                            .map(
-                                |&(cbuf_binding, cbuf_offset, align, indirect, required_size)| {
-                                    nexium_shader::StorageBufferAddr {
-                                        cbuf_binding,
-                                        cbuf_offset,
-                                        align,
-                                        indirect: indirect.map(
-                                            |(parent_buffer_index, pointer_offset)| {
-                                                nexium_shader::StorageBufferIndirection {
-                                                    parent_buffer_index,
-                                                    pointer_offset,
-                                                }
-                                            },
-                                        ),
-                                        required_size,
-                                        has_dynamic_offset: true,
-                                    }
-                                },
-                            )
-                            .collect(),
+                        static_readonly_ssbo_mask,
+                        ssbo_writes,
+                        ssbo_descs,
                     });
                     guard.insert(shader_key, b.clone());
                     break 'translate b;
@@ -13862,7 +14653,6 @@ fn execute_one_inner(
                         );
                     }
                 }
-                let ssbo_descs = collect_graphics_storage_buffers(&mut vs_cfg, &mut fs_cfg)?;
                 let graphics_cbuf_reads = collect_graphics_cbuf_reads(&vs_cfg, &fs_cfg);
                 let graphics_cbuf_requirements =
                     packed_cbuf_read_requirements(&graphics_cbuf_reads);
@@ -14049,6 +14839,8 @@ fn execute_one_inner(
                     graphics_cbuf_requirements,
                     cbuf_used: vs_cbuf_used.max(fs_cbuf_used),
                     ssbo_descs,
+                    static_readonly_ssbo_mask,
+                    ssbo_writes,
                 });
                 guard.insert(shader_key, b.clone());
                 l2_store.insert(std::sync::Arc::new(
@@ -15126,6 +15918,26 @@ fn execute_one_inner(
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_STATE, enq_phase_started);
     enq_phase_started = super::pusher::kickprof::start();
 
+    let writeback_writers = graphics_ssbo_writeback_enabled() && bundle.ssbo_writes.mask != 0;
+    if writeback_writers {
+        let spans = super::engines::maxwell_compute::pending_writeback_spans_snapshot();
+        let landed = super::engines::maxwell_compute::resolve_pending_writebacks_checked(
+            renderer, mappings, mem_write,
+        );
+        let chunks: Vec<_> = spans.iter().map(|span| GuestWriteChunk {
+            gpu_va: span.gpu_va,
+            cpu_addr: span.cpu_addr,
+            data_offset: 0,
+            len: span.len,
+        }).collect();
+        invalidate_snapshot_cache_guest_write_chunks(ssbo_snapshot_cache, mappings, &chunks);
+        derived_state_cache.clear();
+        if !landed {
+            return Err(format!(
+                "{GRAPHICS_STORAGE_READBACK_ERROR} prior compute publication failed before writer seed vs={vs_addr:#x} fs={fs_addr:#x}"
+            ));
+        }
+    }
     let ssbo_dbg = ssbo_debug_enabled();
     if ssbo_dbg && !bundle.ssbo_descs.is_empty() {
         use std::sync::{Mutex, OnceLock};
@@ -15165,8 +15977,55 @@ fn execute_one_inner(
     let mut ssbo_meta: Vec<(u64, usize, bool)> = Vec::new();
     let ssbo_pointer_sources = storage_pointer_source_mask(&bundle.ssbo_descs);
     let mut resolved_actual_bases: Vec<Option<u64>> = Vec::with_capacity(bundle.ssbo_descs.len());
+    let mut resolved_descriptors = Vec::with_capacity(bundle.ssbo_descs.len());
     for (idx, d) in bundle.ssbo_descs.iter().enumerate() {
+        let stage = if usize::from(d.cbuf_binding) < FRAGMENT_CBUF_BASE {
+            vs_cbuf_group
+        } else {
+            fs_cbuf_group
+        };
+        let binding = usize::from(d.cbuf_binding) % GRAPHICS_CBUF_SLOTS;
+        let resolved = resolve_storage_buffer_descriptor(
+            idx, *d, cbuf_binds[stage][binding].0, &resolved_actual_bases, mappings, mem_read,
+        );
+        resolved_actual_bases.push(resolved.map(|resolved| resolved.actual_base));
+        resolved_descriptors.push(resolved);
+    }
+    let retain_ssbos = retained_ssbo_enabled();
+    let mut alias_spans = [None; 8];
+    let mut writable_spans = Vec::new();
+    let mut writes_known = !bundle.ssbo_writes.unknown;
+    if retain_ssbos || writeback_writers {
+        for (idx, (&descriptor, &resolved)) in bundle.ssbo_descs.iter()
+            .zip(&resolved_descriptors).enumerate().take(8)
+        {
+            alias_spans[idx] = resolved.and_then(|resolved| ssbo_alias_span(descriptor, resolved, mappings));
+            if bundle.ssbo_writes.mask & (1 << idx) != 0 {
+                if let Some(span) = alias_spans[idx] {
+                    writable_spans.push(span);
+                } else {
+                    writes_known = false;
+                }
+            }
+        }
+    }
+    if retain_ssbos {
+        ssbo_snapshot_cache.invalidate_retained_ssbo_writers(
+            writes_known.then_some(writable_spans.as_slice()),
+        );
+    }
+    let mut writeback_full_mask = if writeback_writers { bundle.ssbo_writes.mask } else { 0 };
+    if writeback_writers {
+        for (index, span) in alias_spans.iter().enumerate() {
+            if span.is_some_and(|span| writable_spans.iter().any(|write| span.overlaps(*write))) {
+                writeback_full_mask |= 1 << index;
+            }
+        }
+    }
+    for (idx, d) in bundle.ssbo_descs.iter().enumerate() {
+        let writeback_full_payload = writeback_full_mask & (1 << idx) != 0;
         let mut bytes = Arc::new(vec![0u8; 16]);
+        let mut readonly_noalias = false;
         let mut guest_addr = 0u64;
         let mut logical_size = 16usize;
         let mut data_offset = 0usize;
@@ -15181,15 +16040,7 @@ fn execute_one_inner(
         let mut dbg_slack: usize = 0;
         let mut dbg_size: u32 = 0;
         let mut dbg_readok = false;
-        let resolved = resolve_storage_buffer_descriptor(
-            idx,
-            *d,
-            cb_va,
-            &resolved_actual_bases,
-            mappings,
-            mem_read,
-        );
-        resolved_actual_bases.push(resolved.map(|resolved| resolved.actual_base));
+        let resolved = resolved_descriptors[idx];
         if let Some(resolved) = resolved {
             if ssbo_dbg {
                 if let Some(desc) = resolved.direct_descriptor {
@@ -15226,7 +16077,19 @@ fn execute_one_inner(
             } else {
                 0x40000usize.max(required_logical_size)
             };
-            let window = if d.is_direct() {
+            let shared_arena_size = |size: usize| {
+                size == AURORA_VERTEX_BUFFER_SIZE as usize
+                    || size == AURORA_STORAGE_BUFFER_SIZE as usize
+            };
+            if bundle.static_readonly_ssbo_mask & (1 << idx) != 0
+                && !writeback_full_payload
+                && !is_aurora_fixed_ssbo(*d, size)
+                && !shared_arena_size(logical_size)
+                && !shared_arena_size(required_logical_size)
+            {
+                logical_size = required_logical_size;
+            }
+            let window = if d.is_direct() && !writeback_full_payload {
                 cbuf_data.as_ref().and_then(|data| {
                     aurora_ssbo_read_window(
                         *d,
@@ -15240,7 +16103,9 @@ fn execute_one_inner(
             } else {
                 None
             };
-            let (read_offset, window_size) = if d.is_direct() {
+            let (read_offset, window_size) = if writeback_full_payload {
+                (0, logical_size)
+            } else if d.is_direct() {
                 ssbo_snapshot_window(*d, size, slack, logical_size, window)
             } else {
                 (0, logical_size)
@@ -15271,13 +16136,29 @@ fn execute_one_inner(
                     read_len: read_size,
                 };
                 let requires_fresh_pointer_data = d.indirect.is_some() || ssbo_pointer_sources[idx];
+                let retain_readonly = retain_ssbos
+                    && !writeback_full_payload
+                    && writes_known
+                    && !requires_fresh_pointer_data
+                    && bundle.ssbo_writes.mask & (1 << idx) == 0
+                    && !is_aurora_fixed_ssbo(*d, size)
+                    && data_offset == 0
+                    && read_size == logical_size
+                    && alias_spans[idx].is_some_and(|span| {
+                        !writable_spans.iter().any(|write| span.overlaps(*write))
+                    });
                 let data = if requires_fresh_pointer_data {
                     ssbo_snapshot_cache.read_uncached(buf_cpu, read_size, mem_read)
+                } else if retain_readonly {
+                    ssbo_snapshot_cache.read_retained_ssbo(
+                        key, buf_cpu, mappings.generation(), mem_read,
+                    )
                 } else {
                     ssbo_snapshot_cache.read_or_insert(key, buf_cpu, mem_read)
                 };
                 if let Some(data) = data {
                     bytes = data;
+                    readonly_noalias = retain_readonly;
                     dbg_readok = true;
                 }
             }
@@ -15306,10 +16187,14 @@ fn execute_one_inner(
             guest_addr,
             logical_size,
             data_offset,
+            readonly_noalias,
             data: bytes,
         });
         ssbo_meta.push((dbg_base, dbg_slack, dbg_readok));
     }
+    *storage_writeback_targets = graphics_storage_writeback_targets(
+        bundle.ssbo_writes, &bundle.ssbo_descs, &resolved_descriptors, &ssbo_data, &ssbo_meta, mappings,
+    ).map_err(|error| format!("{error} vs={vs_addr:#x} fs={fs_addr:#x}"))?;
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_SSBO, enq_phase_started);
     enq_phase_started = super::pusher::kickprof::start();
     trace_dusk_quad_inputs(
@@ -15554,6 +16439,7 @@ fn execute_one_inner(
         poly_offset_units: draw.poly_offset_units,
         poly_offset_factor: draw.poly_offset_factor,
         ssbo_data,
+        storage_readback: None,
         present_flip_y,
     };
 
@@ -18581,6 +19467,7 @@ fn trace_clear(
     nvmap_id: u32,
     rt: &RenderTarget,
     rt_gpu_va: u64,
+    rt_key: RtKey,
     clear_scissor: Option<[i32; 4]>,
     color: [f32; 4],
     want_color_clear: bool,
@@ -18600,7 +19487,8 @@ fn trace_clear(
     let clip = draw.surface_clip.effective(rt.width, rt.height);
     log::warn!(
         "[cleartrace] op={} rt={} va={:#x} {}x{} mask={:#x} color={} depth={} stencil={} clear_depth={:.6} clear_stencil={:#x} \
-         ctrl={:#x} scissor_en={} rect={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} zeta={} zeta_va={:#x}",
+         ctrl={:#x} scissor_en={} rect={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} zeta={} zeta_va={:#x} \
+         re_mode={} re_override={} re_addr={:#x} rt_fmt={:#x} rt_tile={:#x} rt_depth={:#x} rt_layer_stride={:#x} rt_base_layer={:#x} resolved_rt={:?}",
         op_seq,
         nvmap_id,
         rt_gpu_va,
@@ -18624,6 +19512,15 @@ fn trace_clear(
         draw.window_origin.triangle_rast_flip(),
         draw.zeta_enable,
         zeta_va,
+        draw.render_enable_mode,
+        draw.render_enable_override,
+        draw.render_enable_addr,
+        rt.format,
+        rt.tile_mode,
+        rt.depth,
+        rt.layer_stride,
+        rt.base_layer,
+        rt_key,
     );
     log::warn!(
         "[cleartrace] op={} rgba=({:.3},{:.3},{:.3},{:.3}) scissor=({},{})->({},{})",
@@ -19213,7 +20110,7 @@ fn fragment_texture_numeric_metadata(
                     )?;
                 }
                 nexium_shader::IrOp::TextureQueryLod {
-                    handle, arrayed, ..
+                    handle, ..
                 } => {
                     let shader_id = match *handle {
                         nexium_shader::TextureHandleOrigin::Bound { cbuf_word_offset } => {
@@ -19232,7 +20129,7 @@ fn fragment_texture_numeric_metadata(
                     record_runtime_texture_image_kind(
                         &mut image_kinds,
                         shader_id,
-                        if *arrayed {
+                        if sampler_arrayed {
                             GraphicsTextureImageKind::D2Array
                         } else {
                             GraphicsTextureImageKind::D2
@@ -29023,6 +29920,65 @@ mod tests {
             )],
             "walker-only VS descriptors appended after translated IDs must not reach the emitter"
         );
+    }
+
+    #[test]
+    fn tmml_metadata_matches_promoted_sample_array_views() {
+        use nexium_gpu::texture_manifest::GraphicsTextureImageKind;
+        use nexium_shader::{IrOp, IrValue, TextureHandleOrigin};
+        for query_arrayed in [false, true] {
+            let mut program = nexium_shader::IrProgram::new();
+            program.emit(
+                IrOp::TextureQueryLod {
+                    handle: TextureHandleOrigin::Bound {
+                        cbuf_word_offset: 0xa,
+                    },
+                    u: IrValue::Zero,
+                    v: IrValue::Zero,
+                    arrayed: query_arrayed,
+                    component: 0,
+                },
+                None,
+            );
+            program.emit(
+                IrOp::SampleTex {
+                    sample_site: None,
+                    tex_id: 0xa,
+                    u: IrValue::Zero,
+                    v: IrValue::Zero,
+                    array: (!query_arrayed).then_some(IrValue::Zero),
+                    volume: None,
+                    cube: None,
+                    dref: None,
+                    implicit_lod: true,
+                    lod_bias: None,
+                    explicit_lod: None,
+                    texel_offset: None,
+                    component: 0,
+                },
+                None,
+            );
+            let cfg = nexium_shader::Cfg {
+                blocks: vec![nexium_shader::BasicBlock {
+                    id: 0,
+                    start_offset: 0,
+                    end_offset: 16,
+                    branch: nexium_shader::BranchKind::Exit,
+                    program,
+                    reg_exit: Default::default(),
+                    pred_phis: Vec::new(),
+                    pred_exit: Default::default(),
+                }],
+                unimplemented: 0,
+                bindless_or_partners: Default::default(),
+            };
+            let metadata = fragment_texture_numeric_metadata(&cfg).unwrap();
+            assert!(metadata.sampler_arrayed);
+            assert_eq!(
+                metadata.image_kinds,
+                vec![(0xa, GraphicsTextureImageKind::D2Array)]
+            );
+        }
     }
 
     #[test]

@@ -5,11 +5,9 @@ use std::sync::Arc;
 use std::io::Write;
 
 fn cache_path(device_tag: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
     let title = nexium_common::title::title_key().unwrap_or_else(|| "default".to_string());
     Some(
-        PathBuf::from(base)
-            .join("NeXium")
+        nexium_common::paths::root()
             .join("shader_cache")
             .join(device_tag)
             .join(format!("{}.bin", title)),
@@ -65,7 +63,7 @@ impl CurrentPipeline {
     }
 }
 
-const SPEC_VERSION: u32 = 55;
+const SPEC_VERSION: u32 = 61;
 const MAX_SPEC_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
@@ -183,11 +181,9 @@ fn write_spec_snapshot(path: &std::path::Path, specs: &[Arc<PipelineSpec>]) {
 }
 
 fn specs_path(device_tag: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
     let title = nexium_common::title::title_key().unwrap_or_else(|| "default".to_string());
     Some(
-        PathBuf::from(base)
-            .join("NeXium")
+        nexium_common::paths::root()
             .join("shader_cache")
             .join(device_tag)
             .join(format!("{}.specs", title)),
@@ -347,7 +343,7 @@ pub fn normalized_color_formats(formats: &[vk::Format]) -> Vec<vk::Format> {
 }
 
 pub fn color_format_key(formats: &[vk::Format]) -> (u32, [u32; 8], u32) {
-    let formats = normalized_color_formats(formats);
+    let formats = &formats[..formats.len().min(8)];
     let mut key = [0u32; 8];
     for (idx, format) in formats.iter().enumerate() {
         key[idx] = format.as_raw() as u32;

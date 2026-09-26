@@ -1033,6 +1033,7 @@ impl PrepState {
                 let mut compute_probe =
                     super::vk_dispatch::ComputeGraphicsProbe::new(&compute_spans);
                 let mut committed_constbuf_writes = 0;
+                let mut draws_completed = true;
                 kickprof::add(kickprof::DRAWS_PRE, kp_pre);
                 if let Some(r) = self.renderer.clone() {
                     if replay_constbuf_writes.is_empty() {
@@ -1052,6 +1053,7 @@ impl PrepState {
                             compute_probe.as_mut(),
                         );
                         self.vk_flush_completed &= completed;
+                        draws_completed &= completed;
                         kickprof::add(kickprof::ENQ, kp);
                     } else {
                         let mut draw_start = 0;
@@ -1090,7 +1092,11 @@ impl PrepState {
                                 compute_probe.as_mut(),
                             );
                             self.vk_flush_completed &= completed;
+                            draws_completed &= completed;
                             kickprof::add(kickprof::ENQ, kp);
+                            if !completed {
+                                break;
+                            }
                             draw_start = draw_end;
                         }
                     }
@@ -1133,7 +1139,7 @@ impl PrepState {
                         draw_start = draw_end;
                     }
                 }
-                if committed_constbuf_writes < replay_constbuf_writes.len() {
+                if draws_completed && committed_constbuf_writes < replay_constbuf_writes.len() {
                     let kp = kickprof::start();
                     self.commit_constbuf_writes(
                         &replay_constbuf_writes[committed_constbuf_writes..],
@@ -1149,7 +1155,7 @@ impl PrepState {
                     probe.finish();
                 }
                 recycle_processed_draw_vec(draw_vec_recycle_tx, draws);
-                true
+                draws_completed
             }
             PrepEvent::EngineMethods { class, methods } => {
                 super::watchdog::phase(

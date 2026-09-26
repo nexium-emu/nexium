@@ -226,41 +226,62 @@ static COMMIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 const OBSERVED_WRITE_PAGE_SHIFT: u64 = 16;
 const OBSERVED_WRITE_PAGE_MASK: u64 = !((1u64 << OBSERVED_WRITE_PAGE_SHIFT) - 1);
 static OBSERVED_WRITE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static OBSERVED_WRITE_GENERATIONS: OnceLock<Mutex<std::collections::HashMap<u64, u64>>> =
-    OnceLock::new();
+const OBSERVED_WRITE_PAGE_4K_MASK: u64 = !0xfffu64;
 
-fn observed_write_generations() -> &'static Mutex<std::collections::HashMap<u64, u64>> {
-    OBSERVED_WRITE_GENERATIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+#[derive(Default)]
+struct ObservedWriteChunk {
+    generation: u64,
+    pages: [u64; 16],
 }
 
-const OBSERVED_WRITE_PAGE_4K_MASK: u64 = !0xfffu64;
-static OBSERVED_WRITE_PAGES: OnceLock<Mutex<nexium_common::fast_hash::FastMap<u64, u64>>> =
-    OnceLock::new();
+type ObservedWriteChunks = nexium_common::fast_hash::FastMap<u64, ObservedWriteChunk>;
+static OBSERVED_WRITE_CHUNKS: OnceLock<Mutex<ObservedWriteChunks>> = OnceLock::new();
 
-fn observed_write_pages() -> &'static Mutex<nexium_common::fast_hash::FastMap<u64, u64>> {
-    OBSERVED_WRITE_PAGES.get_or_init(|| Mutex::new(nexium_common::fast_hash::FastMap::default()))
+fn observed_write_chunks() -> &'static Mutex<ObservedWriteChunks> {
+    OBSERVED_WRITE_CHUNKS.get_or_init(|| Mutex::new(ObservedWriteChunks::default()))
+}
+
+fn visit_observed_pages(
+    chunks: &ObservedWriteChunks,
+    va: u64,
+    end: u64,
+    generation: u64,
+    mut visit: impl FnMut(u64, u64),
+) {
+    let mut page = va & OBSERVED_WRITE_PAGE_4K_MASK;
+    let last = (end - 1) & OBSERVED_WRITE_PAGE_4K_MASK;
+    loop {
+        let base = page & OBSERVED_WRITE_PAGE_MASK;
+        let chunk_last = (base | 0xf000).min(last);
+        if let Some(chunk) = chunks.get(&base).filter(|chunk| chunk.generation > generation) {
+            let first_slot = ((page - base) >> 12) as usize;
+            let last_slot = ((chunk_last - base) >> 12) as usize;
+            for slot in first_slot..=last_slot {
+                let written = chunk.pages[slot];
+                if written > generation {
+                    visit(base + (slot as u64) * 4096, written);
+                }
+            }
+        }
+        if chunk_last == last {
+            break;
+        }
+        page = chunk_last + 4096;
+    }
 }
 
 pub fn observed_write_pages_changed_since(va: u64, len: usize, generation: u64) -> usize {
     if len == 0 {
         return 0;
     }
-    let Some(end_unaligned) = va.checked_add(len as u64) else {
+    let Some(end) = va.checked_add(len as u64) else {
         return usize::MAX;
     };
-    let pages = observed_write_pages()
+    let chunks = observed_write_chunks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let start = va & OBSERVED_WRITE_PAGE_4K_MASK;
-    let end = end_unaligned.saturating_add(0xfff) & OBSERVED_WRITE_PAGE_4K_MASK;
-    let mut changed = 0usize;
-    let mut page = start;
-    while page < end {
-        if pages.get(&page).copied().unwrap_or(0) > generation {
-            changed += 1;
-        }
-        page = page.saturating_add(0x1000);
-    }
+    let mut changed = 0;
+    visit_observed_pages(&chunks, va, end, generation, |_, _| changed += 1);
     changed
 }
 
@@ -277,45 +298,31 @@ pub fn observed_write_spans_since(
         spans.push((va, len));
         return;
     };
-    let pages = observed_write_pages()
+    let chunks = observed_write_chunks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut page = va & OBSERVED_WRITE_PAGE_4K_MASK;
-    let last = (end - 1) & OBSERVED_WRITE_PAGE_4K_MASK;
-    loop {
-        if pages.get(&page).copied().unwrap_or(0) > generation {
-            match spans.last_mut() {
-                Some((last_va, last_len)) if last_va.checked_add(*last_len as u64) == Some(page) => {
-                    *last_len += 4096;
-                }
-                _ => spans.push((page, 4096)),
+    visit_observed_pages(&chunks, va, end, generation, |page, _| {
+        match spans.last_mut() {
+            Some((last_va, last_len)) if last_va.checked_add(*last_len as u64) == Some(page) => {
+                *last_len += 4096;
             }
+            _ => spans.push((page, 4096)),
         }
-        if page == last {
-            break;
-        }
-        page += 4096;
-    }
+    });
 }
 
 pub fn observed_write_generation_pages(va: u64, len: usize) -> u64 {
     if len == 0 {
         return 0;
     }
-    let Some(end_unaligned) = va.checked_add(len as u64) else {
+    let Some(end) = va.checked_add(len as u64) else {
         return u64::MAX;
     };
-    let pages = observed_write_pages()
+    let chunks = observed_write_chunks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let start = va & OBSERVED_WRITE_PAGE_4K_MASK;
-    let end = end_unaligned.saturating_add(0xfff) & OBSERVED_WRITE_PAGE_4K_MASK;
     let mut generation = 0;
-    let mut page = start;
-    while page < end {
-        generation = generation.max(pages.get(&page).copied().unwrap_or(0));
-        page = page.saturating_add(0x1000);
-    }
+    visit_observed_pages(&chunks, va, end, 0, |_, written| generation = generation.max(written));
     generation
 }
 
@@ -325,27 +332,19 @@ fn record_observed_write_pages(base: *mut u8, addresses: &[usize]) {
         return;
     }
     let base_addr = base as usize as u64;
-    let mut generations = observed_write_generations()
+    let mut chunks = observed_write_chunks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let serial = OBSERVED_WRITE_SERIAL
         .load(Ordering::Relaxed)
         .wrapping_add(1);
-    let mut pages = observed_write_pages()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for &address in addresses {
         let guest_va = (address as u64).saturating_sub(base_addr);
-        let generation = generations
-            .entry(guest_va & OBSERVED_WRITE_PAGE_MASK)
-            .or_insert(0);
-        *generation = (*generation).max(serial);
-        let page_generation = pages
-            .entry(guest_va & OBSERVED_WRITE_PAGE_4K_MASK)
-            .or_insert(0);
-        *page_generation = (*page_generation).max(serial);
+        let chunk = chunks.entry(guest_va & OBSERVED_WRITE_PAGE_MASK).or_default();
+        chunk.generation = chunk.generation.max(serial);
+        let page = &mut chunk.pages[((guest_va >> 12) & 15) as usize];
+        *page = (*page).max(serial);
     }
-    drop(pages);
     OBSERVED_WRITE_SERIAL.store(serial, Ordering::Release);
 }
 
@@ -354,21 +353,22 @@ pub fn observed_write_serial() -> u64 {
 }
 
 pub fn observed_write_snapshot_range(va: u64, len: usize) -> (u64, u64) {
-    let generations = observed_write_generations()
+    let chunks = observed_write_chunks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let serial = observed_write_serial();
     let generation = if len == 0 {
         0
-    } else if let Some(end_unaligned) = va.checked_add(len as u64) {
-        let start = va & OBSERVED_WRITE_PAGE_MASK;
-        let end = end_unaligned.saturating_add((1u64 << OBSERVED_WRITE_PAGE_SHIFT) - 1)
-            & OBSERVED_WRITE_PAGE_MASK;
+    } else if let Some(end) = va.checked_add(len as u64) {
+        let mut page = va & OBSERVED_WRITE_PAGE_MASK;
+        let last = (end - 1) & OBSERVED_WRITE_PAGE_MASK;
         let mut generation = 0;
-        let mut page = start;
-        while page < end {
-            generation = generation.max(generations.get(&page).copied().unwrap_or(0));
-            page = page.saturating_add(1u64 << OBSERVED_WRITE_PAGE_SHIFT);
+        loop {
+            generation = generation.max(chunks.get(&page).map_or(0, |chunk| chunk.generation));
+            if page == last {
+                break;
+            }
+            page += 1u64 << OBSERVED_WRITE_PAGE_SHIFT;
         }
         generation
     } else {
@@ -597,9 +597,12 @@ pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
         }
         let result = ADDRESSES.with(|addresses| {
             let mut addresses = addresses.borrow_mut();
-            addresses.resize(page_count, 0);
+            if addresses.len() < page_count {
+                addresses.resize(page_count, 0);
+            }
+            let addresses = &mut addresses[..page_count];
             let ptr = unsafe { base.add(lo as usize) };
-            match sys::take_write_watch(ptr, query_len, &mut addresses) {
+            match sys::take_write_watch(ptr, query_len, addresses) {
                 Some(0) => WriteWatchResult::Clean,
                 Some(count) => {
                     record_observed_write_pages(base, &addresses[..count.min(page_count)]);
@@ -651,9 +654,12 @@ pub fn take_write_watch_spans(
         }
         let result = SPAN_ADDRESSES.with(|addresses| {
             let mut addresses = addresses.borrow_mut();
-            addresses.resize(page_count, 0);
+            if addresses.len() < page_count {
+                addresses.resize(page_count, 0);
+            }
+            let addresses = &mut addresses[..page_count];
             let ptr = unsafe { base.add(lo as usize) };
-            match sys::take_write_watch(ptr, query_len, &mut addresses) {
+            match sys::take_write_watch(ptr, query_len, addresses) {
                 Some(0) => WriteWatchResult::Clean,
                 Some(count) => {
                     let base_addr = base as usize as u64;
@@ -717,9 +723,12 @@ pub fn take_write_watch_spans_observed(
         }
         let result = SPAN_ADDRESSES.with(|addresses| {
             let mut addresses = addresses.borrow_mut();
-            addresses.resize(page_count, 0);
+            if addresses.len() < page_count {
+                addresses.resize(page_count, 0);
+            }
+            let addresses = &mut addresses[..page_count];
             let ptr = unsafe { base.add(lo as usize) };
-            match sys::take_write_watch(ptr, query_len, &mut addresses) {
+            match sys::take_write_watch(ptr, query_len, addresses) {
                 Some(0) => WriteWatchResult::Clean,
                 Some(count) => {
                     let base_addr = base as usize as u64;
@@ -982,7 +991,7 @@ mod tests {
 
     #[test]
     fn observed_span_take_brackets_scoped_generation() {
-        const VA: u64 = 0xf2_0000_0000;
+        const VA: u64 = 0xf3_0000_0000;
         const LEN: usize = 0x1_0000;
         let ptr = commit(VA, LEN).expect("write-watched fastmem allocation");
         let _ = take_write_watch(VA, LEN);
@@ -999,7 +1008,36 @@ mod tests {
         assert!(observation.generation_after > observation.generation_before);
         assert!(observation.serial_after >= observation.generation_after);
         assert_eq!(spans, vec![(VA + 0x2000, 0x1000)]);
+        assert_eq!(observed_write_pages_changed_since(VA, LEN, consumed_generation), 1);
+        assert_eq!(observed_write_generation_pages(VA, 0x1000), consumed_generation);
+        assert_eq!(observed_write_generation_pages(VA + 0x2000, 1), observation.generation_after);
+        let mut replay = Vec::new();
+        observed_write_spans_since(VA + 1, LEN - 1, consumed_generation, &mut replay);
+        assert_eq!(replay, spans);
         decommit(ptr, LEN);
+    }
+
+    #[test]
+    fn observed_write_chunks_match_page_scan_across_sparse_and_partial_ranges() {
+        let mut chunks = ObservedWriteChunks::default();
+        let mut expected_pages = std::collections::BTreeMap::new();
+        for (page, generation) in [(0x0000, 1), (0xf000, 2), (0x10000, 3), (0x1f000, 4), (0x40000, 7)] {
+            let chunk = chunks.entry(page & OBSERVED_WRITE_PAGE_MASK).or_default();
+            chunk.generation = chunk.generation.max(generation);
+            chunk.pages[((page >> 12) & 15) as usize] = generation;
+            expected_pages.insert(page, generation);
+        }
+        for (va, len) in [(0, 0x50000), (1, 0xf000), (0xf123, 0x11000), (0x10001, 1), (0x20000, 0x10000), (0x40001, 0xfff)] {
+            for generation in 0..=8 {
+                let mut actual = Vec::new();
+                visit_observed_pages(&chunks, va, va + len, generation, |page, written| actual.push((page, written)));
+                let expected: Vec<_> = expected_pages.iter().filter_map(|(&page, &written)| {
+                    (page >= (va & OBSERVED_WRITE_PAGE_4K_MASK) && page < va + len && written > generation)
+                        .then_some((page, written))
+                }).collect();
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]

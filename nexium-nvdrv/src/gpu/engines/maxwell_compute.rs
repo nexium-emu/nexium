@@ -174,7 +174,14 @@ struct PreparedTexelWrite {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct FrontendCacheKey {
     code_sha256: [u8; 32],
-    indirect_cbuf_hash: Option<u64>,
+    cbuf_dependencies: Option<Arc<[FrontendCbufDependency]>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FrontendCbufDependency {
+    binding: u8,
+    byte_offset: u32,
+    value: Option<u32>,
 }
 
 struct FrontendPlan {
@@ -187,7 +194,7 @@ struct FrontendPlan {
 #[derive(Default)]
 struct FrontendPlanCache {
     plans: HashMap<FrontendCacheKey, Arc<FrontendPlan>>,
-    indirect_codes: HashSet<[u8; 32]>,
+    dependent_keys: HashMap<[u8; 32], Vec<FrontendCacheKey>>,
     #[cfg(test)]
     build_attempts: usize,
 }
@@ -198,47 +205,41 @@ impl FrontendPlanCache {
         code_sha256: [u8; 32],
         cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS],
         indirect_hits_enabled: bool,
-    ) -> (Option<(FrontendCacheKey, Arc<FrontendPlan>)>, Option<u64>) {
-        let key = if self.indirect_codes.contains(&code_sha256) {
+    ) -> Option<(FrontendCacheKey, Arc<FrontendPlan>)> {
+        if let Some(keys) = self.dependent_keys.get(&code_sha256) {
             if !indirect_hits_enabled {
-                return (None, None);
+                return None;
             }
-            let indirect_hash = indirect_cbuf_hash(cbufs);
-            let key = frontend_cache_key(code_sha256, Some(indirect_hash));
-            return (
-                self.plans.get(&key).map(|plan| (key, Arc::clone(plan))),
-                Some(indirect_hash),
-            );
-        } else {
-            frontend_cache_key(code_sha256, None)
-        };
-        (
-            self.plans.get(&key).map(|plan| (key, Arc::clone(plan))),
-            None,
-        )
+            return keys.iter().find_map(|key| {
+                let matches = key.cbuf_dependencies.as_ref()?.iter().all(|dependency| {
+                    read_frontend_cbuf(cbufs, dependency.binding, dependency.byte_offset)
+                        == dependency.value
+                });
+                if !matches {
+                    return None;
+                }
+                self.plans
+                    .get(key)
+                    .map(|plan| (key.clone(), Arc::clone(plan)))
+            });
+        }
+        let key = frontend_cache_key(code_sha256, None);
+        self.plans.get(&key).map(|plan| (key, Arc::clone(plan)))
     }
 
     fn insert(
         &mut self,
         code_sha256: [u8; 32],
-        cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS],
-        uses_indirect: bool,
-        probed_indirect_hash: Option<u64>,
+        mut dependencies: Vec<FrontendCbufDependency>,
         plan: Arc<FrontendPlan>,
     ) -> (FrontendCacheKey, Arc<FrontendPlan>) {
-        let cbuf_dependent = uses_indirect || self.indirect_codes.contains(&code_sha256);
-        if uses_indirect {
-            self.indirect_codes.insert(code_sha256);
-            self.plans.remove(&frontend_cache_key(code_sha256, None));
-        }
-        let key = if cbuf_dependent {
-            frontend_cache_key(
-                code_sha256,
-                Some(probed_indirect_hash.unwrap_or_else(|| indirect_cbuf_hash(cbufs))),
-            )
-        } else {
-            frontend_cache_key(code_sha256, None)
-        };
+        dependencies.sort_unstable_by_key(|dependency| (dependency.binding, dependency.byte_offset));
+        dependencies.dedup();
+        let cbuf_dependent = !dependencies.is_empty();
+        let key = frontend_cache_key(
+            code_sha256,
+            cbuf_dependent.then(|| Arc::from(dependencies)),
+        );
         if let Some(existing) = self.plans.get(&key) {
             return (key, Arc::clone(existing));
         }
@@ -246,17 +247,19 @@ impl FrontendPlanCache {
             if let Some(oldest) = self.plans.keys().next().cloned() {
                 let evicted_code = oldest.code_sha256;
                 self.plans.remove(&oldest);
-                if !self
-                    .plans
-                    .keys()
-                    .any(|candidate| candidate.code_sha256 == evicted_code)
-                {
-                    self.indirect_codes.remove(&evicted_code);
+                if let Some(keys) = self.dependent_keys.get_mut(&evicted_code) {
+                    keys.retain(|candidate| *candidate != oldest);
+                    if keys.is_empty() {
+                        self.dependent_keys.remove(&evicted_code);
+                    }
                 }
             }
         }
         if cbuf_dependent {
-            self.indirect_codes.insert(code_sha256);
+            self.dependent_keys
+                .entry(code_sha256)
+                .or_default()
+                .push(key.clone());
         }
         let plan = Arc::clone(self.plans.entry(key.clone()).or_insert(plan));
         if cbuf_dependent {
@@ -576,6 +579,7 @@ fn compute_offload_enabled() -> bool {
 
 struct PendingComputeWriteback {
     id: PendingComputeId,
+    program_gpu_va: u64,
     serial: u64,
     output_targets: Vec<OutputTarget>,
     texel_targets: Vec<TexelTarget>,
@@ -584,9 +588,17 @@ struct PendingComputeWriteback {
 
 struct LandingRecord {
     id: PendingComputeId,
+    program_gpu_va: u64,
     output_targets: Vec<OutputTarget>,
     texel_targets: Vec<TexelTarget>,
     done: crossbeam::channel::Sender<()>,
+}
+
+static COMPUTE_WRITEBACK_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn mark_compute_writeback_failed() {
+    COMPUTE_WRITEBACK_FAILED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn compute_landing_enabled() -> bool {
@@ -615,6 +627,7 @@ pub(crate) fn schedule_pending_landings(
                 record.landed = Some(landed);
                 LandingRecord {
                     id: record.id.clone(),
+                    program_gpu_va: record.program_gpu_va,
                     output_targets: record.output_targets.clone(),
                     texel_targets: record.texel_targets.clone(),
                     done,
@@ -649,19 +662,28 @@ fn land_records(
                         let mappings = memory.read_mappings();
                         if let Err(error) = write_back_outputs(
                             result,
+                            record.program_gpu_va,
                             &record.output_targets,
                             &record.texel_targets,
                             renderer,
                             &mappings,
                             &mem_write,
                         ) {
+                            mark_compute_writeback_failed();
                             log::error!("[compute-landing] id={} {}", id, error);
                         }
                     }
-                    Err(error) => log::error!("[compute-landing] id={} {}", id, error),
+                    Err(error) => {
+                        mark_compute_writeback_failed();
+                        log::error!("[compute-landing] id={} {}", id, error);
+                    }
                 }
+            } else {
+                mark_compute_writeback_failed();
+                log::error!("[compute-landing] dispatch did not produce a completion ID");
             }
         } else {
+            mark_compute_writeback_failed();
             log::error!("[compute-landing] guest memory writer unavailable; outputs dropped");
         }
         let _ = record.done.send(());
@@ -947,6 +969,7 @@ pub(crate) fn resolve_pending_writebacks_report(
                 .recv_timeout(std::time::Duration::from_secs(3))
                 .is_err()
             {
+                mark_compute_writeback_failed();
                 log::error!("[compute-landing] wait for a scheduled landing timed out");
             }
             if trace {
@@ -980,22 +1003,27 @@ pub(crate) fn resolve_pending_writebacks_report(
             );
         }
         let Some(id) = waited else {
+            mark_compute_writeback_failed();
+            log::error!("[compute-lazy-resolve] dispatch did not produce a completion ID");
             continue;
         };
         match renderer.take_pending_compute(id) {
             Ok(result) => {
                 if let Err(error) = write_back_outputs(
                     result,
+                    record.program_gpu_va,
                     &record.output_targets,
                     &record.texel_targets,
                     renderer,
                     mappings,
                     mem_write,
                 ) {
+                    mark_compute_writeback_failed();
                     log::error!("[compute-lazy-writeback] id={} {}", id, error);
                 }
             }
             Err(error) => {
+                mark_compute_writeback_failed();
                 log::error!("[compute-lazy-resolve] id={} {}", id, error);
             }
         }
@@ -1015,6 +1043,16 @@ pub(crate) fn resolve_pending_writebacks(
     report_resolved_writeback_spans(resolve_pending_writebacks_report(
         renderer, mappings, mem_write,
     ));
+}
+
+#[track_caller]
+pub(crate) fn resolve_pending_writebacks_checked(
+    renderer: &nexium_gpu::Renderer,
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+) -> bool {
+    resolve_pending_writebacks(renderer, mappings, mem_write);
+    !COMPUTE_WRITEBACK_FAILED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn dispatch_requires_pending_writeback_resolution(
@@ -2245,6 +2283,7 @@ fn prepare_and_execute(
             );
             push_pending_writeback(PendingComputeWriteback {
                     id: PendingComputeId::Deferred(id_rx),
+                    program_gpu_va: code_gpu,
                     serial,
                     output_targets,
                     texel_targets,
@@ -2265,6 +2304,7 @@ fn prepare_and_execute(
             let kp_wb = crate::gpu::pusher::kickprof::start();
             let written = write_back_outputs(
                 result,
+                code_gpu,
                 &output_targets,
                 &texel_targets,
                 renderer,
@@ -2273,6 +2313,9 @@ fn prepare_and_execute(
             );
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_WB, kp_wb);
             renderer.release_unreferenced_compute_raw_storage();
+            if written.is_err() {
+                mark_compute_writeback_failed();
+            }
             written.map_err(ExecuteError::Submitted)
         }
         ComputeDispatchOutcome::Submitted(id) => {
@@ -2284,6 +2327,7 @@ fn prepare_and_execute(
             }
             push_pending_writeback(PendingComputeWriteback {
                     id: PendingComputeId::Ready(id),
+                    program_gpu_va: code_gpu,
                     serial,
                     output_targets,
                     texel_targets,
@@ -2297,6 +2341,7 @@ fn prepare_and_execute(
             Err(ExecuteError::Unsupported(reason))
         }
         ComputeDispatchOutcome::SubmittedFailure(reason) => {
+            mark_compute_writeback_failed();
             renderer.release_unreferenced_compute_raw_storage();
             Err(ExecuteError::Submitted(reason))
         }
@@ -2317,11 +2362,24 @@ fn snapshot_code(
         ));
     }
     let mut code = vec![0u8; len];
-    if !mem_read(cpu_addr, &mut code) {
-        return Err(format!(
-            "could not read Maxwell compute code at {gpu_va:#x}"
-        ));
+    if mem_read(cpu_addr, &mut code) {
+        return Ok(code);
     }
+    let mut filled = 0;
+    while filled < len {
+        let address = gpu_va + filled as u64;
+        let Some((cpu, available)) = mapped_range(mappings, address) else { break };
+        let page_remaining = 0x1000 - (cpu & 0xfff) as usize;
+        let count = (len - filled).min(page_remaining).min(available as usize) & !7;
+        if count == 0 || !mem_read(cpu, &mut code[filled..filled + count]) {
+            break;
+        }
+        filled += count;
+    }
+    if filled == 0 {
+        return Err(format!("could not read Maxwell compute code at {gpu_va:#x}"));
+    }
+    code.truncate(filled);
     Ok(code)
 }
 
@@ -2363,17 +2421,25 @@ fn qmd_cbuf_range(qmd: &[u32; 0x40], slot: u8) -> Option<(u64, usize)> {
     Some((gpu_va, size))
 }
 
-fn frontend_cache_key(code_sha256: [u8; 32], indirect_cbuf_hash: Option<u64>) -> FrontendCacheKey {
+fn frontend_cache_key(
+    code_sha256: [u8; 32],
+    cbuf_dependencies: Option<Arc<[FrontendCbufDependency]>>,
+) -> FrontendCacheKey {
     FrontendCacheKey {
         code_sha256,
-        indirect_cbuf_hash,
+        cbuf_dependencies,
     }
 }
 
-fn indirect_cbuf_hash(cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    cbufs.hash(&mut hasher);
-    hasher.finish()
+fn read_frontend_cbuf(
+    cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS],
+    binding: u8,
+    byte_offset: u32,
+) -> Option<u32> {
+    cbufs
+        .get(binding as usize)
+        .and_then(Option::as_deref)
+        .and_then(|cbuf| cbuf_u32(cbuf, byte_offset))
 }
 
 fn indirect_frontend_cache_enabled() -> bool {
@@ -2501,25 +2567,27 @@ fn cached_frontend_plan_with_cache(
     cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS],
     indirect_hits_enabled: bool,
 ) -> Result<(FrontendCacheKey, Arc<FrontendPlan>), String> {
-    let probed_indirect_hash = {
+    {
         let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-        let (hit, probed_indirect_hash) = cache.lookup(code_sha256, cbufs, indirect_hits_enabled);
-        if let Some(hit) = hit {
-            profile_frontend_cache_lookup(Some(hit.0.indirect_cbuf_hash.is_some()));
+        if let Some(hit) = cache.lookup(code_sha256, cbufs, indirect_hits_enabled) {
+            profile_frontend_cache_lookup(Some(hit.0.cbuf_dependencies.is_some()));
             return Ok(hit);
         }
         profile_frontend_cache_lookup(None);
         cache.record_build_attempt();
-        probed_indirect_hash
-    };
+    }
 
     profile_frontend_cache_cfg_build();
+    let mut dependencies = Vec::new();
     let mut cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         nexium_shader::build_compute_cfg_with_cbuf(code, |binding, byte_offset| {
-            cbufs
-                .get(binding as usize)
-                .and_then(Option::as_deref)
-                .and_then(|cbuf| cbuf_u32(cbuf, byte_offset))
+            let value = read_frontend_cbuf(cbufs, binding, byte_offset);
+            dependencies.push(FrontendCbufDependency {
+                binding,
+                byte_offset,
+                value,
+            });
+            value
         })
     }))
     .map_err(|_| "Maxwell compute frontend panicked while building the CFG".to_string())?;
@@ -2566,10 +2634,6 @@ fn cached_frontend_plan_with_cache(
         }
     }
     let needs = collect_resource_needs(&cfg)?;
-    let uses_indirect = cfg
-        .blocks
-        .iter()
-        .any(|block| matches!(block.branch, nexium_shader::BranchKind::Indirect { .. }));
     let plan = Arc::new(FrontendPlan {
         cfg,
         needs,
@@ -2577,13 +2641,7 @@ fn cached_frontend_plan_with_cache(
         writable_storage_buffers,
     });
     let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-    Ok(cache.insert(
-        code_sha256,
-        cbufs,
-        uses_indirect,
-        probed_indirect_hash,
-        plan,
-    ))
+    Ok(cache.insert(code_sha256, dependencies, plan))
 }
 
 struct CachedComputeModule {
@@ -4024,8 +4082,57 @@ fn write_storage_image_guest(
     Ok(())
 }
 
+fn trace_compute_storage_watch(program_gpu_va: u64, write: &PreparedTexelWrite, published: bool) {
+    static WATCH: OnceLock<Option<(usize, usize, u64)>> = OnceLock::new();
+    let Some((offset, len, limit)) = *WATCH.get_or_init(|| {
+        let spec = std::env::var("NEXIUM_GRAPHICS_SSBO_WATCH").ok()?;
+        let parse = |value: &str| {
+            let value = value.trim();
+            if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                value.parse::<u64>().ok()
+            }
+        };
+        let parsed = (|| {
+            let (offset, len) = spec.trim().split_once(':')?;
+            let offset = usize::try_from(parse(offset)?).ok()?;
+            let len = usize::try_from(parse(len)?).ok()?;
+            offset.checked_add(len)?;
+            let limit = std::env::var("NEXIUM_GRAPHICS_SSBO_WATCH_LIMIT").ok()
+                .and_then(|value| parse(&value)).unwrap_or(256);
+            (len != 0).then_some((offset, len, limit))
+        })();
+        if parsed.is_none() {
+            log::warn!("[compute-ssbo-watch] invalid byte offset:length {spec:?}");
+        }
+        parsed
+    }) else { return };
+    if offset >= write.bytes.len() { return; }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static OUTPUTS: AtomicU64 = AtomicU64::new(0);
+    let output = OUTPUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if output > limit {
+        if output == limit.saturating_add(1) {
+            log::info!("[compute-ssbo-watch] output log limit={limit} reached");
+        }
+        return;
+    }
+    let end = offset.saturating_add(len).min(write.bytes.len());
+    let mut words = Vec::new();
+    for word_offset in ((offset & !3)..end).step_by(4) {
+        let word_end = word_offset.saturating_add(4).min(write.bytes.len());
+        let mut bytes = [0u8; 4];
+        bytes[..word_end - word_offset].copy_from_slice(&write.bytes[word_offset..word_end]);
+        let bits = u32::from_le_bytes(bytes);
+        words.push(format!("{word_offset:#x}:{bits:#010x}({:e})", f32::from_bits(bits)));
+    }
+    log::info!("[compute-ssbo-watch] output={output} program_code_gpu={program_gpu_va:#x} binding={} resource={} raw={} gpu={:#x} cpu={:#x} bytes={} published={published} watch={offset:#x}..{end:#x} words=[{}]", write.target.binding, write.target.resource_index, write.target.raw, write.target.gpu_va, write.target.cpu_addr, write.bytes.len(), words.join(" "));
+}
+
 fn write_back_outputs(
     result: ComputeDispatchResult,
+    program_gpu_va: u64,
     targets: &[OutputTarget],
     texel_targets: &[TexelTarget],
     renderer: &nexium_gpu::Renderer,
@@ -4180,21 +4287,30 @@ fn write_back_outputs(
     }
     let prep_elapsed = stage_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     let write_started = stage_started.map(|_| std::time::Instant::now());
-    for write in &prepared {
-        write_storage_image_guest(write, mem_write)?;
-    }
-    for write in &prepared_texels {
-        if !mem_write(write.target.cpu_addr, &write.bytes) {
-            return Err(format!(
-                "Maxwell storage texel buffer binding {} guest writeback failed at {:#x}",
-                write.target.binding, write.target.cpu_addr
-            ));
+    let mut attempted_images = 0;
+    let mut attempted_texels = 0;
+    let write_result = (|| {
+        for write in &prepared {
+            attempted_images += 1;
+            write_storage_image_guest(write, mem_write)?;
         }
-    }
+        for write in &prepared_texels {
+            attempted_texels += 1;
+            let published = mem_write(write.target.cpu_addr, &write.bytes);
+            trace_compute_storage_watch(program_gpu_va, write, published);
+            if !published {
+                return Err(format!(
+                    "Maxwell storage texel buffer binding {} guest writeback failed at {:#x}",
+                    write.target.binding, write.target.cpu_addr
+                ));
+            }
+        }
+        Ok(())
+    })();
     let write_elapsed =
         write_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     let invalidate_started = stage_started.map(|_| std::time::Instant::now());
-    for write in prepared {
+    for write in prepared.into_iter().take(attempted_images) {
         if write.target.subresource.mip_level == 0 {
             if let Some(nvmap_id) = mappings.nvmap_id_for(write.target.gpu_va) {
                 if let Some(key) =
@@ -4210,18 +4326,20 @@ fn write_back_outputs(
             write.target.gpu_va,
             write.target.cpu_addr,
             write.target.guest_size,
+            None,
         );
         if write.target.gpu_va != write.target.tic.gpu_va {
             renderer.invalidate_texture_address(write.target.tic.gpu_va);
         }
     }
-    for write in prepared_texels {
+    for write in prepared_texels.into_iter().take(attempted_texels) {
         invalidate_guest_write(
             renderer,
             mappings,
             write.target.gpu_va,
             write.target.cpu_addr,
             write.bytes.len(),
+            write.target.raw_storage_key,
         );
     }
     if let Some(started) = stage_started {
@@ -4232,7 +4350,7 @@ fn write_back_outputs(
             started.elapsed(),
         );
     }
-    Ok(())
+    write_result
 }
 
 fn compute_stage_profile_enabled() -> bool {
@@ -4286,6 +4404,7 @@ fn invalidate_guest_write(
     gpu_va: u64,
     cpu_addr: u64,
     size: usize,
+    preserve_raw_storage: Option<ComputeRawStorageKey>,
 ) {
     let profile = compute_stage_profile_enabled();
     let alias_started = profile.then(std::time::Instant::now);
@@ -4299,6 +4418,12 @@ fn invalidate_guest_write(
     aliases.sort_unstable();
     aliases.dedup();
     let alias_elapsed = alias_started.map_or(std::time::Duration::ZERO, |s| s.elapsed());
+    renderer.invalidate_compute_raw_storage_range_except(
+        cpu_addr,
+        size as u64,
+        &aliases,
+        preserve_raw_storage,
+    );
     let rt_started = profile.then(std::time::Instant::now);
     renderer.invalidate_render_target_range(cpu_addr, size as u64, &aliases);
     let rt_elapsed = rt_started.map_or(std::time::Duration::ZERO, |s| s.elapsed());
@@ -4823,7 +4948,7 @@ mod tests {
         let (first_key, first) =
             cached_frontend_plan_with_cache(&cache, code_sha256, &code, &first_cbufs, true)
                 .expect("direct frontend plan");
-        assert_eq!(first_key.indirect_cbuf_hash, None);
+        assert_eq!(first_key.cbuf_dependencies, None);
         assert_eq!(cache.lock().unwrap().build_attempts, 1);
 
         let mut changed_cbufs = empty_compute_cbufs();
@@ -4845,7 +4970,7 @@ mod tests {
         let (first_key, first) =
             cached_frontend_plan_with_cache(&cache, code_sha256, &code, &first_cbufs, true)
                 .expect("first indirect frontend plan");
-        assert!(first_key.indirect_cbuf_hash.is_some());
+        assert!(first_key.cbuf_dependencies.is_some());
         assert_eq!(cache.lock().unwrap().build_attempts, 1);
 
         let (_, first_again) =
@@ -4938,6 +5063,24 @@ mod tests {
         let mut hole = GpuMappings::new();
         hole.add(0x1000, 0x1000, 0x10000, 1);
         assert!(read_gpu_vec(&hole, &read, 0x1ff0, 32, "test").is_err());
+    }
+
+    #[test]
+    fn compute_code_snapshot_preserves_readable_prefix_of_reserved_mapping() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x10000, 0x10000, 0x72000, 1);
+        let read = |address: u64, bytes: &mut [u8]| {
+            if address + bytes.len() as u64 > 0x78000 { return false; }
+            for (offset, byte) in bytes.iter_mut().enumerate() {
+                *byte = offset as u8;
+            }
+            true
+        };
+        let code = snapshot_code(&mappings, &read, 0x10100).unwrap();
+        assert_eq!(code.len(), 0x5f00);
+        assert!(code.iter().enumerate().all(|(offset, byte)| *byte == offset as u8));
+        assert!(snapshot_code(&mappings, &read, 0x16000).is_err());
+        assert!(snapshot_code(&GpuMappings::new(), &read, 0x10000).is_err());
     }
 
     #[test]
@@ -5042,6 +5185,7 @@ mod tests {
         let records = vec![
             PendingComputeWriteback {
                 id: PendingComputeId::Ready(1),
+                program_gpu_va: 0,
                 serial: 11,
                 output_targets: vec![OutputTarget {
                     resource_index: 0,
@@ -5066,6 +5210,7 @@ mod tests {
             },
             PendingComputeWriteback {
                 id: PendingComputeId::Ready(2),
+                program_gpu_va: 0,
                 serial: 12,
                 output_targets: Vec::new(),
                 texel_targets: vec![TexelTarget {

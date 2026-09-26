@@ -206,6 +206,65 @@ pub fn find_texture_rt_mips(
     out
 }
 
+pub(crate) fn resolved_rt_mip_memo_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RESOLVED_RT_MIP_MEMO").is_some())
+}
+
+fn resolved_mip_profile(hit: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RESOLVED_MIP_PROFILE").is_some()) { return; }
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    let count = if hit { HITS.fetch_add(1, Ordering::Relaxed) + 1 + MISSES.load(Ordering::Relaxed) }
+        else { MISSES.fetch_add(1, Ordering::Relaxed) + 1 + HITS.load(Ordering::Relaxed) };
+    if count % 32768 == 0 {
+        log::info!("[resolved-mip-reuse] hits={} misses={}", HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed));
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ResolvedTextureRtMipMemo {
+    entries: nexium_common::fast_hash::FastMap<(TicEntry, RtKey, vk::Format), (RtKey, (u64, u64), Vec<TextureRtMip>)>,
+    hits: u64,
+    misses: u64,
+}
+
+impl ResolvedTextureRtMipMemo {
+    pub(crate) fn find(
+        &mut self,
+        rt_cache: &RtCache,
+        tic: &TicEntry,
+        base_key: RtKey,
+        format: vk::Format,
+    ) -> Vec<TextureRtMip> {
+        if !texture_rt_mip_candidate(tic) {
+            return Vec::new();
+        }
+        if !cfg!(test) && !resolved_rt_mip_memo_enabled() {
+            return find_texture_rt_mips(rt_cache, tic, base_key, format);
+        }
+        let generation = rt_cache.color_sampling_generation(base_key.nvmap_id);
+        let key = (*tic, base_key, format);
+        if let Some((stored, previous, mips)) = self.entries.get(&key) {
+            if *previous == generation && stored.same_live_identity(base_key) {
+                self.hits += 1;
+                resolved_mip_profile(true);
+                return mips.clone();
+            }
+        }
+        self.misses += 1;
+        resolved_mip_profile(false);
+        let mips = find_texture_rt_mips(rt_cache, tic, base_key, format);
+        if self.entries.len() >= 4096 {
+            self.entries.clear();
+        }
+        self.entries.insert(key, (base_key, generation, mips.clone()));
+        mips
+    }
+}
+
 fn rt_mip_memo_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -277,7 +336,7 @@ pub fn rt_mip_memo_stats() -> (u64, u64, usize) {
 
 pub fn find_texture_rt_mips_memo(
     rt_cache: &RtCache,
-    texture_identity: u64,
+    texture_identity: impl FnOnce() -> u64,
     tic: &TicEntry,
     base_key: RtKey,
     format: vk::Format,
@@ -286,7 +345,7 @@ pub fn find_texture_rt_mips_memo(
         return find_texture_rt_mips(rt_cache, tic, base_key, format);
     }
     let memo_key = (
-        texture_identity,
+        texture_identity(),
         base_key.cpu_addr ^ (base_key.mapping_epoch.rotate_left(32)),
         base_key.nvmap_id,
         format.as_raw() as u32,
@@ -411,6 +470,119 @@ mod tests {
             extent,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         ));
+    }
+
+    fn assert_resolved_memo_matches(
+        memo: &mut ResolvedTextureRtMipMemo,
+        cache: &RtCache,
+        tic: &TicEntry,
+        base: RtKey,
+        format: vk::Format,
+    ) -> Vec<TextureRtMip> {
+        let expected = find_texture_rt_mips(cache, tic, base, format);
+        let actual = memo.find(cache, tic, base, format);
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!((actual.level, actual.layer, actual.src_layer), (expected.level, expected.layer, expected.src_layer));
+            assert_eq!((actual.width, actual.height), (expected.width, expected.height));
+            assert!(actual.key.same_live_identity(expected.key));
+            assert_eq!((actual.image, actual.layout, actual.format, actual.stamp), (expected.image, expected.layout, expected.format, expected.stamp));
+        }
+        actual
+    }
+
+    #[test]
+    fn resolved_memo_reuses_across_unrelated_allocations_but_tracks_new_source_mips() {
+        let (tic, base) = height_texture();
+        let mut cache = RtCache::new();
+        let mut memo = ResolvedTextureRtMipMemo::default();
+        let format = vk::Format::R16_SFLOAT;
+        let first = mip_key(&tic, base, 0);
+        insert_source(&mut cache, first, format, vk::Extent2D { width: first.width, height: first.height });
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 1);
+        let misses = memo.misses;
+        let unrelated = RtKey { nvmap_id: first.nvmap_id + 1, gpu_va: first.gpu_va + 0x10000000, cpu_addr: first.cpu_addr + 0x10000000, ..first };
+        insert_source(&mut cache, unrelated, format, vk::Extent2D { width: first.width, height: first.height });
+        cache.mark_drawn(unrelated);
+        cache.mark_cleared(unrelated, true);
+        cache.mark_guest_written_range(unrelated.cpu_addr, 16, &[]);
+        assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
+        assert_eq!(memo.misses, misses);
+        assert_eq!(memo.hits, 1);
+        let second = mip_key(&tic, base, 1);
+        insert_source(&mut cache, second, format, vk::Extent2D { width: second.width, height: second.height });
+        cache.mark_cleared(second, true);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 1);
+        cache.mark_drawn(second);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 2);
+        assert!(memo.misses > misses);
+    }
+
+    #[test]
+    fn resolved_memo_tracks_first_draw_clears_guest_writes_and_image_changes() {
+        let (tic, base) = height_texture();
+        let key = mip_key(&tic, base, 0);
+        let mut cache = RtCache::new();
+        let mut memo = ResolvedTextureRtMipMemo::default();
+        let format = vk::Format::R16_SFLOAT;
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        insert_source(&mut cache, key, format, vk::Extent2D { width: key.width, height: key.height });
+        let initial = assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
+        assert_eq!(initial.len(), 1);
+        assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
+        cache.mark_cleared(key, true);
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        cache.mark_drawn(key);
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0].stamp > initial[0].stamp);
+        cache.mark_cleared(key, false);
+        assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
+        cache.mark_guest_written(key);
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        cache.mark_synced_sample(key);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 1);
+        cache.mark_guest_uploaded(key);
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        cache.mark_synced_sample_from(key, 100);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0].stamp, 100);
+        cache.set_color_layout(key, vk::ImageLayout::UNDEFINED);
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        cache.set_color_layout(key, vk::ImageLayout::GENERAL);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0].layout, vk::ImageLayout::GENERAL);
+        cache.get_existing(key).unwrap().image = vk::Image::from_raw(1234);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0].image, vk::Image::from_raw(1234));
+        cache.mark_guest_written_range(key.cpu_addr, 16, &[]);
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        cache.mark_drawn(key);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 1);
+        cache.mark_all_guest_written();
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+    }
+
+    #[test]
+    fn resolved_memo_distinguishes_mapping_layout_footprint_and_texture_view() {
+        let (tic, base) = height_texture();
+        let mut cache = RtCache::new();
+        let mut memo = ResolvedTextureRtMipMemo::default();
+        let format = vk::Format::R16_SFLOAT;
+        for level in 0..2 {
+            let key = mip_key(&tic, base, level);
+            insert_source(&mut cache, key, format, vk::Extent2D { width: key.width, height: key.height });
+        }
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 2);
+        for changed in [
+            RtKey { mapping_epoch: base.mapping_epoch + 1, ..base },
+            RtKey { cpu_addr: base.cpu_addr + 4096, ..base },
+            RtKey { guest_size_bytes: 16, ..base },
+            RtKey { base_layer: 1, ..base },
+            RtKey { is_3d: true, ..base },
+        ] {
+            assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, changed, format).is_empty());
+            assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 2);
+        }
+        let changed = TicEntry { res_max_mip_level: 0, ..tic };
+        assert_resolved_memo_matches(&mut memo, &cache, &changed, base, format);
+        assert_resolved_memo_matches(&mut memo, &cache, &tic, base, vk::Format::R8_UNORM);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 2);
     }
 
     #[test]

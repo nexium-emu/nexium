@@ -415,6 +415,18 @@ fn render_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some())
 }
 
+fn precise_draw_gather_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PRECISE_GATHER").is_some())
+}
+
+fn draw_gather_wait_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_RENDER_GATHER_WAIT_PROFILE").is_ok_and(|value| value == "1")
+    })
+}
+
 fn draw_gather_grace() -> Duration {
     static GRACE: OnceLock<Duration> = OnceLock::new();
     *GRACE.get_or_init(|| {
@@ -529,12 +541,92 @@ fn recv_group_candidate<T>(
             if remaining.is_zero() {
                 return Err(DrawGatherEndReason::Deadline);
             }
-            match rx.recv_timeout(remaining) {
-                Ok(received) => Ok(received),
-                Err(RecvTimeoutError::Timeout) => Err(DrawGatherEndReason::Deadline),
-                Err(RecvTimeoutError::Disconnected) => Err(DrawGatherEndReason::Disconnected),
+            let precise = precise_draw_gather_enabled() && remaining < Duration::from_millis(1);
+            let wait_started = draw_gather_wait_profile_enabled().then(Instant::now);
+            let result = if precise {
+                recv_group_candidate_precise(rx, gather_deadline, hard_after)
+            } else {
+                match rx.recv_timeout(remaining) {
+                    Ok(received) => Ok(received),
+                    Err(RecvTimeoutError::Timeout) => Err(DrawGatherEndReason::Deadline),
+                    Err(RecvTimeoutError::Disconnected) => Err(DrawGatherEndReason::Disconnected),
+                }
+            };
+            if let Some(wait_started) = wait_started {
+                profile_draw_gather_wait(
+                    wait_started,
+                    gather_deadline,
+                    precise,
+                    matches!(&result, Err(DrawGatherEndReason::Deadline)),
+                );
             }
+            result
         }
+    }
+}
+
+fn recv_group_candidate_precise<T>(
+    rx: &Receiver<T>,
+    gather_deadline: Instant,
+    hard_after: impl Fn() -> bool,
+) -> Result<T, DrawGatherEndReason> {
+    loop {
+        if hard_after() {
+            return Err(DrawGatherEndReason::Hard);
+        }
+        match rx.try_recv() {
+            Ok(received) => return Ok(received),
+            Err(TryRecvError::Disconnected) => return Err(DrawGatherEndReason::Disconnected),
+            Err(TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= gather_deadline {
+            return Err(DrawGatherEndReason::Deadline);
+        }
+        std::hint::spin_loop();
+    }
+}
+
+fn profile_draw_gather_wait(
+    started: Instant,
+    gather_deadline: Instant,
+    precise: bool,
+    timed_out: bool,
+) {
+    static WAITS: AtomicUsize = AtomicUsize::new(0);
+    static PRECISE_WAITS: AtomicUsize = AtomicUsize::new(0);
+    static WAIT_US: AtomicUsize = AtomicUsize::new(0);
+    static TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+    static OVERSHOOT_US: AtomicUsize = AtomicUsize::new(0);
+    static MAX_OVERSHOOT_US: AtomicUsize = AtomicUsize::new(0);
+    let finished = Instant::now();
+    WAIT_US.fetch_add(
+        finished.duration_since(started).as_micros() as usize,
+        Ordering::Relaxed,
+    );
+    PRECISE_WAITS.fetch_add(usize::from(precise), Ordering::Relaxed);
+    if timed_out {
+        let overshoot = finished
+            .saturating_duration_since(gather_deadline)
+            .as_micros() as usize;
+        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        OVERSHOOT_US.fetch_add(overshoot, Ordering::Relaxed);
+        MAX_OVERSHOOT_US.fetch_max(overshoot, Ordering::Relaxed);
+    }
+    if (WAITS.fetch_add(1, Ordering::Relaxed) + 1) % 1024 == 0 {
+        let precise_waits = PRECISE_WAITS.swap(0, Ordering::Relaxed);
+        let wait_us = WAIT_US.swap(0, Ordering::Relaxed);
+        let timeouts = TIMEOUTS.swap(0, Ordering::Relaxed);
+        let overshoot_us = OVERSHOOT_US.swap(0, Ordering::Relaxed);
+        let max_overshoot_us = MAX_OVERSHOOT_US.swap(0, Ordering::Relaxed);
+        log::warn!(
+            "[render-gather-wait] waits=1024 precise={} wait_ms={:.3} avg_wait_us={:.2} timeouts={} avg_timeout_overshoot_us={:.2} max_timeout_overshoot_us={}",
+            precise_waits,
+            wait_us as f64 / 1000.0,
+            wait_us as f64 / 1024.0,
+            timeouts,
+            overshoot_us as f64 / timeouts.max(1) as f64,
+            max_overshoot_us,
+        );
     }
 }
 
@@ -1371,8 +1463,9 @@ mod tests {
         draw_group_fit_end_reason, draw_group_fits, enqueue_draw_group_fifo,
         max_groups_per_submission_from_value, pending_group_budget_from_value,
         pending_snapshot_budget_bytes_from_value, pop_front_below_group_limit,
-        recv_group_candidate, rejected_draw_end_reason, retain_received_if_unsealed,
-        seal_draw_tail_locked, sealed_candidate_end_reason, DrawGatherEndReason, DrawWorkBudget,
+        recv_group_candidate, recv_group_candidate_precise, rejected_draw_end_reason,
+        retain_received_if_unsealed, seal_draw_tail_locked, sealed_candidate_end_reason,
+        DrawGatherEndReason, DrawWorkBudget,
         DrawWorkCompletion, DrawWorkCost, PresentThread, RenderThread, RenderWork,
         DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION, DEFAULT_PENDING_DRAW_GROUP_BUDGET,
         DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES, DRAW_GATHER_GRACE,
@@ -2042,6 +2135,116 @@ mod tests {
         });
         assert_eq!(result, Err(DrawGatherEndReason::Deadline));
         assert_eq!(checks.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn precise_draw_gather_accepts_prequeued_work_at_expired_deadline_in_order() {
+        let (tx, rx) = bounded(2);
+        tx.send(7u32).unwrap();
+        tx.send(8u32).unwrap();
+        let deadline = Instant::now();
+        assert_eq!(recv_group_candidate_precise(&rx, deadline, || false), Ok(7));
+        assert_eq!(recv_group_candidate_precise(&rx, deadline, || false), Ok(8));
+        assert_eq!(
+            recv_group_candidate_precise(&rx, deadline, || false),
+            Err(DrawGatherEndReason::Deadline)
+        );
+    }
+
+    #[test]
+    fn precise_draw_gather_preserves_disconnected_state() {
+        let (tx, rx) = bounded::<u32>(1);
+        drop(tx);
+        assert_eq!(
+            recv_group_candidate_precise(&rx, Instant::now() + Duration::from_secs(1), || false),
+            Err(DrawGatherEndReason::Disconnected)
+        );
+    }
+
+    #[test]
+    fn precise_draw_gather_stops_at_original_deadline() {
+        let (_tx, rx) = bounded::<u32>(1);
+        let deadline = Instant::now();
+        let checks = AtomicUsize::new(0);
+        assert_eq!(
+            recv_group_candidate_precise(&rx, deadline, || {
+                checks.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+            Err(DrawGatherEndReason::Deadline)
+        );
+        assert_eq!(checks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn precise_draw_gather_accepts_arriving_work_without_consuming_successor() {
+        let (tx, rx) = bounded(2);
+        let checks = AtomicUsize::new(0);
+        let received =
+            recv_group_candidate_precise(&rx, Instant::now() + Duration::from_secs(1), || {
+                if checks.fetch_add(1, Ordering::Relaxed) == 1 {
+                    tx.send(7u32).unwrap();
+                    tx.send(8u32).unwrap();
+                }
+                false
+            });
+        assert_eq!(received, Ok(7));
+        assert_eq!(rx.try_recv(), Ok(8));
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn precise_draw_gather_observes_seal_while_waiting_and_preserves_fifo() {
+        let (tx, rx) = bounded(2);
+        let flag = Arc::new(AtomicBool::new(false));
+        let worker_flag = Arc::clone(&flag);
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let checks = AtomicUsize::new(0);
+            let result =
+                recv_group_candidate_precise(&rx, Instant::now() + Duration::from_secs(2), || {
+                    if checks.fetch_add(1, Ordering::Relaxed) == 1 {
+                        waiting_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    }
+                    worker_flag.load(Ordering::Acquire)
+                });
+            (result, rx)
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut tail = Some(Arc::downgrade(&flag));
+        seal_draw_tail_locked(&mut tail);
+        tx.send(7u32).unwrap();
+        tx.send(8u32).unwrap();
+        resume_tx.send(()).unwrap();
+        let (result, rx) = worker.join().unwrap();
+        assert_eq!(result, Err(DrawGatherEndReason::Hard));
+        assert!(tail.is_none());
+        assert_eq!(rx.try_recv(), Ok(7));
+        assert_eq!(rx.try_recv(), Ok(8));
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn precise_draw_gather_retains_received_candidate_when_sealed_after_receive() {
+        let (tx, rx) = bounded(2);
+        tx.send(7u32).unwrap();
+        tx.send(8u32).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let received =
+            recv_group_candidate_precise(&rx, Instant::now(), || flag.load(Ordering::Acquire))
+                .unwrap();
+        let mut tail = Some(Arc::downgrade(&flag));
+        seal_draw_tail_locked(&mut tail);
+        let lookahead =
+            retain_received_if_unsealed(received, || flag.load(Ordering::Acquire)).unwrap_err();
+        tx.send(9u32).unwrap();
+        assert_eq!(
+            [lookahead, rx.try_recv().unwrap(), rx.try_recv().unwrap()],
+            [7, 8, 9]
+        );
+        assert!(rx.is_empty());
     }
 
     #[test]
