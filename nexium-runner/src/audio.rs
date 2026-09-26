@@ -199,7 +199,7 @@ pub fn push_test_tone(freq_hz: f32, seconds: f32) -> usize {
     sink.push_stereo_f32(&buf)
 }
 
-fn resolve_device(preferred: Option<&str>) -> Option<Device> {
+pub fn resolve_output_device(preferred: Option<&str>) -> Option<Device> {
     let host = cpal::default_host();
     if let Some(name) = preferred {
         match host.output_devices() {
@@ -409,7 +409,7 @@ pub fn init_host_audio(preferred_device: Option<&str>, initial_volume: f32) {
 }
 
 fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32) {
-    let Some(device) = resolve_device(preferred_device) else {
+    let Some(device) = resolve_output_device(preferred_device) else {
         log::warn!("Audio output disabled: no output device available");
         return;
     };

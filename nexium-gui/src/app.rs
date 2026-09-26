@@ -554,7 +554,7 @@ impl HorizonApp {
         nro_arg: Option<String>,
     ) -> Self {
         Self::apply_theme(&cc.egui_ctx);
-        crate::ui_audio::init();
+        crate::ui_audio::init(app_settings.audio_output_device.as_deref());
         let input = InputBackend::new().or_else(|| {
             log::warn!("SDL3 gamepad init failed");
             None
@@ -5486,7 +5486,7 @@ impl HorizonApp {
                     );
                 }
                 let desc = match i {
-                    0 => "Output device for all audio. Applies on next boot.",
+                    0 => "Output device for all audio. Restart NeXium to apply changes.",
                     6 => {
                         "Either Select All, or specific tracks for your Main Carousel Music Themes."
                     }
@@ -5658,7 +5658,10 @@ impl HorizonApp {
             }
             if let Some((ri, frac)) = drag_set {
                 match ri {
-                    1 => self.app_settings.audio_volume = frac,
+                    1 => {
+                        self.app_settings.audio_volume = frac;
+                        set_master_volume(frac);
+                    }
                     2 => self.app_settings.music_volume = frac,
                     3 => self.app_settings.sfx_volume = frac,
                     _ => {}
@@ -5674,7 +5677,8 @@ impl HorizonApp {
                 match self.prefs_row {
                     1 => {
                         self.app_settings.audio_volume =
-                            (self.app_settings.audio_volume + step).clamp(0.0, 1.0)
+                            (self.app_settings.audio_volume + step).clamp(0.0, 1.0);
+                        set_master_volume(self.app_settings.audio_volume);
                     }
                     2 => {
                         self.app_settings.music_volume =
@@ -10192,8 +10196,8 @@ fn audio_settings_content(
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new(
-            "Pick which audio output to use. Device changes apply on next emulator boot \
-         (the stream is opened once at startup).",
+            "Pick the output for game audio, menu music, and sound effects. Restart NeXium \
+         to apply device changes.",
         )
         .size(11.0)
         .color(MUTED),

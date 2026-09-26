@@ -1,5 +1,7 @@
 const CHANNELS: usize = 24;
 const MIX_SIZE: usize = 0x930;
+const UNUSED_MIX_ID: usize = i32::MAX as usize;
+const UNUSED_SPLITTER_ID: usize = u32::MAX as usize;
 type StereoMap = [[f32; 2]; CHANNELS];
 
 #[derive(Clone, Debug)]
@@ -8,13 +10,23 @@ struct Mix {
     count: usize,
     used: bool,
     destination: usize,
+    splitter: usize,
     matrix: [[f32; CHANNELS]; CHANNELS],
+}
+
+#[derive(Clone, Debug)]
+struct SplitterDestination {
+    mix_id: usize,
+    used: bool,
+    volumes: [f32; CHANNELS],
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct AudioRouting {
     mixes: Vec<Option<Mix>>,
     channels: Vec<Option<[f32; CHANNELS]>>,
+    splitters: Vec<Option<Vec<usize>>>,
+    splitter_destinations: Vec<Option<SplitterDestination>>,
     outputs: Vec<StereoMap>,
 }
 
@@ -35,6 +47,72 @@ fn scalar(bytes: &[u8], offset: usize) -> f32 {
 }
 
 impl AudioRouting {
+    pub fn update_splitters(&mut self, data: &[u8], revision_num: u32) {
+        const HEADER_MAGIC: u32 = 0x4844_4e53;
+        const INFO_MAGIC: u32 = 0x4944_4e53;
+        const DEST_MAGIC: u32 = 0x4444_4e53;
+        if data.len() < 0x20 || uint(data, 0) != HEADER_MAGIC {
+            return;
+        }
+        let info_count = uint(data, 4) as usize;
+        let destination_count = uint(data, 8) as usize;
+        if info_count > 256 || destination_count > 1024 {
+            return;
+        }
+        let mut offset = 0x20usize;
+        let mut updated_infos = Vec::with_capacity(info_count);
+        for _ in 0..info_count {
+            if data.get(offset..offset + 0x10).is_none() || uint(data, offset) != INFO_MAGIC {
+                return;
+            }
+            let id = uint(data, offset + 4) as usize;
+            let count = uint(data, offset + 0xC) as usize;
+            let Some(end) = count.checked_mul(4).and_then(|size| offset.checked_add(0x1C + size)) else {
+                return;
+            };
+            if id >= 256 || count > 1024 || end > data.len() {
+                return;
+            }
+            let ids = (0..count)
+                .map(|index| uint(data, offset + 0x10 + index * 4) as usize)
+                .collect();
+            updated_infos.push((id, ids));
+            offset = end;
+        }
+        let (stride, used_offset) = if revision_num >= 15 {
+            (0xA8, 0x9C)
+        } else if revision_num >= 12 {
+            (0x90, 0x84)
+        } else {
+            (0x70, 0x6C)
+        };
+        let mut updated_destinations = Vec::with_capacity(destination_count);
+        for _ in 0..destination_count {
+            if data.get(offset..offset + stride).is_none() || uint(data, offset) != DEST_MAGIC {
+                return;
+            }
+            let id = uint(data, offset + 4) as usize;
+            if id >= 1024 {
+                return;
+            }
+            updated_destinations.push((id, SplitterDestination {
+                mix_id: uint(data, offset + 0x68) as usize,
+                used: data[offset + used_offset] != 0,
+                volumes: std::array::from_fn(|index| scalar(data, offset + 8 + index * 4)),
+            }));
+            offset += stride;
+        }
+        for (id, ids) in updated_infos {
+            self.splitters.resize_with(self.splitters.len().max(id + 1), || None);
+            self.splitters[id] = Some(ids);
+        }
+        for (id, destination) in updated_destinations {
+            self.splitter_destinations
+                .resize_with(self.splitter_destinations.len().max(id + 1), || None);
+            self.splitter_destinations[id] = Some(destination);
+        }
+    }
+
     pub fn update(&mut self, channels: &[u8], mixes: &[u8], sinks: &[u8], dirty: bool) {
         self.channels.clear();
         self.channels.resize(channels.len() / 0x70, None);
@@ -71,6 +149,7 @@ impl AudioRouting {
                 count: (uint(bytes, 8) as usize).min(CHANNELS),
                 used: bytes[12] != 0,
                 destination: uint(bytes, 0x924) as usize,
+                splitter: uint(bytes, 0x928) as usize,
                 matrix: std::array::from_fn(|i| {
                     std::array::from_fn(|j| scalar(bytes, 0x24 + (i * CHANNELS + j) * 4))
                 }),
@@ -114,7 +193,15 @@ impl AudioRouting {
         let mut cache = vec![None; self.mixes.len()];
         let mut visiting = vec![false; self.mixes.len()];
         for id in 0..self.mixes.len() {
-            Self::resolve(id, &self.mixes, &final_map, &mut cache, &mut visiting);
+            Self::resolve(
+                id,
+                &self.mixes,
+                &self.splitters,
+                &self.splitter_destinations,
+                &final_map,
+                &mut cache,
+                &mut visiting,
+            );
         }
         self.outputs = cache
             .into_iter()
@@ -125,6 +212,8 @@ impl AudioRouting {
     fn resolve(
         id: usize,
         mixes: &[Option<Mix>],
+        splitters: &[Option<Vec<usize>>],
+        destinations: &[Option<SplitterDestination>],
         final_map: &StereoMap,
         cache: &mut [Option<StereoMap>],
         visiting: &mut [bool],
@@ -147,8 +236,39 @@ impl AudioRouting {
                     map[i][side] = final_map[i][side] * mix.volume;
                 }
             }
+        } else if mix.splitter != UNUSED_SPLITTER_ID {
+            if let Some(Some(links)) = splitters.get(mix.splitter) {
+                for (position, destination_id) in links.iter().copied().enumerate() {
+                    let Some(Some(destination)) = destinations.get(destination_id) else {
+                        continue;
+                    };
+                    if !destination.used || destination.mix_id == UNUSED_MIX_ID {
+                        continue;
+                    }
+                    let next = Self::resolve(
+                        destination.mix_id, mixes, splitters, destinations,
+                        final_map, cache, visiting,
+                    );
+                    if mix.count == 0 {
+                        continue;
+                    }
+                    let source = position % mix.count;
+                    if source >= CHANNELS {
+                        continue;
+                    }
+                    for output in 0..CHANNELS {
+                        for side in 0..2 {
+                            map[source][side] +=
+                                mix.volume * destination.volumes[output] * next[output][side];
+                        }
+                    }
+                }
+            }
         } else {
-            let next = Self::resolve(mix.destination, mixes, final_map, cache, visiting);
+            let next = Self::resolve(
+                mix.destination, mixes, splitters, destinations,
+                final_map, cache, visiting,
+            );
             for i in 0..mix.count {
                 for j in 0..CHANNELS {
                     for side in 0..2 {
@@ -164,7 +284,33 @@ impl AudioRouting {
 
     pub fn voice_gains(&self, voice: &[u8], channel_count: usize) -> [[f32; 2]; 2] {
         let mut gains = [[0.0; 2]; 2];
-        let Some(map) = self.outputs.get(uint(voice, 0x58) as usize) else {
+        let mix_id = uint(voice, 0x58) as usize;
+        if mix_id == UNUSED_MIX_ID {
+            let splitter_id = uint(voice, 0x5C) as usize;
+            let Some(Some(links)) = self.splitters.get(splitter_id) else {
+                return gains;
+            };
+            for channel in 0..channel_count.min(2) {
+                for destination_id in links.iter().copied().skip(channel).step_by(channel_count) {
+                    let Some(Some(destination)) = self.splitter_destinations.get(destination_id) else {
+                        continue;
+                    };
+                    if !destination.used {
+                        continue;
+                    }
+                    let Some(map) = self.outputs.get(destination.mix_id) else {
+                        continue;
+                    };
+                    for output in 0..CHANNELS {
+                        for side in 0..2 {
+                            gains[channel][side] += destination.volumes[output] * map[output][side];
+                        }
+                    }
+                }
+            }
+            return gains;
+        }
+        let Some(map) = self.outputs.get(mix_id) else {
             return gains;
         };
         for channel in 0..channel_count.min(2) {
@@ -179,6 +325,56 @@ impl AudioRouting {
             }
         }
         gains
+    }
+
+    pub fn describe_voice_path(&self, voice: &[u8], channel_count: usize) -> String {
+        let mix_id = uint(voice, 0x58) as usize;
+        let splitter_id = uint(voice, 0x5C) as usize;
+        let mix_state = |id: usize| -> Option<(bool, f32, usize, usize)> {
+            self.mixes
+                .get(id)
+                .and_then(Option::as_ref)
+                .map(|mix| (mix.used, mix.volume, mix.count, mix.destination))
+        };
+        let output_entries = self
+            .outputs
+            .get(mix_id)
+            .map(|map| {
+                map.iter()
+                    .filter(|pair| pair[0].abs() > 0.001 || pair[1].abs() > 0.001)
+                    .count()
+            })
+            .unwrap_or(0);
+        let channels: Vec<_> = (0..channel_count.min(2))
+            .map(|channel| {
+                let id = uint(voice, 0x140 + channel * 4) as usize;
+                let state = self.channels.get(id).and_then(Option::as_ref);
+                let nonzero = state
+                    .map(|volumes| volumes.iter().filter(|v| v.abs() > 0.001).count())
+                    .unwrap_or(0);
+                let leading: Vec<_> = state
+                    .into_iter()
+                    .flat_map(|volumes| volumes.iter().copied().take(8))
+                    .collect();
+                (id, state.is_some(), nonzero, leading)
+            })
+            .collect();
+        let linked_destinations: Vec<_> = self.splitters
+            .get(splitter_id)
+            .and_then(Option::as_ref)
+            .into_iter()
+            .flat_map(|ids| ids.iter().copied().take(12))
+            .map(|id| {
+                let destination = self.splitter_destinations.get(id).and_then(Option::as_ref);
+                (id, destination.map(|d| (d.used, d.mix_id, d.volumes[..6].to_vec())))
+            })
+            .collect();
+        format!(
+            "mix_id={mix_id} mix={:?} mix0={:?} mixes={} output_entries={output_entries} splitter_id={splitter_id} links={linked_destinations:?} channels={channels:?}",
+            mix_state(mix_id),
+            mix_state(0),
+            self.mixes.len(),
+        )
     }
 }
 

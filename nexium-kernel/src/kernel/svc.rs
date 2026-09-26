@@ -31,6 +31,12 @@ fn audio_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_AUDIO_DEBUG").is_some())
 }
 
+fn audio_path_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_AUDIO_PATH_TRACE").is_some())
+}
+
 fn diagnostics_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -6807,6 +6813,7 @@ fn dispatch_service_v2(
                 let mut in_channels_sz: u64 = 0;
                 let mut in_effects_sz: u64 = 0;
                 let mut in_mixes_sz: u64 = 0;
+                let mut in_splitters_sz: u64 = 0;
                 let mut in_sinks_sz: u64 = 0;
                 let mut in_perf_sz: u64 = 0;
                 let mut in_behavior_param: Option<audren_behavior::InParameter> = None;
@@ -6828,6 +6835,7 @@ fn dispatch_service_v2(
                         in_mixes_sz = rd(0x18);
                         in_sinks_sz = rd(0x1C);
                         in_perf_sz = rd(0x20);
+                        in_splitters_sz = rd(0x24);
                     }
                     if in_behavior_sz as usize >= audren_behavior::IN_PARAMETER_SIZE {
                         let mut block = [0u8; audren_behavior::IN_PARAMETER_SIZE];
@@ -6866,13 +6874,15 @@ fn dispatch_service_v2(
                     static LOGGED_LAYOUT: AtomicBool = AtomicBool::new(false);
                     if !LOGGED_LAYOUT.swap(true, Ordering::Relaxed) {
                         log::info!(
-                            "[audio-debug] input={:#x} behavior={:#x} mempools={:#x} voices={:#x} channels={:#x} effects={:#x} sinks={:#x} parsed_voices={}",
+                            "[audio-debug] input={:#x} behavior={:#x} mempools={:#x} voices={:#x} channels={:#x} effects={:#x} splitters={:#x} mixes={:#x} sinks={:#x} parsed_voices={}",
                             in_buf.map(|b| b.size).unwrap_or(0),
                             in_behavior_sz,
                             in_mempools_sz,
                             in_voices_sz,
                             in_channels_sz,
                             in_effects_sz,
+                            in_splitters_sz,
+                            in_mixes_sz,
                             in_sinks_sz,
                             voice_count_seen
                         );
@@ -6939,7 +6949,9 @@ fn dispatch_service_v2(
 
                 if let Some(ib) = in_buf {
                     let channels_offset = 0x40 + in_behavior_sz + in_mempools_sz;
-                    let mixes_offset = channels_offset + in_channels_sz + in_voices_sz + in_effects_sz;
+                    let splitters_offset =
+                        channels_offset + in_channels_sz + in_voices_sz + in_effects_sz;
+                    let mixes_offset = splitters_offset + in_splitters_sz;
                     let read_section = |offset: u64, size: u64| {
                         let mut data = Vec::new();
                         if size <= 4 * 1024 * 1024 && offset.checked_add(size).is_some_and(|end| end <= ib.size) {
@@ -6950,6 +6962,10 @@ fn dispatch_service_v2(
                         }
                         data
                     };
+                    st.routing.update_splitters(
+                        &read_section(splitters_offset, in_splitters_sz),
+                        revision_num,
+                    );
                     st.routing.update(
                         &read_section(channels_offset, in_channels_sz),
                         &read_section(mixes_offset, in_mixes_sz),
@@ -7240,6 +7256,25 @@ fn dispatch_service_v2(
                                 );
                                 st.voice_adpcm_states[vid] = next_state;
                                 if decoded_samples == 0 {
+                                    if audio_path_trace_enabled() && vid < 64 && volume.abs() > 0.01 {
+                                        use std::sync::atomic::{AtomicU64, Ordering};
+                                        static FIRST_EMPTY_DECODE: AtomicU64 = AtomicU64::new(0);
+                                        let bit = 1u64 << vid;
+                                        if FIRST_EMPTY_DECODE.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                                            let coef_addr = u64::from_le_bytes(v[0x048..0x050].try_into().unwrap());
+                                            let wb_size = u64::from_le_bytes(wb[0x08..0x10].try_into().unwrap());
+                                            let context_addr = u64::from_le_bytes(wb[0x20..0x28].try_into().unwrap());
+                                            let mut coef = [0u8; 32];
+                                            let mut header = [0u8; 1];
+                                            let coef_read = coef_addr != 0
+                                                && kernel.address_space.read(coef_addr, &mut coef).is_ok();
+                                            let header_read = kernel.address_space.read(buffer_address, &mut header).is_ok();
+                                            log::info!(
+                                                "[audio-path] voice={vid} frame={frame} ADPCM decoded=0 volume={volume:.6} coef_addr={coef_addr:#x} coef_read={coef_read} wb_addr={buffer_address:#x} wb_size={wb_size:#x} wb_offsets={start_offset}..{end_offset} context_addr={context_addr:#x} header_read={header_read} header={:#x} progress={progress} frames_needed={in_frames}",
+                                                header[0],
+                                            );
+                                        }
+                                    }
                                     continue;
                                 }
                                 available_source_frames = decoded_samples;
@@ -7375,6 +7410,36 @@ fn dispatch_service_v2(
                             let mut frac_q15 = initial_frac_q15;
                             let gain = volume;
                             let routing = st.routing.voice_gains(&v, channel_count as usize);
+                            if audio_path_trace_enabled() && vid < 64 && gain.abs() > 0.01 {
+                                use std::sync::atomic::{AtomicU64, Ordering};
+                                static FIRST_ACTIVE: AtomicU64 = AtomicU64::new(0);
+                                static FIRST_SOURCE: AtomicU64 = AtomicU64::new(0);
+                                static FIRST_ROUTE: AtomicU64 = AtomicU64::new(0);
+                                static FIRST_AUDIBLE: AtomicU64 = AtomicU64::new(0);
+                                let source_peak = pcm_l[..available_source_frames.min(pcm_l.len())]
+                                    .iter()
+                                    .chain(&pcm_r[..available_source_frames.min(pcm_r.len())])
+                                    .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+                                let route_peak = routing
+                                    .iter()
+                                    .flatten()
+                                    .fold(0.0f32, |peak, value| peak.max(value.abs()));
+                                let bit = 1u64 << vid;
+                                let first_active = FIRST_ACTIVE.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+                                let first_source = source_peak > 0.001
+                                    && FIRST_SOURCE.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+                                let first_route = route_peak > 0.001
+                                    && FIRST_ROUTE.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+                                let first_audible = source_peak * gain.abs() * route_peak > 0.001
+                                    && FIRST_AUDIBLE.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+                                if first_active || first_source || first_route || first_audible {
+                                    log::info!(
+                                        "[audio-path] voice={vid} frame={frame} fmt={sample_format} decoded={} source_peak={source_peak:.6} volume={gain:.6} route_peak={route_peak:.6} routing={routing:?} first_active={first_active} first_source={first_source} first_route={first_route} first_audible={first_audible} {}",
+                                        available_source_frames,
+                                        st.routing.describe_voice_path(&v, channel_count as usize),
+                                    );
+                                }
+                            }
                             let mut ramped_routing = st.voice_prev_routing[vid];
                             let routing_step: [[f32; 2]; 2] = std::array::from_fn(|channel| {
                                 std::array::from_fn(|side| (routing[channel][side] - ramped_routing[channel][side]) / TARGET_FRAMES as f32)

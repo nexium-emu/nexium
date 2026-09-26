@@ -1,4 +1,4 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use std::hash::{BuildHasher, Hasher};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
@@ -250,8 +250,8 @@ fn key(s: Sfx) -> u8 {
     }
 }
 
-pub fn init() {
-    ENGINE.get_or_init(build);
+pub fn init(preferred_device: Option<&str>) {
+    ENGINE.get_or_init(|| build(preferred_device));
 }
 
 pub fn play_move() {
@@ -311,7 +311,7 @@ pub fn stop_loop(s: Sfx) {
     }
 }
 
-fn build() -> Option<Engine> {
+fn build(preferred_device: Option<&str>) -> Option<Engine> {
     let mut banks = std::collections::HashMap::new();
     banks.insert(key(Sfx::Move), std::sync::Arc::new(render(Sfx::Move)));
     banks.insert(key(Sfx::Select), std::sync::Arc::new(render(Sfx::Select)));
@@ -383,8 +383,7 @@ fn build() -> Option<Engine> {
         shop_variant + 1
     );
 
-    let host = cpal::default_host();
-    let device = host.default_output_device()?;
+    let device = crate::audio::resolve_output_device(preferred_device)?;
     let device_name = device
         .description()
         .map(|desc| desc.name().to_string())
