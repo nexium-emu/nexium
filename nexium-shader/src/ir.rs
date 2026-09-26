@@ -350,9 +350,28 @@ pub enum CbufAddressMode {
     Segmented,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoubleOp {
+    Add,
+    Multiply,
+    Fma,
+    FromFloat32,
+    ToFloat32,
+    Move,
+}
+
 #[derive(Clone, Debug)]
 pub enum Op {
     Mov(Value),
+
+    Double {
+        op: DoubleOp,
+        a: [Value; 2],
+        b: [Value; 2],
+        c: [Value; 2],
+        mods: FMods,
+        component: u8,
+    },
 
     FMul {
         a: Value,
@@ -384,6 +403,8 @@ pub enum Op {
     YDirection,
 
     SampleId,
+
+    HelperInvocation,
 
     LoadAttrIndexed { address: Value },
     InterpAttrIndexed { address: Value, perspective: Value, mode: u8, sat: bool },
@@ -1039,6 +1060,9 @@ impl Inst {
         write!(f, "{pred_tag}{dest_tag}")?;
         match &self.op {
             Op::Mov(s) => write!(f, "Mov   {s}"),
+            Op::Double { op, a, b, c, component, .. } => {
+                write!(f, "Double.{op:?}.{component} {a:?}, {b:?}, {c:?}")
+            }
             Op::FMul { a, b, .. } => write!(f, "FMul  {a}, {b}"),
             Op::FAdd { a, b, .. } => write!(f, "FAdd  {a}, {b}"),
             Op::FFma { a, b, c, .. } => write!(f, "FFma  {a}, {b}, {c}"),
@@ -1047,6 +1071,7 @@ impl Inst {
             Op::LoadAttrIndexed { address } => write!(f, "LoadAttrIndexed {address}"),
             Op::InterpAttrIndexed { address, .. } => write!(f, "InterpAttrIndexed {address}"),
             Op::SampleId => write!(f, "SampleId"),
+            Op::HelperInvocation => write!(f, "HelperInvocation"),
             Op::YDirection => write!(f, "YDirection"),
             Op::HAdd { a, b, .. } => write!(f, "HAdd  {a}, {b}"),
             Op::HMul { a, b, .. } => write!(f, "HMul  {a}, {b}"),

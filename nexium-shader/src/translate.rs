@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::bindless_texture_id_pair;
 use super::decode::decode_one;
 use super::ir::{
-    BoolOp, CbufAddressMode, FComp, FMods, HalfMerge, HalfPrecision, HalfSwizzle, ICmp,
+    BoolOp, CbufAddressMode, DoubleOp, FComp, FMods, HalfMerge, HalfPrecision, HalfSwizzle, ICmp,
     ImageAtomicOp, ImageAtomicType, ImageDimension, Inst, LogicOp, MemoryBarrierScope, MufuFunc,
     Op, Predicate, Program, ShaderStage, SubgroupMask, TextureHandleOrigin, Value, ValueId,
     VoteMode,
@@ -429,6 +429,8 @@ pub struct Translator {
 
     pred_state: HashMap<u8, ValueId>,
     cc_source: Option<Value>,
+    carry_source: Option<Value>,
+    carry_guard: Option<(Predicate, Option<ValueId>)>,
     pending_bindless_origin_checks: Vec<PendingBindlessOriginCheck>,
     pub finished: bool,
     pub unimplemented_count: u32,
@@ -485,6 +487,8 @@ impl Translator {
             stage,
             pred_state: initial_pred,
             cc_source: None,
+            carry_source: None,
+            carry_guard: None,
             pending_bindless_origin_checks: Vec::new(),
             finished: false,
             unimplemented_count: 0,
@@ -626,7 +630,6 @@ impl Translator {
                 | Opcode::JMX
                 | Opcode::KIL
                 | Opcode::LONGJMP
-                | Opcode::PBK
                 | Opcode::PCNT
                 | Opcode::PEXIT
                 | Opcode::PLONGJMP
@@ -837,9 +840,13 @@ impl Translator {
                     dimension,
                     u,
                     v: (dimension != ImageDimension::D1).then_some(v),
-                    w: (dimension == ImageDimension::D3).then(|| {
-                        volume.expect("3D compute texture sample must have a W coordinate")
-                    }),
+                    w: match dimension {
+                        ImageDimension::D2Array => array,
+                        ImageDimension::D3 => Some(
+                            volume.expect("3D compute texture sample must have a W coordinate"),
+                        ),
+                        _ => None,
+                    },
                     implicit_lod: form.implicit_lod,
                     lod_bias,
                     explicit_lod,
@@ -906,9 +913,49 @@ impl Translator {
         )
     }
 
-    fn emit_f2f(&mut self, raw: u64, src: Value, pred: Option<Predicate>) {
+    fn double_pair(&self, reg: u8) -> [Value; 2] {
+        if reg == RZ { [Value::Zero; 2] } else { [self.read_reg(reg), self.read_reg(reg + 1)] }
+    }
+
+    fn write_double(
+        &mut self, dest: u8, op: DoubleOp, a: [Value; 2], b: [Value; 2], c: [Value; 2],
+        mods: FMods, pred: Option<Predicate>,
+    ) {
+        for component in 0..if op == DoubleOp::ToFloat32 { 1 } else { 2 } {
+            let reg = if dest == RZ { RZ } else { dest + component };
+            self.write_reg(reg, Op::Double { op, a, b, c, mods, component }, pred);
+        }
+    }
+
+    fn emit_f2f(&mut self, raw: u64, src: Value, pred: Option<Predicate>) -> bool {
         let dest = reg_dest(raw);
         let m = f2f_mods(raw);
+        let src_size = (raw >> 10) & 3;
+        let dst_size = (raw >> 8) & 3;
+        if src_size == 3 || dst_size == 3 {
+            let opcode = decode_one(raw).unwrap().opcode;
+            if !matches!(src_size, 2 | 3) || !matches!(dst_size, 2 | 3)
+                || ((raw >> 47) & 1) != 0 || ((raw >> 39) & 15) != 0
+                || (dst_size == 3 && dest != RZ && dest % 2 != 0)
+                || (src_size == 3 && opcode == Opcode::F2F_imm)
+                || (src_size == 3 && opcode == Opcode::F2F_reg && reg_b(raw) != RZ && reg_b(raw) % 2 != 0)
+            {
+                self.program.emit_void(Op::Unimplemented { opcode, raw });
+                self.unimplemented_count += 1;
+                return false;
+            }
+            let a = if src_size == 2 { [src, Value::Zero] } else if opcode == Opcode::F2F_reg {
+                self.double_pair(reg_b(raw))
+            } else {
+                let cb = cbuf(raw);
+                let high = self.program.emit(Op::LoadCbuf { binding: cb.binding, byte_offset: cb.byte_offset + 4 }, None);
+                [src, Value::Inst(high)]
+            };
+            let op = if src_size == 2 { DoubleOp::FromFloat32 } else if dst_size == 2 { DoubleOp::ToFloat32 } else { DoubleOp::Move };
+            self.write_double(dest, op, a, [Value::Zero; 2], [Value::Zero; 2],
+                FMods { neg_a: m.neg, abs_a: m.abs, ..FMods::default() }, pred);
+            return true;
+        }
         self.write_reg(
             dest,
             Op::F2F {
@@ -920,6 +967,7 @@ impl Translator {
             },
             pred,
         );
+        true
     }
 
     fn emit_i2f(&mut self, raw: u64, src: Value, pred: Option<Predicate>) {
@@ -1191,45 +1239,72 @@ impl Translator {
         }
     }
 
-    fn emit_iadd(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
-        let dest = reg_dest(raw);
-        let a = self.read_reg(reg_a(raw));
-        self.write_reg(
-            dest,
-            Op::IAdd {
-                a,
-                b,
-                neg_a: iadd_neg_a(raw),
-                neg_b: iadd_neg_b(raw),
-            },
-            pred,
-        );
-    }
-
-    fn emit_iadd32i(&mut self, raw: u64, pred: Option<Predicate>) {
-        let dest = reg_dest(raw);
-        let a = self.read_reg(reg_a(raw));
-        let add = Op::IAdd {
-            a,
-            b: Value::ImmU32(imm32(raw)),
-            neg_a: iadd32i_neg_a(raw),
-            neg_b: false,
+    fn emit_iadd(&mut self, raw: u64, b: Value, pred: Option<Predicate>) -> bool {
+        let opcode = decode_one(raw).unwrap().opcode;
+        let immediate32 = opcode == Opcode::IADD32I;
+        let cc = ((raw >> if immediate32 { 52 } else { 47 }) & 1) != 0;
+        let x = ((raw >> if immediate32 { 53 } else { 43 }) & 1) != 0;
+        let sat = ((raw >> if immediate32 { 54 } else { 50 }) & 1) != 0;
+        let po = if immediate32 {
+            iadd32i_po(raw)
+        } else {
+            ((raw >> 48) & 3) == 3
         };
-        if iadd32i_po(raw) {
+        let carry_available = self.carry_source.is_some()
+            && self.carry_guard.is_none_or(|(guard, version)| {
+                Some(guard) == pred && self.pred_state.get(&guard.idx).copied() == version
+            });
+        if sat || (cc && (x || po)) || (x && (po || !carry_available)) {
+            self.program.emit_void(Op::Unimplemented { opcode, raw });
+            self.unimplemented_count += 1;
+            return false;
+        }
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        let neg_a = if immediate32 {
+            iadd32i_neg_a(raw)
+        } else {
+            iadd_neg_a(raw)
+        };
+        let neg_b = !immediate32 && !po && iadd_neg_b(raw);
+        let add = Op::IAdd { a, b, neg_a, neg_b };
+        let result = if po || x {
             let sum = self.emit_value(add);
             self.write_reg(
                 dest,
                 Op::IAdd {
                     a: sum,
-                    b: Value::ImmU32(1),
+                    b: if po {
+                        Value::ImmU32(1)
+                    } else {
+                        self.carry_source.unwrap()
+                    },
                     neg_a: false,
                     neg_b: false,
                 },
                 pred,
-            );
+            )
         } else {
-            self.write_reg(dest, add, pred);
+            self.write_reg(dest, add, pred)
+        };
+        if cc {
+            let unsigned_a = if neg_a { self.emit_ineg_value(a) } else { a };
+            self.record_add_flags(result, unsigned_a, pred);
         }
+        true
+    }
+
+    fn record_add_flags(&mut self, result: ValueId, unsigned_a: Value, pred: Option<Predicate>) {
+        self.cc_source = pred.is_none().then_some(Value::Inst(result));
+        let carry_mask = self.emit_value(Op::ISet {
+            cmp: ICmp::Lt,
+            signed: false,
+            a: Value::Inst(result),
+            b: unsigned_a,
+            bool_float: false,
+        });
+        self.carry_source = Some(self.emit_bfe_value(carry_mask, 0, 1, false));
+        self.carry_guard = pred.map(|guard| (guard, self.pred_state.get(&guard.idx).copied()));
     }
 
     fn emit_imad(&mut self, raw: u64, b: Value, c: Value, pred: Option<Predicate>) {
@@ -1862,7 +1937,7 @@ impl Translator {
     fn emit_iscadd(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
         let dest = reg_dest(raw);
         let a = self.read_reg(reg_a(raw));
-        self.write_reg(
+        let result = self.write_reg(
             dest,
             Op::IScAdd {
                 a,
@@ -1873,6 +1948,18 @@ impl Translator {
             },
             pred,
         );
+        if ((raw >> 47) & 1) != 0 {
+            let a = if iadd_neg_a(raw) {
+                self.emit_ineg_value(a)
+            } else {
+                a
+            };
+            let scaled = self.emit_value(Op::IShl {
+                a,
+                b: Value::ImmU32(u32::from(iscadd_shift(raw))),
+            });
+            self.record_add_flags(result, scaled, pred);
+        }
     }
 
     fn emit_ilop(
@@ -1901,10 +1988,20 @@ impl Translator {
 
     fn emit_lop_predicate(&mut self, raw: u64, result: ValueId, pred: Option<Predicate>) {
         let dest_p = ((raw >> 48) & 7) as u8;
+        self.emit_logic_predicate(dest_p, ((raw >> 44) & 3) as u8, result, pred);
+    }
+
+    fn emit_logic_predicate(
+        &mut self,
+        dest_p: u8,
+        mode: u8,
+        result: ValueId,
+        pred: Option<Predicate>,
+    ) {
         if dest_p == PT {
             return;
         }
-        let cmp = match (raw >> 44) & 3 {
+        let cmp = match mode {
             0 => ICmp::F,
             1 => ICmp::T,
             2 => ICmp::Eq,
@@ -2002,6 +2099,7 @@ impl Translator {
     fn shared_word_count(raw: u64) -> Option<u32> {
         match (raw >> 48) & 0x7 {
             4 => Some(1),
+            5 => Some(2),
             6 => Some(4),
             _ => None,
         }
@@ -2191,6 +2289,7 @@ impl Translator {
         let pred = decoded_pred(raw);
         if Self::invalidates_cc_source(decoded.opcode, raw) {
             self.cc_source = None;
+            self.carry_source = None;
         }
         match decoded.opcode {
             Opcode::NOP => {}
@@ -2757,16 +2856,41 @@ impl Translator {
                 pred,
             ),
 
+            opcode @ (Opcode::DADD_reg | Opcode::DMUL_reg | Opcode::DFMA_reg) => {
+                let fma = opcode == Opcode::DFMA_reg;
+                let round = (raw >> if fma { 50 } else { 39 }) & 3;
+                let registers = [reg_dest(raw), reg_a(raw), reg_b(raw), if fma { reg_c(raw) } else { RZ }];
+                if ((raw >> 47) & 1) != 0 || round != 0 || registers.iter().any(|reg| *reg != RZ && reg % 2 != 0) {
+                    self.program.emit_void(Op::Unimplemented { opcode, raw });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let op = match opcode { Opcode::DADD_reg => DoubleOp::Add, Opcode::DMUL_reg => DoubleOp::Multiply, _ => DoubleOp::Fma };
+                let mods = if fma {
+                    FMods { neg_b: ((raw >> 48) & 1) != 0, neg_c: ((raw >> 49) & 1) != 0, ..FMods::default() }
+                } else {
+                    FMods {
+                        neg_a: ((raw >> 48) & 1) != 0,
+                        abs_a: opcode == Opcode::DADD_reg && ((raw >> 46) & 1) != 0,
+                        neg_b: opcode == Opcode::DADD_reg && ((raw >> 45) & 1) != 0,
+                        abs_b: opcode == Opcode::DADD_reg && ((raw >> 49) & 1) != 0,
+                        ..FMods::default()
+                    }
+                };
+                self.write_double(reg_dest(raw), op, self.double_pair(reg_a(raw)), self.double_pair(reg_b(raw)),
+                    if fma { self.double_pair(reg_c(raw)) } else { [Value::Zero; 2] }, mods, pred);
+            }
+
             Opcode::F2F_reg => {
                 let s = self.read_reg(reg_b(raw));
-                self.emit_f2f(raw, s, pred);
+                if !self.emit_f2f(raw, s, pred) { return false; }
             }
             Opcode::F2F_cbuf => {
                 let cb = self.load_cbuf(raw);
-                self.emit_f2f(raw, Value::Inst(cb), pred);
+                if !self.emit_f2f(raw, Value::Inst(cb), pred) { return false; }
             }
             Opcode::F2F_imm => {
-                self.emit_f2f(raw, Value::ImmF32(float_imm20(raw)), pred);
+                if !self.emit_f2f(raw, Value::ImmF32(float_imm20(raw)), pred) { return false; }
             }
 
             Opcode::RRO_reg => {
@@ -3038,6 +3162,7 @@ impl Translator {
                     let dimension = match form.tex_type {
                         0 => ImageDimension::D1,
                         2 => ImageDimension::D2,
+                        3 if form.bias_reg.is_none() => ImageDimension::D2Array,
                         4 => ImageDimension::D3,
                         _ => {
                             self.program.emit_void(Op::Unimplemented {
@@ -3101,6 +3226,7 @@ impl Translator {
                     let dimension = match form.tex_type {
                         0 => ImageDimension::D1,
                         2 => ImageDimension::D2,
+                        3 if form.bias_reg.is_none() => ImageDimension::D2Array,
                         4 => ImageDimension::D3,
                         _ => {
                             self.program.emit_void(Op::Unimplemented {
@@ -3559,6 +3685,19 @@ impl Translator {
                             Some(self.read_reg(rb)),
                             None,
                         ),
+                        4 if ra == RZ || ra & 1 == 0 => {
+                            let offsets = self.read_reg(rb);
+                            let dx = self.emit_bfe_value(offsets, 0, 4, true);
+                            let dy = self.emit_bfe_value(offsets, 4, 4, true);
+                            let x = self.program.emit(Op::IAdd {
+                                a: self.read_reg(ra), b: dx, neg_a: false, neg_b: false,
+                            }, None);
+                            let y = self.program.emit(Op::IAdd {
+                                a: if ra == RZ { Value::Zero } else { self.read_reg(ra + 1) },
+                                b: dy, neg_a: false, neg_b: false,
+                            }, None);
+                            (ImageDimension::D2, Value::Inst(x), Some(Value::Inst(y)), None)
+                        }
                         7 => (
                             ImageDimension::D3,
                             self.read_reg(ra),
@@ -4202,6 +4341,51 @@ impl Translator {
                 }
             }
 
+            Opcode::ATOM => {
+                let size = ((raw >> 49) & 7) as u8;
+                let operation = ((raw >> 52) & 15) as u8;
+                if size > 1 || operation > 8 {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::ATOM,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let address = reg_a(raw);
+                let immediate = ((raw >> 28) & 0xfffff) as u32;
+                let offset = if address == RZ {
+                    immediate as i32
+                } else {
+                    ((immediate << 12) as i32) >> 12
+                };
+                let addr_lo = self.read_reg(address);
+                let value = self.read_reg(reg_b(raw));
+                let op = match operation {
+                    0 => ImageAtomicOp::Add,
+                    1 => ImageAtomicOp::Min,
+                    2 => ImageAtomicOp::Max,
+                    3 => ImageAtomicOp::Increment,
+                    4 => ImageAtomicOp::Decrement,
+                    5 => ImageAtomicOp::And,
+                    6 => ImageAtomicOp::Or,
+                    7 => ImageAtomicOp::Xor,
+                    _ => ImageAtomicOp::Exchange,
+                };
+                let operation =
+                    if size == 1 && matches!(op, ImageAtomicOp::Increment | ImageAtomicOp::Decrement) {
+                        Op::LoadGlobal { addr_lo, offset }
+                    } else {
+                        Op::GlobalAtomic {
+                            addr_lo,
+                            offset,
+                            value,
+                            op,
+                            is_signed: size == 1,
+                        }
+                    };
+                self.write_side_effecting_reg(reg_dest(raw), operation, pred);
+            }
             Opcode::RED => {
                 let operand = reg_dest(raw);
                 let addr_reg = reg_a(raw);
@@ -4732,35 +4916,17 @@ impl Translator {
 
             Opcode::IADD_reg => {
                 let b = self.read_reg(reg_b(raw));
-                self.emit_iadd(raw, b, pred);
+                if !self.emit_iadd(raw, b, pred) { return false; }
             }
             Opcode::IADD_cbuf => {
                 let id = self.load_cbuf(raw);
-                self.emit_iadd(raw, Value::Inst(id), pred);
+                if !self.emit_iadd(raw, Value::Inst(id), pred) { return false; }
             }
             Opcode::IADD_imm => {
-                self.emit_iadd(raw, Value::ImmU32(imm20(raw) as u32), pred);
+                if !self.emit_iadd(raw, Value::ImmU32(imm20(raw) as u32), pred) { return false; }
             }
             Opcode::IADD32I => {
-                let cc = ((raw >> 52) & 1) != 0;
-                let x = ((raw >> 53) & 1) != 0;
-                let sat = ((raw >> 54) & 1) != 0;
-                if cc || x || sat {
-                    log::debug!(
-                        "IADD32I unsupported flags raw={:#018x} cc={} x={} sat={}",
-                        raw,
-                        cc,
-                        x,
-                        sat,
-                    );
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::IADD32I,
-                        raw,
-                    });
-                    self.unimplemented_count += 1;
-                    return false;
-                }
-                self.emit_iadd32i(raw, pred);
+                if !self.emit_iadd(raw, Value::ImmU32(imm32(raw)), pred) { return false; }
             }
 
             Opcode::IMUL_imm => {
@@ -4948,12 +5114,13 @@ impl Translator {
                     pred,
                 );
             }
-            Opcode::LOP3_imm => {
+            opcode @ (Opcode::LOP3_reg | Opcode::LOP3_cbuf | Opcode::LOP3_imm) => {
                 let cc = ((raw >> 47) & 1) != 0;
-                let lut = ((raw >> 48) & 0xff) as u8;
-                if cc {
+                let register_form = opcode == Opcode::LOP3_reg;
+                let extended = register_form && ((raw >> 38) & 1) != 0;
+                if cc || extended {
                     self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::LOP3_imm,
+                        opcode,
                         raw,
                     });
                     self.unimplemented_count += 1;
@@ -4961,19 +5128,87 @@ impl Translator {
                 }
 
                 let a = self.read_reg(reg_a(raw));
+                let b = match opcode {
+                    Opcode::LOP3_reg => self.read_reg(reg_b(raw)),
+                    Opcode::LOP3_cbuf => Value::Inst(self.load_cbuf(raw)),
+                    _ => Value::ImmU32(imm20(raw) as u32),
+                };
                 let c = self.read_reg(reg_c(raw));
-                self.write_reg(
+                let lut = ((raw >> if register_form { 28 } else { 48 }) & 0xff) as u8;
+                let result = self.write_reg(
                     reg_dest(raw),
                     Op::ILop3 {
                         a,
-                        b: Value::ImmU32(imm20(raw) as u32),
+                        b,
                         c,
                         lut,
                     },
                     pred,
                 );
+                if register_form {
+                    self.emit_logic_predicate(
+                        ((raw >> 48) & 7) as u8,
+                        ((raw >> 36) & 3) as u8,
+                        result,
+                        pred,
+                    );
+                }
             }
 
+            Opcode::VMNMX => {
+                let operation = ((raw >> 51) & 7) as u8;
+                if ((raw >> 47) & 1) != 0 || ((raw >> 55) & 1) != 0 || !matches!(operation, 5 | 6) {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::VMNMX,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let immediate = ((raw >> 50) & 1) == 0;
+                let mut a = self.read_reg(reg_a(raw));
+                let mut b = if immediate {
+                    Value::ImmU32(((raw >> 20) & 0xffff) as u32)
+                } else {
+                    self.read_reg(reg_b(raw))
+                };
+                let c = self.read_reg(reg_c(raw));
+                let a_width = (raw >> 37) & 3;
+                let b_width = if immediate { 2 } else { (raw >> 29) & 3 };
+                let a_signed = ((raw >> 48) & 1) != 0;
+                let b_signed = ((raw >> 49) & 1) != 0;
+                if a_width != 3 {
+                    let bits = if a_width == 2 { 16 } else { 8 };
+                    a = self.emit_bfe_value(a, ((raw >> 36) & 3) as u32 * bits, bits, a_signed);
+                }
+                if b_width != 3 {
+                    let bits = if b_width == 2 { 16 } else { 8 };
+                    let selector = if immediate {
+                        0
+                    } else {
+                        ((raw >> 28) & 3) as u32
+                    };
+                    b = self.emit_bfe_value(b, selector * bits, bits, b_signed);
+                }
+                let first = self.emit_value(Op::IMinMaxPred {
+                    a,
+                    b,
+                    signed: b_signed,
+                    pred: PT,
+                    neg_pred: ((raw >> 56) & 1) != 0,
+                });
+                self.write_reg(
+                    reg_dest(raw),
+                    Op::IMinMaxPred {
+                        a: first,
+                        b: c,
+                        signed: ((raw >> 54) & 1) != 0,
+                        pred: PT,
+                        neg_pred: operation == 6,
+                    },
+                    pred,
+                );
+            }
             Opcode::FLO_reg => {
                 let tilde = ((raw >> 40) & 0x1) != 0;
                 let shift = ((raw >> 41) & 0x1) != 0;
@@ -5389,7 +5624,18 @@ impl Translator {
                 } else {
                     match sr {
                         0 => {
-                            self.write_reg(dest, Op::Mov(Value::ImmU32(0)), pred);
+                            self.write_reg(dest, Op::SubgroupLaneId, pred);
+                        }
+                        0x38..=0x3c => {
+                            let kind = match sr {
+                                0x38 => SubgroupMask::Eq,
+                                0x39 => SubgroupMask::Lt,
+                                0x3a => SubgroupMask::Le,
+                                0x3b => SubgroupMask::Gt,
+                                0x3c => SubgroupMask::Ge,
+                                _ => unreachable!(),
+                            };
+                            self.write_reg(dest, Op::SubgroupMask { kind }, pred);
                         }
                         0x1d if self.stage == ShaderStage::Geometry => {
                             self.write_reg(dest, Op::GeometryInvocationInfo, pred);
@@ -5397,11 +5643,14 @@ impl Translator {
                         18 => {
                             self.write_reg(dest, Op::YDirection, pred);
                         }
+                        19 if self.stage == ShaderStage::Fragment => {
+                            self.write_reg(dest, Op::HelperInvocation, pred);
+                        }
                         30 | 31 => {
                             self.write_reg(dest, Op::Mov(Value::ImmU32(0x3F80_0000)), pred);
                         }
                         _ => {
-                            log::debug!("S2R sr={} → 0 (approx) raw={:#018x}", sr, raw);
+                            log::debug!("S2R sr={} â†’ 0 (approx) raw={:#018x}", sr, raw);
                             self.write_reg(dest, Op::Mov(Value::ImmU32(0)), pred);
                         }
                     }
@@ -8948,6 +9197,107 @@ mod tests {
     }
 
     #[test]
+    fn lop3_register_decodes_captured_operands_and_all_truth_tables() {
+        const CAPTURED: u64 = 0x5be7_060f_e0b7_0d08;
+        for lut in 0..=255u64 {
+            let raw = (CAPTURED & !(0xff << 28)) | (lut << 28);
+            let mut t = Translator::new_fragment();
+            assert!(t.translate(raw), "raw={raw:#018x}");
+            assert_eq!(t.unimplemented_count, 0);
+            assert_eq!(t.program.instructions.len(), 1);
+            assert!(matches!(t.program.instructions[0].op,
+                    Op::ILop3 {
+                        a: Value::GprIn(13), b: Value::GprIn(11),
+                        c: Value::GprIn(12), lut: actual,
+                    } if u64::from(actual) == lut));
+            assert_eq!(t.program.instructions[0].dest_reg, Some(8));
+            assert!(t.snapshot_pred_state().is_empty());
+        }
+    }
+
+    #[test]
+    fn tlds_offsets_are_signed_nibbles_and_snapshot_aliased_coordinates() {
+        let raw = 0xda8c_008f_f077_0000;
+        for mut t in [Translator::new_compute(), Translator::new()] {
+            assert!(t.translate(raw));
+            assert_eq!(t.unimplemented_count, 0);
+            let mut offsets = Vec::new();
+            for inst in &t.program.instructions {
+                if let Op::Bfe { a, b: Value::ImmU32(control), signed } = inst.op {
+                    if a == Value::GprIn(7) {
+                        offsets.push((control & 255, (control >> 8) & 255, signed));
+                    }
+                }
+            }
+            assert_eq!(offsets, vec![(0, 4, true), (4, 4, true)]);
+            let fetch = t.program.instructions.iter().find(|inst| matches!(inst.op, Op::TexelFetchHandle { .. })).unwrap();
+            let Op::TexelFetchHandle { dimension, x: Value::Inst(x), y: Some(Value::Inst(y)), component, .. } = fetch.op else { panic!("expected offset fetch") };
+            assert_eq!(dimension, ImageDimension::D2);
+            assert_eq!(component, 3);
+            for (id, reg) in [(x, 0), (y, 1)] {
+                assert!(t.program.instructions.iter().any(|inst| inst.result == Some(id)
+                    && matches!(inst.op, Op::IAdd { a: Value::GprIn(actual), neg_b: false, .. } if actual == reg)));
+            }
+        }
+    }
+
+    #[test]
+    fn lop3_register_predicate_modes_and_guard_survive_rz_destination() {
+        for (mode, expected) in [(0, ICmp::F), (1, ICmp::T), (2, ICmp::Eq), (3, ICmp::Ne)] {
+            let raw = (0x5be7_060f_e0b7_0d08u64 & !((7 << 48) | (3 << 36) | (15 << 16) | 0xff))
+                | ((mode as u64) << 36)
+                | (8 << 16)
+                | 0xff;
+            let mut t = Translator::new_fragment();
+            assert!(t.translate(raw));
+            let logical = t
+                .program
+                .instructions
+                .iter()
+                .find(|inst| matches!(inst.op, Op::ILop3 { .. }))
+                .unwrap();
+            let predicate = t.program.instructions.last().unwrap();
+            assert_eq!(
+                predicate.pred,
+                Some(Predicate {
+                    idx: 0,
+                    negate: true
+                })
+            );
+            assert!(matches!(predicate.op, Op::ISetPred {
+                    cmp, src_a: Value::Inst(result), dest_p: 0, dest_np: PT, ..
+                } if cmp == expected && Some(result) == logical.result));
+        }
+        for flag in [38, 47] {
+            let mut t = Translator::new_fragment();
+            assert!(!t.translate(0x5be7_060f_e0b7_0d08 | (1 << flag)));
+            assert_eq!(t.unimplemented_count, 1);
+        }
+    }
+
+    #[test]
+    fn lop3_constant_buffer_uses_lut48_without_predicate_output() {
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(0x02f8_0100_0027_0302));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t
+            .program
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst.op, Op::LoadCbuf { .. })));
+        assert!(matches!(
+            t.program.instructions.last().unwrap().op,
+            Op::ILop3 {
+                a: Value::GprIn(3),
+                b: Value::Inst(_),
+                c: Value::GprIn(2),
+                lut: 0xf8
+            }
+        ));
+        assert!(t.snapshot_pred_state().is_empty());
+    }
+
+    #[test]
     fn lop3_imm_preserves_captured_truth_table_and_aliasing() {
         for (raw, dest, a, c) in [
             (0x3cf8_0100_0027_0302, 2, 3, 2),
@@ -9843,6 +10193,52 @@ mod tests {
     }
 
     #[test]
+    fn compute_shared_b64_preserves_both_words_and_offsets() {
+        for (raw, load) in [
+            (0xef4d_1000_4287_ff0c, true),
+            (0xef5d_1000_4287_ff0c, false),
+        ] {
+            let mut t = Translator::new_compute();
+            assert!(t.translate(raw));
+            assert_eq!(t.unimplemented_count, 0);
+            let memory_ops: Vec<_> = t
+                .program
+                .instructions
+                .iter()
+                .filter_map(|inst| match inst.op {
+                    Op::LoadShared { addr } if load => Some(addr),
+                    Op::StoreShared { addr, .. } if !load => Some(addr),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(memory_ops.len(), 2);
+            assert_eq!(memory_ops[0], Value::ImmU32(0x428));
+            assert!(t.program.instructions.iter().any(|inst| matches!(
+                inst.op,
+                Op::IAdd {
+                    a: Value::ImmU32(0x428),
+                    b: Value::ImmU32(4),
+                    ..
+                }
+            )));
+            if load {
+                for reg in [12, 13] {
+                    assert!(t
+                        .program
+                        .instructions
+                        .iter()
+                        .any(|inst| inst.dest_reg == Some(reg)));
+                }
+            } else {
+                for reg in [12, 13] {
+                    assert!(t.program.instructions.iter().any(|inst| matches!(inst.op,
+                            Op::StoreShared { value: Value::GprIn(source), .. } if source == reg)));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn compute_shared_rejects_unknown_widths() {
         let unsupported = 0xef5e_0000_0007_0d08 | (1u64 << 48);
         let mut t = Translator::new_compute();
@@ -10034,9 +10430,9 @@ mod tests {
     }
 
     #[test]
-    fn iadd32i_x_sat_and_cc_fail_closed() {
+    fn iadd32i_unknown_carry_and_saturation_fail_closed() {
         const CAPTURED: u64 = 0x1c0f_ffff_fff7_2222;
-        for flag in [52, 53, 54] {
+        for flag in [53, 54] {
             let mut t = Translator::new();
             let raw = CAPTURED | (1u64 << flag);
             assert!(!t.translate(raw));
@@ -10049,6 +10445,144 @@ mod tests {
                 }) if *actual == raw
             ));
         }
+    }
+
+    #[test]
+    fn captured_integer_address_add_propagates_carry_across_u32_boundary() {
+        fn value(value: Value, results: &HashMap<ValueId, u32>) -> u32 {
+            match value {
+                Value::Zero => 0,
+                Value::ImmU32(word) => word,
+                Value::Inst(id) => results[&id],
+                _ => panic!("unexpected value {value:?}"),
+            }
+        }
+        for low in [0, 0xffff_ffe3, 0xffff_ffe4, u32::MAX] {
+            let mut t = Translator::new_fragment();
+            t.reg_state.insert(4, Value::ImmU32(low));
+            t.reg_state.insert(3, Value::ImmU32(9));
+            assert!(t.translate(0x1c10_0000_01c7_0404));
+            assert!(t.translate(0x5c10_0800_0037_ff05));
+            let mut results = HashMap::new();
+            for inst in &t.program.instructions {
+                let result = match inst.op {
+                    Op::IAdd { a, b, neg_a, neg_b } => {
+                        let a = value(a, &results);
+                        let b = value(b, &results);
+                        (if neg_a { a.wrapping_neg() } else { a }).wrapping_add(if neg_b {
+                            b.wrapping_neg()
+                        } else {
+                            b
+                        })
+                    }
+                    Op::ISet {
+                        a,
+                        b,
+                        cmp: ICmp::Lt,
+                        signed: false,
+                        ..
+                    } => {
+                        if value(a, &results) < value(b, &results) {
+                            u32::MAX
+                        } else {
+                            0
+                        }
+                    }
+                    Op::Bfe {
+                        a,
+                        b,
+                        signed: false,
+                    } => {
+                        let control = value(b, &results);
+                        (value(a, &results) >> (control & 0xff)) & ((1 << ((control >> 8) & 0xff)) - 1)
+                    }
+                    _ => panic!("unexpected operation {:?}", inst.op),
+                };
+                results.insert(inst.result.unwrap(), result);
+            }
+            let actual = (u64::from(value(t.reg_state[&5], &results)) << 32)
+                | u64::from(value(t.reg_state[&4], &results));
+            assert_eq!(actual, ((9u64 << 32) | u64::from(low)) + 0x1c);
+        }
+    }
+
+    #[test]
+    fn captured_global_atomic_keeps_guard_result_and_operand_aliasing() {
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(0xed01_0000_0058_0205));
+        assert_eq!(t.unimplemented_count, 0);
+        let atomic = &t.program.instructions[0];
+        assert_eq!(
+            atomic.pred,
+            Some(Predicate {
+                idx: 0,
+                negate: true
+            })
+        );
+        assert!(matches!(
+            atomic.op,
+            Op::GlobalAtomic {
+                addr_lo: Value::GprIn(2),
+                offset: 0,
+                value: Value::GprIn(5),
+                op: ImageAtomicOp::Add,
+                is_signed: false,
+            }
+        ));
+        assert!(matches!(t.program.instructions[1].op, Op::SelectPred {
+                if_true: Value::Inst(id), if_false: Value::GprIn(5), ..
+            } if Some(id) == atomic.result));
+    }
+
+    #[test]
+    fn scaled_and_predicated_pointer_adds_keep_compatible_carry() {
+        for pair in [
+            [0x4c18_8200_0500_0404, 0x4c10_0800_0510_ff05],
+            [0x4c18_8200_0447_0600, 0x4c10_0800_0457_ff01],
+            [0x4c10_8000_1440_0606, 0x4c10_0800_1450_ff07],
+        ] {
+            let mut t = Translator::new();
+            assert!(t.translate(pair[0]));
+            assert!(t.carry_source.is_some());
+            assert!(t.translate(pair[1]));
+            assert_eq!(t.unimplemented_count, 0);
+        }
+        let mut t = Translator::new();
+        assert!(t.translate(0x4c10_8000_1440_0606));
+        assert!(!t.translate(0x4c10_0800_1457_ff07));
+        let mut t = Translator::new();
+        assert!(t.translate(0x4c10_8000_1440_0606));
+        t.pred_state.insert(0, ValueId(999));
+        assert!(!t.translate(0x4c10_0800_1450_ff07));
+    }
+
+    #[test]
+    fn captured_vmnmx_lowers_unsigned_word_max_chain() {
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(0x3b34_0060_6037_0102));
+        assert_eq!(t.unimplemented_count, 0);
+        assert_eq!(t.program.instructions.len(), 2);
+        assert!(matches!(
+            t.program.instructions[0].op,
+            Op::IMinMaxPred {
+                a: Value::GprIn(1),
+                b: Value::GprIn(3),
+                signed: false,
+                pred: PT,
+                neg_pred: true,
+            }
+        ));
+        assert!(matches!(
+            t.program.instructions[1].op,
+            Op::IMinMaxPred {
+                a: Value::Inst(_),
+                b: Value::GprIn(0),
+                signed: false,
+                pred: PT,
+                neg_pred: true,
+            }
+        ));
+        assert_eq!(t.program.instructions[1].dest_reg, Some(2));
     }
 
     #[test]
@@ -10217,7 +10751,71 @@ mod tests {
     }
 
     #[test]
-    fn i2i_cc_source_is_invalidated_by_later_cc_writer() {
+    fn break_setup_preserves_condition_flags_for_later_csetp() {
+        let mut t = Translator::new();
+        for raw in [
+            0x5ce0_8000_00f7_0aff,
+            0xe2a0_0000_b600_0000,
+            0x50a0_0380_0007_0d07,
+        ] {
+            assert!(t.translate(raw), "raw={raw:#018x}");
+        }
+        assert!(matches!(
+            t.program.instructions.last().unwrap().op,
+            Op::ISetPred {
+                src_a: Value::GprIn(15),
+                cmp: ICmp::Ne,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn double_arithmetic_snapshots_pairs_before_overwriting_aliases() {
+        let mut t = Translator::new();
+        assert!(t.translate(0x5b70_0200_0027_1402));
+        assert_eq!(t.program.instructions.len(), 2);
+        for (component, inst) in t.program.instructions.iter().enumerate() {
+            assert!(matches!(inst.op, Op::Double {
+                op: DoubleOp::Fma,
+                a: [Value::GprIn(20), Value::GprIn(21)],
+                b: [Value::GprIn(2), Value::GprIn(3)],
+                c: [Value::GprIn(4), Value::GprIn(5)],
+                component: actual, ..
+            } if usize::from(actual) == component));
+            assert_eq!(inst.dest_reg, Some(2 + component as u8));
+        }
+        for raw in [0x5c80_0000_0007_1600u64, 0x5c70_0000_0027_0c12] {
+            let mut t = Translator::new();
+            assert!(t.translate(raw));
+            assert_eq!(t.unimplemented_count, 0);
+            assert_eq!(t.program.instructions.len(), 2);
+            let mut unsupported = Translator::new();
+            assert!(!unsupported.translate(raw | (1 << 47)));
+        }
+    }
+
+    #[test]
+    fn double_conversion_preserves_register_pair_width() {
+        let mut widen = Translator::new();
+        assert!(widen.translate(0x4ca8_0010_0017_0b00));
+        assert_eq!(widen.program.instructions.len(), 3);
+        for component in [0, 1] {
+            assert!(matches!(widen.program.instructions[component + 1].op,
+                Op::Double { op: DoubleOp::FromFloat32, component: actual, .. }
+                if usize::from(actual) == component));
+        }
+        let mut narrow = Translator::new();
+        assert!(narrow.translate(0x5ca8_0000_0067_0e01));
+        assert_eq!(narrow.program.instructions.len(), 1);
+        assert!(matches!(narrow.program.instructions[0].op, Op::Double {
+            op: DoubleOp::ToFloat32, a: [Value::GprIn(6), Value::GprIn(7)], component: 0, ..
+        }));
+        assert_eq!(narrow.program.instructions[0].dest_reg, Some(1));
+    }
+
+    #[test]
+    fn i2i_cc_source_is_replaced_by_later_integer_add() {
         const I2I_CC: u64 = 0x5ce0_8000_0017_0aff;
         const IADD_CC: u64 = 0x5c10_8000_0037_0404;
         const CSETP_NEU_P0: u64 = 0x50a0_0380_0007_0d07;
@@ -10230,15 +10828,13 @@ mod tests {
         assert!(t.translate(I2I_CC));
         assert_eq!(t.cc_source, Some(Value::GprIn(1)));
         assert!(t.translate(IADD_CC));
-        assert_eq!(t.cc_source, None);
-        assert!(!t.translate(CSETP_NEU_P0));
-        assert_eq!(t.unimplemented_count, 1);
+        let result = t.cc_source.unwrap();
+        assert_ne!(result, Value::GprIn(1));
+        assert!(t.translate(CSETP_NEU_P0));
+        assert_eq!(t.unimplemented_count, 0);
         assert!(matches!(
             t.program.instructions.last().map(|inst| &inst.op),
-            Some(Op::Unimplemented {
-                opcode: Opcode::CSETP,
-                raw: CSETP_NEU_P0,
-            })
+            Some(Op::ISetPred { src_a, cmp: ICmp::Ne, .. }) if *src_a == result
         ));
     }
 
