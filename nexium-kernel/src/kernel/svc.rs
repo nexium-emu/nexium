@@ -11848,6 +11848,101 @@ mod offline_web_applet_tests {
     }
 }
 
+#[cfg(test)]
+mod cache_storage_reader_tests {
+    use super::{dispatch_service_v2, HandleType, Kernel, Session};
+    use nexium_ipc::{DomainIn, IpcCtx, CMIF_IN_MAGIC};
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::Arc;
+
+    fn request(command: u32, object_id: Option<u32>) -> IpcCtx {
+        let mut bytes = vec![0; 0x100];
+        bytes[..4].copy_from_slice(&4u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&CMIF_IN_MAGIC.to_le_bytes());
+        bytes[0x18..0x1c].copy_from_slice(&command.to_le_bytes());
+        let mut ctx = IpcCtx::parse(bytes, false).unwrap();
+        ctx.domain = object_id.map(|object_id| DomainIn {
+            kind: 1,
+            object_id,
+            num_in_objects: 0,
+            data_size: 16,
+        });
+        ctx
+    }
+
+    #[test]
+    fn cache_storage_reader_returns_object_and_empty_count() {
+        const BASE: u64 = 0x1000_0000_0000;
+        let memory = Arc::new(AddressSpace::new());
+        memory
+            .map(BASE, 0x20000, Perm::RW, "cache_reader_test")
+            .unwrap();
+        let mut kernel = Kernel::new(
+            memory,
+            BASE,
+            0x1000,
+            BASE + 0x10000,
+            0x1000,
+            BASE + 0x18000,
+            0x1000,
+            BASE + 0x19000,
+            BASE + 0x1a000,
+        );
+        for domain in [false, true] {
+            let handle = kernel.handles.create_handle(HandleType::Session);
+            let mut session = Session::new(handle, "fsp-srv".into());
+            if domain {
+                session.convert_to_domain();
+            }
+            kernel.sessions.insert(handle, session);
+            let response = dispatch_service_v2(
+                &mut kernel,
+                "fsp-srv",
+                &mut request(62, domain.then_some(1)),
+                handle,
+                &mut Vec::new(),
+            );
+            let (reader_handle, object_id, data_offset) = if domain {
+                assert_eq!(&response[0x10..0x14], &1u32.to_le_bytes());
+                assert_eq!(&response[0x28..0x2c], &0u32.to_le_bytes());
+                let id = u32::from_le_bytes(response[0x30..0x34].try_into().unwrap());
+                assert_eq!(
+                    kernel.sessions[&handle].service_for_object(id),
+                    Some("ISaveDataInfoReaderCacheStorage")
+                );
+                (handle, Some(id), 0x30)
+            } else {
+                assert_eq!(
+                    (u32::from_le_bytes(response[8..12].try_into().unwrap()) >> 5) & 15,
+                    1
+                );
+                assert_eq!(&response[0x18..0x1c], &0u32.to_le_bytes());
+                let reader = u32::from_le_bytes(response[12..16].try_into().unwrap());
+                assert_eq!(
+                    kernel.sessions[&reader].port_name,
+                    "ISaveDataInfoReaderCacheStorage"
+                );
+                (reader, None, 0x20)
+            };
+            for _ in 0..2 {
+                let response = dispatch_service_v2(
+                    &mut kernel,
+                    "ISaveDataInfoReaderCacheStorage",
+                    &mut request(0, object_id),
+                    reader_handle,
+                    &mut Vec::new(),
+                );
+                assert_eq!(
+                    &response[data_offset - 8..data_offset - 4],
+                    &0u32.to_le_bytes()
+                );
+                assert_eq!(&response[data_offset..data_offset + 8], &0u64.to_le_bytes());
+            }
+        }
+    }
+}
+
 fn build_launch_parameter() -> Vec<u8> {
     let mut out = vec![0u8; 0x88];
     out[0..4].copy_from_slice(&0xC794_97CAu32.to_le_bytes());
@@ -12103,6 +12198,7 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("IDeliveryCacheStorageService", 1) => Some("IDeliveryCacheDirectoryService"),
         ("aoc:u", 100 | 101) => Some("IPurchaseEventManager"),
         ("fsp-srv", 18) => Some("IFileSystem"),
+        ("fsp-srv", 62) => Some("ISaveDataInfoReaderCacheStorage"),
         ("fsp-srv", 200) => Some("IFsStorage"),
         ("fsp-srv", 1200) => Some("IMultiCommitManager"),
         ("vi:m" | "vi:s" | "vi:u", 0) => Some("IApplicationDisplayService"),
@@ -12135,6 +12231,9 @@ fn applet_command_response(
 
         ("IFileSystem", _) => Some((Vec::new(), None)),
         ("IMultiCommitManager", _) => Some((Vec::new(), None)),
+        ("ISaveDataInfoReaderCacheStorage", 0) => {
+            Some((0u64.to_le_bytes().to_vec(), None))
+        }
         ("fsp-srv", _) => Some((Vec::new(), None)),
 
         ("psm", _) => Some((Vec::new(), None)),
