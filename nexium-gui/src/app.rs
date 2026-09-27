@@ -32,6 +32,8 @@ struct NativeGameTexture {
     width: u32,
     height: u32,
     filter: FilterMode,
+    scaler: Option<crate::frame_scaler::FrameScaler>,
+    dirty: bool,
 }
 
 fn legacy_gui_upload() -> bool {
@@ -515,6 +517,8 @@ pub struct HorizonApp {
     pending_quick: Option<String>,
     modal_active_frame_start: bool,
     game_info_path: Option<std::path::PathBuf>,
+    mod_manager: Option<crate::mods::ModManager>,
+    content_manager: Option<crate::content_manager::ContentManager>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -538,6 +542,8 @@ enum ConfirmKind {
 
 enum GameInfoAction {
     Launch(std::path::PathBuf),
+    ManageMods(std::path::PathBuf),
+    ManageContent(std::path::PathBuf),
     ToggleFavorite(std::path::PathBuf),
     DownloadIcon(std::path::PathBuf),
 }
@@ -786,6 +792,8 @@ impl HorizonApp {
             pending_quick: None,
             modal_active_frame_start: false,
             game_info_path: None,
+            mod_manager: None,
+            content_manager: None,
         };
         app.reload_profile_texture(&cc.egui_ctx);
         crate::ui_audio::set_sfx_volume(app.app_settings.sfx_volume);
@@ -885,6 +893,26 @@ impl HorizonApp {
             self.app_settings.favorites.push(path);
         }
         let _ = self.app_settings.save();
+    }
+
+    fn open_content_manager(&mut self, path: std::path::PathBuf, ctx: &egui::Context) {
+        let (title, cover, accent) = if let Some(index) = self.library.index_of_path(&path) {
+            let title = self.library.games[index].title.clone();
+            let accent = self.library.games[index].dominant_color;
+            (title, self.library.texture(ctx, index), accent)
+        } else {
+            (path.file_stem().unwrap_or_default().to_string_lossy().into_owned(), None, ACCENT)
+        };
+        self.game_info_path = None;
+        self.mod_manager = None;
+        self.content_manager = Some(crate::content_manager::ContentManager::new(path, title, cover, accent, ctx));
+        crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+    }
+
+    fn open_mod_manager(&mut self, path: std::path::PathBuf, ctx: &egui::Context) {
+        self.game_info_path = None;
+        self.mod_manager = Some(crate::mods::ModManager::new(path, ctx));
+        crate::ui_audio::play(crate::ui_audio::Sfx::Open);
     }
 
     fn open_icon_picker(&mut self, path: std::path::PathBuf) {
@@ -1067,6 +1095,12 @@ impl HorizonApp {
                     if ui.button("Change Icon").clicked() {
                         action = Some(GameInfoAction::DownloadIcon(path.clone()));
                     }
+                    if ui.add_enabled(exists, egui::Button::new("Manage Mods")).clicked() {
+                        action = Some(GameInfoAction::ManageMods(path.clone()));
+                    }
+                    if ui.add_enabled(exists, egui::Button::new("Updates & DLC")).clicked() {
+                        action = Some(GameInfoAction::ManageContent(path.clone()));
+                    }
                     if ui.button("Open Containing Folder").clicked() {
                         reveal_in_file_manager(&path);
                     }
@@ -1084,7 +1118,7 @@ impl HorizonApp {
             self.game_info_path = None;
         } else if matches!(
             &action,
-            Some(GameInfoAction::Launch(_) | GameInfoAction::DownloadIcon(_))
+            Some(GameInfoAction::Launch(_) | GameInfoAction::DownloadIcon(_) | GameInfoAction::ManageMods(_) | GameInfoAction::ManageContent(_))
         ) {
             self.game_info_path = None;
         }
@@ -1138,6 +1172,8 @@ impl HorizonApp {
 
         let mut launch: Option<String> = None;
         let mut info_request: Option<std::path::PathBuf> = None;
+        let mut mods_request: Option<std::path::PathBuf> = None;
+        let mut content_request: Option<std::path::PathBuf> = None;
         let mut favorite_request: Option<std::path::PathBuf> = None;
         let mut download_request: Option<std::path::PathBuf> = None;
         let mut reveal_request: Option<std::path::PathBuf> = None;
@@ -1192,6 +1228,14 @@ impl HorizonApp {
                                             info_request = Some(game_path.clone());
                                             menu.close();
                                         }
+                                        if menu.button("Manage Mods").clicked() {
+                                            mods_request = Some(game_path.clone());
+                                            menu.close();
+                                        }
+                                        if menu.button("Updates & DLC").clicked() {
+                                            content_request = Some(game_path.clone());
+                                            menu.close();
+                                        }
                                         menu.separator();
                                         let favorite_label = if favorite {
                                             "Unfavorite Game"
@@ -1239,6 +1283,10 @@ impl HorizonApp {
         if let Some(path) = launch {
             self.nro_path = path;
             self.boot_nro(ctx);
+        } else if let Some(path) = content_request {
+            self.open_content_manager(path, ctx);
+        } else if let Some(path) = mods_request {
+            self.open_mod_manager(path, ctx);
         } else if let Some(path) = info_request {
             crate::ui_audio::play(crate::ui_audio::Sfx::Open);
             self.game_info_path = Some(path);
@@ -1293,8 +1341,8 @@ impl HorizonApp {
             return;
         };
         let tex_opts = match self.app_settings.filter {
-            crate::app_settings::FilterMode::Linear => egui::TextureOptions::LINEAR,
-            crate::app_settings::FilterMode::Nearest => egui::TextureOptions::NEAREST,
+            FilterMode::Nearest => egui::TextureOptions::NEAREST,
+            _ => egui::TextureOptions::LINEAR,
         };
         if let Some(mut frame) = take_next_game_frame(&handle.frame_rx) {
             if let Some(window) = &mut self.native_game { window.active = false; }
@@ -1307,10 +1355,14 @@ impl HorizonApp {
                 frame.height,
                 frame.pixels.len()
             );
-            if self.wgpu_state.is_some() && !legacy_gui_upload() {
+            if self.wgpu_state.is_some()
+                && (!legacy_gui_upload()
+                    || !matches!(self.app_settings.filter, FilterMode::Nearest | FilterMode::Linear))
+            {
                 self.upload_frame_native(&mut frame);
                 return;
             }
+            self.free_native_texture();
             let image_size = [frame.width as usize, frame.height as usize];
             let img = egui::ColorImage::from_rgba_unmultiplied(image_size, &frame.pixels);
             match &mut self.game_texture {
@@ -1338,7 +1390,7 @@ impl HorizonApp {
         }
         let filter = self.app_settings.filter;
         let recreate = self.game_texture_native.as_ref().map_or(true, |t| {
-            t.width != frame.width || t.height != frame.height || t.filter != filter
+            t.width != frame.width || t.height != frame.height
         });
         if recreate {
             self.free_native_texture();
@@ -1359,8 +1411,8 @@ impl HorizonApp {
             });
             let view = texture.create_view(&Default::default());
             let wgpu_filter = match filter {
-                FilterMode::Linear => eframe::wgpu::FilterMode::Linear,
                 FilterMode::Nearest => eframe::wgpu::FilterMode::Nearest,
+                _ => eframe::wgpu::FilterMode::Linear,
             };
             let id = rs
                 .renderer
@@ -1372,14 +1424,17 @@ impl HorizonApp {
                 width: frame.width,
                 height: frame.height,
                 filter,
+                scaler: None,
+                dirty: true,
             });
         }
         if self.carousel.boot_stage != crate::carousel::BootStage::None {
             self.carousel.boot_stage = crate::carousel::BootStage::None;
         }
-        let Some(t) = self.game_texture_native.as_ref() else {
+        let Some(t) = self.game_texture_native.as_mut() else {
             return;
         };
+        t.dirty = true;
         let _ = rs.device.poll(eframe::wgpu::PollType::Poll);
         rs.queue.write_texture(
             eframe::wgpu::TexelCopyTextureInfo {
@@ -1406,11 +1461,60 @@ impl HorizonApp {
         }
     }
 
+    fn filtered_game_texture(&mut self, rect: egui::Rect, pixels_per_point: f32) -> Option<egui::TextureId> {
+        if self.native_game.as_ref().is_some_and(|window| window.active) {
+            return None;
+        }
+        let rs = self.wgpu_state.as_ref()?;
+        let texture = self.game_texture_native.as_mut()?;
+        let filter = self.app_settings.filter;
+        if texture.filter != filter {
+            let sampler = if filter == FilterMode::Nearest {
+                eframe::wgpu::FilterMode::Nearest
+            } else {
+                eframe::wgpu::FilterMode::Linear
+            };
+            rs.renderer.write().update_egui_texture_from_wgpu_texture(
+                &rs.device,
+                &texture.texture.create_view(&Default::default()),
+                sampler,
+                texture.id,
+            );
+            texture.filter = filter;
+            texture.dirty = true;
+        }
+        if matches!(filter, FilterMode::Nearest | FilterMode::Linear) {
+            if let Some(id) = texture.scaler.take().and_then(|scaler| scaler.id) {
+                rs.renderer.write().free_texture(&id);
+            }
+            return Some(texture.id);
+        }
+        let size = [
+            (rect.width() * pixels_per_point).round().max(1.0) as u32,
+            (rect.height() * pixels_per_point).round().max(1.0) as u32,
+        ];
+        let scaler = texture.scaler.get_or_insert_with(|| crate::frame_scaler::FrameScaler::new(&rs.device));
+        let id = scaler.render(
+            rs,
+            &texture.texture,
+            size,
+            filter.scaling_filter(),
+            self.app_settings.fsr_sharpness,
+            texture.dirty,
+        );
+        texture.dirty = false;
+        Some(id)
+    }
+
     fn free_native_texture(&mut self) {
         self.game_depth = None;
         if let Some(t) = self.game_texture_native.take() {
             if let Some(rs) = &self.wgpu_state {
-                rs.renderer.write().free_texture(&t.id);
+                let mut renderer = rs.renderer.write();
+                renderer.free_texture(&t.id);
+                if let Some(id) = t.scaler.and_then(|scaler| scaler.id) {
+                    renderer.free_texture(&id);
+                }
             }
         }
     }
@@ -1422,6 +1526,8 @@ impl HorizonApp {
             || self.shop.open
             || self.carousel_settings_open
             || self.game_info_path.is_some()
+            || self.mod_manager.is_some()
+            || self.content_manager.is_some()
             || self.vkeyboard.open
     }
 
@@ -4346,7 +4452,7 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 8] = [
+            let rows: [(&str, String); 9] = [
                 ("GPU", self.app_settings.gpu_device_label()),
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
                 ("Output Scale", format!("{}x", scale)),
@@ -4354,6 +4460,7 @@ impl HorizonApp {
                     "Texture Filter",
                     self.app_settings.filter.label().to_string(),
                 ),
+                ("FSR Sharpness", format!("{}%", self.app_settings.fsr_sharpness)),
                 ("High-DPI Aware", on(self.app_settings.dpi_aware)),
                 ("V-Sync", on(self.app_settings.vsync)),
                 ("Async Shaders", on(self.app_settings.async_shaders)),
@@ -4512,13 +4619,17 @@ impl HorizonApp {
                         self.app_settings.filter =
                             all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
                     }
-                    4 => self.app_settings.dpi_aware = !self.app_settings.dpi_aware,
-                    5 => self.app_settings.vsync = !self.app_settings.vsync,
-                    6 => {
+                    4 => {
+                        self.app_settings.fsr_sharpness =
+                            (i32::from(self.app_settings.fsr_sharpness) + dir * 5).clamp(0, 100) as u8;
+                    }
+                    5 => self.app_settings.dpi_aware = !self.app_settings.dpi_aware,
+                    6 => self.app_settings.vsync = !self.app_settings.vsync,
+                    7 => {
                         self.app_settings.async_shaders = !self.app_settings.async_shaders;
                         nexium_common::async_compile::set_enabled(self.app_settings.async_shaders);
                     }
-                    7 => {
+                    8 => {
                         self.app_settings.depth_share = !self.app_settings.depth_share;
                         nexium_common::depth_share::set_enabled(self.app_settings.depth_share);
                     }
@@ -6743,6 +6854,22 @@ impl HorizonApp {
                         self.app_settings.filter = all[(index + 1) % all.len()];
                         let _ = self.app_settings.save();
                     }
+                    if self.app_settings.filter == FilterMode::Fsr {
+                        ui.add_space(8.0);
+                        ui.scope(|ui| {
+                            ui.spacing_mut().slider_width = 64.0;
+                            let slider = if ui.available_width() < 720.0 {
+                                ui.add(egui::DragValue::new(&mut self.app_settings.fsr_sharpness)
+                                    .range(0..=100).prefix("Sharp: ").suffix("%"))
+                            } else {
+                                ui.add(egui::Slider::new(&mut self.app_settings.fsr_sharpness, 0..=100)
+                                    .suffix("%").text("Sharpness").trailing_fill(true))
+                            }.on_hover_text("Drag to adjust FSR sharpness: 0% disables sharpening, 100% is strongest");
+                            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                                let _ = self.app_settings.save();
+                            }
+                        });
+                    }
                     bar_divider(ui);
                     let vsync = self.app_settings.vsync;
                     if bar_item(
@@ -6900,13 +7027,26 @@ impl HorizonApp {
             .and_then(|s| s.to_str())
             .unwrap_or("Unknown")
             .to_string();
-        let (game, version) = match meta {
+        let (game, mut version) = match meta {
             Some(m) => {
                 let name = if m.title.is_empty() { stem } else { m.title };
                 (name, m.version)
             }
             None => (stem, String::new()),
         };
+        if ext != "nro" {
+            if let Ok(Some(title_id)) = nexium_loader::read_application_title_id(path) {
+                if let Ok(content) = nexium_loader::content::list_game_content(&nexium_common::paths::content_dir(), title_id) {
+                    if let Some(update) = content.entries.iter().find(|entry| {
+                        entry.enabled && entry.kind == nexium_loader::content::ContentKind::Update
+                    }) {
+                        if !update.display_version.trim().is_empty() {
+                            version = update.display_version.trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
         let mut title = format!("NeXium {} | {}", env!("CARGO_PKG_VERSION"), game);
         if !version.is_empty() {
             title.push_str(&format!(" {}", version));
@@ -7068,6 +7208,123 @@ pub fn clipboard_text() -> String {
     arboard::Clipboard::new()
         .and_then(|mut c| c.get_text())
         .unwrap_or_default()
+}
+
+fn guest_pointer_position(position: egui::Pos2, rect: egui::Rect) -> Option<[i32; 2]> {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 || !rect.contains(position) {
+        return None;
+    }
+    let normalized = (position - rect.min) / rect.size();
+    Some([
+        ((normalized.x * 1280.0).round() as i32).clamp(0, 1279),
+        ((normalized.y * 720.0).round() as i32).clamp(0, 719),
+    ])
+}
+
+fn guest_wheel_delta(input: &egui::InputState) -> egui::Vec2 {
+    input.events.iter().filter_map(|event| {
+        let egui::Event::MouseWheel { unit, delta, .. } = event else {
+            return None;
+        };
+        Some(match unit {
+            egui::MouseWheelUnit::Line => *delta,
+            egui::MouseWheelUnit::Point => *delta / 40.0,
+            egui::MouseWheelUnit::Page => *delta * (input.viewport_rect().height() / 40.0),
+        })
+    }).fold(egui::Vec2::ZERO, |total, delta| total + delta)
+}
+
+fn guest_keyboard_input(
+    input: &egui::InputState,
+    enabled: bool,
+    blocked: bool,
+    speed_shortcut: bool,
+    overlay_shortcut: bool,
+) -> nexium_core::hid_state::KeyboardInput {
+    use nexium_core::hid_state::{KeyboardInput, KEYBOARD_MOD_CONTROL, KEYBOARD_MOD_SHIFT, KEYBOARD_MOD_LEFT_ALT};
+    let mut keyboard = KeyboardInput { connected: enabled, ..KeyboardInput::default() };
+    if !enabled || blocked || !input.focused {
+        return keyboard;
+    }
+    for key in &input.keys_down {
+        if (speed_shortcut && *key == egui::Key::U)
+            || (overlay_shortcut && *key == egui::Key::O)
+        {
+            continue;
+        }
+        if let Some(index) = hid_keyboard_usage(*key) {
+            keyboard.keys[usize::from(index / 8)] |= 1 << (index % 8);
+        }
+    }
+    if input.modifiers.ctrl { keyboard.modifiers |= KEYBOARD_MOD_CONTROL; }
+    if input.modifiers.shift { keyboard.modifiers |= KEYBOARD_MOD_SHIFT; }
+    if input.modifiers.alt { keyboard.modifiers |= KEYBOARD_MOD_LEFT_ALT; }
+    keyboard
+}
+
+#[cfg(test)]
+mod guest_input_tests {
+    use super::{guest_keyboard_input, guest_pointer_position, guest_wheel_delta};
+    use egui::{pos2, vec2, Event, InputState, Key, Modifiers, MouseWheelUnit, Rect};
+
+    #[test]
+    fn f12_reaches_direct_keyboard_without_controller_mapping() {
+        let mut input = InputState::default();
+        input.focused = true;
+        input.keys_down.insert(Key::F12);
+        let keyboard = guest_keyboard_input(&input, true, false, false, false);
+        assert!(keyboard.connected);
+        assert_eq!(keyboard.keys[8], 1 << 5);
+        assert_eq!(keyboard.keys.iter().map(|byte| byte.count_ones()).sum::<u32>(), 1);
+        for (enabled, blocked, focused) in [(false, false, true), (true, true, true), (true, false, false)] {
+            input.focused = focused;
+            let keyboard = guest_keyboard_input(&input, enabled, blocked, false, false);
+            assert_eq!(keyboard.keys, [0; 32]);
+            assert_eq!(keyboard.modifiers, 0);
+        }
+        input.focused = true;
+        input.keys_down.clear();
+        assert_eq!(guest_keyboard_input(&input, true, false, false, false).keys, [0; 32]);
+    }
+
+    #[test]
+    fn emulator_shortcuts_do_not_press_guest_letters() {
+        let mut input = InputState::default();
+        input.focused = true;
+        input.keys_down.extend([Key::U, Key::O, Key::F12]);
+        let keyboard = guest_keyboard_input(&input, true, false, true, true);
+        assert_eq!(keyboard.keys[8], 1 << 5);
+        assert_eq!(keyboard.keys.iter().map(|byte| byte.count_ones()).sum::<u32>(), 1);
+    }
+
+    #[test]
+    fn mouse_coordinates_exclude_letterboxing_and_status_bar() {
+        let rect = Rect::from_min_size(pos2(100.0, 30.0), vec2(1600.0, 900.0));
+        assert_eq!(guest_pointer_position(rect.center(), rect), Some([640, 360]));
+        assert_eq!(guest_pointer_position(rect.min, rect), Some([0, 0]));
+        assert_eq!(guest_pointer_position(rect.max, rect), Some([1279, 719]));
+        assert_eq!(guest_pointer_position(pos2(90.0, 480.0), rect), None);
+        assert_eq!(guest_pointer_position(pos2(900.0, 950.0), rect), None);
+        let scaled = Rect::from_min_max(rect.min / 1.5, rect.max / 1.5);
+        assert_eq!(guest_pointer_position(rect.center() / 1.5, scaled), Some([640, 360]));
+    }
+
+    #[test]
+    fn wheel_preserves_axes_notches_and_fractional_trackpad_motion() {
+        let mut input = InputState::default();
+        let wheel = |unit, delta| Event::MouseWheel {
+            unit, delta, modifiers: Modifiers { shift: true, ..Default::default() },
+            phase: egui::TouchPhase::Move,
+        };
+        input.events.push(wheel(MouseWheelUnit::Line, vec2(2.0, -3.0)));
+        assert_eq!(guest_wheel_delta(&input), vec2(2.0, -3.0));
+        input.events = vec![wheel(MouseWheelUnit::Point, vec2(0.0, 10.0))];
+        let mut total = egui::Vec2::ZERO;
+        for _ in 0..4 { total += guest_wheel_delta(&input); }
+        assert_eq!(total, vec2(0.0, 1.0));
+        input.events.clear();
+        assert_eq!(guest_wheel_delta(&input), egui::Vec2::ZERO);
+    }
 }
 
 pub fn raw_wheel_delta(i: &egui::InputState) -> egui::Vec2 {
@@ -8513,7 +8770,7 @@ impl eframe::App for HorizonApp {
 
         let speed_shortcut_active = self.emulation_handle.as_ref().is_some_and(|h| h.is_running())
             && self.rebinding.is_none() && self.rebinding_pad.is_none()
-            && !self.modal_active() && !ctx.egui_wants_keyboard_input();
+            && !self.modal_active() && !ctx.text_edit_focused();
         if speed_shortcut_active && ctx.input_mut(take_speed_limit_shortcut) {
             let limited = nexium_common::speed_limit::toggle();
             log::info!("Emulation speed: {}", if limited { "limited" } else { "unlocked" });
@@ -8541,6 +8798,9 @@ impl eframe::App for HorizonApp {
             ctx.request_repaint();
         }
 
+        if !self.app_settings.emulate_mouse {
+            self.mouse_wheel_accum = egui::Vec2::ZERO;
+        }
         if self.rebinding.is_none() && self.rebinding_pad.is_none() {
             let pressed: Vec<String> = ctx.input(|i| {
                 let mut v = Vec::new();
@@ -8666,56 +8926,57 @@ impl eframe::App for HorizonApp {
                 stick_r_y: sticks[3],
             });
 
-            let wants_keyboard = ctx.egui_wants_keyboard_input();
-            let wants_pointer = ctx.egui_wants_pointer_input();
-            let mut keys = [0u8; 32];
-            let mut modifiers = 0u32;
-            if self.app_settings.emulate_keyboard && !wants_keyboard && !swkbd_open {
-                ctx.input(|i| {
-                    for key in i.keys_down.iter() {
-                        if speed_key_held && *key == egui::Key::U {
-                            continue;
-                        }
-                        if let Some(index) = hid_keyboard_usage(*key) {
-                            keys[(index / 8) as usize] |= 1 << (index % 8);
-                        }
-                    }
-                    if i.modifiers.ctrl {
-                        modifiers |= nexium_core::hid_state::KEYBOARD_MOD_CONTROL;
-                    }
-                    if i.modifiers.shift {
-                        modifiers |= nexium_core::hid_state::KEYBOARD_MOD_SHIFT;
-                    }
-                    if i.modifiers.alt {
-                        modifiers |= nexium_core::hid_state::KEYBOARD_MOD_LEFT_ALT;
-                    }
-                });
-            }
+            let game_input_active = self.emulation_handle.as_ref()
+                .is_some_and(|handle| handle.is_running() && !handle.is_paused())
+                && self.game_display().is_some()
+                && !self.modal_active() && !self.show_settings && !self.show_profile
+                && self.profile_anim == 0.0 && self.pause_anim.is_none()
+                && self.resume_anim.is_none() && !swkbd_open;
+            let keyboard_blocked = !game_input_active || ctx.text_edit_focused();
+            let keyboard = ctx.input(|input| guest_keyboard_input(
+                input,
+                self.app_settings.emulate_keyboard,
+                keyboard_blocked,
+                speed_key_held,
+                overlay_key_held,
+            ));
+            let pointer = ctx.input(|input| {
+                if !game_input_active || !input.focused {
+                    return None;
+                }
+                guest_pointer_position(input.pointer.latest_pos()?, self.last_game_rect?)
+            });
+            let pointer_blocked = ctx.egui_is_using_pointer()
+                || ctx.input(|input| input.pointer.latest_pos())
+                    .and_then(|position| ctx.layer_id_at(position))
+                    .is_some_and(|layer| layer.order != egui::Order::Background);
             let mut mouse = nexium_core::hid_state::MouseInput::default();
             let mut touch = hid.touch;
             touch.pressed = false;
-            if (self.app_settings.emulate_mouse || self.app_settings.emulate_touch) && !swkbd_open {
+            if self.app_settings.emulate_mouse || self.app_settings.emulate_touch {
                 let previous = hid.mouse;
                 mouse = nexium_core::hid_state::MouseInput {
                     connected: self.app_settings.emulate_mouse,
                     buttons: 0,
                     ..previous
                 };
-                let game_rect = self.last_game_rect;
+                let wheel_delta = if ctx.current_pass_index() == 0 {
+                    ctx.input(guest_wheel_delta)
+                } else {
+                    egui::Vec2::ZERO
+                };
                 let wheel_accum = &mut self.mouse_wheel_accum;
                 ctx.input(|i| {
-                    *wheel_accum += raw_wheel_delta(i);
-                    mouse.wheel_x = wheel_accum.x as i32;
-                    mouse.wheel_y = wheel_accum.y as i32;
-                    if let (Some(pos), Some(rect)) = (i.pointer.latest_pos(), game_rect) {
-                        if rect.width() > 0.0 && rect.height() > 0.0 {
-                            let nx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                            let ny = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-                            mouse.x = ((nx * 1280.0) as i32).min(1279);
-                            mouse.y = ((ny * 720.0) as i32).min(719);
-                        }
+                    if let Some([x, y]) = pointer {
+                        mouse.x = x;
+                        mouse.y = y;
                     }
-                    if !wants_pointer {
+                    if pointer.is_some() && !pointer_blocked {
+                        if self.app_settings.emulate_mouse {
+                            *wheel_accum += wheel_delta;
+                            mouse.wheel_x = wheel_accum.x as i32;
+                            mouse.wheel_y = wheel_accum.y as i32;
+                        }
                         if i.pointer.primary_down() {
                             mouse.buttons |= nexium_core::hid_state::MOUSE_BUTTON_LEFT;
                         }
@@ -8737,24 +8998,26 @@ impl eframe::App for HorizonApp {
                     touch = nexium_core::hid_state::TouchInput {
                         x: mouse.x.max(0) as u32,
                         y: mouse.y.max(0) as u32,
-                        pressed: !wants_pointer
-                            && ctx.input(|i| i.pointer.primary_down())
-                            && self.last_game_rect.is_some(),
+                        pressed: pointer.is_some() && !pointer_blocked
+                            && ctx.input(|i| i.pointer.primary_down()),
                     };
                 }
                 if !self.app_settings.emulate_mouse {
                     mouse = nexium_core::hid_state::MouseInput::default();
                 }
             }
-            hid.update_devices(
-                mouse,
-                nexium_core::hid_state::KeyboardInput {
-                    modifiers,
-                    keys,
-                    connected: self.app_settings.emulate_keyboard,
-                },
-                touch,
-            );
+            hid.update_devices(mouse, keyboard, touch);
+        } else {
+            let state = nexium_core::hid_state::get_hid_state();
+            let mut hid = state.lock();
+            let mouse = nexium_core::hid_state::MouseInput { buttons: 0, ..hid.mouse };
+            let keyboard = nexium_core::hid_state::KeyboardInput {
+                connected: self.app_settings.emulate_keyboard,
+                ..Default::default()
+            };
+            let touch = nexium_core::hid_state::TouchInput { pressed: false, ..hid.touch };
+            hid.update_input(Default::default());
+            hid.update_devices(mouse, keyboard, touch);
         }
 
         self.poll_frames(ctx);
@@ -9384,6 +9647,12 @@ impl eframe::App for HorizonApp {
                             crate::carousel::CarouselAction::DownloadIcon(path) => {
                                 self.open_icon_picker(std::path::PathBuf::from(path));
                             }
+                            crate::carousel::CarouselAction::ManageMods(path) => {
+                                self.open_mod_manager(std::path::PathBuf::from(path), ctx);
+                            }
+                            crate::carousel::CarouselAction::ManageContent(path) => {
+                                self.open_content_manager(std::path::PathBuf::from(path), ctx);
+                            }
                             crate::carousel::CarouselAction::ViewGameInfo(path) => {
                                 crate::ui_audio::play(crate::ui_audio::Sfx::Open);
                                 self.game_info_path = Some(std::path::PathBuf::from(path));
@@ -9515,6 +9784,7 @@ impl eframe::App for HorizonApp {
                         {
                             ui.painter().rect_filled(draw_rect, 0.0, Color32::BLACK);
                         } else {
+                            let tid = self.filtered_game_texture(draw_rect, ctx.pixels_per_point()).unwrap_or(tid);
                             egui::Image::new((tid, draw_rect.size())).paint_at(ui, draw_rect);
                         }
                         if let Some(depth) = self.game_depth.clone() {
@@ -9539,11 +9809,28 @@ impl eframe::App for HorizonApp {
                 }
                 self.draw_modal(ctx, ui);
                 let game_info_action = self.draw_game_info(ctx);
+                if let Some(manager) = &mut self.mod_manager {
+                    if !manager.show(ctx, &self.last_input) {
+                        self.mod_manager = None;
+                    }
+                }
+                let content_game_running = self.emulation_handle.as_ref().is_some_and(|handle| handle.is_running());
+                if let Some(manager) = &mut self.content_manager {
+                    if !manager.show(ctx, &self.last_input, content_game_running) {
+                        self.content_manager = None;
+                    }
+                }
                 self.update_icon_picker(ctx, ui);
                 if let Some(action) = game_info_action {
                     match action {
                         GameInfoAction::Launch(path) => {
                             self.request_launch(path.to_string_lossy().to_string(), ctx, running);
+                        }
+                        GameInfoAction::ManageMods(path) => {
+                            self.open_mod_manager(path, ctx);
+                        }
+                        GameInfoAction::ManageContent(path) => {
+                            self.open_content_manager(path, ctx);
                         }
                         GameInfoAction::ToggleFavorite(path) => {
                             self.toggle_favorite_path(path);
@@ -9870,7 +10157,7 @@ impl eframe::App for HorizonApp {
             window.update(self.last_game_rect.filter(|_| native_visible), &holes, ctx.pixels_per_point(),
                 nexium_common::speed_limit::enabled()
                     && crate::host_vsync_enabled(self.app_settings.vsync, std::env::var("NEXIUM_VSYNC").ok().as_deref()),
-                self.app_settings.filter == FilterMode::Nearest);
+                self.app_settings.filter.scaling_filter(), self.app_settings.fsr_sharpness);
         }
         request_idle_repaint(
             ctx,
@@ -10449,7 +10736,7 @@ fn graphics_settings_content(
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new(
-            "Nearest preserves pixel-art crispness. Linear smooths upscaled output.",
+            "Choose how the game image is scaled to fit the window.",
         )
         .size(11.0)
         .color(MUTED),
@@ -10458,6 +10745,16 @@ fn graphics_settings_content(
     for f in FilterMode::all() {
         if ui.radio(cfg.filter == *f, f.label()).clicked() {
             cfg.filter = *f;
+            *save_needed = true;
+        }
+    }
+    if cfg.filter == FilterMode::Fsr {
+        ui.add_space(6.0);
+        if ui.add(
+            egui::Slider::new(&mut cfg.fsr_sharpness, 0..=100)
+                .suffix("%")
+                .text("FSR sharpness"),
+        ).on_hover_text("0% disables sharpening; 100% is strongest").changed() {
             *save_needed = true;
         }
     }

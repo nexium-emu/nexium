@@ -247,6 +247,9 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
         "dnsp" => "NSP",
         _ => return None,
     };
+    if format == "NSP" && nexium_loader::content::is_content_only_package(path) {
+        return None;
+    }
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let stem = path
         .file_stem()

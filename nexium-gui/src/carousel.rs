@@ -137,6 +137,8 @@ pub enum CarouselAction {
     ToggleFavorite(String),
     DownloadIcon(String),
     ViewGameInfo(String),
+    ManageMods(String),
+    ManageContent(String),
     OpenShop,
     OpenCarouselSettings,
     OpenUpdate,
@@ -2671,6 +2673,8 @@ pub fn carousel_view(
     let mut want_fav: Option<String> = None;
     let mut want_download: Option<String> = None;
     let mut want_info: Option<String> = None;
+    let mut want_mods = None;
+    let mut want_content = None;
     let mut want_launch: Option<String> = None;
     let mut want_close = false;
     let mut fav_first: Option<egui::Rect> = None;
@@ -2899,6 +2903,14 @@ pub fn carousel_view(
                 }
                 if ui.button("View Game Information").clicked() {
                     want_info = Some(path_string.clone());
+                    ui.close();
+                }
+                if ui.button("Manage Mods").clicked() {
+                    want_mods = Some(path_string.clone());
+                    ui.close();
+                }
+                if ui.button("Updates & DLC").clicked() {
+                    want_content = Some(path_string.clone());
                     ui.close();
                 }
             });
@@ -3425,6 +3437,12 @@ pub fn carousel_view(
     }
     if let Some(p) = want_info {
         action = CarouselAction::ViewGameInfo(p);
+    }
+    if let Some(p) = want_mods {
+        action = CarouselAction::ManageMods(p);
+    }
+    if let Some(p) = want_content {
+        action = CarouselAction::ManageContent(p);
     }
     if let Some(p) = want_launch {
         action = CarouselAction::Launch(p);
@@ -4015,7 +4033,7 @@ pub fn carousel_view(
 
         let pw = 236.0;
         let rowh = 44.0;
-        let ph = rowh * 3.0 + 22.0;
+        let ph = rowh * 5.0 + 22.0;
         let slide = (1.0 - e) * 18.0;
         let ax = hero_cx + hero_size * 0.5 + 30.0 + slide;
         let ay = hero_cy - ph * 0.5;
@@ -4058,6 +4076,8 @@ pub fn carousel_view(
             },
             "View Game Information",
             "Download Icon",
+            "Manage Mods",
+            "Updates & DLC",
         ];
         for (i, label) in labels.iter().enumerate() {
             let ry0 = ay + 11.0 + i as f32 * rowh;
@@ -5050,7 +5070,7 @@ fn handle_input(
             state.game_menu_sel -= 1;
             crate::ui_audio::play_move();
         }
-        if down && state.game_menu_sel < 2 {
+        if down && state.game_menu_sel < 4 {
             state.game_menu_sel += 1;
             crate::ui_audio::play_move();
         }
@@ -5059,7 +5079,9 @@ fn handle_input(
                 *action = match state.game_menu_sel {
                     0 => CarouselAction::ToggleFavorite(p.clone()),
                     1 => CarouselAction::ViewGameInfo(p.clone()),
-                    _ => CarouselAction::DownloadIcon(p.clone()),
+                    2 => CarouselAction::DownloadIcon(p.clone()),
+                    3 => CarouselAction::ManageMods(p.clone()),
+                    _ => CarouselAction::ManageContent(p.clone()),
                 };
                 crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
             }

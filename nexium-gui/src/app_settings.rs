@@ -317,6 +317,9 @@ impl AspectMode {
 pub enum FilterMode {
     Nearest,
     Linear,
+    Bicubic,
+    ScaleForce,
+    Fsr,
 }
 
 impl Default for FilterMode {
@@ -327,18 +330,40 @@ impl Default for FilterMode {
 
 impl FilterMode {
     pub fn all() -> &'static [FilterMode] {
-        &[FilterMode::Nearest, FilterMode::Linear]
+        &[
+            FilterMode::Nearest,
+            FilterMode::Linear,
+            FilterMode::Bicubic,
+            FilterMode::ScaleForce,
+            FilterMode::Fsr,
+        ]
     }
     pub fn label(&self) -> &'static str {
         match self {
-            FilterMode::Nearest => "Nearest",
-            FilterMode::Linear => "Linear",
+            FilterMode::Nearest => "Nearest Neighbor",
+            FilterMode::Linear => "Bilinear",
+            FilterMode::Bicubic => "Bicubic",
+            FilterMode::ScaleForce => "ScaleForce",
+            FilterMode::Fsr => "AMD FSR 1",
+        }
+    }
+    pub fn scaling_filter(&self) -> nexium_gpu::presentation::ScalingFilter {
+        use nexium_gpu::presentation::ScalingFilter;
+        match self {
+            FilterMode::Nearest => ScalingFilter::Nearest,
+            FilterMode::Linear => ScalingFilter::Linear,
+            FilterMode::Bicubic => ScalingFilter::Bicubic,
+            FilterMode::ScaleForce => ScalingFilter::ScaleForce,
+            FilterMode::Fsr => ScalingFilter::Fsr,
         }
     }
 }
 
 fn default_output_scale() -> u8 {
     1
+}
+fn default_fsr_sharpness() -> u8 {
+    87
 }
 fn default_vsync() -> bool {
     true
@@ -474,6 +499,8 @@ pub struct AppSettings {
     pub aspect: AspectMode,
     #[serde(default)]
     pub filter: FilterMode,
+    #[serde(default = "default_fsr_sharpness")]
+    pub fsr_sharpness: u8,
     #[serde(default)]
     pub dpi_aware: bool,
     #[serde(default = "default_vsync")]
@@ -710,6 +737,7 @@ impl Default for AppSettings {
             output_scale: default_output_scale(),
             aspect: AspectMode::default(),
             filter: FilterMode::default(),
+            fsr_sharpness: default_fsr_sharpness(),
             dpi_aware: false,
             vsync: default_vsync(),
             cpu_backend: CpuBackend::default(),
@@ -793,6 +821,7 @@ impl AppSettings {
         } else {
             Self::default()
         };
+        cfg.fsr_sharpness = cfg.fsr_sharpness.min(100);
         if cfg.performance_debug.sanitize_unsafe_gpu_overrides() {
             let _ = cfg.save();
         }
@@ -881,6 +910,36 @@ mod tests {
         assert!(settings.resident_vb);
         assert!(settings.resident_cbuf);
         assert!(!settings.sanitize_unsafe_gpu_overrides());
+    }
+
+    #[test]
+    fn fsr_sharpness_defaults_and_persists() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("fsr_sharpness");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.fsr_sharpness, 87);
+        for sharpness in [0, 37, 87, 100] {
+            let settings = AppSettings {
+                filter: FilterMode::Fsr,
+                fsr_sharpness: sharpness,
+                ..AppSettings::default()
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            let restored: AppSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.fsr_sharpness, sharpness);
+            assert_eq!(restored.filter, FilterMode::Fsr);
+        }
+    }
+
+    #[test]
+    fn filter_settings_preserve_legacy_serialized_names() {
+        for (name, filter) in [("Nearest", FilterMode::Nearest), ("Linear", FilterMode::Linear)] {
+            let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+            value["filter"] = serde_json::json!(name);
+            let settings: AppSettings = serde_json::from_value(value).unwrap();
+            assert_eq!(settings.filter, filter);
+            assert_eq!(serde_json::to_value(settings).unwrap()["filter"], name);
+        }
     }
 
     #[test]

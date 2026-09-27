@@ -1,4 +1,4 @@
-use nexium_gpu::presentation::{PresentationTarget, SurfaceState};
+use nexium_gpu::presentation::{PresentationTarget, ScalingFilter, SurfaceState};
 use std::sync::Arc;
 
 pub struct NativeGameWindow {
@@ -121,7 +121,8 @@ impl NativeGameWindow {
         holes: &[egui::Rect],
         scale: f32,
         vsync: bool,
-        nearest: bool,
+        filter: ScalingFilter,
+        sharpness: u8,
     ) {
         let rect = rect.filter(|rect| self.active && rect.is_positive());
         let Some(rect) = rect else {
@@ -189,7 +190,8 @@ impl NativeGameWindow {
                 height: h as u32,
                 visible: true,
                 vsync,
-                nearest,
+                filter,
+                sharpness,
             });
         }
     }
