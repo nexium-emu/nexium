@@ -352,6 +352,9 @@ fn default_multicore() -> bool {
 fn default_docked() -> bool {
     true
 }
+fn default_game_bar() -> bool {
+    true
+}
 
 fn default_menu_music_track() -> u8 {
     255
@@ -533,6 +536,10 @@ pub struct AppSettings {
     pub dockbar_theme: DockbarTheme,
     #[serde(default)]
     pub perf_overlay_corner: OverlayCorner,
+    #[serde(default)]
+    pub perf_overlay_hidden: bool,
+    #[serde(default = "default_game_bar")]
+    pub game_bar: bool,
     #[serde(default = "default_left_deadzone")]
     pub left_deadzone: f32,
     #[serde(default = "default_right_deadzone")]
@@ -734,6 +741,8 @@ impl Default for AppSettings {
             sfx_muted: false,
             dockbar_theme: DockbarTheme::default(),
             perf_overlay_corner: OverlayCorner::default(),
+            perf_overlay_hidden: false,
+            game_bar: default_game_bar(),
             left_deadzone: default_left_deadzone(),
             right_deadzone: default_right_deadzone(),
             emulate_mouse: default_emulated_device(),

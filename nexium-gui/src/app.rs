@@ -163,10 +163,14 @@ fn gui_rate_stats(kind: usize, count: u64) {
 }
 
 fn take_speed_limit_shortcut(input: &mut egui::InputState) -> bool {
+    take_ctrl_shortcut(input, egui::Key::U)
+}
+
+fn take_ctrl_shortcut(input: &mut egui::InputState, shortcut: egui::Key) -> bool {
     let mut toggle = false;
     input.events.retain(|event| {
-        if let egui::Event::Key { key: egui::Key::U, pressed: true, repeat, modifiers, .. } = event {
-            if modifiers.ctrl && !modifiers.alt && !modifiers.shift {
+        if let egui::Event::Key { key, pressed: true, repeat, modifiers, .. } = event {
+            if *key == shortcut && modifiers.ctrl && !modifiers.alt && !modifiers.shift {
                 toggle |= !repeat;
                 return false;
             }
@@ -296,6 +300,7 @@ pub struct HorizonApp {
     game_texture_native: Option<NativeGameTexture>,
     native_game: Option<crate::native_game::NativeGameWindow>,
     native_overlay_rect: Option<egui::Rect>,
+    game_bar_tab_rect: Option<egui::Rect>,
     game_depth: Option<std::sync::Arc<nexium_gpu::PresentDepth>>,
     game_depth_seq: u64,
     last_game_rect: Option<egui::Rect>,
@@ -569,6 +574,7 @@ impl HorizonApp {
             game_texture_native: None,
             native_game: crate::native_game::NativeGameWindow::new(cc),
             native_overlay_rect: None,
+            game_bar_tab_rect: None,
             game_depth: None,
             game_depth_seq: 0,
             last_game_rect: None,
@@ -5885,7 +5891,7 @@ impl HorizonApp {
             }
         };
 
-        let full = ctx.viewport_rect();
+        let full = ui.max_rect();
         let base_bw = 224.0;
         let base_bh = 138.0;
         let mut sc = self.perf_scale.clamp(0.7, 3.0);
@@ -6542,6 +6548,246 @@ impl HorizonApp {
         } else {
             self.nro_path = path;
             self.boot_nro(ctx);
+        }
+    }
+
+    fn draw_docked_toggle(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let docked = nexium_core::hid_state::is_docked();
+        let (mode_icon, mode_txt, mode_col) = if docked {
+            (StatusIcon::Dock, "Docked", GREEN)
+        } else {
+            (StatusIcon::Handheld, "Handheld", AMBER)
+        };
+        let label_resp = ui.add(
+            egui::Label::new(egui::RichText::new(mode_txt).size(12.0).color(mode_col))
+                .sense(egui::Sense::click()),
+        );
+        ui.add_space(2.0);
+        let icon_resp = status_icon(ui, mode_icon, mode_col);
+        let mode_resp = label_resp.union(icon_resp);
+        if mode_resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if mode_resp
+            .on_hover_text("Toggle Docked / Handheld (Pro Controller vs Handheld)")
+            .clicked()
+        {
+            let docked = !docked;
+            nexium_core::hid_state::set_docked(docked);
+            self.app_settings.docked = docked;
+            let _ = self.app_settings.save();
+        }
+    }
+
+    fn draw_game_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        fn bar_item(
+            ctx: &egui::Context,
+            ui: &mut egui::Ui,
+            text: String,
+            color: Color32,
+            hover: &str,
+        ) -> egui::Response {
+            let resp = ui
+                .add(
+                    egui::Label::new(egui::RichText::new(text).size(12.0).color(color))
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(hover);
+            if resp.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            resp
+        }
+        fn bar_divider(ui: &mut egui::Ui) {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+            ui.add_space(8.0);
+        }
+        egui::Panel::bottom("gamebar")
+            .exact_size(26.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
+                    .stroke(Stroke::new(1.0_f32, BORDER)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  {}",
+                            self.app_settings.gpu_backend.label(),
+                            self.active_gpu_name()
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                    bar_divider(ui);
+                    self.draw_docked_toggle(ctx, ui);
+                    bar_divider(ui);
+                    let aspect = self.app_settings.aspect;
+                    if bar_item(
+                        ctx,
+                        ui,
+                        format!("Aspect: {}", aspect.label()),
+                        TEXT,
+                        "Cycle aspect mode",
+                    )
+                    .clicked()
+                    {
+                        let all = crate::app_settings::AspectMode::all();
+                        let index = all.iter().position(|mode| *mode == aspect).unwrap_or(0);
+                        self.app_settings.aspect = all[(index + 1) % all.len()];
+                        let _ = self.app_settings.save();
+                    }
+                    bar_divider(ui);
+                    let filter = self.app_settings.filter;
+                    if bar_item(
+                        ctx,
+                        ui,
+                        format!("Filter: {}", filter.label()),
+                        TEXT,
+                        "Cycle upscaling filter",
+                    )
+                    .clicked()
+                    {
+                        let all = FilterMode::all();
+                        let index = all.iter().position(|mode| *mode == filter).unwrap_or(0);
+                        self.app_settings.filter = all[(index + 1) % all.len()];
+                        let _ = self.app_settings.save();
+                    }
+                    bar_divider(ui);
+                    let vsync = self.app_settings.vsync;
+                    if bar_item(
+                        ctx,
+                        ui,
+                        format!("VSync: {}", if vsync { "On" } else { "Off" }),
+                        if vsync { GREEN } else { AMBER },
+                        "Toggle host VSync",
+                    )
+                    .clicked()
+                    {
+                        self.app_settings.vsync = !vsync;
+                        let _ = self.app_settings.save();
+                    }
+                    bar_divider(ui);
+                    let limited = nexium_common::speed_limit::enabled();
+                    if bar_item(
+                        ctx,
+                        ui,
+                        format!("Speed: {}", if limited { "Limited" } else { "Unlocked" }),
+                        if limited { TEXT } else { AMBER },
+                        "Toggle the emulation speed limit (Ctrl+U)",
+                    )
+                    .clicked()
+                    {
+                        nexium_common::speed_limit::toggle();
+                        if let Some(path) = &self.playing_path {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                                self.game_window_title(path),
+                            ));
+                        }
+                    }
+
+                    bar_divider(ui);
+                    let fps = self.performance.get_fps();
+                    if bar_item(
+                        ctx,
+                        ui,
+                        format!("{fps:.1} FPS"),
+                        if fps >= 55.0 { GREEN } else if fps >= 28.0 { AMBER } else { DANGER },
+                        "Toggle performance overlay (Ctrl+O)",
+                    ).clicked() {
+                        self.app_settings.perf_overlay_hidden = !self.app_settings.perf_overlay_hidden;
+                        let _ = self.app_settings.save();
+                    }
+                    let building = nexium_common::shader_progress::in_flight();
+                    if building > 0 {
+                        bar_divider(ui);
+                        ui.label(egui::RichText::new(format!("Building shaders: {building}")).size(12.0).color(AMBER));
+                    } else if nexium_common::shader_progress::recently_active() {
+                        bar_divider(ui);
+                        ui.label(egui::RichText::new(format!("Built {} shaders", nexium_common::shader_progress::burst_built())).size(12.0).color(MUTED));
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        if bar_item(ctx, ui, "Hide".to_string(), MUTED, "Hide this bar (Ctrl+B shows it again)")
+                            .clicked()
+                        {
+                            self.app_settings.game_bar = false;
+                            let _ = self.app_settings.save();
+                        }
+                        bar_divider(ui);
+                        let mut volume = self.app_settings.audio_volume;
+                        ui.spacing_mut().slider_width = 110.0;
+                        let slider = ui.add(
+                            egui::Slider::new(&mut volume, 0.0..=1.0)
+                                .show_value(false)
+                                .trailing_fill(true),
+                        );
+                        if slider.changed() {
+                            self.app_settings.audio_volume = volume;
+                            set_master_volume(volume);
+                        }
+                        if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                            let _ = self.app_settings.save();
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!("Volume {:.0}%", volume * 100.0))
+                                .size(12.0)
+                                .color(TEXT),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn draw_game_bar_reveal_tab(&mut self, ctx: &egui::Context) {
+        let screen = ctx.viewport_rect();
+        let near_bottom = ctx
+            .input(|input| input.pointer.hover_pos())
+            .is_some_and(|pos| pos.y >= screen.max.y - 10.0);
+        let tab = egui::Rect::from_min_size(
+            egui::pos2(screen.center().x - 26.0, screen.max.y - 14.0),
+            egui::vec2(52.0, 14.0),
+        );
+        let hovering_tab = ctx
+            .input(|input| input.pointer.hover_pos())
+            .is_some_and(|pos| tab.contains(pos));
+        if !near_bottom && !hovering_tab {
+            return;
+        }
+        self.game_bar_tab_rect = Some(tab.expand(3.0));
+        let response = egui::Area::new(egui::Id::new("gamebar_reveal"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(tab.min)
+            .show(ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(tab.size(), egui::Sense::click());
+                ui.painter().rect(
+                    rect,
+                    CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 },
+                    Color32::from_rgb(0x0C, 0x0C, 0x0E),
+                    Stroke::new(1.0_f32, BORDER),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "▴ bar",
+                    FontId::proportional(10.5),
+                    if response.hovered() { TEXT } else { MUTED },
+                );
+                response
+            })
+            .inner;
+        if response.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.on_hover_text("Show the game bar (Ctrl+B)").clicked() {
+            self.app_settings.game_bar = true;
+            let _ = self.app_settings.save();
         }
     }
 
@@ -7957,6 +8203,7 @@ impl eframe::App for HorizonApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         self.native_overlay_rect = None;
+        self.game_bar_tab_rect = None;
         if ctx.input(|i| i.viewport().close_requested()) {
             self.play_times.save_if_dirty();
             if let Some(mut h) = self.emulation_handle.take() {
@@ -8195,8 +8442,24 @@ impl eframe::App for HorizonApp {
             }
             ctx.request_repaint();
         }
+        if speed_shortcut_active
+            && ctx.input_mut(|input| take_ctrl_shortcut(input, egui::Key::O))
+        {
+            self.app_settings.perf_overlay_hidden = !self.app_settings.perf_overlay_hidden;
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+        let overlay_key_held = speed_shortcut_active
+            && ctx.input(|i| i.modifiers.ctrl && i.key_down(egui::Key::O));
         let speed_key_held = speed_shortcut_active
             && ctx.input(|i| i.modifiers.ctrl && i.key_down(egui::Key::U));
+        if speed_shortcut_active
+            && ctx.input_mut(|input| take_ctrl_shortcut(input, egui::Key::B))
+        {
+            self.app_settings.game_bar = !self.app_settings.game_bar;
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
 
         if self.rebinding.is_none() && self.rebinding_pad.is_none() {
             let pressed: Vec<String> = ctx.input(|i| {
@@ -8206,7 +8469,9 @@ impl eframe::App for HorizonApp {
                         key, pressed: true, ..
                     } = ev
                     {
-                        if !(speed_key_held && *key == egui::Key::U) {
+                        if !(speed_key_held && *key == egui::Key::U)
+                            && !(overlay_key_held && *key == egui::Key::O)
+                        {
                             v.push(format!("{:?}", key));
                         }
                     }
@@ -8257,7 +8522,9 @@ impl eframe::App for HorizonApp {
                     egui::Key::Space,
                     egui::Key::Escape,
                 ] {
-                    if i.key_down(k) && !(speed_key_held && k == egui::Key::U) {
+                    if i.key_down(k) && !(speed_key_held && k == egui::Key::U)
+                        && !(overlay_key_held && k == egui::Key::O)
+                    {
                         let s = format!("{:?}", k);
                         if !v.contains(&s) {
                             v.push(s);
@@ -8626,35 +8893,7 @@ impl eframe::App for HorizonApp {
                             ui.add_space(6.0);
                             ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
                             ui.add_space(6.0);
-                            let docked = nexium_core::hid_state::is_docked();
-                            let (mode_icon, mode_txt, mode_col) = if docked {
-                                (StatusIcon::Dock, "Docked", GREEN)
-                            } else {
-                                (StatusIcon::Handheld, "Handheld", AMBER)
-                            };
-                            let label_resp = ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(mode_txt).size(12.0).color(mode_col),
-                                )
-                                .sense(egui::Sense::click()),
-                            );
-                            ui.add_space(2.0);
-                            let icon_resp = status_icon(ui, mode_icon, mode_col);
-                            let mode_resp = label_resp.union(icon_resp);
-                            if mode_resp.hovered() {
-                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
-                            if mode_resp
-                                .on_hover_text(
-                                    "Toggle Docked / Handheld (Pro Controller vs Handheld)",
-                                )
-                                .clicked()
-                            {
-                                let docked = !docked;
-                                nexium_core::hid_state::set_docked(docked);
-                                self.app_settings.docked = docked;
-                                let _ = self.app_settings.save();
-                            }
+                            self.draw_docked_toggle(ctx, ui);
                             ui.add_space(6.0);
                             ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
                             ui.add_space(6.0);
@@ -8705,8 +8944,9 @@ impl eframe::App for HorizonApp {
                             };
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{}Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
+                                    "{}{:.1} FPS  ·  Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
                                     building_prefix,
+                                    self.performance.get_fps(),
                                     self.performance.get_frame_time(),
                                     stats.svc_count,
                                     stats.cycle_count,
@@ -8718,6 +8958,16 @@ impl eframe::App for HorizonApp {
                         });
                     });
                 });
+        }
+
+        let game_bar_context = running
+            && !carousel_mode
+            && !show_chrome
+            && self.game_display().is_some();
+        if game_bar_context && self.app_settings.game_bar {
+            self.draw_game_bar(ctx, ui);
+        } else if game_bar_context {
+            self.draw_game_bar_reveal_tab(ctx);
         }
 
         egui::CentralPanel::default()
@@ -9228,7 +9478,9 @@ impl eframe::App for HorizonApp {
                     && self.game_display().is_some()
                     && self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel
                 {
-                    self.draw_perf_overlay(ctx, ui);
+                    if !self.app_settings.perf_overlay_hidden {
+                        self.draw_perf_overlay(ctx, ui);
+                    }
                 }
                 {
                     let accent = self.theme_accent();
@@ -9530,7 +9782,7 @@ impl eframe::App for HorizonApp {
 
         let native_visible = self.native_game_visible(carousel_mode);
         if let Some(window) = &mut self.native_game {
-            let mut holes: Vec<_> = self.native_overlay_rect.into_iter().collect();
+            let mut holes: Vec<_> = self.native_overlay_rect.into_iter().chain(self.game_bar_tab_rect).collect();
             if self.download_toast.is_some() {
                 let screen = ctx.viewport_rect();
                 holes.push(egui::Rect::from_min_size(egui::pos2(screen.center().x - 184.0, screen.min.y + 20.0), egui::vec2(368.0, 74.0)));
