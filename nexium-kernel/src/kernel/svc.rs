@@ -11341,23 +11341,26 @@ mod ctrl_wait_event_tests {
     }
 }
 
+fn nvdrv_buffer(
+    mapped: &[ipc::IpcBuffer],
+    pointers: &[ipc::IpcBuffer],
+    index: usize,
+) -> Option<ipc::IpcBuffer> {
+    mapped
+        .get(index)
+        .filter(|buffer| buffer.size != 0)
+        .or_else(|| pointers.get(index).filter(|buffer| buffer.size != 0))
+        .filter(|buffer| buffer.addr != 0)
+        .copied()
+}
+
 fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name: &str) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
     log::trace!("nvdrv:{}.cmd_{}", port_name, cmd_id);
 
     match cmd_id {
         0 => {
-            let buf_src = ctx
-                .send_statics
-                .iter()
-                .find(|b| b.size > 0 && b.addr != 0)
-                .copied()
-                .or_else(|| {
-                    ctx.send_buffers
-                        .iter()
-                        .find(|b| b.size > 0 && b.addr != 0)
-                        .copied()
-                });
+            let buf_src = nvdrv_buffer(&ctx.send_buffers, &ctx.send_statics, 0);
             let path = if let Some(sb) = buf_src {
                 let mut buf = vec![0u8; sb.size as usize];
                 let _ = kernel.address_space.read(sb.addr, &mut buf);
@@ -11400,13 +11403,6 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             };
             let ioctl_cmd = (ioctl_id & 0xFFFF) as u16;
 
-            let in_srcs: Vec<_> = ctx
-                .send_buffers
-                .iter()
-                .chain(ctx.send_statics.iter())
-                .filter(|b| b.size > 0 && b.addr != 0)
-                .copied()
-                .collect();
             let read_input = |buf: Option<ipc::IpcBuffer>| -> Vec<u8> {
                 let Some(sb) = buf else {
                     return Vec::new();
@@ -11415,21 +11411,14 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 let _ = kernel.address_space.read(sb.addr, &mut data);
                 data
             };
-            let in_data = read_input(in_srcs.first().copied());
+            let in_data = read_input(nvdrv_buffer(&ctx.send_buffers, &ctx.send_statics, 0));
             let inline_in_data = if cmd_id == 11 {
-                read_input(in_srcs.get(1).copied())
+                read_input(nvdrv_buffer(&ctx.send_buffers, &ctx.send_statics, 1))
             } else {
                 Vec::new()
             };
 
-            let out_dsts: Vec<_> = ctx
-                .recv_buffers
-                .iter()
-                .chain(ctx.recv_statics.iter())
-                .filter(|b| b.size > 0 && b.addr != 0)
-                .copied()
-                .collect();
-            let out_dst = out_dsts.first().copied();
+            let out_dst = nvdrv_buffer(&ctx.recv_buffers, &ctx.recv_statics, 0);
             let out_size = out_dst.map(|b| b.size as usize).unwrap_or(0);
 
             if cmd_id == 1 {
@@ -11510,7 +11499,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                     let _ = kernel.address_space.write(buf.addr, &outcome.data[..n]);
                 }
                 if cmd_id == 12 {
-                    if let Some(buf) = out_dsts.get(1).copied() {
+                    if let Some(buf) = nvdrv_buffer(&ctx.recv_buffers, &ctx.recv_statics, 1) {
                         let inline = match ioctl_cmd {
                             0x4705 if outcome.data.len() > 16 => &outcome.data[16..],
                             0x4706 if outcome.data.len() >= 20 => &outcome.data[16..20],
