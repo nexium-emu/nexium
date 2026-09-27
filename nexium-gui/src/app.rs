@@ -206,6 +206,93 @@ fn take_next_game_frame(
     }
 }
 
+fn game_display_rect(
+    panel: egui::Rect,
+    texture_size: Vec2,
+    aspect: AspectMode,
+    output_scale: u8,
+    pixels_per_point: f32,
+) -> egui::Rect {
+    if !panel.is_positive() || texture_size.x <= 0.0 || texture_size.y <= 0.0 {
+        return egui::Rect::from_center_size(panel.center(), Vec2::ZERO);
+    }
+    if aspect == AspectMode::Integer {
+        let pixel_min = (panel.min.to_vec2() * pixels_per_point).ceil();
+        let pixel_max = (panel.max.to_vec2() * pixels_per_point).floor();
+        let available = pixel_max - pixel_min;
+        if available.x <= 0.0 || available.y <= 0.0 {
+            return egui::Rect::from_center_size(panel.center(), Vec2::ZERO);
+        }
+        let fit = (available.x / texture_size.x).min(available.y / texture_size.y);
+        let scale = if fit >= 1.0 {
+            fit.floor().min(output_scale.max(1) as f32)
+        } else {
+            fit
+        };
+        let size = (texture_size * scale).floor();
+        let origin = pixel_min + ((available - size) * 0.5).floor();
+        return egui::Rect::from_min_max(
+            (origin / pixels_per_point).to_pos2(),
+            ((origin + size) / pixels_per_point).to_pos2(),
+        );
+    }
+    let available = panel.size();
+    let size = if aspect == AspectMode::Stretch {
+        available
+    } else {
+        texture_size * (available.x / texture_size.x).min(available.y / texture_size.y)
+    };
+    egui::Rect::from_center_size(panel.center(), size)
+}
+
+#[cfg(test)]
+mod game_display_tests {
+    use super::game_display_rect;
+    use crate::app_settings::AspectMode;
+    use egui::{pos2, vec2, Rect};
+
+    #[test]
+    fn integer_scale_uses_physical_pixels_at_fractional_dpi() {
+        let panel = Rect::from_min_max(pos2(0.0, 30.4), pos2(1280.0, 696.8));
+        let rect = game_display_rect(panel, vec2(1280.0, 720.0), AspectMode::Integer, 1, 1.25);
+        assert!(panel.contains_rect(rect));
+        assert_eq!(rect.size() * 1.25, vec2(1280.0, 720.0));
+        assert_eq!(rect.min.to_vec2() * 1.25, vec2(160.0, 94.0));
+        assert!(rect.max.y * 1.25 <= 871.0);
+    }
+
+    #[test]
+    fn integer_scale_shrinks_to_fit_below_one_times() {
+        let panel = Rect::from_min_max(pos2(0.0, 30.0), pos2(960.0, 510.0));
+        let rect = game_display_rect(panel, vec2(1280.0, 720.0), AspectMode::Integer, 3, 1.0);
+        assert!(panel.contains_rect(rect));
+        assert_eq!(rect.size(), vec2(853.0, 480.0));
+        assert_eq!(rect.max.y, 510.0);
+    }
+
+    #[test]
+    fn integer_scale_respects_requested_scale_and_panel_limit() {
+        let panel = Rect::from_min_size(pos2(0.0, 20.0), vec2(2048.0, 1200.0));
+        let two = game_display_rect(panel, vec2(1280.0, 720.0), AspectMode::Integer, 3, 1.5);
+        let one = game_display_rect(panel, vec2(1280.0, 720.0), AspectMode::Integer, 1, 1.5);
+        assert!(panel.contains_rect(two));
+        assert!(panel.contains_rect(one));
+        assert_eq!((two.size() * 1.5).round(), vec2(2560.0, 1440.0));
+        assert_eq!((one.size() * 1.5).round(), vec2(1280.0, 720.0));
+    }
+
+    #[test]
+    fn integer_scale_rounds_panel_edges_inward() {
+        let panel = Rect::from_min_max(pos2(0.25, 30.25), pos2(1024.5, 606.1));
+        let rect = game_display_rect(panel, vec2(1280.0, 720.0), AspectMode::Integer, 1, 1.25);
+        assert!(panel.contains_rect(rect));
+        assert!((rect.min.x * 1.25).round() >= (panel.min.x * 1.25).ceil());
+        assert!((rect.min.y * 1.25).round() >= (panel.min.y * 1.25).ceil());
+        assert!((rect.max.x * 1.25).round() <= (panel.max.x * 1.25).floor());
+        assert!((rect.max.y * 1.25).round() <= (panel.max.y * 1.25).floor());
+    }
+}
+
 #[cfg(test)]
 mod frame_receive_tests {
     use super::{request_game_frame_repaint, take_next_game_frame};
@@ -6960,21 +7047,14 @@ impl HorizonApp {
         }
     }
 
-    fn game_draw_rect(&self, panel: egui::Rect, tsz: Vec2) -> egui::Rect {
-        let avail = panel.size();
-        let user_scale = self.app_settings.output_scale.max(1) as f32;
-        let draw_size = match self.app_settings.aspect {
-            AspectMode::Stretch => avail,
-            AspectMode::Letterbox => {
-                let s = (avail.x / tsz.x).min(avail.y / tsz.y);
-                tsz * s
-            }
-            AspectMode::Integer => {
-                let max_s = (avail.x / tsz.x).min(avail.y / tsz.y).floor().max(1.0);
-                tsz * user_scale.min(max_s)
-            }
-        };
-        egui::Rect::from_center_size(panel.center(), draw_size)
+    fn game_draw_rect(&self, panel: egui::Rect, tsz: Vec2, pixels_per_point: f32) -> egui::Rect {
+        game_display_rect(
+            panel,
+            tsz,
+            self.app_settings.aspect,
+            self.app_settings.output_scale,
+            pixels_per_point,
+        )
     }
 
     fn is_running(&self) -> bool {
@@ -9334,7 +9414,7 @@ impl eframe::App for HorizonApp {
                                 }
                             } else if let Some((tid, tsz)) = self.game_display() {
                                 let ef = 1.0 - (1.0 - f) * (1.0 - f);
-                                let rect = self.game_draw_rect(panel, tsz);
+                                let rect = self.game_draw_rect(panel, tsz, ctx.pixels_per_point());
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
                                     egui::Id::new("home_zoom"),
@@ -9346,7 +9426,7 @@ impl eframe::App for HorizonApp {
                             let f = (start.elapsed().as_secs_f32() / 0.30).min(1.0);
                             if let Some((tid, tsz)) = self.game_display() {
                                 let ef = 1.0 - (1.0 - f) * (1.0 - f);
-                                let rect = self.game_draw_rect(panel, tsz);
+                                let rect = self.game_draw_rect(panel, tsz, ctx.pixels_per_point());
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
                                     egui::Id::new("home_zoom"),
@@ -9399,7 +9479,7 @@ impl eframe::App for HorizonApp {
                         );
                         if t < 1.05 {
                             if let Some((tid, tsz)) = self.game_display() {
-                                let rect = self.game_draw_rect(panel, tsz);
+                                let rect = self.game_draw_rect(panel, tsz, ctx.pixels_per_point());
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
                                     egui::Id::new("stop_dissolve"),
@@ -9411,7 +9491,7 @@ impl eframe::App for HorizonApp {
                         let display = self.game_display();
                         self.library_view(ui, ctx);
                         if let Some((tid, tsz)) = display {
-                            let rect = self.game_draw_rect(panel, tsz);
+                            let rect = self.game_draw_rect(panel, tsz, ctx.pixels_per_point());
                             let p = ctx.layer_painter(egui::LayerId::new(
                                 egui::Order::Foreground,
                                 egui::Id::new("stop_dissolve"),
@@ -9427,7 +9507,7 @@ impl eframe::App for HorizonApp {
                     }
                 } else if running {
                     if let Some((tid, tsz)) = self.game_display() {
-                        let draw_rect = self.game_draw_rect(ui.max_rect(), tsz);
+                        let draw_rect = self.game_draw_rect(ui.max_rect(), tsz, ctx.pixels_per_point());
                         self.last_game_rect = Some(draw_rect);
                         ui.allocate_rect(draw_rect, egui::Sense::hover());
                         if self.native_game.as_ref().is_some_and(|window| window.active)
@@ -10323,7 +10403,7 @@ fn graphics_settings_content(
             .color(TEXT),
     );
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("Letterbox keeps the game's aspect ratio. Integer snaps to pixel-perfect 1x/2x/3x. Stretch fills the window.").size(11.0).color(MUTED));
+    ui.label(egui::RichText::new("Letterbox keeps the game's aspect ratio. Integer uses pixel-perfect 1x/2x/3x and fits smaller windows. Stretch fills the window.").size(11.0).color(MUTED));
     ui.add_space(6.0);
     for m in AspectMode::all() {
         if ui.radio(cfg.aspect == *m, m.label()).clicked() {
