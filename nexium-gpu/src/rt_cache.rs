@@ -3545,6 +3545,9 @@ impl RtCache {
         usage: vk::ImageUsageFlags,
         aspect: vk::ImageAspectFlags,
     ) -> Result<GpuImage, String> {
+        let mem_props = self
+            .mem_properties
+            .ok_or_else(|| "RtCache: memory properties not set".to_string())?;
         let extent = vk::Extent2D {
             width: key.width,
             height: key.height,
@@ -3592,15 +3595,14 @@ impl RtCache {
         };
 
         let req = unsafe { device.get_image_memory_requirements(image) };
-        let mem_props = self
-            .mem_properties
-            .ok_or_else(|| "RtCache: memory properties not set".to_string())?;
-        let mem_type = find_memory_type(
+        let Some(mem_type) = find_memory_type(
             &mem_props,
             req.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .ok_or_else(|| "RtCache: no suitable DEVICE_LOCAL memory type".to_string())?;
+        ) else {
+            unsafe { device.destroy_image(image, None) };
+            return Err("RtCache: no suitable DEVICE_LOCAL memory type".to_string());
+        };
 
         let alloc_info = vk::MemoryAllocateInfo {
             s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
@@ -3609,18 +3611,31 @@ impl RtCache {
             p_next: std::ptr::null(),
             _marker: std::marker::PhantomData,
         };
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc_info, None)
-                .map_err(|e| format!("allocate_memory: {:?}", e))?
+        let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(format!("allocate_memory: {:?}", error));
+            }
         };
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .map_err(|e| format!("bind_image_memory: {:?}", e))?;
+        if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+            return Err(format!("bind_image_memory: {:?}", error));
         }
 
-        let view = create_image_view(device, image, format, aspect, key)?;
+        let view = match create_image_view(device, image, format, aspect, key) {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe {
+                    device.destroy_image(image, None);
+                    device.free_memory(memory, None);
+                }
+                return Err(error);
+            }
+        };
         let mut views = std::collections::HashMap::default();
         views.insert(format, view);
 
@@ -6140,5 +6155,191 @@ mod tests {
                 vk::ComponentMapping::default(),
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod allocation_cleanup_tests {
+    use super::{destroy_gpu_image, RtCache, RtKey};
+    use ash::vk;
+    use ash::vk::Handle;
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+
+    #[derive(Default)]
+    struct MockState {
+        fail: u8,
+        events: Vec<&'static str>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<MockState> = RefCell::new(MockState::default());
+    }
+
+    fn record(event: &'static str) -> u8 {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.events.push(event);
+            state.fail
+        })
+    }
+
+    unsafe extern "system" fn create_image(
+        _: vk::Device,
+        _: *const vk::ImageCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        image: *mut vk::Image,
+    ) -> vk::Result {
+        if record("create") == 1 {
+            return vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        unsafe { *image = vk::Image::from_raw(11) };
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn requirements(
+        _: vk::Device,
+        _: vk::Image,
+        requirements: *mut vk::MemoryRequirements,
+    ) {
+        record("requirements");
+        unsafe {
+            *requirements = vk::MemoryRequirements {
+                size: 4096,
+                alignment: 256,
+                memory_type_bits: 1,
+            };
+        }
+    }
+
+    unsafe extern "system" fn allocate_memory(
+        _: vk::Device,
+        _: *const vk::MemoryAllocateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        memory: *mut vk::DeviceMemory,
+    ) -> vk::Result {
+        if record("allocate") == 3 {
+            return vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        unsafe { *memory = vk::DeviceMemory::from_raw(22) };
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn bind_memory(
+        _: vk::Device,
+        _: vk::Image,
+        _: vk::DeviceMemory,
+        _: vk::DeviceSize,
+    ) -> vk::Result {
+        if record("bind") == 4 {
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+        } else {
+            vk::Result::SUCCESS
+        }
+    }
+
+    unsafe extern "system" fn create_view(
+        _: vk::Device,
+        _: *const vk::ImageViewCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        view: *mut vk::ImageView,
+    ) -> vk::Result {
+        if record("view") == 5 {
+            return vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        unsafe { *view = vk::ImageView::from_raw(33) };
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn destroy_image(
+        _: vk::Device,
+        _: vk::Image,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        record("destroy-image");
+    }
+
+    unsafe extern "system" fn free_memory(
+        _: vk::Device,
+        _: vk::DeviceMemory,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        record("free-memory");
+    }
+
+    unsafe extern "system" fn destroy_view(
+        _: vk::Device,
+        _: vk::ImageView,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        record("destroy-view");
+    }
+
+    fn device() -> ash::Device {
+        unsafe {
+            ash::Device::load_with(|name| match name.to_bytes() {
+                b"vkCreateImage" => create_image as *const () as *const c_void,
+                b"vkGetImageMemoryRequirements" => requirements as *const () as *const c_void,
+                b"vkAllocateMemory" => allocate_memory as *const () as *const c_void,
+                b"vkBindImageMemory" => bind_memory as *const () as *const c_void,
+                b"vkCreateImageView" => create_view as *const () as *const c_void,
+                b"vkDestroyImage" => destroy_image as *const () as *const c_void,
+                b"vkFreeMemory" => free_memory as *const () as *const c_void,
+                b"vkDestroyImageView" => destroy_view as *const () as *const c_void,
+                _ => std::ptr::null(),
+            }, vk::Device::from_raw(1))
+        }
+    }
+
+    fn cache(fail: u8) -> RtCache {
+        STATE.with(|state| *state.borrow_mut() = MockState { fail, events: Vec::new() });
+        let mut cache = RtCache::new();
+        if fail != 6 {
+            let mut props = vk::PhysicalDeviceMemoryProperties::default();
+            props.memory_type_count = 1;
+            props.memory_types[0].property_flags = if fail == 2 {
+                vk::MemoryPropertyFlags::HOST_VISIBLE
+            } else {
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+            };
+            cache.set_mem_properties(props);
+        }
+        cache
+    }
+
+    #[test]
+    fn color_and_depth_construction_release_every_failed_allocation() {
+        let device = device();
+        let key = RtKey::new(1, 32, 32, 0x10000);
+        for (format, usage, aspect) in [
+            (vk::Format::R8G8B8A8_UNORM, vk::ImageUsageFlags::COLOR_ATTACHMENT, vk::ImageAspectFlags::COLOR),
+            (vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, vk::ImageAspectFlags::DEPTH),
+        ] {
+            for (fail, expected) in [
+                (1, vec!["create"]),
+                (2, vec!["create", "requirements", "destroy-image"]),
+                (3, vec!["create", "requirements", "allocate", "destroy-image"]),
+                (4, vec!["create", "requirements", "allocate", "bind", "destroy-image", "free-memory"]),
+                (5, vec!["create", "requirements", "allocate", "bind", "view", "destroy-image", "free-memory"]),
+                (6, vec![]),
+            ] {
+                let cache = cache(fail);
+                assert!(cache.create_image_inner(&device, key, format, usage, aspect).is_err());
+                STATE.with(|state| assert_eq!(state.borrow().events, expected, "failure stage {fail}"));
+            }
+        }
+    }
+
+    #[test]
+    fn successful_construction_retains_resources_until_image_destruction() {
+        let device = device();
+        let cache = cache(0);
+        let image = cache.create_image(&device, RtKey::new(1, 32, 32, 0x10000), vk::Format::R8G8B8A8_UNORM).unwrap();
+        assert_eq!(image.image, vk::Image::from_raw(11));
+        assert_eq!(image.memory, vk::DeviceMemory::from_raw(22));
+        assert_eq!(image.view, vk::ImageView::from_raw(33));
+        STATE.with(|state| assert_eq!(state.borrow().events, vec!["create", "requirements", "allocate", "bind", "view"]));
+        destroy_gpu_image(&device, image);
+        STATE.with(|state| assert_eq!(state.borrow().events, vec!["create", "requirements", "allocate", "bind", "view", "destroy-view", "destroy-image", "free-memory"]));
     }
 }

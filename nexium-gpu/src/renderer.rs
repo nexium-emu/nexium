@@ -27084,39 +27084,49 @@ fn create_persistent_upload_buffer_sized(
             .map_err(|e| format!("create_buffer(persistent upload): {:?}", e))?
     };
     let req = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let mt = find_memory_type(
-        mem_props,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
-    .ok_or_else(|| "no HOST_VISIBLE memory type for persistent upload".to_string())?;
-    let alloc = vk::MemoryAllocateInfo {
-        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-        allocation_size: req.size,
-        memory_type_index: mt,
-        p_next: std::ptr::null(),
-        _marker: std::marker::PhantomData,
-    };
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc, None)
-            .map_err(|e| format!("allocate_memory(persistent upload): {:?}", e))?
-    };
-    unsafe {
-        device
-            .bind_buffer_memory(buffer, memory, 0)
-            .map_err(|e| format!("bind_buffer_memory(persistent upload): {:?}", e))?;
-        let mapped = device
-            .map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
-            .map_err(|e| format!("map_memory(persistent upload): {:?}", e))?
-            as *mut u8;
-        Ok(PersistentUploadBuffer {
-            buffer,
-            memory,
-            size,
-            mapped,
-        })
+    let mut memory = vk::DeviceMemory::null();
+    let result = (|| -> Result<PersistentUploadBuffer, String> {
+        let mt = find_memory_type(
+            mem_props,
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or_else(|| "no HOST_VISIBLE memory type for persistent upload".to_string())?;
+        let alloc = vk::MemoryAllocateInfo {
+            s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+            allocation_size: req.size,
+            memory_type_index: mt,
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        memory = unsafe {
+            device.allocate_memory(&alloc, None).map_err(|error| {
+                format!(
+                    "allocate_memory(persistent upload): {error:?} requested_bytes={requested_size} allocation_bytes={} memory_type={mt} usage={usage:?}",
+                    req.size,
+                )
+            })?
+        };
+        unsafe {
+            device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(|error| format!("bind_buffer_memory(persistent upload): {error:?}"))?;
+            let mapped = device
+                .map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
+                .map_err(|error| format!("map_memory(persistent upload): {error:?}"))?
+                as *mut u8;
+            Ok(PersistentUploadBuffer { buffer, memory, size, mapped })
+        }
+    })();
+    if result.is_err() {
+        unsafe {
+            device.destroy_buffer(buffer, None);
+            if memory != vk::DeviceMemory::null() {
+                device.free_memory(memory, None);
+            }
+        }
     }
+    result
 }
 
 fn create_persistent_upload_buffer(
@@ -28110,40 +28120,131 @@ fn create_texture_image(
             .map_err(|e| format!("create_image(tex {}x{}): {:?}", width, height, e))?
     };
     let req = unsafe { device.get_image_memory_requirements(image) };
-    let mt = find_memory_type(
-        mem_props,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )
-    .ok_or_else(|| "no DEVICE_LOCAL for texture image".to_string())?;
-    let alloc = vk::MemoryAllocateInfo {
-        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-        allocation_size: req.size,
-        memory_type_index: mt,
-        p_next: std::ptr::null(),
-        _marker: std::marker::PhantomData,
-    };
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc, None)
-            .map_err(|e| format!("allocate_memory(tex): {:?}", e))?
-    };
-    unsafe {
-        device
-            .bind_image_memory(image, memory, 0)
-            .map_err(|e| format!("bind_image_memory(tex): {:?}", e))?;
-    }
-
-    let stage = if volume_slices.is_none() {
-        Some(allocate_texture_upload(
-            device,
+    let mut memory = vk::DeviceMemory::null();
+    let mut view = vk::ImageView::null();
+    let mut stage = None;
+    let mut copies = Vec::new();
+    let preparation = (|| -> Result<(), String> {
+        let mt = find_memory_type(
             mem_props,
-            rgba8,
-            upload_slot,
-        )?)
-    } else {
-        None
-    };
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| "no DEVICE_LOCAL for texture image".to_string())?;
+        let alloc = vk::MemoryAllocateInfo {
+            s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+            allocation_size: req.size,
+            memory_type_index: mt,
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        memory = unsafe {
+            device
+                .allocate_memory(&alloc, None)
+                .map_err(|error| {
+                    format!(
+                        "allocate_memory(tex): {error:?} requested_bytes={} dimensions={}x{} layers={} mips={} format={:?} memory_type={}",
+                        req.size, width, height, layers, mip_levels, format, mt,
+                    )
+                })?
+        };
+        unsafe {
+            device
+                .bind_image_memory(image, memory, 0)
+                .map_err(|e| format!("bind_image_memory(tex): {:?}", e))?;
+        }
+
+        stage = if volume_slices.is_none() {
+            Some(allocate_texture_upload(
+                device,
+                mem_props,
+                rgba8,
+                upload_slot,
+            )?)
+        } else {
+            None
+        };
+
+        let view_info = vk::ImageViewCreateInfo {
+            s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+            image,
+            view_type: if volume {
+                vk::ImageViewType::TYPE_3D
+            } else if cube_array {
+                vk::ImageViewType::CUBE_ARRAY
+            } else if cube {
+                vk::ImageViewType::CUBE
+            } else if arrayed {
+                vk::ImageViewType::TYPE_2D_ARRAY
+            } else {
+                vk::ImageViewType::TYPE_2D
+            },
+            format,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: base_mip,
+                level_count: view_mips,
+                base_array_layer: if volume { 0 } else { view_base_layer },
+                layer_count: if volume { 1 } else { view_layer_count },
+            },
+            components: texture_component_mapping(swizzle),
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+        view = unsafe {
+            device
+                .create_image_view(&view_info, None)
+                .map_err(|e| format!("create_image_view(tex): {:?}", e))?
+        };
+        if let Some(stage) = stage.as_ref() {
+            copies = mip_copies
+                .iter()
+                .map(|copy| {
+                    let buffer_offset = copy
+                        .buffer_offset
+                        .checked_add(stage.base_offset)
+                        .ok_or_else(|| "texture upload arena offset overflow".to_string())?;
+                    Ok(vk::BufferImageCopy {
+                        buffer_offset,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: aspect,
+                            mip_level: copy.mip_level,
+                            base_array_layer: 0,
+                            layer_count: if volume { 1 } else { layers },
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D {
+                            width: copy.width,
+                            height: copy.height,
+                            depth: if volume { layers } else { 1 },
+                        },
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            if copies.is_empty() {
+                return Err("texture upload has no mip copy regions".to_string());
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = preparation {
+        if let Some(buffer) = stage.take().and_then(|stage| stage.dedicated) {
+            destroy_persistent_upload_buffer(device, buffer);
+        }
+        unsafe {
+            if view != vk::ImageView::null() {
+                device.destroy_image_view(view, None);
+            }
+            device.destroy_image(image, None);
+            if memory != vk::DeviceMemory::null() {
+                device.free_memory(memory, None);
+            }
+        }
+        return Err(error);
+    }
 
     transition_image_range(
         device,
@@ -28256,35 +28357,6 @@ fn create_texture_image(
             }
         }
     } else if let Some(stage) = stage.as_ref() {
-        let copies: Vec<vk::BufferImageCopy> = mip_copies
-            .iter()
-            .map(|copy| {
-                let buffer_offset = copy
-                    .buffer_offset
-                    .checked_add(stage.base_offset)
-                    .ok_or_else(|| "texture upload arena offset overflow".to_string())?;
-                Ok(vk::BufferImageCopy {
-                    buffer_offset,
-                    buffer_row_length: 0,
-                    buffer_image_height: 0,
-                    image_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: aspect,
-                        mip_level: copy.mip_level,
-                        base_array_layer: 0,
-                        layer_count: if volume { 1 } else { layers },
-                    },
-                    image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                    image_extent: vk::Extent3D {
-                        width: copy.width,
-                        height: copy.height,
-                        depth: if volume { layers } else { 1 },
-                    },
-                })
-            })
-            .collect::<Result<_, String>>()?;
-        if copies.is_empty() {
-            return Err("texture upload has no mip copy regions".to_string());
-        }
         unsafe {
             device.cmd_copy_buffer_to_image(
                 cmd,
@@ -28309,38 +28381,6 @@ fn create_texture_image(
         if volume { 1 } else { layers },
     );
 
-    let view_info = vk::ImageViewCreateInfo {
-        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-        image,
-        view_type: if volume {
-            vk::ImageViewType::TYPE_3D
-        } else if cube_array {
-            vk::ImageViewType::CUBE_ARRAY
-        } else if cube {
-            vk::ImageViewType::CUBE
-        } else if arrayed {
-            vk::ImageViewType::TYPE_2D_ARRAY
-        } else {
-            vk::ImageViewType::TYPE_2D
-        },
-        format,
-        subresource_range: vk::ImageSubresourceRange {
-            aspect_mask: aspect,
-            base_mip_level: base_mip,
-            level_count: view_mips,
-            base_array_layer: if volume { 0 } else { view_base_layer },
-            layer_count: if volume { 1 } else { view_layer_count },
-        },
-        components: texture_component_mapping(swizzle),
-        p_next: std::ptr::null(),
-        flags: Default::default(),
-        _marker: std::marker::PhantomData,
-    };
-    let view = unsafe {
-        device
-            .create_image_view(&view_info, None)
-            .map_err(|e| format!("create_image_view(tex): {:?}", e))?
-    };
     Ok((
         CachedTexture {
             image,
