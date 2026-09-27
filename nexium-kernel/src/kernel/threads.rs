@@ -315,9 +315,9 @@ impl Threads {
             return;
         };
         for i in 0..31 {
-            t.ctx.x[i] = cpu.get_register(i as u32);
+            t.ctx.x[i] = cpu.get_thread_register(i as u32);
         }
-        t.ctx.sp = cpu.get_register(31);
+        t.ctx.sp = cpu.get_thread_register(31);
         t.ctx.pc = cpu.get_pc();
         t.ctx.tpidrro_el0 = cpu.get_tpidrro_el0();
         if let Err(e) = cpu.save_thread_context(&mut t.ctx.backend) {
@@ -337,9 +337,9 @@ impl Threads {
             log::error!("failed to restore thread context for {:#x}: {}", handle, e);
         }
         for i in 0..31 {
-            cpu.set_register(i as u32, t.ctx.x[i]);
+            cpu.set_thread_register(i as u32, t.ctx.x[i]);
         }
-        cpu.set_register(31, t.ctx.sp);
+        cpu.set_thread_register(31, t.ctx.sp);
         cpu.set_pc(t.ctx.pc);
         cpu.set_tpidrro_el0(t.ctx.tpidrro_el0);
     }

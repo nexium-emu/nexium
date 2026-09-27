@@ -104,10 +104,18 @@ pub struct FaultSnapshot {
     pub regs: [u64; 31],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestIsa {
+    AArch64,
+    AArch32,
+}
+
 #[derive(Clone)]
 pub enum CpuThreadContext {
     #[cfg(feature = "backend-dynarmic")]
     Dynarmic(dynarmic_sys::DynarmicContext),
+    #[cfg(feature = "backend-dynarmic")]
+    Dynarmic32(dynarmic_sys::DynarmicContext32),
     #[cfg(feature = "backend-rustarmic")]
     Rustarmic(rustarmic::RustarmicThreadContext),
     #[cfg(nce_runtime)]
@@ -119,6 +127,8 @@ impl std::fmt::Debug for CpuThreadContext {
         match self {
             #[cfg(feature = "backend-dynarmic")]
             Self::Dynarmic(_) => f.write_str("Dynarmic"),
+            #[cfg(feature = "backend-dynarmic")]
+            Self::Dynarmic32(_) => f.write_str("Dynarmic32"),
             #[cfg(feature = "backend-rustarmic")]
             Self::Rustarmic(_) => f.write_str("Rustarmic"),
             #[cfg(nce_runtime)]
@@ -223,6 +233,43 @@ impl Cpu {
         DynarmicCpu::new().map(Cpu::Dynarmic)
     }
 
+    #[cfg(feature = "backend-dynarmic")]
+    pub fn new_dynarmic_a32() -> Result<Self, String> {
+        DynarmicCpu::new_with_isa(GuestIsa::AArch32).map(Cpu::Dynarmic)
+    }
+
+    pub fn new_with_isa(backend: CpuBackendKind, isa: GuestIsa) -> Result<Self, String> {
+        match isa {
+            GuestIsa::AArch64 => Self::new(backend),
+            GuestIsa::AArch32 => {
+                #[cfg(feature = "backend-dynarmic")]
+                {
+                    if !matches!(backend, CpuBackendKind::Dynarmic) {
+                        log::warn!(
+                            "cpu backend {} cannot run AArch32 guests; using Dynarmic",
+                            backend.label()
+                        );
+                    }
+                    Self::new_dynarmic_a32()
+                }
+                #[cfg(not(feature = "backend-dynarmic"))]
+                {
+                    let _ = backend;
+                    Err("AArch32 guests require the Dynarmic backend".to_string())
+                }
+            }
+        }
+    }
+
+    pub fn isa(&self) -> GuestIsa {
+        match self {
+            #[cfg(feature = "backend-dynarmic")]
+            Cpu::Dynarmic(cpu) => cpu.isa(),
+            #[allow(unreachable_patterns)]
+            _ => GuestIsa::AArch64,
+        }
+    }
+
     #[cfg(feature = "backend-rustarmic")]
     pub fn new_rustarmic() -> Result<Self, String> {
         RustarmicCpu::new().map(Cpu::Rustarmic)
@@ -298,6 +345,56 @@ impl Cpu {
         dispatch!(self, cpu => cpu.get_register(reg))
     }
 
+    pub fn set_thread_register(&mut self, reg: u32, val: u64) {
+        #[cfg(feature = "backend-dynarmic")]
+        if let Cpu::Dynarmic(cpu) = self {
+            cpu.set_raw_register(reg, val);
+            return;
+        }
+        self.set_register(reg, val)
+    }
+
+    pub fn get_thread_register(&self, reg: u32) -> u64 {
+        #[cfg(feature = "backend-dynarmic")]
+        if let Cpu::Dynarmic(cpu) = self {
+            return cpu.get_raw_register(reg);
+        }
+        self.get_register(reg)
+    }
+
+    pub fn get_r32(&self, reg: u32) -> u32 {
+        #[cfg(feature = "backend-dynarmic")]
+        if let Cpu::Dynarmic(cpu) = self {
+            return cpu.get_r32(reg);
+        }
+        let _ = reg;
+        0
+    }
+
+    pub fn set_r32(&mut self, reg: u32, val: u32) {
+        #[cfg(feature = "backend-dynarmic")]
+        if let Cpu::Dynarmic(cpu) = self {
+            cpu.set_r32(reg, val);
+        }
+        let _ = (reg, val);
+    }
+
+    pub fn svc_shadow_enter(&mut self, x: [u64; 8]) {
+        #[cfg(feature = "backend-dynarmic")]
+        if let Cpu::Dynarmic(cpu) = self {
+            cpu.svc_shadow_enter(x);
+        }
+        let _ = x;
+    }
+
+    pub fn svc_shadow_exit(&mut self) -> [u64; 8] {
+        #[cfg(feature = "backend-dynarmic")]
+        if let Cpu::Dynarmic(cpu) = self {
+            return cpu.svc_shadow_exit();
+        }
+        [0; 8]
+    }
+
     pub fn set_pc(&mut self, pc: u64) {
         dispatch!(self, cpu => cpu.set_pc(pc))
     }
@@ -338,6 +435,16 @@ impl Cpu {
         match self {
             #[cfg(feature = "backend-dynarmic")]
             Cpu::Dynarmic(cpu) => {
+                if cpu.isa() == GuestIsa::AArch32 {
+                    if !matches!(context.as_ref(), Some(CpuThreadContext::Dynarmic32(_))) {
+                        *context =
+                            Some(CpuThreadContext::Dynarmic32(cpu.alloc_thread_context32()));
+                    }
+                    let Some(CpuThreadContext::Dynarmic32(context)) = context.as_mut() else {
+                        unreachable!()
+                    };
+                    return cpu.save_thread_context32(context);
+                }
                 if !matches!(context.as_ref(), Some(CpuThreadContext::Dynarmic(_))) {
                     *context = Some(CpuThreadContext::Dynarmic(cpu.alloc_thread_context()));
                 }
@@ -364,6 +471,10 @@ impl Cpu {
             #[cfg(feature = "backend-dynarmic")]
             (Cpu::Dynarmic(cpu), CpuThreadContext::Dynarmic(context)) => {
                 cpu.restore_thread_context(context)
+            }
+            #[cfg(feature = "backend-dynarmic")]
+            (Cpu::Dynarmic(cpu), CpuThreadContext::Dynarmic32(context)) => {
+                cpu.restore_thread_context32(context)
             }
             #[cfg(feature = "backend-rustarmic")]
             (Cpu::Rustarmic(cpu), CpuThreadContext::Rustarmic(context)) => {

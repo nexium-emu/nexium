@@ -17,6 +17,9 @@ const NULL_SKIP_MAX: u32 = 64;
 
 pub struct DynarmicCpu {
     emu: Arc<SharedDynarmic>,
+    isa: crate::GuestIsa,
+    shadow: RefCell<[u64; 32]>,
+    shadow_active: Cell<bool>,
     last_event: Rc<Cell<Option<CpuEvent>>>,
     last_fault: Rc<RefCell<Option<FaultSnapshot>>>,
     continue_on_null: Rc<Cell<bool>>,
@@ -30,9 +33,102 @@ pub struct DynarmicCpu {
 unsafe impl Send for DynarmicCpu {}
 unsafe impl Sync for DynarmicCpu {}
 
+unsafe extern "C" fn a32_cp15_send_one_word(
+    _user: *mut std::ffi::c_void,
+    _two: bool,
+    opc1: std::ffi::c_uint,
+    crn: std::ffi::c_uint,
+    crm: std::ffi::c_uint,
+    opc2: std::ffi::c_uint,
+    _value: u32,
+) {
+    if crn == 7 {
+        return;
+    }
+    a32_cp15_report("mcr", opc1, crn, crm, opc2);
+}
+
+unsafe extern "C" fn a32_cp15_send_two_words(
+    _user: *mut std::ffi::c_void,
+    _two: bool,
+    opc: std::ffi::c_uint,
+    crm: std::ffi::c_uint,
+    _low: u32,
+    _high: u32,
+) {
+    a32_cp15_report("mcrr", opc, 0, crm, 0);
+}
+
+unsafe extern "C" fn a32_cp15_get_one_word(
+    _user: *mut std::ffi::c_void,
+    _two: bool,
+    opc1: std::ffi::c_uint,
+    crn: std::ffi::c_uint,
+    crm: std::ffi::c_uint,
+    opc2: std::ffi::c_uint,
+) -> u32 {
+    if opc1 == 0 && crn == 14 && crm == 0 && opc2 == 0 {
+        return 19_200_000;
+    }
+    a32_cp15_report("mrc", opc1, crn, crm, opc2);
+    0
+}
+
+unsafe extern "C" fn a32_cp15_get_two_words(
+    _user: *mut std::ffi::c_void,
+    _two: bool,
+    opc: std::ffi::c_uint,
+    crm: std::ffi::c_uint,
+) -> u64 {
+    if opc == 0 && crm == 14 {
+        return dynarmic_sys::host_cntpct();
+    }
+    a32_cp15_report("mrrc", opc, 0, crm, 0);
+    0
+}
+
+fn a32_cp15_report(kind: &str, opc1: u32, crn: u32, crm: u32, opc2: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+    if REPORTS.fetch_add(1, Ordering::Relaxed) < 16 {
+        log::warn!(
+            "dynarmic a32: unhandled cp15 {} opc1={} c{} c{} opc2={}",
+            kind,
+            opc1,
+            crn,
+            crm,
+            opc2
+        );
+    }
+}
+
+fn a32_coprocessors() -> [dynarmic_sys::CoprocessorHandler; 16] {
+    let none = dynarmic_sys::CoprocessorHandler {
+        user_data: std::ptr::null_mut(),
+        send_one_word: None,
+        send_two_words: None,
+        get_one_word: None,
+        get_two_words: None,
+    };
+    let mut table = [none; 16];
+    table[15] = dynarmic_sys::CoprocessorHandler {
+        user_data: std::ptr::null_mut(),
+        send_one_word: Some(a32_cp15_send_one_word),
+        send_two_words: Some(a32_cp15_send_two_words),
+        get_one_word: Some(a32_cp15_get_one_word),
+        get_two_words: Some(a32_cp15_get_two_words),
+    };
+    table
+}
+
 impl DynarmicCpu {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_isa(crate::GuestIsa::AArch64)
+    }
+
+    pub fn new_with_isa(isa: crate::GuestIsa) -> Result<Self, String> {
         configure_dynarmic_fast_paths();
+        let a32 = matches!(isa, crate::GuestIsa::AArch32);
         let force_no_fastmem = env_flag("NEXIUM_DYNARMIC_NO_FASTMEM")
             || nexium_memory::fastmem::direct_va_base().is_some()
             || ((std::env::var("NEXIUM_WATCH_WRITE_CPU").is_ok()
@@ -40,22 +136,43 @@ impl DynarmicCpu {
                 && !watch_page_protect_enabled()
                 && !env_flag("NEXIUM_WATCH_INLINE"));
         let emu: dynarmic_sys::Dynarmic<'static, ()> =
-            match (nexium_memory::fastmem::base(), force_no_fastmem) {
-                (Some(base), false) => {
+            match (nexium_memory::fastmem::base(), force_no_fastmem, a32) {
+                (Some(base), false, false) => {
                     log::info!("dynarmic: fastmem enabled, arena base={:p}", base);
                     dynarmic_sys::Dynarmic::new_fastmem_bits(
                         base.cast(),
                         nexium_memory::fastmem::arena_bits(),
                     )
                 }
-                (Some(base), true) => {
+                (Some(base), false, true) => {
+                    log::info!("dynarmic: A32 fastmem enabled, arena base={:p}", base);
+                    dynarmic_sys::Dynarmic::new_a32_fastmem_bits(
+                        base.cast(),
+                        Some(&a32_coprocessors()),
+                    )
+                }
+                (Some(base), true, false) => {
                     log::info!(
                         "dynarmic: fastmem arena reserved at {:p}, CPU fastmem disabled for watch",
                         base
                     );
                     dynarmic_sys::Dynarmic::new()
                 }
-                (None, _) => dynarmic_sys::Dynarmic::new(),
+                (Some(base), true, true) => {
+                    log::info!(
+                        "dynarmic: fastmem arena reserved at {:p}, A32 CPU fastmem disabled for watch",
+                        base
+                    );
+                    dynarmic_sys::Dynarmic::new_a32_fastmem_bits(
+                        std::ptr::null_mut(),
+                        Some(&a32_coprocessors()),
+                    )
+                }
+                (None, _, false) => dynarmic_sys::Dynarmic::new(),
+                (None, _, true) => dynarmic_sys::Dynarmic::new_a32_fastmem_bits(
+                    std::ptr::null_mut(),
+                    Some(&a32_coprocessors()),
+                ),
             };
         log::info!(
             "dynarmic: RSB/FastDispatch {} (default; DYNARMIC_FAST_PATHS=0 disables)",
@@ -196,7 +313,11 @@ impl DynarmicCpu {
             let sp = dyn_.reg_read_sp().unwrap_or(0);
             let mut regs = [0u64; 31];
             for i in 0..31 {
-                regs[i] = dyn_.reg_read(i).unwrap_or(0);
+                regs[i] = if a32 && i < 16 {
+                    dyn_.reg_read_r(i as u32).unwrap_or(0) as u64
+                } else {
+                    dyn_.reg_read(i).unwrap_or(0)
+                };
             }
             let is_null_zone = addr < 0x1000;
             if is_null_zone {
@@ -235,6 +356,9 @@ impl DynarmicCpu {
 
         Ok(Self {
             emu: Arc::new(SharedDynarmic { emu }),
+            isa,
+            shadow: RefCell::new([0; 32]),
+            shadow_active: Cell::new(false),
             last_event,
             last_fault,
             continue_on_null,
@@ -343,7 +467,26 @@ impl DynarmicCpu {
             .map_err(|e| format!("read_bytes failed: {:?}", e))
     }
 
-    pub fn set_register(&mut self, reg: u32, val: u64) {
+    pub fn isa(&self) -> crate::GuestIsa {
+        self.isa
+    }
+
+    fn a32_index(reg: u32) -> Option<u32> {
+        match reg {
+            0..=15 => Some(reg),
+            30 => Some(14),
+            31 => Some(13),
+            _ => None,
+        }
+    }
+
+    pub fn set_raw_register(&mut self, reg: u32, val: u64) {
+        if matches!(self.isa, crate::GuestIsa::AArch32) {
+            if let Some(index) = Self::a32_index(reg) {
+                let _ = self.emu.emu.reg_write_r(index, val as u32);
+            }
+            return;
+        }
         if reg < 31 {
             let _ = self.emu.emu.reg_write_raw(reg as usize, val);
         } else if reg == 31 {
@@ -351,7 +494,13 @@ impl DynarmicCpu {
         }
     }
 
-    pub fn get_register(&self, reg: u32) -> u64 {
+    pub fn get_raw_register(&self, reg: u32) -> u64 {
+        if matches!(self.isa, crate::GuestIsa::AArch32) {
+            return match Self::a32_index(reg) {
+                Some(index) => self.emu.emu.reg_read_r(index).unwrap_or(0) as u64,
+                None => 0,
+            };
+        }
         if reg < 31 {
             self.emu.emu.reg_read(reg as usize).unwrap_or(0)
         } else if reg == 31 {
@@ -359,6 +508,47 @@ impl DynarmicCpu {
         } else {
             0
         }
+    }
+
+    pub fn set_register(&mut self, reg: u32, val: u64) {
+        if self.shadow_active.get() && reg < 32 {
+            self.shadow.borrow_mut()[reg as usize] = val;
+            return;
+        }
+        self.set_raw_register(reg, val)
+    }
+
+    pub fn get_register(&self, reg: u32) -> u64 {
+        if self.shadow_active.get() && reg < 32 {
+            return self.shadow.borrow()[reg as usize];
+        }
+        self.get_raw_register(reg)
+    }
+
+    pub fn get_r32(&self, reg: u32) -> u32 {
+        self.emu.emu.reg_read_r(reg).unwrap_or(0)
+    }
+
+    pub fn set_r32(&mut self, reg: u32, val: u32) {
+        let _ = self.emu.emu.reg_write_r(reg, val);
+    }
+
+    pub fn svc_shadow_enter(&mut self, x: [u64; 8]) {
+        let mut shadow = [0u64; 32];
+        for (i, slot) in shadow.iter_mut().enumerate() {
+            *slot = self.get_raw_register(i as u32);
+        }
+        shadow[..8].copy_from_slice(&x);
+        *self.shadow.borrow_mut() = shadow;
+        self.shadow_active.set(true);
+    }
+
+    pub fn svc_shadow_exit(&mut self) -> [u64; 8] {
+        self.shadow_active.set(false);
+        let shadow = self.shadow.borrow();
+        let mut x = [0u64; 8];
+        x.copy_from_slice(&shadow[..8]);
+        x
     }
 
     pub fn set_pc(&mut self, pc: u64) {
@@ -378,15 +568,46 @@ impl DynarmicCpu {
     }
 
     pub fn set_tpidrro_el0(&mut self, val: u64) {
+        if matches!(self.isa, crate::GuestIsa::AArch32) {
+            let _ = self.emu.emu.reg_write_c13_c0_3(val as u32);
+            return;
+        }
         let _ = self.emu.emu.reg_write_tpidrr0_el0(val);
     }
 
     pub fn get_tpidrro_el0(&self) -> u64 {
+        if matches!(self.isa, crate::GuestIsa::AArch32) {
+            return self.emu.emu.reg_read_c13_c0_3().unwrap_or(0) as u64;
+        }
         self.emu.emu.reg_read_tpidrr0_el0().unwrap_or(0)
     }
 
     pub fn alloc_thread_context(&self) -> dynarmic_sys::DynarmicContext {
         self.emu.emu.context_alloc()
+    }
+
+    pub fn alloc_thread_context32(&self) -> dynarmic_sys::DynarmicContext32 {
+        self.emu.emu.context32_alloc()
+    }
+
+    pub fn save_thread_context32(
+        &self,
+        context: &mut dynarmic_sys::DynarmicContext32,
+    ) -> Result<(), String> {
+        self.emu
+            .emu
+            .context32_save(context)
+            .map_err(|e| format!("save a32 context failed: {:?}", e))
+    }
+
+    pub fn restore_thread_context32(
+        &self,
+        context: &dynarmic_sys::DynarmicContext32,
+    ) -> Result<(), String> {
+        self.emu
+            .emu
+            .context32_restore(context)
+            .map_err(|e| format!("restore a32 context failed: {:?}", e))
     }
 
     pub fn save_thread_context(
@@ -410,6 +631,12 @@ impl DynarmicCpu {
     }
 
     pub fn reset_thread_context(&self) -> Result<(), String> {
+        if matches!(self.isa, crate::GuestIsa::AArch32) {
+            let context = self.alloc_thread_context32();
+            self.restore_thread_context32(&context)?;
+            let _ = self.emu.emu.reg_write_cpsr(0x10);
+            return Ok(());
+        }
         let context = self.alloc_thread_context();
         self.restore_thread_context(&context)
     }
@@ -507,7 +734,13 @@ impl DynarmicCpu {
                 }
             }
         }
-        let event = self.last_event.take();
+        let mut event = self.last_event.take();
+        if event.is_none() && matches!(self.isa, crate::GuestIsa::AArch32) {
+            if let Some((code, at)) = self.emu.emu.take_exception() {
+                log::error!("dynarmic a32 exception {} at pc={:#x}", code, at);
+                event = Some(CpuEvent::Exception(code));
+            }
+        }
         match event {
             Some(CpuEvent::Svc(imm)) => {
                 log::debug!("dynarmic SVC {:#04x} hit at PC={:#x}", imm, pc);

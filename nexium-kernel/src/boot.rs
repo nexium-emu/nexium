@@ -328,60 +328,97 @@ impl BootContext {
 
         let address_space = Arc::new(AddressSpace::new());
 
+        let a32 = !app.npdm.is_64bit;
         let bits: u32 = match app.npdm.address_space {
             nexium_loader::npdm::AddressSpaceType::Is39Bit => 39,
             nexium_loader::npdm::AddressSpaceType::Is36Bit => 36,
+            nexium_loader::npdm::AddressSpaceType::Is32Bit
+            | nexium_loader::npdm::AddressSpaceType::Is32BitNoMap => 32,
+            #[allow(unreachable_patterns)]
             other => {
                 log::warn!("address space {:?} unsupported; using 36-bit layout", other);
                 36
             }
         };
+        if a32 {
+            log::info!(
+                "application is AArch32 ({:?}); using the 32-bit process layout and the Dynarmic A32 backend",
+                app.npdm.address_space
+            );
+        }
         let space: u64 = 1u64 << bits;
 
-        let nce = matches!(config.cpu_backend, nexium_cpu::CpuBackendKind::Nce);
+        let nce = matches!(config.cpu_backend, nexium_cpu::CpuBackendKind::Nce) && !a32;
         let direct_base = nexium_memory::fastmem::direct_va_base().unwrap_or(0);
         if nce && direct_base == 0 {
             return Err("NCE backend requires the direct-mapped fastmem arena".to_string());
+        }
+        if a32 && direct_base != 0 {
+            return Err("AArch32 applications need the standard fastmem arena; restart without NCE".to_string());
         }
         if direct_base != 0 {
             log::info!("guest address space is direct-mapped at {:#x}", direct_base);
         }
         let arena_limit: u64 = nexium_memory::fastmem::arena_size();
         let window: u64 = direct_base + space.min(arena_limit);
-        let alias_size: u64 = if bits == 39 {
-            0x10_0000_0000
-        } else {
-            0x1_8000_0000
-        };
-        let heap_size: u64 = 0xCC00_0000;
-        let stack_region_size: u64 = 0x8000_0000;
-        let code_base: u64 = direct_base + 0x800_0000;
-        let code_span: u64 = 0x1_0000_0000;
-        let mut alias_size = alias_size;
-        let mut cursor = code_base + code_span;
-        let tail = heap_size + stack_region_size + 0x4000_0000;
-        if cursor + alias_size + tail > window {
-            let room = window.saturating_sub(cursor + tail);
-            let shrunk = room.min(alias_size).max(0x8000_0000);
-            log::warn!(
-                "alias region {:#x} does not fit the {:#x} window; using {:#x}",
-                alias_size,
-                window,
-                shrunk
-            );
-            alias_size = shrunk;
-        }
-        let alias_base: u64 = cursor;
-        cursor += alias_size;
-        let heap_base: u64 = cursor;
-        cursor += heap_size;
-        let stack_base: u64 = cursor;
-        cursor += stack_region_size;
-        let env_base: u64 = cursor;
+        let (code_base, alias_base, alias_size, heap_base, heap_size, stack_base, env_base, aslr_base, aslr_size) =
+            if bits == 32 {
+                (
+                    0x20_0000u64,
+                    0u64,
+                    0u64,
+                    0x4000_0000u64,
+                    0x8000_0000u64,
+                    0x3E00_0000u64,
+                    0x3F00_0000u64,
+                    0x20_0000u64,
+                    0x3FE0_0000u64,
+                )
+            } else {
+                let alias_size: u64 = if bits == 39 {
+                    0x10_0000_0000
+                } else {
+                    0x1_8000_0000
+                };
+                let heap_size: u64 = 0xCC00_0000;
+                let stack_region_size: u64 = 0x8000_0000;
+                let code_base: u64 = direct_base + 0x800_0000;
+                let code_span: u64 = 0x1_0000_0000;
+                let mut alias_size = alias_size;
+                let mut cursor = code_base + code_span;
+                let tail = heap_size + stack_region_size + 0x4000_0000;
+                if cursor + alias_size + tail > window {
+                    let room = window.saturating_sub(cursor + tail);
+                    let shrunk = room.min(alias_size).max(0x8000_0000);
+                    log::warn!(
+                        "alias region {:#x} does not fit the {:#x} window; using {:#x}",
+                        alias_size,
+                        window,
+                        shrunk
+                    );
+                    alias_size = shrunk;
+                }
+                let alias_base: u64 = cursor;
+                cursor += alias_size;
+                let heap_base: u64 = cursor;
+                cursor += heap_size;
+                let stack_base: u64 = cursor;
+                cursor += stack_region_size;
+                let env_base: u64 = cursor;
+                (
+                    code_base,
+                    alias_base,
+                    alias_size,
+                    heap_base,
+                    heap_size,
+                    stack_base,
+                    env_base,
+                    code_base,
+                    window - code_base,
+                )
+            };
         let tls_base: u64 = env_base + 0x1000;
         let exit_stub_va: u64 = env_base + 0x2000;
-        let aslr_base: u64 = code_base;
-        let aslr_size: u64 = window - code_base;
 
         const PAGE_SIZE: u64 = 0x1000;
         let code_size = app.total_code_size.max(PAGE_SIZE);
@@ -465,6 +502,10 @@ impl BootContext {
                 log::warn!("[guest-probe] pc={:#x} kind={} ignored: SVC probes are not supported under NCE", pc, kind);
                 continue;
             }
+            if a32 {
+                log::warn!("[guest-probe] pc={:#x} kind={} ignored: SVC probes are not supported for AArch32", pc, kind);
+                continue;
+            }
             let insn: u32 = 0xD400_0FE1;
             match address_space.write(pc, &insn.to_le_bytes()) {
                 Ok(()) => log::warn!(
@@ -496,6 +537,11 @@ impl BootContext {
             env_base
         );
         map_extras_and_exit_stub(&address_space, env_base, exit_stub_va, nce)?;
+        if a32 {
+            address_space
+                .write(exit_stub_va, &0xEF00_0007u32.to_le_bytes())
+                .map_err(|e| format!("Failed to write A32 exit stub: {:?}", e))?;
+        }
 
         let tls_pool_base: u64 = env_base + 0x10000;
         let mut kernel = Kernel::new(
@@ -574,6 +620,11 @@ impl BootContext {
         kernel.alias_size = alias_size;
         kernel.is_application = true;
         kernel.title_id = app.title_id;
+        kernel.guest_isa = if a32 {
+            nexium_cpu::GuestIsa::AArch32
+        } else {
+            nexium_cpu::GuestIsa::AArch64
+        };
         kernel.total_memory = 0xCD50_0000;
         kernel.system_resource_size = app.npdm.system_resource_size as u64;
         log::info!(

@@ -5,6 +5,7 @@ pub mod hid;
 pub mod profile;
 pub mod session;
 pub mod svc;
+pub mod svc_abi32;
 pub mod svc_defs;
 pub mod threads;
 
@@ -76,6 +77,7 @@ pub struct Kernel {
     pub alias_size: u64,
     pub is_application: bool,
     pub title_id: u64,
+    pub guest_isa: nexium_cpu::GuestIsa,
     pub total_memory: u64,
     pub heap_committed: u64,
     pub system_resource_size: u64,
@@ -334,6 +336,7 @@ impl Kernel {
             alias_size: 0x4_0000_0000,
             is_application: false,
             title_id: 0,
+            guest_isa: nexium_cpu::GuestIsa::AArch64,
             total_memory: 0x8000_0000,
             heap_committed: 0,
             system_resource_size: 0,
@@ -1411,7 +1414,7 @@ impl Kernel {
     }
 
     pub fn init_cpu(&self, backend: nexium_cpu::CpuBackendKind) -> Result<Cpu, String> {
-        let mut cpu = Cpu::new(backend)?;
+        let mut cpu = Cpu::new_with_isa(backend, self.guest_isa)?;
         for region in self.address_space.host_regions() {
             unsafe {
                 cpu.map_host(region.base, region.size, region.perm, region.host_ptr)
@@ -1662,11 +1665,37 @@ impl Kernel {
     }
 
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {
+        if matches!(self.guest_isa, nexium_cpu::GuestIsa::AArch32) {
+            return self.dispatch_svc_a32(imm);
+        }
         self.defer_user_preemption_if_disabled();
         let status = svc::dispatch(self, imm);
         if !matches!(imm, 0x10 | 0x1e | 0x7f) {
             if let Some(cpu) = cpu_local::cpu_mut() {
                 cpu.set_register(0, status as u64);
+            }
+        }
+        status
+    }
+
+    fn dispatch_svc_a32(&mut self, imm: u16) -> u32 {
+        let mut regs = [0u32; svc_abi32::REG_COUNT];
+        if let Some(cpu) = cpu_local::cpu_mut() {
+            for (i, reg) in regs.iter_mut().enumerate() {
+                *reg = cpu.get_r32(i as u32);
+            }
+            cpu.svc_shadow_enter(svc_abi32::gather(imm, &regs));
+        }
+        self.defer_user_preemption_if_disabled();
+        let status = svc::dispatch(self, imm);
+        if let Some(cpu) = cpu_local::cpu_mut() {
+            if !matches!(imm, 0x10 | 0x1e | 0x7f) {
+                cpu.set_register(0, status as u64);
+            }
+            let x = cpu.svc_shadow_exit();
+            svc_abi32::scatter(imm, &x, &mut regs);
+            for (i, reg) in regs.iter().enumerate() {
+                cpu.set_r32(i as u32, *reg);
             }
         }
         status
