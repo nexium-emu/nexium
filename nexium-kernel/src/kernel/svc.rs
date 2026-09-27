@@ -6970,7 +6970,7 @@ fn dispatch_service_v2(
                         &read_section(channels_offset, in_channels_sz),
                         &read_section(mixes_offset, in_mixes_sz),
                         &read_section(mixes_offset + in_mixes_sz, in_sinks_sz),
-                        revision_num >= 7,
+                        revision_num,
                     );
                 }
 

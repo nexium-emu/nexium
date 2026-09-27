@@ -113,7 +113,8 @@ impl AudioRouting {
         }
     }
 
-    pub fn update(&mut self, channels: &[u8], mixes: &[u8], sinks: &[u8], dirty: bool) {
+    pub fn update(&mut self, channels: &[u8], mixes: &[u8], sinks: &[u8], revision_num: u32) {
+        let behavior = super::behavior::BehaviorInfo::from_user_revision(revision_num);
         self.channels.clear();
         self.channels.resize(channels.len() / 0x70, None);
         for channel in channels.chunks_exact(0x70) {
@@ -123,7 +124,7 @@ impl AudioRouting {
             }
             self.channels[id] = Some(std::array::from_fn(|i| scalar(channel, 4 + i * 4)));
         }
-        let records = if dirty {
+        let records = if revision_num >= 7 {
             let count = uint(mixes, 4) as usize;
             mixes
                 .get(0x20..)
@@ -134,7 +135,7 @@ impl AudioRouting {
             mixes
         };
         for (index, bytes) in records.chunks_exact(MIX_SIZE).enumerate() {
-            let id = if dirty {
+            let id = if revision_num >= 7 {
                 uint(bytes, 0x10) as usize
             } else {
                 index
@@ -149,7 +150,11 @@ impl AudioRouting {
                 count: (uint(bytes, 8) as usize).min(CHANNELS),
                 used: bytes[12] != 0,
                 destination: uint(bytes, 0x924) as usize,
-                splitter: uint(bytes, 0x928) as usize,
+                splitter: if behavior.is_splitter_supported() {
+                    uint(bytes, 0x928) as usize
+                } else {
+                    UNUSED_SPLITTER_ID
+                },
                 matrix: std::array::from_fn(|i| {
                     std::array::from_fn(|j| scalar(bytes, 0x24 + (i * CHANNELS + j) * 4))
                 }),
@@ -403,6 +408,7 @@ mod tests {
             mixes[off + 12] = 1;
             put(&mut mixes, off + 0x10, i as u32);
             put(&mut mixes, off + 0x924, i.saturating_sub(1) as u32);
+            put(&mut mixes, off + 0x928, u32::MAX);
             for j in 0..6 {
                 float(&mut mixes, off + 0x24 + (j * 24 + j) * 4, 1.0);
             }
@@ -419,14 +425,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_mix_ignores_reserved_splitter_field() {
+        let (mut channels, mut mixes, sink, voice) = setup();
+        float(&mut channels, 4, 1.0);
+        for i in 0..3 {
+            put(&mut mixes, i * MIX_SIZE + 0x928, 0);
+        }
+        let mut routing = AudioRouting::default();
+        routing.update(&channels, &mixes, &sink, 1);
+        assert_eq!(routing.voice_gains(&voice, 1)[0], [1.0, 0.0]);
+        routing.update(&channels, &mixes, &sink, 2);
+        assert_eq!(routing.voice_gains(&voice, 1)[0], [0.0, 0.0]);
+    }
+
+    #[test]
     fn muted_ambience_has_no_output_and_panning_is_preserved() {
         let (mut channels, mixes, sink, voice) = setup();
         let mut routing = AudioRouting::default();
-        routing.update(&channels, &mixes, &sink, false);
+        routing.update(&channels, &mixes, &sink, 1);
         assert_eq!(routing.voice_gains(&voice, 1), [[0.0; 2]; 2]);
         float(&mut channels, 4, 0.7);
         float(&mut channels, 0x70 + 8, 0.4);
-        routing.update(&channels, &mixes, &sink, false);
+        routing.update(&channels, &mixes, &sink, 1);
         assert_eq!(routing.voice_gains(&voice, 2), [[0.7, 0.0], [0.0, 0.4]]);
         assert_eq!(routing.voice_gains(&voice, 1), [[0.7, 0.0], [0.0, 0.0]]);
     }
@@ -438,13 +458,13 @@ mod tests {
         float(&mut mixes, 0, 0.5);
         float(&mut mixes, MIX_SIZE, 0.25);
         let mut routing = AudioRouting::default();
-        routing.update(&channels, &mixes, &sink, false);
+        routing.update(&channels, &mixes, &sink, 1);
         assert_eq!(routing.voice_gains(&voice, 1)[0], [0.125, 0.0]);
         let mut dirty = vec![0; 0x20];
         put(&mut dirty, 4, 1);
         dirty.extend_from_slice(&mixes[MIX_SIZE..MIX_SIZE * 2]);
         float(&mut dirty, 0x20, 0.0);
-        routing.update(&channels, &dirty, &sink, true);
+        routing.update(&channels, &dirty, &sink, 7);
         assert_eq!(routing.voice_gains(&voice, 1), [[0.0; 2]; 2]);
     }
 
@@ -455,10 +475,10 @@ mod tests {
         put(&mut sink, 0x120, 6);
         sink[0x124..0x12a].copy_from_slice(&[0, 1, 4, 5, 2, 3]);
         let mut routing = AudioRouting::default();
-        routing.update(&channels, &mixes, &sink, false);
+        routing.update(&channels, &mixes, &sink, 1);
         assert_eq!(routing.voice_gains(&voice, 1)[0], [0.596; 2]);
         sink[1] = 0;
-        routing.update(&channels, &mixes, &sink, false);
+        routing.update(&channels, &mixes, &sink, 1);
         assert_eq!(routing.voice_gains(&voice, 1), [[0.0; 2]; 2]);
     }
 
@@ -468,11 +488,11 @@ mod tests {
         float(&mut channels, 4, 1.0);
         put(&mut mixes, MIX_SIZE + 0x924, 2);
         let mut routing = AudioRouting::default();
-        routing.update(&channels, &mixes, &sink, false);
+        routing.update(&channels, &mixes, &sink, 1);
         assert_eq!(routing.voice_gains(&voice, 1), [[0.0; 2]; 2]);
         put(&mut voice, 0x58, u32::MAX);
         assert_eq!(routing.voice_gains(&voice, 1), [[0.0; 2]; 2]);
-        routing.update(&[], &[], &[], false);
+        routing.update(&[], &[], &[], 1);
         assert_eq!(routing.voice_gains(&voice, 2), [[0.0; 2]; 2]);
     }
 }
