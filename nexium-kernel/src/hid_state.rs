@@ -83,7 +83,7 @@ pub const NPAD_BUTTON_LEFT_SR: u64 = 1 << 25;
 pub const NPAD_BUTTON_RIGHT_SL: u64 = 1 << 26;
 pub const NPAD_BUTTON_RIGHT_SR: u64 = 1 << 27;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControllerInput {
     pub buttons: u64,
     pub stick_l_x: i32,
@@ -99,7 +99,6 @@ pub const MOUSE_BUTTON_FORWARD: u32 = 1 << 3;
 pub const MOUSE_BUTTON_BACK: u32 = 1 << 4;
 
 const MOUSE_ATTR_IS_CONNECTED: u32 = 1 << 1;
-const KEYBOARD_ATTR_IS_CONNECTED: u32 = 1 << 0;
 
 pub const KEYBOARD_MOD_CONTROL: u32 = 1 << 0;
 pub const KEYBOARD_MOD_SHIFT: u32 = 1 << 1;
@@ -159,23 +158,83 @@ pub struct HidState {
     pub sampling_number: u64,
     pub shmem_va: Option<u64>,
     last_tick: Option<std::time::Instant>,
+    last_trace: Option<HidTraceSample>,
+}
+
+#[derive(PartialEq, Eq)]
+struct HidTraceSample {
+    entry: usize,
+    mapped_host_ptr: usize,
+    requested_buttons: u64,
+    injected: Option<ControllerInput>,
+    npad_buttons: [u64; LAYOUT_COUNT],
+    mouse_buttons: u32,
+    mouse_x: i32,
+    mouse_y: i32,
+    mouse_wheel_x: i32,
+    mouse_wheel_y: i32,
+    keyboard_modifiers: u32,
+    keyboard_keys: [u8; 32],
+    touch_count: u32,
+}
+
+fn exclusive_input_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NEXIUM_HID_INJECT_EXCLUSIVE").as_deref() == Ok("1"))
+}
+
+fn hid_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NEXIUM_HID_TRACE").as_deref() == Ok("1"))
+}
+
+fn selected_controller_input(
+    host: ControllerInput,
+    injected: Option<ControllerInput>,
+    exclusive: bool,
+) -> ControllerInput {
+    injected.unwrap_or_else(|| if exclusive { ControllerInput::default() } else { host })
+}
+
+fn selected_auxiliary_input(
+    mouse: MouseInput,
+    keyboard: KeyboardInput,
+    touch: TouchInput,
+    exclusive: bool,
+) -> (MouseInput, KeyboardInput, TouchInput) {
+    if exclusive {
+        (MouseInput::default(), KeyboardInput::default(), TouchInput::default())
+    } else {
+        (mouse, keyboard, touch)
+    }
 }
 
 fn injected_input() -> Option<ControllerInput> {
     use std::sync::{Mutex, OnceLock};
-    static STATE: OnceLock<Option<(std::path::PathBuf, Mutex<(std::time::Instant, Option<ControllerInput>)>)>> = OnceLock::new();
+    static STATE: OnceLock<Option<(std::path::PathBuf, Mutex<(std::time::Instant, Option<ControllerInput>, &'static str)>)>> = OnceLock::new();
     let (path, cache) = STATE
         .get_or_init(|| {
             std::env::var_os("NEXIUM_HID_INJECT").map(|value| {
                 let stale = std::time::Instant::now() - std::time::Duration::from_secs(1);
-                (std::path::PathBuf::from(value), Mutex::new((stale, None)))
+                (std::path::PathBuf::from(value), Mutex::new((stale, None, "unread")))
             })
         })
         .as_ref()?;
     let mut cache = cache.lock().ok()?;
     if cache.0.elapsed() >= std::time::Duration::from_millis(25) {
         cache.0 = std::time::Instant::now();
-        cache.1 = std::fs::read_to_string(path).ok().and_then(|text| parse_injected_input(&text));
+        let (input, status) = match std::fs::read_to_string(path) {
+            Ok(text) => match parse_injected_input(&text) {
+                Some(input) => (Some(input), "active"),
+                None => (None, "neutral-or-invalid"),
+            },
+            Err(_) => (None, "unreadable"),
+        };
+        if hid_trace_enabled() && (cache.1 != input || cache.2 != status) {
+            log::info!("[hid-inject] status={} input={:?} exclusive={}", status, input, exclusive_input_enabled());
+        }
+        cache.1 = input;
+        cache.2 = status;
     }
     cache.1
 }
@@ -240,6 +299,7 @@ impl HidState {
             sampling_number: 0,
             shmem_va: None,
             last_tick: None,
+            last_trace: None,
         };
         s.init_metadata();
         s.tick(ControllerInput::default());
@@ -252,6 +312,9 @@ impl HidState {
         keyboard: KeyboardInput,
         touch: TouchInput,
     ) {
+        let (mouse, keyboard, touch) = selected_auxiliary_input(
+            mouse, keyboard, touch, exclusive_input_enabled(),
+        );
         let force = mouse.buttons != self.mouse.buttons
             || mouse.connected != self.mouse.connected
             || keyboard != self.keyboard
@@ -269,7 +332,7 @@ impl HidState {
     pub fn maybe_tick(&mut self, input: ControllerInput) {
         const VSYNC: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
         let now = std::time::Instant::now();
-        let input = injected_input().unwrap_or(input);
+        let input = selected_controller_input(input, injected_input(), exclusive_input_enabled());
         let force = input.buttons != self.input.buttons
             || input.stick_l_x != self.input.stick_l_x
             || input.stick_l_y != self.input.stick_l_y
@@ -315,7 +378,16 @@ impl HidState {
     }
 
     pub fn tick(&mut self, input: ControllerInput) {
-        let input = injected_input().unwrap_or(input);
+        self.tick_with_source(input, injected_input(), exclusive_input_enabled());
+    }
+
+    fn tick_with_source(
+        &mut self,
+        requested: ControllerInput,
+        injected: Option<ControllerInput>,
+        exclusive: bool,
+    ) {
+        let input = selected_controller_input(requested, injected, exclusive);
         self.input = input;
         self.sampling_number = self.sampling_number.wrapping_add(1);
         let sampling = self.sampling_number;
@@ -372,14 +444,12 @@ impl HidState {
             );
         }
 
-        let mouse = self.mouse;
-        let previous_mouse = self.last_written_mouse;
+        let (mouse, keyboard, touch) = selected_auxiliary_input(self.mouse, self.keyboard, self.touch, exclusive);
+        let previous_mouse = if exclusive { MouseInput::default() } else { self.last_written_mouse };
         Self::write_mouse_lifo(&mut self.buf[..], &mouse, &previous_mouse, sampling);
         self.last_written_mouse = mouse;
-        let keyboard = self.keyboard;
         Self::write_keyboard_lifo(&mut self.buf[..], &keyboard, sampling);
-        let touch = self.touch;
-        let previous_touch = self.last_written_touch;
+        let previous_touch = if exclusive { TouchInput::default() } else { self.last_written_touch };
         Self::write_touch_lifo(&mut self.buf[..], &touch, &previous_touch, sampling);
         self.last_written_touch = touch;
 
@@ -392,6 +462,54 @@ impl HidState {
                 );
             }
         }
+        if hid_trace_enabled() {
+            self.trace_published_input(active_entry, requested, injected, exclusive);
+        }
+    }
+
+    fn trace_published_input(
+        &mut self,
+        entry: usize,
+        requested: ControllerInput,
+        injected: Option<ControllerInput>,
+        exclusive: bool,
+    ) {
+        let state_at = |lifo: usize, stride: usize| {
+            lifo + LIFO_HEADER_SIZE + read_u64(&self.buf[..], lifo + 0x10) as usize * stride + 8
+        };
+        let read_word = |offset: usize| u32::from_le_bytes(self.buf[offset..offset + 4].try_into().unwrap());
+        let mouse = state_at(MOUSE_OFFSET, MOUSE_ELEM_SIZE);
+        let keyboard = state_at(KEYBOARD_OFFSET, KEYBOARD_ELEM_SIZE);
+        let touch = state_at(TOUCH_OFFSET, TOUCH_ELEM_SIZE);
+        let sample = HidTraceSample {
+            entry,
+            mapped_host_ptr: self.mapped_host_ptr,
+            requested_buttons: requested.buttons,
+            injected,
+            npad_buttons: std::array::from_fn(|layout| {
+                let lifo = NPAD_OFFSET + entry * NPAD_ENTRY_SIZE + LAYOUT_BASE_OFFSET + layout * LAYOUT_STRIDE;
+                read_u64(&self.buf[..], state_at(lifo, LIFO_STORAGE_ELEM_SIZE) + 8)
+            }),
+            mouse_buttons: read_word(mouse + 0x20),
+            mouse_x: read_word(mouse + 0x08) as i32,
+            mouse_y: read_word(mouse + 0x0C) as i32,
+            mouse_wheel_x: read_word(mouse + 0x18) as i32,
+            mouse_wheel_y: read_word(mouse + 0x1C) as i32,
+            keyboard_modifiers: read_word(keyboard + 0x08),
+            keyboard_keys: self.buf[keyboard + 0x10..keyboard + 0x30].try_into().unwrap(),
+            touch_count: read_word(touch + 0x08),
+        };
+        if self.last_trace.as_ref() == Some(&sample) {
+            return;
+        }
+        log::info!(
+            "[hid-publish] sample={} entry={} requested={:#x} injected={:?} npad={:x?} mouse={:#x} mouse_x={} mouse_y={} wheel_x={} wheel_y={} keyboard_mods={:#x} keyboard={:02x?} touches={} exclusive={} mapped={:#x}",
+            self.sampling_number, entry, sample.requested_buttons, sample.injected,
+            sample.npad_buttons, sample.mouse_buttons, sample.mouse_x, sample.mouse_y,
+            sample.mouse_wheel_x, sample.mouse_wheel_y, sample.keyboard_modifiers,
+            sample.keyboard_keys, sample.touch_count, exclusive, sample.mapped_host_ptr,
+        );
+        self.last_trace = Some(sample);
     }
 
     fn write_device_lifo_header(buf: &mut [u8], lifo: usize, sampling: u64) -> usize {
@@ -412,18 +530,13 @@ impl HidState {
         write_u64(buf, state + 0x00, sampling);
         write_i32(buf, state + 0x08, mouse.x);
         write_i32(buf, state + 0x0C, mouse.y);
-        write_i32(buf, state + 0x10, mouse.x.wrapping_sub(previous.x));
-        write_i32(buf, state + 0x14, mouse.y.wrapping_sub(previous.y));
-        write_i32(
-            buf,
-            state + 0x18,
-            mouse.wheel_y.wrapping_sub(previous.wheel_y),
-        );
-        write_i32(
-            buf,
-            state + 0x1C,
-            mouse.wheel_x.wrapping_sub(previous.wheel_x),
-        );
+        let delta = |current: i32, previous_value: i32| {
+            if mouse.connected && previous.connected { current.wrapping_sub(previous_value) } else { 0 }
+        };
+        write_i32(buf, state + 0x10, delta(mouse.x, previous.x));
+        write_i32(buf, state + 0x14, delta(mouse.y, previous.y));
+        write_i32(buf, state + 0x18, delta(mouse.wheel_x, previous.wheel_x));
+        write_i32(buf, state + 0x1C, delta(mouse.wheel_y, previous.wheel_y));
         write_u32(buf, state + 0x20, mouse.buttons);
         write_u32(
             buf,
@@ -480,16 +593,7 @@ impl HidState {
         write_u64(buf, storage, sampling);
         let state = storage + 8;
         write_u64(buf, state + 0x00, sampling);
-        write_u32(buf, state + 0x08, keyboard.modifiers);
-        write_u32(
-            buf,
-            state + 0x0C,
-            if keyboard.connected {
-                KEYBOARD_ATTR_IS_CONNECTED
-            } else {
-                0
-            },
-        );
+        write_u64(buf, state + 0x08, u64::from(keyboard.modifiers));
         buf[state + 0x10..state + 0x30].copy_from_slice(&keyboard.keys);
     }
 
@@ -719,6 +823,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exclusive_injection_blocks_host_fallback_and_preserves_live_input_by_default() {
+        let host = ControllerInput {
+            buttons: NPAD_BUTTON_PLUS | NPAD_BUTTON_DOWN,
+            stick_l_y: -32767,
+            ..ControllerInput::default()
+        };
+        let injected = parse_injected_input("buttons=A").unwrap();
+        assert_eq!(injected.buttons, NPAD_BUTTON_A);
+        assert_eq!(selected_controller_input(host, Some(injected), true), injected);
+        assert_eq!(selected_controller_input(host, Some(injected), false), injected);
+        for text in ["", "buttons=", "buttons= lx=0 ly=0 rx=0 ry=0", "invalid"] {
+            let input = parse_injected_input(text);
+            assert!(input.is_none());
+            assert_eq!(selected_controller_input(host, input, true), ControllerInput::default());
+            assert_eq!(selected_controller_input(host, input, false), host);
+        }
+    }
+
+    #[test]
+    fn exclusive_injection_publishes_only_selected_buttons_and_no_auxiliary_input() {
+        let mut hid = HidState::new();
+        let mut mapped = Box::new([0u8; HID_SHMEM_SIZE]);
+        unsafe { hid.bind_mapped_host(mapped.as_mut_ptr()); }
+        hid.mouse = MouseInput { buttons: MOUSE_BUTTON_LEFT, connected: true, ..MouseInput::default() };
+        hid.keyboard = KeyboardInput { modifiers: KEYBOARD_MOD_CONTROL, keys: [u8::MAX; 32], connected: true };
+        hid.touch = TouchInput { x: 640, y: 360, pressed: true };
+        hid.last_written_mouse = hid.mouse;
+        hid.last_written_touch = hid.touch;
+        let host = ControllerInput { buttons: NPAD_BUTTON_PLUS | NPAD_BUTTON_DOWN, ..ControllerInput::default() };
+        let injected = ControllerInput { buttons: NPAD_BUTTON_A, ..ControllerInput::default() };
+        for _ in 0..LIFO_STORAGE_COUNT + 1 {
+            hid.tick_with_source(host, Some(injected), true);
+        }
+        assert_eq!(&mapped[..], &hid.buf[..]);
+        let active = [NPAD_ENTRY_PLAYER1, NPAD_ENTRY_HANDHELD].into_iter().find(|entry| {
+            let offset = NPAD_OFFSET + *entry * NPAD_ENTRY_SIZE + NPAD_STYLE_TAG_OFFSET;
+            mapped[offset..offset + 4].iter().any(|byte| *byte != 0)
+        }).unwrap();
+        for layout in 0..LAYOUT_COUNT {
+            let lifo = NPAD_OFFSET + active * NPAD_ENTRY_SIZE + LAYOUT_BASE_OFFSET + layout * LAYOUT_STRIDE;
+            for index in 0..LIFO_STORAGE_COUNT {
+                let buttons = lifo + LIFO_HEADER_SIZE + index * LIFO_STORAGE_ELEM_SIZE + 0x10;
+                assert_eq!(read_u64(&mapped[..], buttons), NPAD_BUTTON_A);
+            }
+        }
+        let state_at = |lifo: usize, stride: usize| lifo + LIFO_HEADER_SIZE
+            + read_u64(&mapped[..], lifo + 0x10) as usize * stride + 8;
+        let mouse = state_at(MOUSE_OFFSET, MOUSE_ELEM_SIZE);
+        assert!(mapped[mouse + 0x08..mouse + 0x28].iter().all(|byte| *byte == 0));
+        let keyboard = state_at(KEYBOARD_OFFSET, KEYBOARD_ELEM_SIZE);
+        assert!(mapped[keyboard + 0x08..keyboard + 0x30].iter().all(|byte| *byte == 0));
+        let touch = state_at(TOUCH_OFFSET, TOUCH_ELEM_SIZE);
+        assert_eq!(read_u64(&mapped[..], touch + 0x08), 0);
+        hid.tick_with_source(host, None, true);
+        assert_eq!(hid.input, ControllerInput::default());
+        assert!(hid.unbind_mapped_host(mapped.as_mut_ptr() as usize));
+    }
+
+    #[test]
+    fn auxiliary_input_selection_preserves_devices_unless_exclusive() {
+        let mouse = MouseInput { buttons: MOUSE_BUTTON_RIGHT, connected: true, ..MouseInput::default() };
+        let keyboard = KeyboardInput { modifiers: KEYBOARD_MOD_SHIFT, keys: [1; 32], connected: true };
+        let touch = TouchInput { x: 10, y: 20, pressed: true };
+        assert!(selected_auxiliary_input(mouse, keyboard, touch, false) == (mouse, keyboard, touch));
+        assert!(selected_auxiliary_input(mouse, keyboard, touch, true)
+            == (MouseInput::default(), KeyboardInput::default(), TouchInput::default()));
+    }
+
+    #[test]
     fn standard_npad_lifos_expose_the_latest_sample() {
         let mut hid = HidState::new();
         let input = ControllerInput {
@@ -761,7 +934,7 @@ mod tests {
         hid.mouse = MouseInput {
             x: 140,
             y: 190,
-            wheel_x: 0,
+            wheel_x: -120,
             wheel_y: 240,
             buttons: 0,
             connected: true,
@@ -779,8 +952,8 @@ mod tests {
         assert_eq!(read_i32(0x0C), 190);
         assert_eq!(read_i32(0x10), 40);
         assert_eq!(read_i32(0x14), -10);
-        assert_eq!(read_i32(0x18), 240);
-        assert_eq!(read_i32(0x1C), 0);
+        assert_eq!(read_i32(0x18), -120);
+        assert_eq!(read_i32(0x1C), 240);
         assert_eq!(read_i32(0x20), 0);
         assert_eq!(read_i32(0x24) as u32, 1 << 1);
     }
@@ -804,9 +977,106 @@ mod tests {
             u32::from_le_bytes(hid.buf[state + off..state + off + 4].try_into().unwrap())
         };
         assert_eq!(read_u32_at(0x08), KEYBOARD_MOD_SHIFT);
-        assert_eq!(read_u32_at(0x0C), 1);
+        assert_eq!(read_u64(&hid.buf[..], state + 0x08), u64::from(KEYBOARD_MOD_SHIFT));
+        assert_eq!(read_u32_at(0x0C), 0);
         assert_eq!(hid.buf[state + 0x10], 1 << 4);
         assert_eq!(&hid.buf[state + 0x11..state + 0x30], &[0u8; 31][..]);
+    }
+
+    #[test]
+    fn keyboard_f12_press_and_release_reach_guest_key_word() {
+        let mut hid = HidState::new();
+        let mut mapped = Box::new([0u8; HID_SHMEM_SIZE]);
+        unsafe { hid.bind_mapped_host(mapped.as_mut_ptr()); }
+        let state_at = |buf: &[u8]| KEYBOARD_OFFSET + LIFO_HEADER_SIZE
+            + read_u64(buf, KEYBOARD_OFFSET + 0x10) as usize * KEYBOARD_ELEM_SIZE + 8;
+        hid.keyboard.connected = true;
+        hid.keyboard.modifiers = KEYBOARD_MOD_CONTROL | KEYBOARD_MOD_SHIFT;
+        hid.keyboard.keys[69 / 8] = 1 << (69 % 8);
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        let pressed = state_at(&mapped[..]);
+        assert_eq!(read_u64(&mapped[..], pressed), hid.sampling_number);
+        assert_eq!(read_u64(&mapped[..], pressed + 0x08), u64::from(KEYBOARD_MOD_CONTROL | KEYBOARD_MOD_SHIFT));
+        assert_eq!(read_u64(&mapped[..], pressed + 0x10), 0);
+        assert_eq!(read_u64(&mapped[..], pressed + 0x18), 1u64 << (69 % 64));
+        hid.keyboard.keys.fill(0);
+        hid.keyboard.modifiers = 0;
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        let released = state_at(&mapped[..]);
+        assert!(mapped[released + 0x08..released + 0x30].iter().all(|byte| *byte == 0));
+        assert_eq!(read_u64(&mapped[..], pressed + 0x18), 1u64 << (69 % 64));
+    }
+
+    #[test]
+    fn repeated_guest_polls_preserve_the_current_mouse_sample() {
+        let mut hid = HidState::new();
+        hid.mouse = MouseInput { connected: true, ..MouseInput::default() };
+        hid.tick(ControllerInput::default());
+        hid.mouse.wheel_y = -1;
+        hid.last_tick = None;
+        hid.maybe_tick(ControllerInput::default());
+        let sampling = hid.sampling_number;
+        let snapshot = hid.buf.clone();
+        for _ in 0..100 {
+            hid.maybe_tick(ControllerInput::default());
+        }
+        assert_eq!(hid.sampling_number, sampling);
+        assert_eq!(hid.buf.as_ref(), snapshot.as_ref());
+        hid.last_tick = Some(std::time::Instant::now() - std::time::Duration::from_millis(20));
+        hid.maybe_tick(ControllerInput::default());
+        assert_eq!(hid.sampling_number, sampling + 1);
+        assert_ne!(hid.buf.as_ref(), snapshot.as_ref());
+    }
+
+    #[test]
+    fn mouse_wheel_totals_emit_one_delta_on_each_axis() {
+        let mut hid = HidState::new();
+        let state_at = |buf: &[u8]| MOUSE_OFFSET + LIFO_HEADER_SIZE
+            + read_u64(buf, MOUSE_OFFSET + 0x10) as usize * MOUSE_ELEM_SIZE + 8;
+        hid.mouse.connected = true;
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        hid.mouse = MouseInput { wheel_x: 2, wheel_y: -3, connected: true, ..MouseInput::default() };
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        let state = state_at(&hid.buf[..]);
+        assert_eq!(i32::from_le_bytes(hid.buf[state + 0x18..state + 0x1C].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(hid.buf[state + 0x1C..state + 0x20].try_into().unwrap()), -3);
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        let state = state_at(&hid.buf[..]);
+        assert!(hid.buf[state + 0x18..state + 0x20].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn mouse_connection_changes_do_not_replay_motion_or_old_wheel_totals() {
+        let mut hid = HidState::new();
+        let deltas = |hid: &HidState| {
+            let state = MOUSE_OFFSET + LIFO_HEADER_SIZE
+                + read_u64(&hid.buf[..], MOUSE_OFFSET + 0x10) as usize * MOUSE_ELEM_SIZE + 8;
+            std::array::from_fn::<_, 4, _>(|index| {
+                let offset = state + 0x10 + index * 4;
+                i32::from_le_bytes(hid.buf[offset..offset + 4].try_into().unwrap())
+            })
+        };
+        hid.mouse = MouseInput { x: 300, y: 200, wheel_x: 8, wheel_y: -12, connected: true, ..MouseInput::default() };
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        assert_eq!(deltas(&hid), [0; 4]);
+        hid.mouse.x += 3;
+        hid.mouse.y -= 4;
+        hid.mouse.wheel_x += 1;
+        hid.mouse.wheel_y -= 2;
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        assert_eq!(deltas(&hid), [3, -4, 1, -2]);
+        hid.mouse = MouseInput::default();
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        assert_eq!(deltas(&hid), [0; 4]);
+        hid.mouse = MouseInput { x: 900, y: 600, wheel_x: 9, wheel_y: -14, connected: true, ..MouseInput::default() };
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        assert_eq!(deltas(&hid), [0; 4]);
+        hid.mouse.x -= 2;
+        hid.mouse.y += 1;
+        hid.mouse.wheel_x -= 1;
+        hid.mouse.wheel_y += 1;
+        hid.tick_with_source(ControllerInput::default(), None, false);
+        assert_eq!(deltas(&hid), [-2, 1, -1, 1]);
     }
 
     #[test]

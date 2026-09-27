@@ -70,6 +70,9 @@ impl PartitionFs {
             let name_off = u32at(buf, e + 0x10)? as usize;
             let hash_region_size = if is_hfs0 { u32at(buf, e + 0x14)? } else { 0 };
 
+            if name_off >= strtab_size {
+                return Err(format!("partition entry {i} name offset is outside its string table"));
+            }
             let name_start = strtab.checked_add(name_off).ok_or("name offset overflow")?;
             let name = read_cstr(buf, name_start, strtab + strtab_size);
             entries.push(PartitionEntry {

@@ -30,9 +30,18 @@ pub enum AddressSpaceError {
     Overflow { va: u64, len: u64 },
     #[error("failed to commit va={va:#x} len={len:#x}")]
     CommitFailed { va: u64, len: u64 },
+    #[error("address range va={va:#x} len={len:#x} does not match a shared alias")]
+    AliasMismatch { va: u64, len: u64 },
+    #[error("address range va={va:#x} len={len:#x} has active shared aliases")]
+    AliasInUse { va: u64, len: u64 },
 }
 
 pub type Result<T> = core::result::Result<T, AddressSpaceError>;
+
+struct AliasBacking {
+    source: Arc<Region>,
+    offset: usize,
+}
 
 struct Region {
     base: u64,
@@ -42,6 +51,8 @@ struct Region {
     perm: Mutex<Perm>,
     name: String,
     arena: bool,
+    alias_backing: Option<AliasBacking>,
+    alias_users: AtomicUsize,
 }
 
 unsafe impl Send for Region {}
@@ -59,6 +70,8 @@ impl Region {
                 perm: Mutex::new(perm),
                 name,
                 arena: true,
+                alias_backing: None,
+                alias_users: AtomicUsize::new(0),
             };
         }
         let boxed: Box<[u8]> = vec![0u8; len].into_boxed_slice();
@@ -72,6 +85,8 @@ impl Region {
             perm: Mutex::new(perm),
             name,
             arena: false,
+            alias_backing: None,
+            alias_users: AtomicUsize::new(0),
         }
     }
 
@@ -92,6 +107,8 @@ impl Region {
                     perm: Mutex::new(perm),
                     name,
                     arena: true,
+                alias_backing: None,
+                alias_users: AtomicUsize::new(0),
                 };
             }
         }
@@ -106,6 +123,27 @@ impl Region {
             perm: Mutex::new(perm),
             name,
             arena: false,
+            alias_backing: None,
+            alias_users: AtomicUsize::new(0),
+        }
+    }
+
+    fn alias(base: u64, source: &Arc<Region>, offset: usize, len: usize, perm: Perm, name: String) -> Self {
+        let (source, offset) = match &source.alias_backing {
+            Some(backing) => (Arc::clone(&backing.source), backing.offset + offset),
+            None => (Arc::clone(source), offset),
+        };
+        source.alias_users.fetch_add(1, Ordering::AcqRel);
+        Self {
+            base,
+            buf: unsafe { NonNull::new_unchecked(source.buf.as_ptr().add(offset)) },
+            len,
+            committed_len: AtomicUsize::new(len),
+            perm: Mutex::new(perm),
+            name,
+            arena: false,
+            alias_backing: Some(AliasBacking { source, offset }),
+            alias_users: AtomicUsize::new(0),
         }
     }
 
@@ -142,6 +180,10 @@ impl Region {
 
 impl Drop for Region {
     fn drop(&mut self) {
+        if let Some(backing) = &self.alias_backing {
+            backing.source.alias_users.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
         if self.arena {
             let committed_len = self.committed_len();
             if committed_len != 0 {
@@ -205,6 +247,7 @@ impl HostRegionLease {
 pub enum HostRegionChange {
     Upsert(HostRegion),
     Remove { base: u64, size: u64 },
+    Invalidate { base: u64, size: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -328,6 +371,101 @@ impl AddressSpace {
         Ok(insert_at)
     }
 
+    pub fn map_alias(&self, dst: u64, src: u64, len: u64, perm: Perm, name: impl Into<String>) -> Result<()> {
+        for (what, value) in [("dst", dst), ("src", src), ("len", len)] {
+            check_aligned(what, value)?;
+        }
+        if len == 0 { return Err(AddressSpaceError::ZeroLength { va: dst }); }
+        let dst_end = dst.checked_add(len).ok_or(AddressSpaceError::Overflow { va: dst, len })?;
+        let src_end = src.checked_add(len).ok_or(AddressSpaceError::Overflow { va: src, len })?;
+        let mut regs = self.regions.lock();
+        let (first, last) = validate_range(&regs, src, len as usize, None)?;
+        if let Some(region) = regs.iter().find(|region| region.base < dst_end && dst < region.end()) {
+            return Err(AddressSpaceError::Overlap {
+                va: dst, len, name: region.name.clone(),
+                existing_base: region.base, existing_end: region.end(),
+            });
+        }
+        let name = name.into();
+        let mut aliases = Vec::with_capacity(last - first + 1);
+        for region in &regs[first..=last] {
+            let start = src.max(region.base);
+            let end = src_end.min(region.committed_end());
+            aliases.push(Arc::new(Region::alias(
+                dst + (start - src), region, (start - region.base) as usize,
+                (end - start) as usize, perm, name.clone(),
+            )));
+        }
+        let insert_at = regs.partition_point(|region| region.base < dst);
+        for alias in &aliases {
+            self.publish_host_change(HostRegionChange::Upsert(HostRegion {
+                base: alias.base, size: alias.len as u64, perm: alias.perm(), host_ptr: alias.buf.as_ptr(),
+            }));
+        }
+        regs.splice(insert_at..insert_at, aliases);
+        Ok(())
+    }
+
+    pub fn unmap_alias(&self, dst: u64, src: u64, len: u64) -> Result<()> {
+        for (what, value) in [("dst", dst), ("src", src), ("len", len)] {
+            check_aligned(what, value)?;
+        }
+        if len == 0 { return Err(AddressSpaceError::ZeroLength { va: dst }); }
+        let dst_end = dst.checked_add(len).ok_or(AddressSpaceError::Overflow { va: dst, len })?;
+        src.checked_add(len).ok_or(AddressSpaceError::Overflow { va: src, len })?;
+        let mut regs = self.regions.lock();
+        let (first, last) = validate_range(&regs, dst, len as usize, None)?;
+        let (mut source_index, _) = validate_range(&regs, src, len as usize, None)?;
+        let mut destination_index = first;
+        let mut offset = 0u64;
+        while offset < len {
+            let destination = &regs[destination_index];
+            let source = &regs[source_index];
+            let destination_offset = (dst + offset - destination.base) as usize;
+            let source_offset = (src + offset - source.base) as usize;
+            let same_backing = destination.alias_backing.is_some() && unsafe {
+                destination.buf.as_ptr().add(destination_offset) == source.buf.as_ptr().add(source_offset)
+            };
+            if !same_backing {
+                return Err(AddressSpaceError::AliasMismatch { va: dst, len });
+            }
+            offset += (destination.end() - dst - offset)
+                .min(source.end() - src - offset).min(len - offset);
+            if dst + offset == destination.end() { destination_index += 1; }
+            if src + offset == source.end() { source_index += 1; }
+        }
+        let mut survivors = Vec::new();
+        let mut changes = Vec::new();
+        for region in &regs[first..=last] {
+            if region.base < dst {
+                survivors.push(Arc::new(Region::alias(region.base, region, 0,
+                    (dst - region.base) as usize, region.perm(), region.name.clone())));
+            }
+            if region.end() > dst_end {
+                survivors.push(Arc::new(Region::alias(dst_end, region,
+                    (dst_end - region.base) as usize, (region.end() - dst_end) as usize,
+                    region.perm(), region.name.clone())));
+            }
+            changes.push(HostRegionChange::Remove { base: region.base, size: region.len as u64 });
+            let backing = region.alias_backing.as_ref().unwrap();
+            let start = dst.max(region.base);
+            let end = dst_end.min(region.end());
+            changes.push(HostRegionChange::Invalidate {
+                base: backing.source.base + backing.offset as u64 + (start - region.base),
+                size: end - start,
+            });
+        }
+        for survivor in &survivors {
+            changes.push(HostRegionChange::Upsert(HostRegion {
+                base: survivor.base, size: survivor.len as u64,
+                perm: survivor.perm(), host_ptr: survivor.buf.as_ptr(),
+            }));
+        }
+        regs.splice(first..=last, survivors);
+        for change in changes { self.publish_host_change(change); }
+        Ok(())
+    }
+
     pub fn resize_committed(&self, va: u64, len: u64) -> Result<()> {
         check_aligned("va", va)?;
         check_aligned("len", len)?;
@@ -344,6 +482,11 @@ impl AddressSpace {
             })?;
         let old_len = region.committed_len();
         let new_len = len as usize;
+        if region.alias_backing.is_some()
+            || (new_len < old_len && region.alias_users.load(Ordering::Acquire) != 0)
+        {
+            return Err(AddressSpaceError::AliasInUse { va, len });
+        }
 
         if new_len > old_len {
             let delta = new_len - old_len;
@@ -1212,6 +1355,138 @@ mod tests {
             err,
             AddressSpaceError::Unaligned { what: "len", .. }
         ));
+    }
+
+    #[test]
+    fn shared_alias_writes_through_across_source_regions_without_new_storage() {
+        let a = fresh();
+        let src = 0x6910_0000;
+        let dst = 0x6920_0000;
+        a.map(src, PAGE_SIZE, Perm::RX, "text").unwrap();
+        a.map(src + PAGE_SIZE, PAGE_SIZE, Perm::RO, "ro").unwrap();
+        a.write(src, &[1, 2, 3, 4]).unwrap();
+        a.map_alias(dst, src, PAGE_SIZE * 2, Perm::RW, "alias").unwrap();
+        assert_eq!(a.host_region_at(dst).unwrap().host_ptr, a.host_region_at(src).unwrap().host_ptr);
+        assert_eq!(a.host_region_at(dst + PAGE_SIZE).unwrap().host_ptr,
+            a.host_region_at(src + PAGE_SIZE).unwrap().host_ptr);
+        let payload = [9, 8, 7, 6, 5, 4, 3, 2];
+        a.write_checked(dst + PAGE_SIZE - 4, &payload).unwrap();
+        let mut read = [0; 8];
+        a.read(src + PAGE_SIZE - 4, &mut read).unwrap();
+        assert_eq!(read, payload);
+        assert!(a.write_checked(src, &[0xff]).is_err());
+        a.write(src, &[0xa5]).unwrap();
+        a.read(dst, &mut read[..1]).unwrap();
+        assert_eq!(read[0], 0xa5);
+    }
+
+    #[test]
+    fn shared_alias_high_addresses_do_not_overflow_relative_offset_arithmetic() {
+        let a = fresh();
+        let src = 0xffff_ffff_fffb_0000;
+        let dst = 0xffff_ffff_fffc_0000;
+        a.map(src, PAGE_SIZE * 3, Perm::RO, "high_source").unwrap();
+        a.map_alias(dst, src, PAGE_SIZE * 3, Perm::RW, "high_alias").unwrap();
+        a.write_checked(dst + PAGE_SIZE, &[0x5a]).unwrap();
+        let mut value = [0];
+        a.read(src + PAGE_SIZE, &mut value).unwrap();
+        assert_eq!(value, [0x5a]);
+        let generation = a.generation();
+        a.unmap_alias(dst + PAGE_SIZE, src + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(a.host_region_at(dst + PAGE_SIZE).is_none());
+        assert!(a.host_region_at(dst).is_some());
+        assert!(a.host_region_at(dst + PAGE_SIZE * 2).is_some());
+        assert!(a.host_region_changes_since(generation).changes.iter().any(|change| matches!(change,
+            HostRegionChange::Invalidate { base, size } if *base == src + PAGE_SIZE && *size == PAGE_SIZE)));
+        a.unmap_alias(dst, src, PAGE_SIZE).unwrap();
+        a.unmap_alias(dst + PAGE_SIZE * 2, src + PAGE_SIZE * 2, PAGE_SIZE).unwrap();
+        assert_eq!(a.regions().len(), 1);
+    }
+
+    #[test]
+    fn shared_alias_failure_does_not_publish_or_partially_map() {
+        let a = fresh();
+        let src = 0x6930_0000;
+        let dst = 0x6940_0000;
+        a.map(src, PAGE_SIZE, Perm::RO, "source").unwrap();
+        let generation = a.generation();
+        assert!(a.map_alias(dst, src, PAGE_SIZE * 2, Perm::RW, "alias").is_err());
+        assert_eq!(a.generation(), generation);
+        assert!(a.host_region_at(dst).is_none());
+        assert!(a.map_alias(src, src, PAGE_SIZE, Perm::RW, "alias").is_err());
+        assert_eq!(a.generation(), generation);
+        assert!(a.map_alias(dst + 1, src, PAGE_SIZE, Perm::RW, "alias").is_err());
+        assert!(a.map_alias(dst, src, 0, Perm::RW, "alias").is_err());
+        assert!(a.map_alias(u64::MAX - PAGE_SIZE + 1, src, PAGE_SIZE, Perm::RW, "alias").is_err());
+        assert_eq!(a.regions().len(), 1);
+    }
+
+    #[test]
+    fn shared_alias_partial_unmap_preserves_survivors_and_invalidates_source() {
+        let a = fresh();
+        let src = 0x6950_0000;
+        let dst = 0x6960_0000;
+        a.map(src, PAGE_SIZE * 3, Perm::RX, "source").unwrap();
+        a.map_alias(dst, src, PAGE_SIZE * 3, Perm::RW, "alias").unwrap();
+        a.write_checked(dst + PAGE_SIZE, &[0xa5]).unwrap();
+        let generation = a.generation();
+        a.unmap_alias(dst + PAGE_SIZE, src + PAGE_SIZE, PAGE_SIZE).unwrap();
+        let updates = a.host_region_changes_since(generation);
+        assert!(updates.changes.iter().any(|change| matches!(change,
+            HostRegionChange::Invalidate { base, size } if *base == src + PAGE_SIZE && *size == PAGE_SIZE)));
+        assert!(a.host_region_at(dst + PAGE_SIZE).is_none());
+        assert!(a.host_region_at(dst).is_some());
+        assert!(a.host_region_at(dst + PAGE_SIZE * 2).is_some());
+        let mut value = [0];
+        a.read(src + PAGE_SIZE, &mut value).unwrap();
+        assert_eq!(value, [0xa5]);
+        a.map_alias(dst + PAGE_SIZE, src + PAGE_SIZE, PAGE_SIZE, Perm::RW, "replacement").unwrap();
+        a.unmap_alias(dst, src, PAGE_SIZE * 3).unwrap();
+        assert!(a.host_region_at(dst).is_none());
+        assert_eq!(a.regions().len(), 1);
+        a.read(src + PAGE_SIZE, &mut value).unwrap();
+        assert_eq!(value, [0xa5]);
+    }
+
+    #[test]
+    fn shared_alias_unmap_requires_matching_source_and_preserves_source_storage() {
+        let a = fresh();
+        let src = 0x6970_0000;
+        let other = 0x6980_0000;
+        let dst = 0x6990_0000;
+        a.map(src, PAGE_SIZE, Perm::RW, "source").unwrap();
+        a.map(other, PAGE_SIZE, Perm::RW, "other").unwrap();
+        a.map_alias(dst, src, PAGE_SIZE, Perm::RW, "alias").unwrap();
+        let generation = a.generation();
+        assert!(matches!(a.unmap_alias(dst, other, PAGE_SIZE), Err(AddressSpaceError::AliasMismatch { .. })));
+        assert_eq!(a.generation(), generation);
+        assert!(matches!(a.resize_committed(src, 0), Err(AddressSpaceError::AliasInUse { .. })));
+        a.unmap_alias(dst, src, PAGE_SIZE).unwrap();
+        assert!(a.unmap_alias(dst, src, PAGE_SIZE).is_err());
+        a.write(src, &[0x3c]).unwrap();
+        let mut value = [0];
+        a.read(src, &mut value).unwrap();
+        assert_eq!(value, [0x3c]);
+        a.resize_committed(src, 0).unwrap();
+    }
+
+    #[test]
+    fn shared_alias_lease_pins_original_backing_after_alias_and_space_drop() {
+        let a = fresh();
+        let src = 0x69a0_0000;
+        let dst = 0x69b0_0000;
+        a.map(src, PAGE_SIZE, Perm::RW, "source").unwrap();
+        a.write(src, &[0x6d]).unwrap();
+        a.map_alias(dst, src, PAGE_SIZE, Perm::RW, "alias").unwrap();
+        let lease = a.host_region_lease_at(dst).unwrap();
+        let source = Arc::downgrade(&lease.backing.alias_backing.as_ref().unwrap().source);
+        a.unmap_alias(dst, src, PAGE_SIZE).unwrap();
+        LAST_REGION.with(|slot| *slot.borrow_mut() = None);
+        drop(a);
+        assert!(source.upgrade().is_some());
+        assert_eq!(unsafe { *lease.backing.buf.as_ptr() }, 0x6d);
+        drop(lease);
+        assert!(source.upgrade().is_none());
     }
 
     #[test]

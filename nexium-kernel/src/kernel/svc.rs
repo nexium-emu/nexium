@@ -1,3 +1,6 @@
+#[path = "content.rs"]
+mod content;
+
 use super::{Kernel, MUTEX_HAS_LISTENERS};
 use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 use crate::kernel::handles::HandleType;
@@ -2143,6 +2146,8 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
         0x6f => svc_create_port(kernel),
         0x70 => svc_manage_named_port(kernel),
         0x71 => svc_connect_to_port(kernel),
+        0x74 => svc_process_memory_alias(kernel, false),
+        0x75 => svc_process_memory_alias(kernel, true),
         0x7c => svc_create_resource_limit(kernel),
         0x7d => svc_set_resource_limit_limit_value(kernel),
         0x7e => svc_call_secure_monitor(kernel),
@@ -3206,6 +3211,82 @@ fn svc_unmap_memory(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+fn process_memory_alias_validation(
+    process_handle_valid: bool,
+    address_space_end: u64,
+    dst: u64,
+    src: u64,
+    size: u64,
+) -> u32 {
+    if dst & 0xfff != 0 || src & 0xfff != 0 { return 0xcc01; }
+    if size == 0 || size & 0xfff != 0 { return 0xca01; }
+    if dst.checked_add(size).is_none() || src.checked_add(size).is_none() { return 0xd401; }
+    if !process_handle_valid { return KERNEL_INVALID_HANDLE; }
+    if src + size > address_space_end { return 0xd401; }
+    if dst + size > address_space_end { return 0xdc01; }
+    SUCCESS
+}
+
+fn sync_process_alias_cpu(changes: nexium_memory::HostRegionChanges) -> Result<(), String> {
+    let Some(cpu) = cpu_mut() else { return Ok(()); };
+    for change in changes.changes {
+        match change {
+            nexium_memory::HostRegionChange::Upsert(region) => unsafe {
+                let _ = cpu.unmap_host(region.base, region.size);
+                cpu.map_host(region.base, region.size, region.perm, region.host_ptr)?;
+            },
+            nexium_memory::HostRegionChange::Remove { base, size } => unsafe {
+                let _ = cpu.unmap_host(base, size);
+            },
+            nexium_memory::HostRegionChange::Invalidate { base, size } => cpu.invalidate_range(base, size),
+        }
+    }
+    Ok(())
+}
+
+fn svc_process_memory_alias(kernel: &mut Kernel, unmap: bool) -> u32 {
+    let Some(cpu) = cpu_ref() else { return 1; };
+    let (dst, handle, src, size) = (
+        cpu.get_register(0), cpu.get_register(1) as u32,
+        cpu.get_register(2), cpu.get_register(3),
+    );
+    let valid_handle = kernel.handles.get_handle(handle)
+        .is_some_and(|entry| entry.handle_type == HandleType::Process);
+    let mut result = process_memory_alias_validation(valid_handle, kernel.address_space_end, dst, src, size);
+    if result == SUCCESS && nexium_memory::fastmem::direct_va_base().is_some() {
+        result = KERNEL_NOT_IMPLEMENTED;
+    }
+    if result == SUCCESS {
+        let generation = kernel.address_space.generation();
+        let update = if unmap {
+            kernel.address_space.unmap_alias(dst, src, size)
+        } else {
+            kernel.address_space.map_alias(dst, src, size, nexium_memory::Perm::RW, "process_alias")
+        };
+        match update {
+            Ok(()) => {
+                if let Err(error) = sync_process_alias_cpu(kernel.address_space.host_region_changes_since(generation)) {
+                    log::error!("Process memory alias CPU mapping failed: {error}");
+                    if !unmap {
+                        let rollback_generation = kernel.address_space.generation();
+                        let _ = kernel.address_space.unmap_alias(dst, src, size);
+                        let _ = sync_process_alias_cpu(kernel.address_space.host_region_changes_since(rollback_generation));
+                    }
+                    result = 0xd401;
+                }
+            }
+            Err(error) => {
+                log::warn!("Process memory alias rejected: {error}");
+                result = 0xd401;
+            }
+        }
+    }
+    log::debug!("svc{}ProcessMemory dst={dst:#x} handle={handle:#x} src={src:#x} size={size:#x} -> {result:#x}",
+        if unmap { "Unmap" } else { "Map" });
+    if let Some(cpu) = cpu_mut() { cpu.set_register(0, u64::from(result)); }
+    result
+}
+
 fn svc_query_memory(kernel: &mut Kernel) -> u32 {
     let (out_ptr, address) = if let Some(cpu) = cpu_ref() {
         (cpu.get_register(0), cpu.get_register(2))
@@ -3241,6 +3322,7 @@ fn svc_query_memory(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct SynthMemInfo {
     addr: u64,
     size: u64,
@@ -3250,10 +3332,28 @@ struct SynthMemInfo {
 }
 
 fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
-    let regions = kernel.address_space.regions();
-    for r in &regions {
+    memory_info_for_regions(&kernel.address_space.regions(), address, kernel.address_space_end)
+}
+
+fn memory_info_for_regions(
+    regions: &[nexium_memory::RegionInfo],
+    address: u64,
+    address_space_end: u64,
+) -> SynthMemInfo {
+    if address >= address_space_end {
+        return SynthMemInfo {
+            addr: address_space_end,
+            size: address_space_end.wrapping_neg(),
+            mem_type: 0x10,
+            attr: 0,
+            perm: 0,
+        };
+    }
+    for r in regions {
         if address >= r.base && address < r.base + r.size {
-            let mem_type = if r.name.starts_with("codestatic") {
+            let mem_type = if r.name.starts_with("process_alias") {
+                0x0f
+            } else if r.name.starts_with("codestatic") {
                 0x03
             } else if r.name.starts_with("codemutable") {
                 0x04
@@ -3285,25 +3385,257 @@ fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
         }
     }
 
-    let next_base = regions
-        .iter()
-        .map(|r| r.base)
-        .filter(|&b| b > address)
+    let gap_start = regions.iter()
+        .filter_map(|region| region.base.checked_add(region.size))
+        .filter(|&end| end <= address)
+        .max()
+        .unwrap_or(0);
+    let gap_end = regions.iter()
+        .map(|region| region.base)
+        .filter(|&base| base > address)
         .min()
-        .unwrap_or(u64::MAX);
-    let page_addr = address & !0xFFF;
-    let gap_size = next_base.saturating_sub(page_addr);
+        .unwrap_or(address_space_end)
+        .min(address_space_end);
 
     SynthMemInfo {
-        addr: page_addr,
-        size: if gap_size == 0 {
-            0x10000_0000
-        } else {
-            gap_size
-        },
+        addr: gap_start,
+        size: gap_end - gap_start,
         mem_type: 0,
         attr: 0,
         perm: 0,
+    }
+}
+
+#[cfg(all(test, feature = "backend-rustarmic"))]
+mod process_alias_tests {
+    use super::{process_memory_alias_validation, svc_process_memory_alias, Kernel, SUCCESS, KERNEL_INVALID_HANDLE};
+    use crate::kernel::{cpu_local::set_current_cpu, handles::HandleType};
+    use nexium_cpu::{Cpu, CpuEvent};
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::Arc;
+
+    fn kernel_at(base: u64) -> Kernel {
+        let space = Arc::new(AddressSpace::new());
+        space.map(base, 0x1000, Perm::RX, "codestatic_source").unwrap();
+        space.map(base + 0x10000, 0x1000, Perm::RX, "codestatic_writer").unwrap();
+        space.write(base, &bytemuck::cast_slice(&[0x5280_00e0u32, 0xd400_0fe1])).unwrap();
+        space.write(base + 0x10000, &bytemuck::cast_slice(&[0xb900_0022u32, 0xb940_0023, 0xd400_0fe1])).unwrap();
+        Kernel::new(space, base, 0x1000, base + 0x20000, 0x1000,
+            base + 0x30000, 0x1000, base + 0x40000, base + 0x50000)
+    }
+
+    fn invoke(kernel: &mut Kernel, cpu: &mut Cpu, unmap: bool, dst: u64, handle: u32, src: u64) -> u32 {
+        for (register, value) in [(0, dst), (1, u64::from(handle)), (2, src), (3, 0x1000)] {
+            cpu.set_register(register, value);
+        }
+        let _guard = set_current_cpu(cpu, 0);
+        let result = svc_process_memory_alias(kernel, unmap);
+        assert_eq!(cpu.get_register(0), u64::from(result));
+        result
+    }
+
+    #[test]
+    fn process_alias_svc_writes_through_and_invalidates_original_code() {
+        let base = 0x6a10_0000;
+        let dst = base + 0x60000;
+        let mut kernel = kernel_at(base);
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        for region in kernel.address_space.host_regions() {
+            unsafe { cpu.map_host(region.base, region.size, region.perm, region.host_ptr).unwrap(); }
+        }
+        cpu.set_pc(base);
+        assert!(matches!(cpu.run_with_count(100).event, CpuEvent::Svc(0x7f)));
+        assert_eq!(cpu.get_register(0), 7);
+        let handle = kernel.handles.create_handle(HandleType::Process);
+        assert_eq!(invoke(&mut kernel, &mut cpu, false, dst, handle, base), SUCCESS);
+        cpu.set_register(1, dst);
+        cpu.set_register(2, 0x5280_0120);
+        cpu.set_pc(base + 0x10000);
+        assert!(matches!(cpu.run_with_count(100).event, CpuEvent::Svc(0x7f)));
+        assert_eq!(cpu.get_register(3), 0x5280_0120);
+        let mut source = [0; 4];
+        kernel.address_space.read(base, &mut source).unwrap();
+        assert_eq!(u32::from_le_bytes(source), 0x5280_0120);
+        assert_eq!(invoke(&mut kernel, &mut cpu, true, dst, handle, base), SUCCESS);
+        assert!(kernel.address_space.host_region_at(dst).is_none());
+        cpu.set_pc(base);
+        assert!(matches!(cpu.run_with_count(100).event, CpuEvent::Svc(0x7f)));
+        assert_eq!(cpu.get_register(0), 9);
+    }
+
+    #[test]
+    fn process_alias_svc_rejects_closed_wrong_type_and_pseudo_handles() {
+        let base = 0x6a20_0000;
+        let mut kernel = kernel_at(base);
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        let closed = kernel.handles.create_handle(HandleType::Process);
+        kernel.handles.close_handle(closed).unwrap();
+        let wrong_type = kernel.handles.create_handle(HandleType::Event);
+        let generation = kernel.address_space.generation();
+        for handle in [0, 0xffff_8001, closed, wrong_type] {
+            assert_eq!(invoke(&mut kernel, &mut cpu, false, base + 0x60000, handle, base), KERNEL_INVALID_HANDLE);
+            assert_eq!(kernel.address_space.generation(), generation);
+        }
+    }
+
+    #[test]
+    fn process_alias_arguments_validate_alignment_overflow_and_guest_bounds() {
+        let end = 1u64 << 39;
+        for (dst, src, size, expected) in [
+            (1, 0x1000, 0x1000, 0xcc01),
+            (0x1000, 1, 0x1000, 0xcc01),
+            (0x1000, 0x2000, 0, 0xca01),
+            (0x1000, 0x2000, 1, 0xca01),
+            (u64::MAX - 0xfff, 0x1000, 0x1000, 0xd401),
+            (0x1000, u64::MAX - 0xfff, 0x1000, 0xd401),
+            (0x1000, end, 0x1000, 0xd401),
+            (end, 0x1000, 0x1000, 0xdc01),
+            (0x1000, 0x2000, 0x1000, SUCCESS),
+        ] {
+            assert_eq!(process_memory_alias_validation(true, end, dst, src, size), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_query_tests {
+    use super::memory_info_for_regions;
+    use nexium_loader::nso::{Nso, NsoSegment};
+    use nexium_memory::{AddressSpace, Perm, RegionInfo};
+
+    fn region(base: u64, size: u64) -> RegionInfo {
+        RegionInfo { base, size, perm: Perm::RW, name: "heap".into() }
+    }
+
+    fn module() -> Nso {
+        let segment = |mem_offset, decompressed_size| NsoSegment {
+            file_offset: 0,
+            mem_offset,
+            decompressed_size,
+            compressed_size: decompressed_size,
+            compressed: false,
+        };
+        let mut module_image = vec![0; 0x3000];
+        for (index, page) in module_image.chunks_exact_mut(0x1000).enumerate() {
+            page.fill(index as u8 + 1);
+        }
+        Nso {
+            build_id: [0; 32],
+            text: segment(0, 0x800),
+            ro: segment(0x1000, 0x800),
+            data: segment(0x2000, 0x400),
+            bss_size: 0x400,
+            image_size: 0x3000,
+            module_image,
+        }
+    }
+
+    #[test]
+    fn query_memory_outside_each_guest_width_returns_wrapping_reserved_tail() {
+        for bits in [32, 36, 39] {
+            let end = 1u64 << bits;
+            for address in [end, end + 1, u64::MAX] {
+                let info = memory_info_for_regions(&[], address, end);
+                assert_eq!(info.addr, end);
+                assert_eq!(info.size, 0u64.wrapping_sub(end));
+                assert_eq!(info.addr.wrapping_add(info.size), 0);
+                assert_eq!((info.mem_type, info.perm, info.attr), (0x10, 0, 0));
+                assert!(address >= info.addr);
+            }
+            let last = memory_info_for_regions(&[], end - 1, end);
+            assert_eq!((last.addr, last.size, last.mem_type), (0, end, 0));
+        }
+    }
+
+    #[test]
+    fn query_memory_holes_report_complete_ranges_independent_of_query_offset() {
+        let regions = [region(0x2000, 0x2000), region(0x8000, 0x1000)];
+        let end = 0x10_0000;
+        for (start, stop) in [(0, 0x2000), (0x4000, 0x8000), (0x9000, end)] {
+            for address in [start, start + 1, stop - 1] {
+                let info = memory_info_for_regions(&regions, address, end);
+                assert_eq!((info.addr, info.size, info.mem_type), (start, stop - start, 0));
+            }
+        }
+        for address in [0x2000, 0x2abc, 0x3fff] {
+            let info = memory_info_for_regions(&regions, address, end);
+            assert_eq!((info.addr, info.size, info.mem_type, info.perm), (0x2000, 0x2000, 5, 3));
+        }
+    }
+
+    #[test]
+    fn query_memory_region_walk_reaches_reserved_tail_and_wraps_once() {
+        let regions = [region(0x2000, 0x2000), region(0x8000, 0x1000)];
+        let end = 1u64 << 39;
+        let mut address = 0;
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            let info = memory_info_for_regions(&regions, address, end);
+            assert_eq!(info.addr, address);
+            assert_ne!(info.size, 0);
+            seen.push((info.addr, info.mem_type));
+            let next = info.addr.wrapping_add(info.size);
+            if next == 0 { break; }
+            assert!(next > address);
+            address = next;
+        }
+        assert_eq!(seen, [(0, 0), (0x2000, 5), (0x4000, 0), (0x8000, 5), (0x9000, 0), (end, 0x10)]);
+        let restarted = memory_info_for_regions(&regions, 0, end);
+        assert!(restarted.addr < seen.last().unwrap().0);
+    }
+
+    #[test]
+    fn query_memory_walk_identifies_mapped_module_rx_ro_rw_triplet() {
+        let space = AddressSpace::new();
+        let nso = module();
+        let base = 0x6810_0000;
+        crate::boot::map_application_module(&space, "subsdk3", &nso, base).unwrap();
+        let regions = space.regions();
+        let mut address = base;
+        for (state, perm) in [(3, 5), (3, 1), (4, 3)] {
+            let info = memory_info_for_regions(&regions, address, 1u64 << 39);
+            assert_eq!((info.addr, info.size, info.mem_type, info.perm), (address, 0x1000, state, perm));
+            address = info.addr + info.size;
+        }
+        assert_eq!(address, base + 0x3000);
+        let mut loaded = vec![0; nso.module_image.len()];
+        space.read(base, &mut loaded).unwrap();
+        assert_eq!(loaded, nso.module_image);
+    }
+
+    #[test]
+    fn module_mapping_rejects_invalid_segments_before_mapping_any_pages() {
+        let space = AddressSpace::new();
+        for (ro_start, ro_size, data_start) in [
+            (0x1001, 0x800, 0x2000),
+            (0, 0x800, 0x2000),
+            (0x1000, 0x1001, 0x2000),
+            (0x1000, 0x800, 0x2001),
+        ] {
+            let mut nso = module();
+            nso.ro.mem_offset = ro_start;
+            nso.ro.decompressed_size = ro_size;
+            nso.data.mem_offset = data_start;
+            assert!(crate::boot::map_application_module(&space, "invalid", &nso, 0x6820_0000).is_err());
+            assert!(space.regions().is_empty());
+        }
+    }
+
+    #[test]
+    fn module_mapping_omits_empty_ro_without_dropping_static_padding() {
+        let space = AddressSpace::new();
+        let mut nso = module();
+        nso.ro.mem_offset = 0;
+        nso.ro.decompressed_size = 0;
+        let base = 0x6830_0000;
+        crate::boot::map_application_module(&space, "empty_ro", &nso, base).unwrap();
+        let regions = space.regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!((regions[0].base, regions[0].size, regions[0].perm), (base, 0x2000, Perm::RX));
+        assert_eq!((regions[1].base, regions[1].size, regions[1].perm), (base + 0x2000, 0x1000, Perm::RW));
+        let mut loaded = vec![0; nso.module_image.len()];
+        space.read(base, &mut loaded).unwrap();
+        assert_eq!(loaded, nso.module_image);
     }
 }
 
@@ -3772,7 +4104,7 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
             let mut hid = state.lock();
             if hid.shmem_va.is_some() {
                 let cur = hid.input.clone();
-                hid.tick(cur);
+                hid.maybe_tick(cur);
             }
         }
         {
@@ -3816,7 +4148,7 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         let mut hid = state.lock();
         if hid.shmem_va.is_some() {
             let cur = hid.input.clone();
-            hid.tick(cur);
+            hid.maybe_tick(cur);
         }
     }
 
@@ -5510,29 +5842,14 @@ fn dispatch_service_v2(
         return build_ipc_response(ctx, 0x202, &[], &[]);
     }
 
-    if port_name == "fsp-srv" && cmd_id == 202 && ctx.cmif_in_data_len >= 16 {
-        let title_id_off = ctx.cmif_in_data_off + 8;
-        let title_id = u64::from_le_bytes([
-            ctx.buf[title_id_off],
-            ctx.buf[title_id_off + 1],
-            ctx.buf[title_id_off + 2],
-            ctx.buf[title_id_off + 3],
-            ctx.buf[title_id_off + 4],
-            ctx.buf[title_id_off + 5],
-            ctx.buf[title_id_off + 6],
-            ctx.buf[title_id_off + 7],
-        ]);
-        let available = kernel.system_romfs(title_id).is_some()
-            || matches!(title_id, 0x0100_0000_0000_0802 | 0x0100_0000_0000_0823);
-        if available {
-            let service = format!("IFsStorageSystemData:{title_id:016x}");
-            return return_subsession(kernel, ctx, session_handle, &service);
+    if port_name == "fsp-srv" {
+        if let Some(response) = content::dispatch_mount(kernel, ctx, session_handle, cmd_id) {
+            return response;
         }
-        log::warn!(
-            "fsp-srv.OpenDataStorageByDataId: system archive {:#018x} unavailable",
-            title_id
-        );
-        return build_ipc_response(ctx, 0x202, &[], &[]);
+    }
+
+    if let Some(response) = content::dispatch_file_system(kernel, ctx, session_handle, port_name, cmd_id) {
+        return response;
     }
 
     if let Some(response) = dispatch_aoc_bcat(kernel, port_name, ctx, cmd_id) {
@@ -5813,7 +6130,7 @@ fn dispatch_service_v2(
                             Ok(m) if m.is_dir() => 0,
                             Ok(_) => 1,
                             Err(_) => {
-                                if let Some(ty) = romfs_entry_type(kernel.nro_romfs(), &path_str) {
+                                if let Some(ty) = content::application_entry_type(kernel, &path_str) {
                                     ty
                                 } else {
                                     fs_trace_path("GetEntryType", &path_str, "not_found");
@@ -5825,7 +6142,7 @@ fn dispatch_service_v2(
                                 }
                             }
                         }
-                    } else if let Some(ty) = romfs_entry_type(kernel.nro_romfs(), &path_str) {
+                    } else if let Some(ty) = content::application_entry_type(kernel, &path_str) {
                         ty
                     } else {
                         fs_trace_path("GetEntryType", &path_str, "not_found");
@@ -5893,7 +6210,7 @@ fn dispatch_service_v2(
                                 path_str,
                                 host.display()
                             );
-                        } else if let Some(rf) = romfs_open_file(kernel.nro_romfs(), &path_str) {
+                        } else if let Some(rf) = content::application_file(kernel, &path_str) {
                             kernel
                                 .open_romfs_files
                                 .insert((session_handle, new_obj_id), rf);
@@ -5919,7 +6236,7 @@ fn dispatch_service_v2(
                             fs_trace_path("OpenFile", &path_str, "not_found_host_miss");
                             return build_ipc_response(ctx, 0x202, &[], &[]);
                         }
-                    } else if let Some(rf) = romfs_open_file(kernel.nro_romfs(), &path_str) {
+                    } else if let Some(rf) = content::application_file(kernel, &path_str) {
                         kernel
                             .open_romfs_files
                             .insert((session_handle, new_obj_id), rf);
@@ -6145,14 +6462,19 @@ fn dispatch_service_v2(
                             bytes_read
                         );
                     } else if let Some((base, size)) = romfs_file {
-                        let romfs = kernel.nro_romfs();
-                        let off = offset.max(0) as usize;
-                        let start = base.saturating_add(off).min(romfs.len());
+                        let off = (offset.max(0) as usize).min(size);
+                        let start = base.saturating_add(off);
                         let remaining = size.saturating_sub(off);
                         let want = (read_size as usize).min(buf.size as usize).min(remaining);
-                        let end = start.saturating_add(want).min(romfs.len());
-                        let slice = &romfs[start..end];
-                        if let Err(err) = kernel.address_space.write(buf.addr, slice) {
+                        let data = match content::read_application(kernel, start as u64, want) {
+                            Ok(data) => data,
+                            Err(error) => {
+                                log::error!("IFile.Read application storage failed: {error}");
+                                return build_ipc_response(ctx, 0xD401, &[], &[]);
+                            }
+                        };
+                        let slice = data.as_ref();
+                        if let Err(err) = kernel.address_space.write_checked(buf.addr, slice) {
                             log::error!(
                                 "IFile.Read: guest write addr={:#x} len={:#x} failed: {}",
                                 buf.addr,
@@ -6441,139 +6763,8 @@ fn dispatch_service_v2(
         }
     }
 
-    let system_data_title_id = port_name
-        .strip_prefix("IFsStorageSystemData:")
-        .and_then(|value| u64::from_str_radix(value, 16).ok());
-    if port_name == "IFsStorage" || system_data_title_id.is_some() {
-        let storage = if let Some(title_id) = system_data_title_id {
-            kernel
-                .system_romfs(title_id)
-                .unwrap_or_else(|| match title_id {
-                    0x0100_0000_0000_0802 => mii_model_romfs(),
-                    0x0100_0000_0000_0823 => ng_word2_romfs(),
-                    _ => &[],
-                })
-        } else {
-            kernel.nro_romfs()
-        };
-        match cmd_id {
-            0 => {
-                let off_lo = ctx.cmif_in_data_off;
-                let read_in = &ctx.buf[off_lo..off_lo + 16];
-                let offset = i64::from_le_bytes([
-                    read_in[0], read_in[1], read_in[2], read_in[3], read_in[4], read_in[5],
-                    read_in[6], read_in[7],
-                ]);
-                let read_size = u64::from_le_bytes([
-                    read_in[8],
-                    read_in[9],
-                    read_in[10],
-                    read_in[11],
-                    read_in[12],
-                    read_in[13],
-                    read_in[14],
-                    read_in[15],
-                ]);
-                let target = ctx
-                    .recv_buffers
-                    .iter()
-                    .find(|b| b.size > 0 && b.addr != 0)
-                    .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
-                    .copied();
-                if let Some(buf) = target {
-                    let virtual_len = if system_data_title_id.is_none() {
-                        kernel
-                            .application_romfs
-                            .as_ref()
-                            .map(|r| r.len() as usize)
-                            .unwrap_or(storage.len())
-                    } else {
-                        storage.len()
-                    };
-                    let start = (offset.max(0) as usize).min(virtual_len);
-                    let want = (read_size as usize).min(buf.size as usize);
-                    let end = start.saturating_add(want).min(virtual_len);
-                    let owned;
-                    let slice = if let Some(romfs) = kernel
-                        .application_romfs
-                        .as_ref()
-                        .filter(|_| system_data_title_id.is_none())
-                    {
-                        match romfs.read(start as u64, end - start) {
-                            Ok(bytes) => {
-                                owned = bytes;
-                                &owned[..]
-                            }
-                            Err(err) => {
-                                log::error!("IFsStorage.Read compressed storage failed: {}", err);
-                                return build_ipc_response(ctx, 0xD401, &[], &[]);
-                            }
-                        }
-                    } else {
-                        &storage[start..end]
-                    };
-                    if let Err(err) = kernel.address_space.write_checked(buf.addr, slice) {
-                        log::error!(
-                            "IFsStorage.Read: guest write addr={:#x} len={:#x} failed: {}",
-                            buf.addr,
-                            slice.len(),
-                            err
-                        );
-                        return build_ipc_response(ctx, 0xD401, &[], &[]);
-                    }
-                    log::debug!(
-                        "IFsStorage.Read off={:#x} size={:#x} bytes={} total={}",
-                        offset,
-                        read_size,
-                        slice.len(),
-                        virtual_len
-                    );
-                    let path = if fs_trace_enabled() {
-                        romfs_path_for_data_offset(storage, start)
-                            .map(|(path, file_off, _)| {
-                                let rel = start.saturating_sub(file_off);
-                                format!("{}+{:#x}", path, rel)
-                            })
-                            .unwrap_or_else(|| "<romfs-meta>".to_string())
-                    } else {
-                        String::new()
-                    };
-                    fs_trace_read(
-                        "IFsStorage.Read",
-                        &path,
-                        start,
-                        offset,
-                        read_size,
-                        slice.len() as u64,
-                    );
-                } else {
-                    log::warn!(
-                        "IFsStorage.Read: no recv buffer (off={:#x} size={:#x})",
-                        offset,
-                        read_size
-                    );
-                }
-                return build_ipc_response(ctx, 0, &[], &[]);
-            }
-            4 => {
-                let size = if system_data_title_id.is_none() {
-                    kernel
-                        .application_romfs
-                        .as_ref()
-                        .map(|r| r.len() as i64)
-                        .unwrap_or(storage.len() as i64)
-                } else {
-                    storage.len() as i64
-                };
-                log::debug!("IFsStorage.GetSize â†’ {}", size);
-                return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
-            }
-            5 => {
-                log::debug!("IFsStorage.OperateRange â†’ zeroed QueryRangeInfo");
-                return build_ipc_response(ctx, 0, &[0u8; 16], &[]);
-            }
-            _ => {}
-        }
+    if let Some(response) = content::dispatch_storage(kernel, ctx, port_name, cmd_id) {
+        return response;
     }
 
     if (port_name == "audren:u" || port_name == "audren:a") && cmd_id == 0 {
@@ -8171,13 +8362,6 @@ fn dispatch_service_v2(
         crate::services::generated::dispatch_generated(kernel, port_name, ctx, session_handle)
     {
         return resp;
-    }
-
-    if port_name == "fsp-srv" && cmd_id == 203 {
-        log::debug!(
-            "fsp-srv.OpenPatchDataStorageByCurrentProcess â†’ ResultTargetNotFound (no patch)"
-        );
-        return build_ipc_response(ctx, 0x7D402, &[], &[]);
     }
 
     if port_name == "fsp-srv" && cmd_id == 1005 {
@@ -12041,10 +12225,6 @@ fn return_file_system_with_root(
 
 const BCAT_NO_OPEN_ENTRY: u32 = 122 | (7 << 9);
 
-fn aoc_base_title_id(title_id: u64) -> u64 {
-    (title_id & !0xfff) + 0x1000
-}
-
 fn persistent_event(kernel: &mut Kernel, slot: &mut Option<u32>, signalled: bool) -> u32 {
     if let Some(h) = *slot {
         return h;
@@ -12083,12 +12263,8 @@ fn dispatch_aoc_bcat(
 ) -> Option<Vec<u8>> {
     match port_name {
         "aoc:u" => match cmd_id {
-            0 | 1 | 2 | 3 => Some(build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[])),
-            4 | 5 => {
-                let base = aoc_base_title_id(kernel.title_id);
-                Some(build_ipc_response(ctx, 0, &base.to_le_bytes(), &[]))
-            }
-            6 | 7 | 11 | 12 | 50 | 200 | 300 | 302 => Some(build_ipc_response(ctx, 0, &[], &[])),
+            0..=7 => content::dispatch_add_on_content(kernel, ctx, cmd_id),
+            11 | 12 | 50 | 200 | 300 | 302 => Some(build_ipc_response(ctx, 0, &[], &[])),
             8 | 10 => {
                 let mut slot = kernel.aoc_change_event;
                 let h = persistent_event(kernel, &mut slot, false);
@@ -12984,6 +13160,23 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         31 => 0,
 
         41 => 0,
+        65001 => {
+            let result = if handle as u32 != 0 {
+                KERNEL_INVALID_HANDLE
+            } else if sub != 0 {
+                nexium_common::result::KERNEL_INVALID_COMBINATION
+            } else {
+                SUCCESS
+            };
+            if result != SUCCESS {
+                if let Some(cpu) = cpu_mut() {
+                    cpu.set_register(0, u64::from(result));
+                    cpu.set_register(1, 0);
+                }
+                return result;
+            }
+            u64::from(kernel.handles.create_handle(HandleType::Process))
+        }
         _ => {
             log::warn!(
                 "svcGetInfo: unsupported type {} â€” returning InvalidEnumValue (0xF001)",
@@ -13003,6 +13196,54 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         cpu.set_register(1, val);
     }
     SUCCESS
+}
+
+#[cfg(all(test, feature = "backend-rustarmic"))]
+mod process_info_tests {
+    use super::{svc_get_info, HandleType, Kernel, KERNEL_INVALID_HANDLE, SUCCESS};
+    use crate::kernel::cpu_local::set_current_cpu;
+    use nexium_cpu::Cpu;
+    use nexium_memory::AddressSpace;
+    use std::sync::Arc;
+
+    #[test]
+    fn current_process_info_returns_independently_owned_handles() {
+        let mut kernel = Kernel::new(
+            Arc::new(AddressSpace::new()),
+            0x8000000, 0x1000, 0x20000000, 0x200000,
+            0x30000000, 0x1000, 0x40000000, 0x40001000,
+        );
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        let _guard = set_current_cpu(&mut cpu, 0);
+        let mut returned = Vec::new();
+        for _ in 0..2 {
+            cpu.set_register(1, 65001);
+            cpu.set_register(2, 0);
+            cpu.set_register(3, 0);
+            assert_eq!(svc_get_info(&mut kernel), SUCCESS);
+            assert_eq!(cpu.get_register(0), u64::from(SUCCESS));
+            let handle = cpu.get_register(1) as u32;
+            assert_ne!(handle, kernel.process_handle);
+            assert_eq!(kernel.handles.get_handle(handle).unwrap().handle_type, HandleType::Process);
+            returned.push(handle);
+        }
+        assert_ne!(returned[0], returned[1]);
+        kernel.handles.close_handle(returned[0]).unwrap();
+        assert!(kernel.handles.get_handle(returned[1]).is_some());
+        assert!(kernel.handles.get_handle(kernel.process_handle).is_some());
+        for (handle, sub, expected) in [
+            (kernel.process_handle, 0, KERNEL_INVALID_HANDLE),
+            (0xFFFF8001, 0, KERNEL_INVALID_HANDLE),
+            (0, 1, nexium_common::result::KERNEL_INVALID_COMBINATION),
+        ] {
+            cpu.set_register(1, 65001);
+            cpu.set_register(2, u64::from(handle));
+            cpu.set_register(3, sub);
+            assert_eq!(svc_get_info(&mut kernel), expected);
+            assert_eq!(cpu.get_register(0), u64::from(expected));
+            assert_eq!(cpu.get_register(1), 0);
+        }
+    }
 }
 
 fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {

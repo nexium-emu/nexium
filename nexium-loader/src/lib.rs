@@ -1,17 +1,21 @@
 pub mod application;
+mod bktr;
 pub mod bin_read;
 pub mod cnmt;
 pub mod container;
 pub mod control;
+pub mod content;
 pub mod env;
 pub mod layered;
+pub mod mods;
+pub mod patch;
 pub mod nca;
 pub mod npdm;
 pub mod nro;
 pub mod nso;
 pub mod romfs;
 
-pub use application::{detect, Application, ContainerKind, LazyRomfs, LoadedModule};
+pub use application::{detect, read_application_title_id, Application, ContainerKind, LazyRomfs, LoadedModule};
 pub use layered::{find_overlay_dir, AppRomfs, LayeredRomfs};
 pub use control::read_container_metadata;
 pub use env::EnvBlockBuilder;

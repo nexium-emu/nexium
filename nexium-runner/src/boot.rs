@@ -160,6 +160,9 @@ fn sync_host_region_changes(
                         )
                     })?;
             },
+            nexium_memory::HostRegionChange::Invalidate { base, size } => {
+                cpu.invalidate_range(base, size);
+            }
             nexium_memory::HostRegionChange::Remove { base, size } => unsafe {
                 let _ = cpu.unmap_host(base, size);
             },
@@ -1804,7 +1807,7 @@ impl EmulationHandle {
                             let mut h = hid.lock();
                             if h.shmem_va.is_some() {
                                 let cur = h.input.clone();
-                                h.tick(cur);
+                                h.maybe_tick(cur);
                             }
                             drop(h);
                             if hos_timeslice {
@@ -2327,7 +2330,7 @@ impl EmulationHandle {
                             let mut hid = state.lock();
                             if hid.shmem_va.is_some() {
                                 let cur = hid.input.clone();
-                                hid.tick(cur);
+                                hid.maybe_tick(cur);
                             }
                         }
 

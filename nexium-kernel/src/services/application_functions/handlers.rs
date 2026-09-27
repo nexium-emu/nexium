@@ -69,8 +69,10 @@ pub fn get_desired_language(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u
     0x0000_0053_552D_6E65
 }
 pub fn set_terminate_result(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _result: u32) {}
-pub fn get_display_version(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> (u64, u64) {
-    (u64::from_le_bytes(*b"1.0.0\0\0\0"), 0)
+pub fn get_display_version(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> (u64, u64) {
+    let version = kernel.application_display_version;
+    (u64::from_le_bytes(version[..8].try_into().unwrap()),
+        u64::from_le_bytes(version[8..].try_into().unwrap()))
 }
 pub fn get_launch_storage_info_for_debug(
     _kernel: &mut Kernel,

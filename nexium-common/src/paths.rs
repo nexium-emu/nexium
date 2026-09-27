@@ -30,6 +30,29 @@ pub fn init() {
     let _ = (root(), sdmc_dir(), nand_dir(), nro_dir(), log_dir());
 }
 
+pub fn content_dir() -> PathBuf {
+    ensure(data_root().join("content"))
+}
+
+pub fn mods_dir() -> PathBuf {
+    ensure(data_root().join("mods"))
+}
+
+pub fn title_mods_dir(title_id: u64) -> PathBuf {
+    ensure(mods_dir().join(format!("{title_id:016X}")))
+}
+
+pub fn mod_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(path) = std::env::var_os("NEXIUM_MODS_DIR").filter(|path| !path.is_empty()) {
+        roots.push(PathBuf::from(path));
+    }
+    for path in [mods_dir(), sdmc_dir().join("atmosphere")] {
+        if !roots.contains(&path) { roots.push(path); }
+    }
+    roots
+}
+
 pub fn sdmc_dir() -> PathBuf {
     ensure(data_root().join("sdmc"))
 }

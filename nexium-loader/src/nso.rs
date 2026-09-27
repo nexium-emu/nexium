@@ -3,8 +3,9 @@ use crate::bin_read::{slice, u32at};
 pub const NSO0_MAGIC: u32 = 0x304F534E;
 const PAGE: u32 = 0x1000;
 
-fn page_align(size: u32) -> u32 {
-    (size.wrapping_add(PAGE - 1)) & !(PAGE - 1)
+fn page_align(size: u32) -> Result<u32, String> {
+    size.checked_add(PAGE - 1).map(|size| size & !(PAGE - 1))
+        .ok_or_else(|| "NSO image alignment overflow".to_string())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -17,6 +18,7 @@ pub struct NsoSegment {
 }
 
 pub struct Nso {
+    pub build_id: [u8; 32],
     pub text: NsoSegment,
     pub ro: NsoSegment,
     pub data: NsoSegment,
@@ -32,6 +34,8 @@ impl Nso {
             return Err(format!("NSO magic {:#010x} is not NSO0", magic));
         }
         let flags = u32at(region, 0x0C)?;
+        let mut build_id = [0u8; 32];
+        build_id.copy_from_slice(slice(region, 0x40..0x60)?);
 
         let read_seg = |i: usize| -> Result<NsoSegment, String> {
             let h = 0x10 + i * 0x10;
@@ -56,9 +60,17 @@ impl Nso {
                 .ok_or("NSO segment end overflow")?;
             end = end.max(seg_end);
         }
-        let image_size = page_align(end.checked_add(bss_size).ok_or("NSO image size overflow")?);
+        let image_size = page_align(end.checked_add(bss_size).ok_or("NSO image size overflow")?)?;
 
-        let mut module_image = vec![0u8; image_size as usize];
+        for segment in [&text, &ro, &data] {
+            if !segment.compressed && segment.compressed_size < segment.decompressed_size {
+                return Err("NSO uncompressed segment is shorter than its declared size".to_string());
+            }
+        }
+        let mut module_image = Vec::new();
+        module_image.try_reserve_exact(image_size as usize)
+            .map_err(|error| format!("NSO image allocation failed: {error}"))?;
+        module_image.resize(image_size as usize, 0u8);
         for s in [&text, &ro, &data] {
             let src = slice(
                 region,
@@ -76,7 +88,8 @@ impl Nso {
                 }
                 out
             } else {
-                src[..s.decompressed_size as usize].to_vec()
+                src.get(..s.decompressed_size as usize)
+                    .ok_or("NSO uncompressed segment payload is truncated")?.to_vec()
             };
             let dst = s.mem_offset as usize;
             module_image
@@ -86,6 +99,7 @@ impl Nso {
         }
 
         Ok(Self {
+            build_id,
             text,
             ro,
             data,
@@ -101,6 +115,6 @@ impl Nso {
             self.image_size
                 .saturating_sub(self.data.mem_offset)
                 .max(raw),
-        )
+        ).unwrap_or(self.image_size)
     }
 }

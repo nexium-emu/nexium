@@ -122,8 +122,11 @@ impl CpuCore {
                         self.leases.push(lease);
                     }
                 }
+                HostRegionChange::Invalidate { base, size } => {
+                    self.cpu.invalidate_range(base, size);
+                }
                 HostRegionChange::Remove { base, size } => unsafe {
-                    self.cpu.unmap_host(base, size)?;
+                    let _ = self.cpu.unmap_host(base, size);
                     self.leases.retain(|lease| lease.base() != base);
                 },
             }

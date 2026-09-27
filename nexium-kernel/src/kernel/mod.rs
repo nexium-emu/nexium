@@ -15,7 +15,7 @@ use nexium_cpu::Cpu;
 use nexium_memory::AddressSpace;
 use nexium_nvdrv::Nvdrv;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 pub(crate) const MUTEX_HAS_LISTENERS: u32 = 0x4000_0000;
@@ -48,6 +48,7 @@ pub(crate) fn present_delivery_lane(
 
 pub struct Kernel {
     pub address_space: Arc<AddressSpace>,
+    pub address_space_end: u64,
     pub handles: handles::HandleTable,
     pub threads: threads::Threads,
     pub services: Services,
@@ -128,8 +129,11 @@ pub struct Kernel {
     pub nro_mmap: Option<Arc<memmap2::Mmap>>,
     pub nro_romfs_range: Option<std::ops::Range<usize>>,
     pub application_romfs: Option<nexium_loader::AppRomfs>,
-    pub system_romfs_mmap: Option<Arc<memmap2::Mmap>>,
-    pub system_romfs_ranges: HashMap<u64, std::ops::Range<usize>>,
+    pub application_romfs_metadata: Option<Vec<u8>>,
+    pub application_display_version: [u8; 16],
+    pub system_romfs: HashMap<u64, nexium_loader::LazyRomfs>,
+    pub add_on_content: BTreeMap<u64, Option<nexium_loader::LazyRomfs>>,
+    pub patch_romfs: Option<nexium_loader::LazyRomfs>,
 
     pub homebrew_dir: Option<std::path::PathBuf>,
     pub dir_cursor: HashMap<u32, usize>,
@@ -309,6 +313,7 @@ impl Kernel {
 
         Self {
             address_space,
+            address_space_end: 1u64 << 39,
             handles,
             threads,
             services: Services::new(),
@@ -383,8 +388,11 @@ impl Kernel {
             nro_mmap: None,
             nro_romfs_range: None,
             application_romfs: None,
-            system_romfs_mmap: None,
-            system_romfs_ranges: HashMap::new(),
+            application_romfs_metadata: None,
+            application_display_version: *b"1.0.0\0\0\0\0\0\0\0\0\0\0\0",
+            system_romfs: HashMap::new(),
+            add_on_content: BTreeMap::new(),
+            patch_romfs: None,
             homebrew_dir: None,
             dir_cursor: HashMap::new(),
             open_files: HashMap::new(),
@@ -1090,15 +1098,15 @@ impl Kernel {
 
     pub fn nro_romfs(&self) -> &[u8] {
         match (&self.nro_mmap, &self.nro_romfs_range) {
-            (Some(mmap), Some(range)) => &mmap[range.clone()],
+            (Some(mmap), Some(range)) => mmap.get(range.clone()).unwrap_or(&[]),
             _ => &[],
         }
     }
 
     pub fn system_romfs(&self, title_id: u64) -> Option<&[u8]> {
-        let mmap = self.system_romfs_mmap.as_ref()?;
-        let range = self.system_romfs_ranges.get(&title_id)?;
-        mmap.get(range.clone())
+        let storage = self.system_romfs.get(&title_id)?;
+        let bytes = storage.as_slice();
+        (bytes.len() as u64 == storage.len()).then_some(bytes)
     }
 
     pub fn drain_gpu_fence_events(&mut self) {

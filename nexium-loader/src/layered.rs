@@ -123,13 +123,20 @@ fn parse_base_tree(base: &LazyRomfs) -> Result<DirNode, String> {
     let dir_table_len = u64le(&header, 0x20)? as usize;
     let file_table_off = u64le(&header, 0x38)?;
     let file_table_len = u64le(&header, 0x40)? as usize;
+    let file_data_off = u64le(&header, 0x48)?;
     let dir_table = base.read(dir_table_off, dir_table_len)?;
     let file_table = base.read(file_table_off, file_table_len)?;
     if dir_table.len() != dir_table_len || file_table.len() != file_table_len {
         return Err("base romfs metadata tables truncated".to_string());
     }
 
-    fn walk(dir_table: &[u8], file_table: &[u8], dir_off: u32) -> Result<DirNode, String> {
+    fn walk(
+        dir_table: &[u8],
+        file_table: &[u8],
+        dir_off: u32,
+        file_data_off: u64,
+        base_len: u64,
+    ) -> Result<DirNode, String> {
         let mut node = DirNode::default();
         let dir_abs = dir_off as usize;
         let mut child = u32le(dir_table, dir_abs + 0x08)?;
@@ -140,14 +147,21 @@ fn parse_base_tree(base: &LazyRomfs) -> Result<DirNode, String> {
                 .get(abs + 0x18..abs + 0x18 + name_len)
                 .ok_or("base romfs dir name out of range")?
                 .to_vec();
-            node.dirs.insert(name, walk(dir_table, file_table, child)?);
+            node.dirs.insert(
+                name,
+                walk(dir_table, file_table, child, file_data_off, base_len)?,
+            );
             child = u32le(dir_table, abs + 0x04)?;
         }
         let mut file = u32le(dir_table, dir_abs + 0x0c)?;
         while file != INVALID {
             let abs = file as usize;
-            let data_offset = u64le(file_table, abs + 0x08)?;
+            let data_offset = file_data_off.checked_add(u64le(file_table, abs + 0x08)?)
+                .ok_or("base romfs file data offset overflow")?;
             let size = u64le(file_table, abs + 0x10)?;
+            if data_offset.checked_add(size).is_none_or(|end| end > base_len) {
+                return Err("base romfs file data out of range".to_string());
+            }
             let name_len = u32le(file_table, abs + 0x1c)? as usize;
             let name = file_table
                 .get(abs + 0x20..abs + 0x20 + name_len)
@@ -159,7 +173,7 @@ fn parse_base_tree(base: &LazyRomfs) -> Result<DirNode, String> {
         Ok(node)
     }
 
-    walk(&dir_table, &file_table, 0)
+    walk(&dir_table, &file_table, 0, file_data_off, base.len())
 }
 
 fn overlay_into(node: &mut DirNode, dir: &Path, stats: &mut (usize, usize)) -> Result<(), String> {
@@ -176,12 +190,14 @@ fn overlay_into(node: &mut DirNode, dir: &Path, stats: &mut (usize, usize)) -> R
             continue;
         }
         if meta.is_dir() {
+            node.files.remove(&name_bytes);
             overlay_into(
                 node.dirs.entry(name_bytes).or_default(),
                 &entry.path(),
                 stats,
             )?;
         } else if meta.is_file() {
+            node.dirs.remove(&name_bytes);
             stats.0 += 1;
             if node
                 .files
@@ -222,6 +238,10 @@ struct FlatFile {
 
 impl LayeredRomfs {
     pub fn build(base: Option<&LazyRomfs>, overlay_dir: &Path) -> Result<Self, String> {
+        Self::build_many(base, &[overlay_dir.to_path_buf()])
+    }
+
+    pub fn build_many(base: Option<&LazyRomfs>, overlay_dirs: &[PathBuf]) -> Result<Self, String> {
         let mut root = match base {
             Some(base) if !base.is_empty() => parse_base_tree(base)?,
             _ => DirNode::default(),
@@ -236,7 +256,9 @@ impl LayeredRomfs {
         count_files(&root, &mut base_file_count);
 
         let mut stats = (0usize, 0usize);
-        overlay_into(&mut root, overlay_dir, &mut stats)?;
+        for overlay_dir in overlay_dirs {
+            overlay_into(&mut root, overlay_dir, &mut stats)?;
+        }
 
         let mut dirs: Vec<FlatDir> = Vec::new();
         let mut files: Vec<FlatFile> = Vec::new();

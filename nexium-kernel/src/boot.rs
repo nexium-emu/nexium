@@ -1,6 +1,6 @@
 use crate::kernel::Kernel;
 use nexium_cpu::Cpu;
-use nexium_loader::{Application, LoadedProgram, Loader, Nro};
+use nexium_loader::{Application, ContainerKind, LoadedProgram, Nro};
 use nexium_memory::{AddressSpace, Perm};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -74,6 +74,47 @@ fn map_extras_and_exit_stub(
         .map_err(|e| format!("Failed to write exit stub: {:?}", e))
 }
 
+pub(crate) fn map_application_module(
+    address_space: &AddressSpace,
+    name: &str,
+    nso: &nexium_loader::nso::Nso,
+    base: u64,
+) -> Result<(), String> {
+    let image_end = u64::from(nso.image_size);
+    let data_start = u64::from(nso.data.mem_offset);
+    let text_end = u64::from(nso.text.mem_offset) + u64::from(nso.text.decompressed_size);
+    if data_start & 0xfff != 0 || data_start > image_end || text_end > data_start {
+        return Err(format!("Invalid NSO segment layout for {name}: data must start on a page after text"));
+    }
+    let ro_start = if nso.ro.decompressed_size == 0 {
+        data_start
+    } else {
+        let start = u64::from(nso.ro.mem_offset);
+        let end = start + u64::from(nso.ro.decompressed_size);
+        if start & 0xfff != 0 || start < text_end || end > data_start {
+            return Err(format!("Invalid NSO segment layout for {name}: read-only data must start on a page between text and data"));
+        }
+        start
+    };
+    if image_end as usize != nso.module_image.len() || image_end & 0xfff != 0
+        || base.checked_add(image_end).is_none()
+    {
+        return Err(format!("Invalid NSO image range for {name}"));
+    }
+    for (start, end, perm, prefix) in [
+        (0, ro_start, Perm::RX, "codestatic_text"),
+        (ro_start, data_start, Perm::RO, "codestatic_rodata"),
+        (data_start, image_end, Perm::RW, "codemutable"),
+    ] {
+        if start == end { continue; }
+        address_space.map(base + start, end - start, perm, format!("{prefix}_{name}"))
+            .map_err(|error| format!("Failed to map {name} {prefix}: {error}"))?;
+        address_space.write(base + start, &nso.module_image[start as usize..end as usize])
+            .map_err(|error| format!("Failed to write {name} {prefix}: {error}"))?;
+    }
+    Ok(())
+}
+
 fn apply_nce_patch(
     address_space: &AddressSpace,
     name: &str,
@@ -117,9 +158,20 @@ fn apply_nce_patch(
 
 impl BootContext {
     pub fn new(config: BootConfig) -> Result<Self, String> {
-        match Loader::load_any(&config.nro_path)? {
-            LoadedProgram::Nro(nro) => Self::new_nro(config, nro),
-            LoadedProgram::Application(app) => Self::new_application(config, app),
+        let file = std::fs::File::open(&config.nro_path)
+            .map_err(|error| format!("open {}: {error}", config.nro_path))?;
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|error| format!("mmap {}: {error}", config.nro_path))?);
+        match nexium_loader::detect(&config.nro_path, &mmap) {
+            ContainerKind::Nro => Self::new_nro(config, Nro::parse_mmap(mmap)?),
+            ContainerKind::Unknown => Err(format!("unrecognized file format: {}", config.nro_path)),
+            _ => {
+                drop(mmap);
+                let app = Application::load_with_content(
+                    &config.nro_path, &nexium_common::paths::content_dir(),
+                )?;
+                Self::new_application(config, app)
+            }
         }
     }
 
@@ -256,6 +308,7 @@ impl BootContext {
             tls_base,
             tls_pool_base,
         );
+        kernel.address_space_end = direct_base + (1u64 << 39).min(nexium_memory::fastmem::arena_size());
         kernel.nro_mmap = Some(nro.mmap_arc());
         kernel.nro_romfs_range = nro.romfs_range();
         kernel.homebrew_dir = resolve_homebrew_dir(&config.nro_path);
@@ -319,13 +372,20 @@ impl BootContext {
         })
     }
 
-    fn new_application(config: BootConfig, app: Application) -> Result<Self, String> {
+    fn new_application(config: BootConfig, mut app: Application) -> Result<Self, String> {
         log::info!(
             "Loading application: {} (title_id={:#018x})",
             config.nro_path,
             app.title_id
         );
 
+        let mods = nexium_loader::mods::discover_mods(&nexium_common::paths::mod_roots(), app.title_id)?;
+        for entry in &mods {
+            log::info!("[mods] {} enabled={} romfs={} exefs={} path={}", entry.name,
+                entry.enabled, entry.has_romfs, entry.has_exefs, entry.path.display());
+        }
+        nexium_loader::mods::apply_exefs_mods(&mut app, &mods)?;
+        let application_romfs = nexium_loader::mods::build_mod_romfs(&app, &mods)?;
         let address_space = Arc::new(AddressSpace::new());
 
         let a32 = !app.npdm.is_64bit;
@@ -446,32 +506,7 @@ impl BootContext {
             let static_size = data_off;
             let mutable_size = image - data_off;
 
-            if static_size > 0 {
-                address_space
-                    .map(
-                        base,
-                        static_size,
-                        Perm::RX,
-                        format!("codestatic_{}", m.name),
-                    )
-                    .map_err(|e| format!("Failed to map {} text/ro: {:?}", m.name, e))?;
-                address_space
-                    .write(base, &m.nso.module_image[..static_size as usize])
-                    .map_err(|e| format!("Failed to write {} text/ro: {:?}", m.name, e))?;
-            }
-            if mutable_size > 0 {
-                address_space
-                    .map(
-                        base + data_off,
-                        mutable_size,
-                        Perm::RW,
-                        format!("codemutable_{}", m.name),
-                    )
-                    .map_err(|e| format!("Failed to map {} data/bss: {:?}", m.name, e))?;
-                address_space
-                    .write(base + data_off, &m.nso.module_image[data_off as usize..])
-                    .map_err(|e| format!("Failed to write {} data/bss: {:?}", m.name, e))?;
-            }
+            map_application_module(&address_space, &m.name, &m.nso, base)?;
             log::info!(
                 "  module {} @ {:#x} static={:#x} mutable={:#x}",
                 m.name,
@@ -558,62 +593,24 @@ impl BootContext {
         kernel.compatibility_guest_probe_enabled = compatibility_guest_probe_enabled;
 
         let (romfs_mmap, romfs_range) = match &app.romfs {
-            Some(r) => (Some(r.mmap.clone()), Some(r.range.clone())),
-            None => (None, None),
+            Some(r) if r.as_slice().len() as u64 == r.len() => {
+                (Some(r.mmap.clone()), Some(r.range.clone()))
+            }
+            _ => (None, None),
         };
         kernel.nro_mmap = romfs_mmap;
         kernel.nro_romfs_range = romfs_range;
-        kernel.application_romfs = {
-            let mut roots = Vec::new();
-            if let Ok(dir) = std::env::var("NEXIUM_MODS_DIR") {
-                if !dir.is_empty() {
-                    roots.push(std::path::PathBuf::from(dir));
-                }
-            }
-            roots.push(nexium_common::paths::root().join("mods"));
-            roots.push(nexium_common::paths::sdmc_dir().join("atmosphere"));
-            match nexium_loader::find_overlay_dir(&roots, app.title_id) {
-                Some(overlay) => {
-                    let started = std::time::Instant::now();
-                    match nexium_loader::LayeredRomfs::build(app.romfs.as_ref(), &overlay) {
-                        Ok(layered) => {
-                            log::info!(
-                                "layered romfs: {} ({} base files, {} overlay files, {} replaced, {} total, virtual size {:#x}, built in {:?})",
-                                overlay.display(),
-                                layered.base_file_count,
-                                layered.overlay_file_count,
-                                layered.replaced_file_count,
-                                layered.file_count(),
-                                layered.len(),
-                                started.elapsed()
-                            );
-                            Some(nexium_loader::AppRomfs::Layered(std::sync::Arc::new(
-                                layered,
-                            )))
-                        }
-                        Err(err) => {
-                            log::error!(
-                                "layered romfs build failed for {}: {} (using base romfs only)",
-                                overlay.display(),
-                                err
-                            );
-                            app.romfs.clone().map(nexium_loader::AppRomfs::Plain)
-                        }
-                    }
-                }
-                None => app.romfs.clone().map(nexium_loader::AppRomfs::Plain),
-            }
-        };
-        kernel.system_romfs_mmap = if app.system_romfs.is_empty() {
-            None
-        } else {
-            Some(app.mmap.clone())
-        };
-        kernel.system_romfs_ranges = app
-            .system_romfs
-            .iter()
-            .map(|(&title_id, romfs)| (title_id, romfs.range.clone()))
-            .collect();
+        kernel.application_romfs = application_romfs;
+        if !app.display_version.is_empty() {
+            kernel.application_display_version.fill(0);
+            let bytes = app.display_version.as_bytes();
+            let size = bytes.len().min(kernel.application_display_version.len());
+            kernel.application_display_version[..size].copy_from_slice(&bytes[..size]);
+        }
+        kernel.system_romfs = app.system_romfs.clone();
+        kernel.add_on_content = app.add_on_content.clone();
+        kernel.patch_romfs = app.patch_romfs.clone();
+        kernel.address_space_end = window;
         kernel.aslr_base = aslr_base;
         kernel.aslr_size = aslr_size;
         kernel.alias_base = alias_base;

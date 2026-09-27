@@ -52,6 +52,15 @@ pub struct NcaFsSection {
     pub section_range: Range<usize>,
     pub fs_data_range: Range<usize>,
     pub compression: Option<NcaCompressionInfo>,
+    pub patch: Option<NcaPatchInfo>,
+    pub sparse: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NcaPatchInfo {
+    pub bucket_offset: u64,
+    pub bucket_size: u64,
+    pub entry_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +164,23 @@ impl Nca {
                     aes_ctr_ex_size,
                 );
             }
+            let patch = if indirect_size != 0 {
+                let magic = u32at(fs_header, 0x110)?;
+                let version = u32at(fs_header, 0x114)?;
+                let entry_count = u32at(fs_header, 0x118)?;
+                if indirect_offset < 0 || indirect_size < 0 || magic != 0x52544b42
+                    || version > 1 || entry_count == 0
+                {
+                    return Err(format!("invalid NCA indirect table in section {i}"));
+                }
+                Some(NcaPatchInfo {
+                    bucket_offset: indirect_offset as u64,
+                    bucket_size: indirect_size as u64,
+                    entry_count,
+                })
+            } else {
+                None
+            };
             let sparse_bucket_offset = crate::bin_read::i64at(fs_header, 0x148)?;
             let sparse_bucket_size = crate::bin_read::i64at(fs_header, 0x150)?;
             let sparse_physical_offset = crate::bin_read::i64at(fs_header, 0x168)?;
@@ -210,8 +236,8 @@ impl Nca {
             let fs_data_end = fs_data_start
                 .checked_add(data_size)
                 .ok_or("fs data end overflow")?;
-            let fs_data_end = fs_data_end.min(section_end);
-            if fs_data_start > section_end {
+            let fs_data_end = if patch.is_some() { fs_data_end } else { fs_data_end.min(section_end) };
+            if patch.is_none() && fs_data_start > section_end {
                 return Err(format!(
                     "NCA section {} fs data start {:#x} beyond section end {:#x}",
                     i, fs_data_start, section_end
@@ -226,6 +252,8 @@ impl Nca {
                 section_range: section_start as usize..section_end as usize,
                 fs_data_range: fs_data_start as usize..fs_data_end as usize,
                 compression,
+                patch,
+                sparse: sparse_generation != 0,
             });
         }
 
