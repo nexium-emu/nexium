@@ -3,6 +3,7 @@ pub(crate) mod completion;
 pub mod engines;
 pub mod flat_allocator;
 mod formats;
+pub(crate) mod graphics_storage;
 pub(crate) mod prep;
 pub mod pusher;
 pub mod stackdump;

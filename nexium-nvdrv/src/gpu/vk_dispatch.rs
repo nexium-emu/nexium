@@ -1041,20 +1041,36 @@ fn ssbo_alias_span(
     (len as u64 <= remaining).then_some(SsboAliasSpan { gpu_addr, cpu_addr, len })
 }
 
-fn read_storage_descriptor_bytes(
+fn read_storage_descriptor_bytes<const N: usize>(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     gpu_va: u64,
-    len: usize,
-) -> Option<Vec<u8>> {
-    read_gpu_strict(mappings, mem_read, gpu_va, len).or_else(|| {
-        let (_, cpu, remaining) = mappings.cpu_address_for_any32(gpu_va)?;
-        if remaining < len as u64 {
-            return None;
+) -> Option<[u8; N]> {
+    let mut data = [0u8; N];
+    match mappings.cpu_range_for(gpu_va) {
+        Some((cpu, remaining)) if remaining >= N as u64 => {
+            if mem_read(cpu, &mut data) {
+                return Some(data);
+            }
+            trace_gpu_read_failure(mappings, gpu_va, N, gpu_va, Some(cpu), remaining, "cpu-read");
         }
-        let mut data = vec![0u8; len];
-        mem_read(cpu, &mut data).then_some(data)
-    })
+        _ => {
+            if let Some(bytes) = read_gpu_strict(mappings, mem_read, gpu_va, N) {
+                return bytes.try_into().ok();
+            }
+        }
+    }
+    let (_, cpu, remaining) = mappings.cpu_address_for_any32(gpu_va)?;
+    if remaining < N as u64 {
+        return None;
+    }
+    data.fill(0);
+    mem_read(cpu, &mut data).then_some(data)
+}
+
+fn empty_storage_buffer_data() -> Arc<Vec<u8>> {
+    static DATA: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+    Arc::clone(DATA.get_or_init(|| Arc::new(vec![0u8; 16])))
 }
 
 fn resolve_storage_buffer_descriptor(
@@ -1072,8 +1088,8 @@ fn resolve_storage_buffer_descriptor(
         }
         let parent_base = resolved_actual_bases.get(parent_index).copied().flatten()?;
         let pointer_va = parent_base.checked_add(u64::from(indirect.pointer_offset))?;
-        let bytes = read_storage_descriptor_bytes(mappings, mem_read, pointer_va, 8)?;
-        let actual_base = u64::from_le_bytes(bytes.try_into().ok()?);
+        let bytes = read_storage_descriptor_bytes(mappings, mem_read, pointer_va)?;
+        let actual_base = u64::from_le_bytes(bytes);
         (actual_base != 0).then_some(ResolvedStorageBufferDescriptor {
             actual_base,
             descriptor_size: descriptor.required_size.max(16),
@@ -1084,8 +1100,8 @@ fn resolve_storage_buffer_descriptor(
             return None;
         }
         let descriptor_va = direct_cbuf_va.checked_add(u64::from(descriptor.cbuf_offset))?;
-        let bytes = read_storage_descriptor_bytes(mappings, mem_read, descriptor_va, 16)?;
-        let direct_descriptor: [u8; 16] = bytes.try_into().ok()?;
+        let direct_descriptor: [u8; 16] =
+            read_storage_descriptor_bytes(mappings, mem_read, descriptor_va)?;
         let actual_base = u64::from_le_bytes(direct_descriptor[0..8].try_into().ok()?);
         let descriptor_size = u32::from_le_bytes(direct_descriptor[8..12].try_into().ok()?);
         (actual_base != 0).then_some(ResolvedStorageBufferDescriptor {
@@ -5276,26 +5292,11 @@ impl SsboSnapshotCache {
         if !self.deferred_patched_writes.is_empty() {
             let writes = std::mem::take(&mut self.deferred_patched_writes);
             let kp = super::pusher::kickprof::start();
-            if !self.entries.is_empty() {
-                self.entries.retain(|key, _| {
-                    let entry_gpu = key.guest_addr.saturating_add(key.data_offset as u64);
-                    !writes.iter().any(|&(gpu_addr, _, len)| {
-                        byte_ranges_overlap(entry_gpu, key.read_len, gpu_addr, len)
-                    })
-                });
-                self.full_watch_ranges
-                    .retain(|key, _| self.entries.contains_key(key));
-            }
-            let spans: Vec<InputInvalidationSpan> = writes
+            let gpu_writes: Vec<(u64, usize)> = writes
                 .iter()
-                .map(|&(gpu_addr, cpu_addr, len)| InputInvalidationSpan {
-                    gpu_addr: Some(gpu_addr),
-                    cpu_addr: Some(cpu_addr),
-                    len,
-                    cpu_watch: false,
-                })
+                .map(|&(gpu_addr, _, len)| (gpu_addr, len))
                 .collect();
-            self.invalidate_input_spans(&spans);
+            self.invalidate_gpu_writes_inner(mappings, &gpu_writes, &writes);
             super::pusher::kickprof::add(super::pusher::kickprof::GPU_INVAL, kp);
         }
     }
@@ -15973,8 +15974,8 @@ fn execute_one_inner(
             }
         }
     }
-    let mut ssbo_data: Vec<StorageBufferSnapshot> = Vec::new();
-    let mut ssbo_meta: Vec<(u64, usize, bool)> = Vec::new();
+    let mut ssbo_data: Vec<StorageBufferSnapshot> = Vec::with_capacity(bundle.ssbo_descs.len());
+    let mut ssbo_meta: Vec<(u64, usize, bool)> = Vec::with_capacity(bundle.ssbo_descs.len());
     let ssbo_pointer_sources = storage_pointer_source_mask(&bundle.ssbo_descs);
     let mut resolved_actual_bases: Vec<Option<u64>> = Vec::with_capacity(bundle.ssbo_descs.len());
     let mut resolved_descriptors = Vec::with_capacity(bundle.ssbo_descs.len());
@@ -16022,9 +16023,12 @@ fn execute_one_inner(
             }
         }
     }
+    let graphics_storage_residency = !writeback_writers
+        && super::graphics_storage::residency_enabled()
+        && renderer.timeline_sync_available();
     for (idx, d) in bundle.ssbo_descs.iter().enumerate() {
         let writeback_full_payload = writeback_full_mask & (1 << idx) != 0;
-        let mut bytes = Arc::new(vec![0u8; 16]);
+        let mut bytes = None;
         let mut readonly_noalias = false;
         let mut guest_addr = 0u64;
         let mut logical_size = 16usize;
@@ -16157,7 +16161,7 @@ fn execute_one_inner(
                     ssbo_snapshot_cache.read_or_insert(key, buf_cpu, mem_read)
                 };
                 if let Some(data) = data {
-                    bytes = data;
+                    bytes = Some(data);
                     readonly_noalias = retain_readonly;
                     dbg_readok = true;
                 }
@@ -16177,10 +16181,52 @@ fn execute_one_inner(
                         dbg_base,
                         dbg_size,
                         dbg_readok,
-                        bytes.len()
+                        bytes.as_ref().map_or(16, |data| data.len())
                     );
                 }
             }
+        }
+        let resident = if graphics_storage_residency && idx < 8 && d.indirect.is_none() {
+            resolved
+                .and(bytes.as_ref())
+                .and_then(|data| {
+                    let key = super::engines::maxwell_compute::raw_storage_cache_key(
+                        mappings,
+                        guest_addr,
+                        logical_size,
+                    )?;
+                    let writes =
+                        !bundle.ssbo_writes.unknown && bundle.ssbo_writes.mask & (1 << idx) != 0;
+                    super::graphics_storage::bind(key, writes, data, data_offset, &mut |range| {
+                        let size = usize::try_from(range.size).ok()?;
+                        let pending_before = super::engines::maxwell_compute::pending_writeback_overlaps(
+                            range.gpu_va, range.cpu_addr, size,
+                        );
+                        let mut seed = vec![0u8; size];
+                        let read = mem_read(range.cpu_addr, &mut seed);
+                        let pending_after = super::engines::maxwell_compute::pending_writeback_overlaps(
+                            range.gpu_va, range.cpu_addr, size,
+                        );
+                        super::graphics_storage::note_seed_read(range, pending_before, pending_after, read, &seed);
+                        read.then(|| Arc::new(seed))
+                    })
+                })
+        } else {
+            None
+        };
+        if resident.is_none()
+            && graphics_storage_residency
+            && idx < 8
+            && bundle.ssbo_writes.mask & (1 << idx) != 0
+        {
+            super::graphics_storage::note_unresident_writer(
+                guest_addr,
+                logical_size,
+                idx,
+                d.indirect.is_some(),
+                bundle.ssbo_writes.unknown,
+                bytes.is_some(),
+            );
         }
         ssbo_data.push(StorageBufferSnapshot {
             binding: idx as u32,
@@ -16188,7 +16234,8 @@ fn execute_one_inner(
             logical_size,
             data_offset,
             readonly_noalias,
-            data: bytes,
+            data: bytes.unwrap_or_else(empty_storage_buffer_data),
+            resident,
         });
         ssbo_meta.push((dbg_base, dbg_slack, dbg_readok));
     }

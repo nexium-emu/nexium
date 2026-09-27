@@ -217,6 +217,7 @@ pub struct ComputeTexelBuffer {
     pub raw_storage_key: Option<ComputeRawStorageKey>,
     pub writable: bool,
     pub requires_atomics: bool,
+    pub graphics_storage: Option<(ComputeRawStorageKey, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1290,6 +1291,14 @@ fn create_compute_raw_storage_buffer(
     )
 }
 
+pub(crate) fn create_graphics_storage_buffer(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    data: &[u8],
+) -> Result<ComputeBufferResource, String> {
+    create_compute_raw_storage_buffer(device, mem_props, data)
+}
+
 pub(crate) fn create_compute_buffer(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -2221,6 +2230,7 @@ mod tests {
                 raw_storage_key: None,
                 writable: true,
                 requires_atomics: false,
+                graphics_storage: None,
             },
             ComputeTexelBuffer {
                 bindings: vec![32, 33, 34],
@@ -2231,6 +2241,7 @@ mod tests {
                 raw_storage_key: None,
                 writable: true,
                 requires_atomics: false,
+                graphics_storage: None,
             },
         ];
         assert_eq!(compute_buffer_binding_counts(&buffers), (11, 3));

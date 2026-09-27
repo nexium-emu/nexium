@@ -37,8 +37,7 @@ pub struct RawColorTargetReadback {
 pub struct Renderer {
     presenter: Option<crate::presentation::Presenter>,
     inner: Mutex<RendererInner>,
-    raw_storage_resident:
-        Arc<Mutex<nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>>>,
+    raw_storage_resident: Arc<Mutex<ComputeRawStorageResidency>>,
     device: ash::Device,
     submit_timeline: vk::Semaphore,
     submit_state: Arc<SubmitState>,
@@ -1489,10 +1488,12 @@ struct RendererInner {
     compute_guest_image_pool: VecDeque<CachedComputeGuestImage>,
     compute_raw_storage_cache:
         HashMap<crate::compute::ComputeRawStorageKey, CachedComputeRawStorage>,
-    raw_storage_resident:
-        Arc<Mutex<nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>>>,
+    raw_storage_resident: Arc<Mutex<ComputeRawStorageResidency>>,
     compute_overlay_sources: HashMap<u64, Vec<(u32, vk::Buffer)>>,
     parked_compute_buffers: Vec<ParkedComputeBuffer>,
+    graphics_storage: HashMap<crate::compute::ComputeRawStorageKey, GraphicsStorageEntry>,
+    retired_graphics_storage: Vec<(u64, crate::compute::ComputeBufferResource)>,
+    graphics_storage_batch: u64,
     frame_slots: Vec<FrameSlot>,
     frame_index: usize,
     utility_slot: FrameSlot,
@@ -3994,10 +3995,336 @@ struct CachedComputeRawStorage {
     dirty: bool,
 }
 
+#[derive(Default)]
+struct ComputeRawStorageResidency {
+    resident: nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>,
+    queued_uses: HashMap<crate::compute::ComputeRawStorageKey, usize>,
+}
+
+pub struct ComputeRawStorageLease {
+    key: crate::compute::ComputeRawStorageKey,
+    residency: Arc<Mutex<ComputeRawStorageResidency>>,
+}
+
+impl Drop for ComputeRawStorageLease {
+    fn drop(&mut self) {
+        let mut residency = self.residency.lock();
+        if let Entry::Occupied(mut entry) = residency.queued_uses.entry(self.key) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
 struct ParkedComputeBuffer {
     resource: crate::compute::ComputeBufferResource,
     serials: Vec<u64>,
     retire_generation: u64,
+}
+
+struct GraphicsStorageEntry {
+    generation: u64,
+    resource: crate::compute::ComputeBufferResource,
+    last_submit_generation: u64,
+    last_batch: u64,
+}
+
+const GRAPHICS_STORAGE_MAX_ENTRIES: usize = 64;
+const GRAPHICS_STORAGE_PENDING_SUBMIT: u64 = u64::MAX;
+
+#[derive(Default)]
+struct GraphicsStorageBatch {
+    used: Vec<crate::compute::ComputeRawStorageKey>,
+    written_since_barrier: bool,
+    read_since_barrier: bool,
+}
+
+fn graphics_storage_call_access(call: &crate::draw::Maxwell3dDrawCall) -> (bool, bool) {
+    let mut reads = false;
+    let mut writes = false;
+    for resident in call.ssbo_data.iter().filter_map(|snapshot| snapshot.resident.as_ref()) {
+        if resident.writes {
+            writes = true;
+        } else {
+            reads = true;
+        }
+    }
+    (reads, writes)
+}
+
+fn record_graphics_storage_barrier(device: &ash::Device, cmd: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_GRAPHICS
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_GRAPHICS,
+            vk::DependencyFlags::empty(),
+            &[barrier],
+            &[],
+            &[],
+        );
+    }
+}
+
+fn reap_retired_graphics_storage(
+    device: &ash::Device,
+    retired: &mut Vec<(u64, crate::compute::ComputeBufferResource)>,
+    completed: u64,
+) {
+    for (retire_at, _) in retired.iter_mut() {
+        if *retire_at == GRAPHICS_STORAGE_PENDING_SUBMIT {
+            *retire_at = 0;
+        }
+    }
+    let mut index = 0;
+    while index < retired.len() {
+        if retired[index].0 <= completed {
+            let (_, resource) = retired.swap_remove(index);
+            resource.destroy(device);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn bind_graphics_storage(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    entries: &mut HashMap<crate::compute::ComputeRawStorageKey, GraphicsStorageEntry>,
+    retired: &mut Vec<(u64, crate::compute::ComputeBufferResource)>,
+    batch: &mut GraphicsStorageBatch,
+    batch_serial: u64,
+    completed: u64,
+    offset_alignment: u64,
+    resident: &crate::draw::GraphicsStorageResidentRef,
+    range: u64,
+) -> Result<vk::DescriptorBufferInfo, String> {
+    let key = resident.key;
+    if range == 0
+        || resident.offset.checked_add(range).is_none_or(|end| end > key.size)
+        || resident.offset % offset_alignment.max(1) != 0
+    {
+        return Err(format!(
+            "resident graphics storage binding {:#x}+{:#x} does not fit {:#x}+{:#x}",
+            resident.offset, range, key.gpu_va, key.size
+        ));
+    }
+    let current = entries
+        .get(&key)
+        .is_some_and(|entry| entry.generation == resident.generation);
+    if !current {
+        let seed = resident
+            .seed
+            .as_deref()
+            .filter(|seed| seed.len() as u64 == key.size)
+            .ok_or_else(|| {
+                format!(
+                    "resident graphics storage {:#x}+{:#x} generation {} has no seed",
+                    key.gpu_va, key.size, resident.generation
+                )
+            })?;
+        let used = batch.used.contains(&key);
+        let reusable = entries
+            .get(&key)
+            .is_some_and(|entry| !used && entry.last_submit_generation <= completed);
+        if graphics_storage_trace_enabled() {
+            log::warn!(
+                "[graphics-storage] renderer seeds gpu={:#x}+{:#x} generation={} previous={:?} used_in_batch={} reusable={}",
+                key.gpu_va,
+                key.size,
+                resident.generation,
+                entries.get(&key).map(|entry| entry.generation),
+                used,
+                reusable
+            );
+        }
+        if reusable {
+            let entry = entries.get_mut(&key).expect("reusable graphics storage entry exists");
+            entry.resource.write(device, seed)?;
+            entry.generation = resident.generation;
+        } else {
+            let resource = crate::compute::create_graphics_storage_buffer(device, mem_props, seed)?;
+            let replaced = entries.insert(
+                key,
+                GraphicsStorageEntry {
+                    generation: resident.generation,
+                    resource,
+                    last_submit_generation: 0,
+                    last_batch: batch_serial,
+                },
+            );
+            if let Some(old) = replaced {
+                let retire_at = if used {
+                    GRAPHICS_STORAGE_PENDING_SUBMIT
+                } else {
+                    old.last_submit_generation
+                };
+                retired.push((retire_at, old.resource));
+            }
+        }
+    }
+    let entry = entries
+        .get_mut(&key)
+        .ok_or_else(|| "resident graphics storage entry disappeared".to_string())?;
+    entry.last_batch = batch_serial;
+    if !batch.used.contains(&key) {
+        batch.used.push(key);
+    }
+    Ok(vk::DescriptorBufferInfo {
+        buffer: entry.resource.buffer,
+        offset: resident.offset,
+        range,
+    })
+}
+
+fn finish_graphics_storage_batch(
+    entries: &mut HashMap<crate::compute::ComputeRawStorageKey, GraphicsStorageEntry>,
+    retired: &mut Vec<(u64, crate::compute::ComputeBufferResource)>,
+    batch: &mut GraphicsStorageBatch,
+    submit_generation: u64,
+) {
+    for key in batch.used.drain(..) {
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.last_submit_generation = submit_generation;
+        }
+    }
+    for (retire_at, _) in retired.iter_mut() {
+        if *retire_at == GRAPHICS_STORAGE_PENDING_SUBMIT {
+            *retire_at = submit_generation;
+        }
+    }
+    while entries.len() > GRAPHICS_STORAGE_MAX_ENTRIES {
+        let Some(oldest) = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_batch)
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        if let Some(entry) = entries.remove(&oldest) {
+            retired.push((entry.last_submit_generation, entry.resource));
+        }
+    }
+}
+
+fn adopt_graphics_storage_for_compute(
+    inner: &mut RendererInner,
+    graphics_key: crate::compute::ComputeRawStorageKey,
+    generation: u64,
+    key: crate::compute::ComputeRawStorageKey,
+) {
+    if graphics_key == key
+        && !inner.graphics_storage.contains_key(&key)
+        && inner.compute_raw_storage_cache.contains_key(&key)
+    {
+        if graphics_storage_trace_enabled() {
+            log::warn!(
+                "[graphics-storage] compute reuses adopted gpu={:#x}+{:#x} generation={}",
+                key.gpu_va,
+                key.size,
+                generation
+            );
+        }
+        return;
+    }
+    let retained_bytes = inner
+        .compute_raw_storage_cache
+        .keys()
+        .fold(0u64, |total, existing| total.saturating_add(existing.size));
+    let adoptable = graphics_key == key
+        && !inner.compute_raw_storage_cache.contains_key(&key)
+        && inner
+            .graphics_storage
+            .get(&key)
+            .is_some_and(|entry| entry.generation == generation)
+        && !inner
+            .compute_raw_storage_cache
+            .keys()
+            .copied()
+            .any(|existing| compute_raw_storage_keys_conflict(existing, key))
+        && compute_raw_storage_cache_can_admit(
+            inner.compute_raw_storage_cache.len(),
+            retained_bytes,
+            key.size,
+        );
+    if !adoptable {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MISSES: AtomicU64 = AtomicU64::new(0);
+        let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if misses <= 8 || graphics_storage_trace_enabled() {
+            let resident_generation = inner.graphics_storage.get(&key).map(|entry| entry.generation);
+            let reason = if graphics_key != key {
+                "key mismatch"
+            } else if inner.compute_raw_storage_cache.contains_key(&key) {
+                "compute cache already holds the range"
+            } else if resident_generation.is_none() {
+                "no resident graphics buffer"
+            } else if resident_generation != Some(generation) {
+                "generation mismatch"
+            } else if inner
+                .compute_raw_storage_cache
+                .keys()
+                .copied()
+                .any(|existing| compute_raw_storage_keys_conflict(existing, key))
+            {
+                "overlapping compute range"
+            } else {
+                "compute cache full"
+            };
+            log::warn!(
+                "[graphics-storage] compute could not adopt gpu={:#x}+{:#x} generation={} resident={:?} reason={} (misses={})",
+                key.gpu_va,
+                key.size,
+                generation,
+                resident_generation,
+                reason,
+                misses
+            );
+        }
+        return;
+    }
+    let Some(entry) = inner.graphics_storage.remove(&key) else {
+        return;
+    };
+    inner.raw_storage_resident.lock().resident.remove(&key);
+    inner.compute_raw_storage_cache.insert(
+        key,
+        CachedComputeRawStorage {
+            resource: entry.resource,
+            ready: true,
+            valid: true,
+            dirty: true,
+        },
+    );
+    if graphics_storage_trace_enabled() {
+        log::warn!(
+            "[graphics-storage] renderer adopted gpu={:#x}+{:#x} generation={}",
+            key.gpu_va,
+            key.size,
+            generation
+        );
+    }
+}
+
+fn graphics_storage_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_GRAPHICS_STORAGE_TRACE").is_some())
+}
+
+fn note_graphics_storage_bind_failure(error: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FAILURES: AtomicU64 = AtomicU64::new(0);
+    let failures = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures <= 8 || failures % 4096 == 0 {
+        log::warn!("[graphics-storage] resident bind failed ({failures}): {error}");
+    }
 }
 
 struct PendingCompute {
@@ -4173,7 +4500,22 @@ impl Renderer {
         &self,
         key: crate::compute::ComputeRawStorageKey,
     ) -> bool {
-        self.raw_storage_resident.lock().contains(&key)
+        self.raw_storage_resident.lock().resident.contains(&key)
+    }
+
+    pub fn pin_compute_raw_storage(
+        &self,
+        key: crate::compute::ComputeRawStorageKey,
+    ) -> Option<ComputeRawStorageLease> {
+        let mut residency = self.raw_storage_resident.lock();
+        if !residency.resident.contains(&key) {
+            return None;
+        }
+        *residency.queued_uses.entry(key).or_default() += 1;
+        Some(ComputeRawStorageLease {
+            key,
+            residency: Arc::clone(&self.raw_storage_resident),
+        })
     }
 
     pub fn invalidate_compute_raw_storage_range(
@@ -4213,7 +4555,7 @@ impl Renderer {
             }
             invalidated += usize::from(entry.valid);
             entry.valid = false;
-            resident.remove(key);
+            resident.resident.remove(key);
         }
         invalidated
     }
@@ -5591,8 +5933,7 @@ impl Renderer {
         log::info!("nexium-gpu Renderer init OK: {} (Vulkan via Ash)", name);
 
         let device_handle = device.clone();
-        let raw_storage_resident =
-            Arc::new(Mutex::new(nexium_common::fast_hash::FastSet::default()));
+        let raw_storage_resident = Arc::new(Mutex::new(ComputeRawStorageResidency::default()));
         let presenter = if let Some(target) = presentation_target {
             let present_queue = unsafe { device.get_device_queue(queue_family, queue_count - 1) };
             match crate::presentation::Presenter::new(
@@ -5648,6 +5989,9 @@ impl Renderer {
                 raw_storage_resident,
                 compute_overlay_sources: HashMap::new(),
                 parked_compute_buffers: Vec::new(),
+                graphics_storage: HashMap::new(),
+                retired_graphics_storage: Vec::new(),
+                graphics_storage_batch: 0,
                 frame_slots,
                 frame_index: 0,
                 utility_slot,
@@ -10902,6 +11246,7 @@ impl Renderer {
                 };
                 let storage_only = graphics_storage_only_draw(call);
                 if !use_depth && !call_writes_any_color(call) && !storage_only {
+                    trace_skipped_graphics_storage_writer(call, "no attachment output");
                     continue;
                 }
                 let pipeline = match self
@@ -10938,7 +11283,10 @@ impl Renderer {
                     None if call.storage_readback.is_some() => {
                         return Err("graphics storage writer pipeline is not ready".to_string());
                     }
-                    None => continue,
+                    None => {
+                        trace_skipped_graphics_storage_writer(call, "pipeline not ready");
+                        continue;
+                    }
                 };
                 let (vertex_bindings, draw_vertex_count) =
                     match prepare_vertex_bindings_shared(call, &read_group) {
@@ -10948,6 +11296,7 @@ impl Renderer {
                                 return Err(graphics_draw_call_error(call_index, call, "vertex-prepare", e));
                             }
                             log_vertex_bindings_skip(call, &e);
+                            trace_skipped_graphics_storage_writer(call, "vertex bindings");
                             continue;
                         }
                     };
@@ -11158,12 +11507,24 @@ impl Renderer {
             max_storage_buffer_range,
             max_texel_buffer_elements,
             compute_overlay_sources,
+            graphics_storage,
+            retired_graphics_storage,
+            graphics_storage_batch,
             ..
         } = &mut *inner;
 
         let cur_idx = *frame_index;
         let other_idx = (cur_idx + 1) % frame_slots.len();
         let cbuf_alignment = *min_storage_buffer_offset_alignment;
+        *graphics_storage_batch = graphics_storage_batch.wrapping_add(1);
+        let graphics_storage_serial = *graphics_storage_batch;
+        let graphics_storage_completed = if *submit_timeline == vk::Semaphore::null() {
+            0
+        } else {
+            unsafe { device.get_semaphore_counter_value(*submit_timeline) }.unwrap_or(0)
+        };
+        reap_retired_graphics_storage(device, retired_graphics_storage, graphics_storage_completed);
+        let mut graphics_storage_pass = GraphicsStorageBatch::default();
 
         let rp_t2 = std::time::Instant::now();
         let mut rp_fence_wait = std::time::Duration::ZERO;
@@ -11430,6 +11791,13 @@ impl Renderer {
                 .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(batch): {:?}", e))?;
         }
+        if group_preps
+            .iter()
+            .flat_map(|(_, preps)| preps.iter())
+            .any(|(call, _)| call.ssbo_data.iter().any(|snapshot| snapshot.resident.is_some()))
+        {
+            record_graphics_storage_barrier(device, cmd);
+        }
         let mut post_submit_texture_probes = Vec::with_capacity(group_preps.len());
         let mut color_sync_checked = Vec::<(RtKey, vk::Format)>::new();
         let mut rt_mip_memo = crate::texture_mips::ResolvedTextureRtMipMemo::default();
@@ -11518,6 +11886,15 @@ impl Renderer {
                     format,
                     &mut frame_slots[cur_idx].retired_rt_images,
                 )?;
+                if graphics_storage_trace_enabled() && key.width <= 512 && key.height <= 288 {
+                    log::warn!(
+                        "[graphics-storage] rt bind key={} fmt={:?} layout={:?} draws={}",
+                        key.label(),
+                        format,
+                        rt.layout,
+                        preps.len()
+                    );
+                }
                 color_bind.push((*key, rt.image, rt.view, rt.extent, rt.layout));
             }
             let depth_source = preps
@@ -13722,6 +14099,32 @@ impl Renderer {
                         continue;
                     }
                     let idx = snapshot.binding;
+                    if let Some(resident) = snapshot
+                        .resident
+                        .as_ref()
+                        .filter(|_| call.storage_readback.is_none())
+                    {
+                        match bind_graphics_storage(
+                            device,
+                            mem_props,
+                            graphics_storage,
+                            retired_graphics_storage,
+                            &mut graphics_storage_pass,
+                            graphics_storage_serial,
+                            graphics_storage_completed,
+                            cbuf_alignment,
+                            resident,
+                            snapshot.logical_size as u64,
+                        ) {
+                            Ok(info) => {
+                                ssbo_infos.push(info);
+                                ssbo_bindings.push(idx);
+                                ssbo_provided[idx as usize] = true;
+                                continue;
+                            }
+                            Err(error) => note_graphics_storage_bind_failure(&error),
+                        }
+                    }
                     let canonical = storage_readback_canonical[idx as usize] as usize;
                     if let Some(info) = call.storage_readback.as_ref()
                         .and_then(|_| storage_alias_uploads[canonical])
@@ -14021,6 +14424,11 @@ impl Renderer {
                 rp_dset += profile_elapsed(rp_ds0);
 
                 let need_depth = prep.use_depth;
+                let (graphics_storage_reads, graphics_storage_writes) =
+                    graphics_storage_call_access(call);
+                let graphics_storage_barrier = (graphics_storage_reads
+                    && graphics_storage_pass.written_since_barrier)
+                    || (graphics_storage_writes && graphics_storage_pass.read_since_barrier);
                 if !pass_open {
                     for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
                         if let Some(layout) = rt_cache.color_layout(*key) {
@@ -14029,6 +14437,7 @@ impl Renderer {
                     }
                 }
                 if !pass_open
+                    || graphics_storage_barrier
                     || pass_depth != need_depth
                     || pass_storage_only != storage_only
                     || pass_rt_layout != required_rt_layout
@@ -14049,6 +14458,11 @@ impl Renderer {
                             &pass_trace_calls,
                         );
                         pass_trace_calls.clear();
+                    }
+                    if graphics_storage_barrier {
+                        record_graphics_storage_barrier(device, cmd);
+                        graphics_storage_pass.written_since_barrier = false;
+                        graphics_storage_pass.read_since_barrier = false;
                     }
                     let needs_color_transition = color_layouts
                         .iter()
@@ -14229,6 +14643,8 @@ impl Renderer {
                     pass_trace_calls.clear();
                     had_pass = true;
                 }
+                graphics_storage_pass.written_since_barrier |= graphics_storage_writes;
+                graphics_storage_pass.read_since_barrier |= graphics_storage_reads;
                 unsafe {
                     let vp = draw_viewport(call.vp_rect, call.depth_range, rt_extent);
                     let scissor = draw_scissor(call.scissor, rt_extent);
@@ -14476,6 +14892,12 @@ impl Renderer {
             inline_draw_group_count,
         );
         frame_slots[cur_idx].submit_generation = submit_generation;
+        finish_graphics_storage_batch(
+            graphics_storage,
+            retired_graphics_storage,
+            &mut graphics_storage_pass,
+            submit_generation,
+        );
         frame_slots[cur_idx]
             .fermi_exact_rt_snapshot_leases
             .extend_from_slice(fermi_exact_rt_snapshot_lease_ids);
@@ -16065,7 +16487,33 @@ fn call_writes_any_color(call: &crate::draw::Maxwell3dDrawCall) -> bool {
 }
 
 fn graphics_storage_only_draw(call: &crate::draw::Maxwell3dDrawCall) -> bool {
-    call.storage_readback.is_some() && call.depth_key.is_none() && !call_writes_any_color(call)
+    (call.storage_readback.is_some() || call_writes_resident_graphics_storage(call))
+        && call.depth_key.is_none()
+        && !call_writes_any_color(call)
+}
+
+fn call_writes_resident_graphics_storage(call: &crate::draw::Maxwell3dDrawCall) -> bool {
+    call.ssbo_data
+        .iter()
+        .any(|snapshot| snapshot.resident.as_ref().is_some_and(|resident| resident.writes))
+}
+
+fn trace_skipped_graphics_storage_writer(call: &crate::draw::Maxwell3dDrawCall, reason: &str) {
+    if !graphics_storage_trace_enabled() || !call_writes_resident_graphics_storage(call) {
+        return;
+    }
+    for resident in call.ssbo_data.iter().filter_map(|snapshot| snapshot.resident.as_ref()) {
+        log::warn!(
+            "[graphics-storage] renderer skipped writer vs={:#x} fs={:#x} gpu={:#x}+{:#x} generation={} writes={} reason={}",
+            call.vs_gpu_va,
+            call.fs_gpu_va,
+            resident.key.gpu_va,
+            resident.key.size,
+            resident.generation,
+            resident.writes,
+            reason
+        );
+    }
 }
 
 fn call_writes_depth_stencil(call: &crate::draw::Maxwell3dDrawCall) -> bool {
@@ -17813,9 +18261,7 @@ impl PreparedComputeResources {
         &self,
         dispatch: &crate::compute::ComputeDispatch,
         cache: &mut HashMap<crate::compute::ComputeRawStorageKey, CachedComputeRawStorage>,
-        resident: &Arc<
-            Mutex<nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>>,
-        >,
+        resident: &Arc<Mutex<ComputeRawStorageResidency>>,
     ) {
         for (request, texel) in dispatch.texel_buffers.iter().zip(&self.texels) {
             let Some(key) = texel.resident_key else {
@@ -17826,7 +18272,7 @@ impl PreparedComputeResources {
             };
             entry.ready = true;
             if entry.valid {
-                resident.lock().insert(key);
+                resident.lock().resident.insert(key);
             }
             if request.writable {
                 entry.dirty = true;
@@ -17910,6 +18356,17 @@ fn acquire_compute_raw_storage(
         return Err("compute raw storage key has an empty range".to_string());
     }
     if let Some(entry) = inner.compute_raw_storage_cache.get(&key) {
+        if graphics_storage_trace_enabled() {
+            log::warn!(
+                "[graphics-storage] compute cache hit gpu={:#x}+{:#x} valid={} ready={} dirty={} seed_bytes={}",
+                key.gpu_va,
+                key.size,
+                entry.valid,
+                entry.ready,
+                entry.dirty,
+                seed.len()
+            );
+        }
         if !entry.valid {
             return Ok(None);
         }
@@ -17917,6 +18374,16 @@ fn acquire_compute_raw_storage(
             return Err("compute raw storage cache hit is not ready".to_string());
         }
         return Ok(Some(PreparedComputeTexel::resident(key, entry)));
+    }
+    if graphics_storage_trace_enabled() {
+        let nonzero_words = seed.chunks_exact(4).filter(|word| *word != [0u8; 4]).count();
+        log::warn!(
+            "[graphics-storage] compute cache create gpu={:#x}+{:#x} seed_nonzero_words={}/{}",
+            key.gpu_va,
+            key.size,
+            nonzero_words,
+            seed.len() / 4
+        );
     }
     if usize::try_from(key.size).ok() != Some(seed.len()) {
         return Err(format!(
@@ -17956,7 +18423,7 @@ fn acquire_compute_raw_storage(
             .ok_or_else(|| "generic Vulkan compute backend is unavailable".to_string())?
             .acquire_raw_storage_buffer(device, mem_props, seed)?
     };
-    inner.raw_storage_resident.lock().remove(&key);
+    inner.raw_storage_resident.lock().resident.remove(&key);
     inner.compute_raw_storage_cache.insert(
         key,
         CachedComputeRawStorage {
@@ -17980,19 +18447,29 @@ fn release_unreferenced_compute_raw_storage(inner: &mut RendererInner) {
         .filter(|pending| pending.resources.is_some())
         .flat_map(|pending| pending.resident_raw_storage.iter().copied())
         .collect();
-    let removable: Vec<_> = inner
-        .compute_raw_storage_cache
-        .keys()
-        .copied()
-        .filter(|key| !referenced.contains(key))
-        .collect();
+    let removable: Vec<_> = {
+        let mut residency = inner.raw_storage_resident.lock();
+        let removable: Vec<_> = inner
+            .compute_raw_storage_cache
+            .keys()
+            .copied()
+            .filter(|key| !referenced.contains(key) && !residency.queued_uses.contains_key(key))
+            .collect();
+        for key in &removable {
+            residency.resident.remove(key);
+        }
+        removable
+    };
     if removable.is_empty() {
         return;
     }
-    {
-        let mut resident = inner.raw_storage_resident.lock();
+    if graphics_storage_trace_enabled() {
         for key in &removable {
-            resident.remove(key);
+            log::warn!(
+                "[graphics-storage] compute cache release gpu={:#x}+{:#x}",
+                key.gpu_va,
+                key.size
+            );
         }
     }
     let raw_storage: Vec<_> = removable
@@ -18575,11 +19052,21 @@ fn settle_pending_compute_record(
     for meta in &pending.texels {
         let texel = &resources.texels[meta.resource_index];
         let readback = if let Some(key) = texel.resident_key {
-            inner
+            let entry = inner
                 .compute_raw_storage_cache
                 .get(&key)
-                .ok_or_else(|| "resident compute raw storage disappeared".to_string())
-                .and_then(|entry| entry.resource.read(&inner.device, meta.byte_len))
+                .ok_or_else(|| "resident compute raw storage disappeared".to_string());
+            if graphics_storage_trace_enabled() {
+                log::warn!(
+                    "[graphics-storage] settle readback id={} gpu={:#x}+{:#x} same_buffer={:?} valid={:?}",
+                    pending.id,
+                    key.gpu_va,
+                    key.size,
+                    entry.as_ref().ok().map(|entry| entry.resource.buffer == texel.buffer),
+                    entry.as_ref().ok().map(|entry| entry.valid),
+                );
+            }
+            entry.and_then(|entry| entry.resource.read(&inner.device, meta.byte_len))
         } else {
             texel
                 .owned
@@ -19536,6 +20023,9 @@ fn execute_compute_dispatch(
                             "compute raw storage request/key size mismatch: request={:#x} key={:#x}",
                             texel.byte_len, key.size
                         ));
+                    }
+                    if let Some((graphics_key, generation)) = texel.graphics_storage {
+                        adopt_graphics_storage_for_compute(inner, graphics_key, generation, key);
                     }
                     if let Some(resource) = acquire_compute_raw_storage(inner, key, &texel.bytes)? {
                         resource
@@ -30859,13 +31349,26 @@ impl Drop for RendererInner {
             std::mem::forget(parked_compute_buffers);
         }
         let cached_compute_raw_storage = std::mem::take(&mut self.compute_raw_storage_cache);
-        self.raw_storage_resident.lock().clear();
+        self.raw_storage_resident.lock().resident.clear();
         if device_idle {
             for (_, entry) in cached_compute_raw_storage {
                 entry.resource.destroy(&self.device);
             }
         } else {
             std::mem::forget(cached_compute_raw_storage);
+        }
+        let graphics_storage = std::mem::take(&mut self.graphics_storage);
+        let retired_graphics_storage = std::mem::take(&mut self.retired_graphics_storage);
+        if device_idle {
+            for (_, entry) in graphics_storage {
+                entry.resource.destroy(&self.device);
+            }
+            for (_, resource) in retired_graphics_storage {
+                resource.destroy(&self.device);
+            }
+        } else {
+            std::mem::forget(graphics_storage);
+            std::mem::forget(retired_graphics_storage);
         }
         let cached_compute_guest_images = std::mem::take(&mut self.compute_guest_image_pool);
         if device_idle {
@@ -33758,6 +34261,7 @@ mod tests {
             data_offset,
             data: std::sync::Arc::new(data.to_vec()),
             readonly_noalias: false,
+            resident: None,
         }
     }
 
@@ -33773,6 +34277,7 @@ mod tests {
             data_offset: 0,
             data,
             readonly_noalias: false,
+            resident: None,
         }
     }
 

@@ -378,7 +378,7 @@ fn raw_storage_snapshot_size(
     }
 }
 
-fn raw_storage_cache_key(
+pub(crate) fn raw_storage_cache_key(
     mappings: &GpuMappings,
     gpu_va: u64,
     size: usize,
@@ -1596,6 +1596,10 @@ fn prepare_and_execute(
         raw_storage_ranges.push((aligned, byte_len));
         raw_storage_keys.push(raw_storage_cache_key(mappings, aligned, byte_len));
     }
+    let mut raw_storage_leases: Vec<_> = raw_storage_keys
+        .iter()
+        .map(|key| key.and_then(|key| renderer.pin_compute_raw_storage(key)))
+        .collect();
     if has_pending_writebacks() {
         let image_overlap = resolved.iter().any(|resource| {
             let Ok(size) = resource_size(&resource.tic) else {
@@ -1625,14 +1629,17 @@ fn prepare_and_execute(
                         return false;
                     };
                     let key = raw_storage_keys[index];
-                    let resident =
-                        key.is_some_and(|key| renderer.compute_raw_storage_is_resident(key));
+                    let resident = raw_storage_leases[index].is_some();
                     pending_writeback_requires_raw_storage_resolution(
                         gpu_va, cpu_addr, size, key, resident,
                     )
                 });
         if dispatch_requires_pending_writeback_resolution(raw_storage_overlap, image_overlap) {
             resolve_pending_writebacks(renderer, mappings, mem_write);
+            for (key, lease) in raw_storage_keys.iter().zip(&mut raw_storage_leases) {
+                let refreshed = key.and_then(|key| renderer.pin_compute_raw_storage(key));
+                *lease = refreshed;
+            }
         }
     }
     let (image_aliases, overlapping_sampled) =
@@ -1649,7 +1656,7 @@ fn prepare_and_execute(
     for (index, &(aligned, byte_len)) in raw_storage_ranges.iter().enumerate() {
         let raw_storage_key = raw_storage_keys[index];
         let bytes =
-            if raw_storage_key.is_some_and(|key| renderer.compute_raw_storage_is_resident(key)) {
+            if raw_storage_leases[index].is_some() {
                 Vec::new()
             } else {
                 read_gpu_vec(mappings, mem_read, aligned, byte_len, "raw storage buffer")
@@ -1657,6 +1664,20 @@ fn prepare_and_execute(
             };
         let resource_index = texel_buffers.len();
         let writable = frontend.writable_storage_buffers[index];
+        let graphics_storage = match raw_storage_key {
+            Some(key) => crate::gpu::graphics_storage::take_for_compute(key),
+            None => {
+                if let Some((cpu_addr, _)) = mapped_range(mappings, aligned) {
+                    crate::gpu::graphics_storage::release_overlapping(
+                        aligned,
+                        cpu_addr,
+                        byte_len as u64,
+                        "compute raw storage",
+                    );
+                }
+                None
+            }
+        };
         texel_buffers.push(ComputeTexelBuffer {
             bindings: vec![nexium_spirv::COMPUTE_STORAGE_BUFFER_BINDING_BASE + index as u32],
             bytes,
@@ -1666,6 +1687,7 @@ fn prepare_and_execute(
             raw_storage_key,
             writable,
             requires_atomics: false,
+            graphics_storage,
         });
         if writable {
             let (cpu_addr, available) = mapped_range(mappings, aligned)
@@ -1814,6 +1836,12 @@ fn prepare_and_execute(
                         guest_size,
                         "storage texel buffer",
                     )?;
+                    crate::gpu::graphics_storage::release_overlapping(
+                        resource.tic.gpu_va,
+                        cpu_addr,
+                        guest_size as u64,
+                        "compute texel buffer",
+                    );
                     let resource_index = texel_buffers.len();
                     texel_buffers.push(ComputeTexelBuffer {
                         bindings: vec![descriptor.binding],
@@ -1824,6 +1852,7 @@ fn prepare_and_execute(
                         raw_storage_key: None,
                         writable: true,
                         requires_atomics,
+                        graphics_storage: None,
                     });
                     texel_targets.push(TexelTarget {
                         resource_index,
@@ -2278,6 +2307,7 @@ fn prepare_and_execute(
                             None
                         }
                     };
+                    drop(raw_storage_leases);
                     let _ = id_tx.send(sent);
                 }),
             );
@@ -2298,6 +2328,7 @@ fn prepare_and_execute(
     } else {
         renderer.dispatch_compute_sync(dispatch)
     };
+    drop(raw_storage_leases);
     crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_EXEC, kp_exec);
     match outcome {
         ComputeDispatchOutcome::Executed(result) => {
@@ -4298,6 +4329,9 @@ fn write_back_outputs(
             attempted_texels += 1;
             let published = mem_write(write.target.cpu_addr, &write.bytes);
             trace_compute_storage_watch(program_gpu_va, write, published);
+            if let Some(key) = write.target.raw_storage_key {
+                crate::gpu::graphics_storage::note_writeback(key, &write.bytes, published);
+            }
             if !published {
                 return Err(format!(
                     "Maxwell storage texel buffer binding {} guest writeback failed at {:#x}",

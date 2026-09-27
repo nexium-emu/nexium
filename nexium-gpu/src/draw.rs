@@ -169,6 +169,16 @@ pub struct StorageBufferSnapshot {
     pub data_offset: usize,
     pub data: std::sync::Arc<Vec<u8>>,
     pub readonly_noalias: bool,
+    pub resident: Option<GraphicsStorageResidentRef>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphicsStorageResidentRef {
+    pub key: crate::compute::ComputeRawStorageKey,
+    pub generation: u64,
+    pub offset: u64,
+    pub writes: bool,
+    pub seed: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -921,6 +931,7 @@ mod tests {
             data_offset: 0,
             data: std::sync::Arc::new(vec![1, 2, 3, 4]),
             readonly_noalias: false,
+            resident: None,
         };
         let cloned = snapshot.clone();
 
