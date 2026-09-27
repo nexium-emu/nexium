@@ -1481,6 +1481,7 @@ struct RendererInner {
     sampler_cache: nexium_common::fast_hash::FastMap<crate::texture::TscEntry, vk::Sampler>,
     integer_sampler_cache: nexium_common::fast_hash::FastMap<crate::texture::TscEntry, vk::Sampler>,
     tex_cache: nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
+    tex_cache_bytes: u64,
     tex_cache_ranges: TextureRangeIndex,
     texel_buffer_cache: HashMap<TexelBufferCacheKey, CachedTexelBuffer>,
     rt_reinterpret_cache: HashMap<RtReinterpretKey, RtReinterpretTexture>,
@@ -2519,6 +2520,7 @@ struct CachedTexture {
     cpu_snapshot_hash: Option<(u64, usize, u64)>,
     invalidated: bool,
     allocation_size: u64,
+    last_use_generation: u64,
 }
 
 impl CachedTexture {
@@ -2527,6 +2529,102 @@ impl CachedTexture {
         self.trusted_source_identity = None;
         self.cpu_snapshot_hash = None;
     }
+}
+
+const DERIVED_TEXTURE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const DERIVED_TEXTURE_CACHE_TARGET_BYTES: u64 = 768 * 1024 * 1024;
+const DERIVED_TEXTURE_CACHE_MAX_ITEMS: usize = 4096;
+const DERIVED_TEXTURE_CACHE_TARGET_ITEMS: usize = 3072;
+
+fn cache_uploaded_texture(
+    cache: &mut nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
+    ranges: &mut TextureRangeIndex,
+    bytes: &mut u64,
+    retired: &mut Vec<CachedTexture>,
+    key: TexCacheKey,
+    texture: CachedTexture,
+) {
+    *bytes = bytes.saturating_add(texture.allocation_size);
+    if let Some(previous) = cache.insert(key, texture) {
+        *bytes = bytes.saturating_sub(previous.allocation_size);
+        retired.push(previous);
+    } else {
+        ranges.insert(key);
+    }
+}
+
+fn trim_derived_texture_cache(
+    cache: &mut nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
+    ranges: &mut TextureRangeIndex,
+    bytes: &mut u64,
+    retired: &mut Vec<CachedTexture>,
+) {
+    if *bytes <= DERIVED_TEXTURE_CACHE_MAX_BYTES && cache.len() <= DERIVED_TEXTURE_CACHE_MAX_ITEMS {
+        return;
+    }
+    let mut candidates: Vec<_> = cache.iter()
+        .map(|(&key, texture)| (key, texture.last_use_generation))
+        .collect();
+    candidates.sort_unstable_by_key(|(key, generation)| (*generation, key.fingerprint));
+    for (key, _) in candidates {
+        if *bytes <= DERIVED_TEXTURE_CACHE_TARGET_BYTES && cache.len() <= DERIVED_TEXTURE_CACHE_TARGET_ITEMS {
+            break;
+        }
+        if let Some(texture) = cache.remove(&key) {
+            *bytes = bytes.saturating_sub(texture.allocation_size);
+            ranges.remove(key);
+            retired.push(texture);
+        }
+    }
+}
+
+fn trace_gpu_memory(
+    rt_cache: &RtCache,
+    texture_count: usize,
+    texture_bytes: u64,
+    slots: &[FrameSlot],
+    rt_retirement: (usize, u64),
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_GPU_MEMORY_PROFILE").is_some()) {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static RETIRED_RT_TOTAL: AtomicU64 = AtomicU64::new(0);
+    static RETIRED_RT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+    let retired_rt_total = RETIRED_RT_TOTAL.fetch_add(rt_retirement.0 as u64, Ordering::Relaxed)
+        + rt_retirement.0 as u64;
+    let retired_rt_bytes_total = RETIRED_RT_BYTES_TOTAL.fetch_add(rt_retirement.1, Ordering::Relaxed)
+        + rt_retirement.1;
+    let now = monotonic_nanos();
+    let last = LAST.load(Ordering::Relaxed);
+    if (last != 0 && now.saturating_sub(last) < 1_000_000_000)
+        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let [(color_count, color_bytes), (depth_count, depth_bytes), (snapshot_count, snapshot_bytes)] = rt_cache.memory_estimates();
+    let mut retired_count = 0usize;
+    let mut retired_bytes = 0u64;
+    let mut retired_rt_count = 0usize;
+    let mut upload_count = 0usize;
+    let mut upload_bytes = 0u64;
+    for slot in slots {
+        retired_count += slot.retired_textures.len();
+        retired_bytes = slot.retired_textures.iter()
+            .fold(retired_bytes, |total, texture| total.saturating_add(texture.allocation_size));
+        retired_rt_count += slot.retired_rt_images.len();
+        for buffer in slot.upload_buffers.iter().chain(&slot.free_upload_buffers)
+            .chain(slot.texture_upload_arena.iter().map(|arena| &arena.buffer))
+        {
+            upload_count += 1;
+            upload_bytes = upload_bytes.saturating_add(buffer.size);
+        }
+    }
+    log::info!(
+        "[gpu-memory] textures={texture_count} texture_bytes={texture_bytes} retired_textures={retired_count} retired_texture_bytes={retired_bytes} rt_colors={color_count} rt_color_estimated_bytes={color_bytes} rt_depths={depth_count} rt_depth_estimated_bytes={depth_bytes} rt_snapshots={snapshot_count} rt_snapshot_estimated_bytes={snapshot_bytes} retired_rts={retired_rt_count} retired_rt_total={retired_rt_total} retired_rt_estimated_bytes_total={retired_rt_bytes_total} uploads={upload_count} upload_bytes={upload_bytes}"
+    );
 }
 
 fn can_retain_invalidated_texture(count: usize, bytes: u64, size: u64) -> bool {
@@ -4874,6 +4972,7 @@ impl Renderer {
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let drained: Vec<_> = inner.tex_cache.drain().map(|(_, t)| t).collect();
+        inner.tex_cache_bytes = 0;
         inner.tex_cache_ranges.clear();
         let texel_drained: Vec<_> = inner
             .texel_buffer_cache
@@ -4960,6 +5059,7 @@ impl Renderer {
                     }
                 }
                 let texture = inner.tex_cache.remove(&key)?;
+                inner.tex_cache_bytes = inner.tex_cache_bytes.saturating_sub(texture.allocation_size);
                 inner.tex_cache_ranges.remove(key);
                 Some(texture)
             })
@@ -5980,6 +6080,7 @@ impl Renderer {
                 sampler_cache: nexium_common::fast_hash::FastMap::default(),
                 integer_sampler_cache: nexium_common::fast_hash::FastMap::default(),
                 tex_cache: nexium_common::fast_hash::FastMap::default(),
+                tex_cache_bytes: 0,
                 tex_cache_ranges: TextureRangeIndex::default(),
                 texel_buffer_cache: HashMap::new(),
                 rt_reinterpret_cache: HashMap::new(),
@@ -9499,6 +9600,7 @@ impl Renderer {
             sampler_anisotropy_supported,
             native_bc_formats,
             tex_cache,
+            tex_cache_bytes,
             tex_cache_ranges,
             texel_buffer_cache,
             rt_reinterpret_cache,
@@ -9582,6 +9684,20 @@ impl Renderer {
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
             }
         }
+        trim_derived_texture_cache(
+            tex_cache, tex_cache_ranges, tex_cache_bytes,
+            &mut frame_slots[cur_idx].retired_textures,
+        );
+        let rt_retirement = if !rt_cache.has_pending_view_retirement()
+            || rt_texture_options().no_alias_sync || rt_texture_options().no_region_sync
+        {
+            (0, 0)
+        } else {
+            let protected = protected_render_target_keys(std::iter::once(call), std::iter::empty());
+            rt_cache.retire_redundant_views(&mut frame_slots[cur_idx].retired_rt_images, &protected)
+        };
+        trace_gpu_memory(rt_cache, tex_cache.len(), *tex_cache_bytes, frame_slots, rt_retirement);
+        let texture_use_generation = submit_state.generation.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(cache) = aurora_resident_ssbos.as_mut() {
             cache.complete_frame_slot(cur_idx);
         }
@@ -10125,44 +10241,45 @@ impl Renderer {
                         cur_gen,
                     ) {
                         Ok(tex) => {
-                            if let Some(old) = tex_cache.insert(key, tex) {
-                                frame_slots[cur_idx].retired_textures.push(old);
-                            } else {
-                                tex_cache_ranges.insert(key);
-                            }
+                            cache_uploaded_texture(
+                                tex_cache, tex_cache_ranges, tex_cache_bytes,
+                                &mut frame_slots[cur_idx].retired_textures, key, tex,
+                            );
                         }
                         Err(error) => {
                             if !bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
                                 log::warn!("texture upload failed: {}", error);
+                            }
+                            if let Some(texture) = tex_cache.get_mut(&key) {
+                                texture.invalidate_content();
                             }
                             binding_failure_reason = Some(error);
                         }
                     }
                 }
             }
+            if let Some(texture) = tex_cache.get_mut(&key).filter(|texture| !texture.invalidated) {
+                texture.last_use_generation = texture_use_generation;
+            }
+            let cached_texture = tex_cache.get(&key).filter(|texture| !texture.invalidated);
             if key.cube_array {
-                bound_tex_views_cube_array[slot] = tex_cache
-                    .get(&key)
-                    .filter(|texture| !texture.invalidated)
+                bound_tex_views_cube_array[slot] = cached_texture
                     .map(|t| t.view)
                     .unwrap_or(dummy_views_cube_array[slot][numeric_family]);
             } else if key.cube {
-                bound_tex_views_cube[slot] = tex_cache
-                    .get(&key)
-                    .filter(|texture| !texture.invalidated)
+                bound_tex_views_cube[slot] = cached_texture
                     .map(|t| t.view)
                     .unwrap_or(dummy_views_cube[slot][numeric_family]);
             } else if key.volume {
-                bound_tex_views_3d[slot] = tex_cache
-                    .get(&key)
+                bound_tex_views_3d[slot] = cached_texture
                     .map(|t| t.view)
                     .unwrap_or(dummy_views_3d[slot][numeric_family]);
             } else {
                 let fallback_view = dummy_views_2d[slot][numeric_family];
                 bound_tex_views[slot] =
-                    tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+                    cached_texture.map(|t| t.view).unwrap_or(fallback_view);
             }
-            let cache_hit = tex_cache.get(&key).is_some();
+            let cache_hit = cached_texture.is_some();
             let selected_view = if key.cube_array {
                 bound_tex_views_cube_array[slot]
             } else if key.cube {
@@ -11544,6 +11661,7 @@ impl Renderer {
             sampler_anisotropy_supported,
             native_bc_formats,
             tex_cache,
+            tex_cache_bytes,
             tex_cache_ranges,
             texel_buffer_cache,
             rt_reinterpret_cache,
@@ -11641,6 +11759,23 @@ impl Renderer {
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
             }
         }
+        trim_derived_texture_cache(
+            tex_cache, tex_cache_ranges, tex_cache_bytes,
+            &mut frame_slots[cur_idx].retired_textures,
+        );
+        let rt_retirement = if !rt_cache.has_pending_view_retirement()
+            || rt_texture_options().no_alias_sync || rt_texture_options().no_region_sync
+        {
+            (0, 0)
+        } else {
+            let protected = protected_render_target_keys(
+                group_preps.iter().flat_map(|(_, preps)| preps.iter().map(|(call, _)| *call)),
+                clear_groups.iter().flat_map(|clears| clears.iter()),
+            );
+            rt_cache.retire_redundant_views(&mut frame_slots[cur_idx].retired_rt_images, &protected)
+        };
+        trace_gpu_memory(rt_cache, tex_cache.len(), *tex_cache_bytes, frame_slots, rt_retirement);
+        let texture_use_generation = submit_state.generation.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(cache) = aurora_resident_ssbos.as_mut() {
             cache.complete_frame_slot(cur_idx);
         }
@@ -13607,11 +13742,10 @@ impl Renderer {
                                         Some(&mut frame_slots[cur_idx]),
                                     ) {
                                         Ok((tex, stage)) => {
-                                            if let Some(old) = tex_cache.insert(key, tex) {
-                                                frame_slots[cur_idx].retired_textures.push(old);
-                                            } else {
-                                                tex_cache_ranges.insert(key);
-                                            }
+                                            cache_uploaded_texture(
+                                                tex_cache, tex_cache_ranges, tex_cache_bytes,
+                                                &mut frame_slots[cur_idx].retired_textures, key, tex,
+                                            );
                                             if let Some(texture) = tex_cache.get_mut(&key) {
                                                 texture.trusted_source_identity =
                                                     trusted_source_identity;
@@ -13624,6 +13758,11 @@ impl Renderer {
                                             if !bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
                                                 log::warn!("texture upload failed: {}", error);
                                             }
+                                            if let Some(texture) = tex_cache.get_mut(&key) {
+                                                texture.invalidate_content();
+                                            }
+                                            hot_generic_texture_bindings.fill(None);
+                                            group_texture_bindings.clear();
                                             binding_failure_reason = Some(error);
                                         }
                                     }
@@ -13633,14 +13772,17 @@ impl Renderer {
                     }
                     rp_tex_upload += profile_elapsed(rp_upload_t0);
                     if let (Some(raw), Some(hash), Some(texture)) =
-                        (raw_snapshot, raw_hash, tex_cache.get_mut(&key))
+                        (raw_snapshot, raw_hash, tex_cache.get_mut(&key).filter(|texture| !texture.invalidated))
                     {
                         texture.cpu_snapshot_hash = raw
                             .trusted_identity()
                             .map(|identity| (identity, raw.len(), hash));
                     }
                     let rp_finish_t0 = record_detail_profile.then(std::time::Instant::now);
-                    let cached_binding = hot_binding.or_else(|| {
+                    if let Some(texture) = tex_cache.get_mut(&key).filter(|texture| !texture.invalidated) {
+                        texture.last_use_generation = texture_use_generation;
+                    }
+                    let cached_binding = hot_binding.filter(|_| binding_failure_reason.is_none()).or_else(|| {
                         tex_cache
                             .get(&key)
                             .filter(|texture| !texture.invalidated)
@@ -14876,6 +15018,7 @@ impl Renderer {
                             frame_slots[cur_idx]
                                 .retired_textures
                                 .extend(tex_cache.drain().map(|(_, texture)| texture));
+                            *tex_cache_bytes = 0;
                             tex_cache_ranges.clear();
                             frame_slots[cur_idx]
                                 .retired_texel_buffers
@@ -16685,6 +16828,30 @@ fn is_ordered_exact_sampled_color_transition(sampled: RtKey, attachment: RtKey) 
         && sampled.nvmap_id != u32::MAX
         && !sampled.is_3d
         && sampled.depth == 1
+}
+
+fn protected_render_target_keys<'a>(
+    calls: impl Iterator<Item = &'a crate::draw::Maxwell3dDrawCall>,
+    clears: impl Iterator<Item = &'a GraphicsClearOp>,
+) -> Vec<RtKey> {
+    let mut keys = std::collections::HashSet::new();
+    for call in calls {
+        keys.insert(call.rt_key);
+        keys.extend(call.color_rt_keys.iter().copied());
+        keys.extend(call.configured_color_rts.iter().map(|target| target.key));
+        keys.extend(call.small_color_rt_writebacks.iter().map(|target| target.key));
+        keys.extend(call.depth_key);
+        keys.extend(call.sampled_rt_key);
+        keys.extend(call.sampled_rt_keys.iter().copied());
+        keys.extend(call.sampled_rt_slots.iter().flatten().copied());
+        keys.extend(call.sampled_rt_copy_sources.iter().flatten().copied());
+        keys.extend(call.sampled_rt_fermi_exact_slots.iter().flatten().map(|token| token.key));
+    }
+    for clear in clears {
+        keys.extend(clear.color.as_ref().map(|color| color.key));
+        keys.extend(clear.depth_stencil.as_ref().map(|depth| depth.key));
+    }
+    keys.into_iter().collect()
 }
 
 fn draw_group_attachment_uses(
@@ -28670,6 +28837,7 @@ fn create_texture_image(
             cpu_snapshot_hash: None,
             invalidated: false,
             allocation_size: req.size,
+            last_use_generation: 0,
         },
         stage.and_then(|stage| stage.dedicated),
     ))
@@ -32038,6 +32206,35 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
 
     #[test]
+    fn current_batch_protects_attachment_sample_copy_and_clear_keys() {
+        let mut call = texture_prepare_test_call();
+        let keys = (0..9).map(|index| RtKey::new(10 + index, 64, 64, 0x10000 + u64::from(index) * 4096))
+            .collect::<Vec<_>>();
+        call.rt_key = keys[0];
+        call.color_rt_keys = vec![keys[0], keys[1]];
+        call.configured_color_rts = vec![crate::draw::ConfiguredColorRt {
+            raw_slot: 0, key: keys[2], format: vk::Format::R8G8B8A8_UNORM,
+        }];
+        call.depth_key = Some(keys[3]);
+        call.sampled_rt_key = Some(keys[4]);
+        call.sampled_rt_keys = vec![keys[5]];
+        call.sampled_rt_slots = vec![None, Some(keys[6])];
+        call.sampled_rt_copy_sources = vec![Some(keys[7])];
+        let clear = super::GraphicsClearOp {
+            color: Some(super::GraphicsColorClear {
+                key: keys[8], format: vk::Format::R8G8B8A8_UNORM,
+                rgba: [0.0; 4], rect: Some([0, 0, 16, 16]),
+            }),
+            depth_stencil: None,
+        };
+        let protected = super::protected_render_target_keys(
+            std::iter::once(&call), std::iter::once(&clear),
+        );
+        assert_eq!(protected.len(), keys.len());
+        assert!(keys.iter().all(|key| protected.contains(key)));
+    }
+
+    #[test]
     fn depth_only_render_extent_ignores_dormant_color_target() {
         let color = RtKey::new(1, 1280, 720, 0x1000);
         let shadow = vk::Extent2D { width: 896, height: 896 };
@@ -32302,6 +32499,7 @@ mod tests {
             cpu_snapshot_hash: Some((17, snapshot.len(), raw_hash)),
             invalidated: false,
             allocation_size: 4096,
+            last_use_generation: 0,
         };
         let mip = TextureRtMip {
             level: 0,
@@ -32380,6 +32578,7 @@ mod tests {
             cpu_snapshot_hash: None,
             invalidated: false,
             allocation_size: 4096,
+            last_use_generation: 0,
         };
         let base = TextureRtMip {
             level: 0,
@@ -32610,6 +32809,135 @@ mod tests {
             pitch_bytes: tic.pitch_bytes,
             numeric_type: 0,
         })
+    }
+
+    fn derived_cache_test_texture(size: u64, last_use_generation: u64) -> super::CachedTexture {
+        super::CachedTexture {
+            image: vk::Image::from_raw(last_use_generation + 1),
+            view: vk::ImageView::from_raw(last_use_generation + 1),
+            memory: vk::DeviceMemory::from_raw(last_use_generation + 1),
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            hash: 0,
+            gen: 0,
+            trusted_source_identity: None,
+            gpu_mip_overlay: false,
+            raw_cpu_hash: None,
+            gpu_subresources: Vec::new(),
+            cpu_snapshot_hash: None,
+            invalidated: false,
+            allocation_size: size,
+            last_use_generation,
+        }
+    }
+
+    #[test]
+    fn derived_texture_cache_retains_entries_within_both_limits() {
+        let key = group_memo_test_key(0x10000);
+        let mut cache = nexium_common::fast_hash::FastMap::default();
+        let mut ranges = super::TextureRangeIndex::default();
+        let mut bytes = 0;
+        let mut retired = Vec::new();
+        super::cache_uploaded_texture(
+            &mut cache, &mut ranges, &mut bytes, &mut retired,
+            key, derived_cache_test_texture(super::DERIVED_TEXTURE_CACHE_MAX_BYTES, 1),
+        );
+        super::trim_derived_texture_cache(&mut cache, &mut ranges, &mut bytes, &mut retired);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(bytes, super::DERIVED_TEXTURE_CACHE_MAX_BYTES);
+        assert!(ranges.overlapping(key.gpu_va, 1) == vec![key]);
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn derived_texture_cache_retires_least_recent_use_and_cleans_range_index() {
+        let mut cache = nexium_common::fast_hash::FastMap::default();
+        let mut ranges = super::TextureRangeIndex::default();
+        let mut bytes = 0;
+        let mut retired = Vec::new();
+        let size = 300 * 1024 * 1024;
+        let keys: Vec<_> = (1..=4).map(|index| group_memo_test_key(index * 0x10000)).collect();
+        for (key, generation) in keys.iter().zip([4, 1, 3, 2]) {
+            super::cache_uploaded_texture(
+                &mut cache, &mut ranges, &mut bytes, &mut retired,
+                *key, derived_cache_test_texture(size, generation),
+            );
+        }
+        super::trim_derived_texture_cache(&mut cache, &mut ranges, &mut bytes, &mut retired);
+        assert_eq!(bytes, 2 * size);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&keys[0]));
+        assert!(cache.contains_key(&keys[2]));
+        assert!(ranges.overlapping(keys[1].gpu_va, 1).is_empty());
+        assert!(ranges.overlapping(keys[3].gpu_va, 1).is_empty());
+        assert_eq!(retired.iter().map(|texture| texture.last_use_generation).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(retired[0].image, vk::Image::from_raw(2));
+        assert_eq!(retired[0].memory, vk::DeviceMemory::from_raw(2));
+    }
+
+    #[test]
+    fn derived_texture_cache_bounds_many_small_allocations() {
+        let mut cache = nexium_common::fast_hash::FastMap::default();
+        let mut ranges = super::TextureRangeIndex::default();
+        let mut bytes = 0;
+        let mut retired = Vec::new();
+        for index in 0..=super::DERIVED_TEXTURE_CACHE_MAX_ITEMS {
+            super::cache_uploaded_texture(
+                &mut cache, &mut ranges, &mut bytes, &mut retired,
+                group_memo_test_key((index as u64 + 1) * 0x10000),
+                derived_cache_test_texture(16, index as u64),
+            );
+        }
+        super::trim_derived_texture_cache(&mut cache, &mut ranges, &mut bytes, &mut retired);
+        assert_eq!(cache.len(), super::DERIVED_TEXTURE_CACHE_TARGET_ITEMS);
+        assert_eq!(bytes, cache.len() as u64 * 16);
+        assert_eq!(retired.len(), super::DERIVED_TEXTURE_CACHE_MAX_ITEMS + 1 - cache.len());
+        assert_eq!(retired.first().unwrap().last_use_generation, 0);
+        assert_eq!(retired.last().unwrap().last_use_generation, retired.len() as u64 - 1);
+    }
+
+    #[test]
+    fn derived_texture_cache_preserves_oversized_upload_until_next_trim() {
+        let key = group_memo_test_key(0x10000);
+        let mut cache = nexium_common::fast_hash::FastMap::default();
+        let mut ranges = super::TextureRangeIndex::default();
+        let mut bytes = 0;
+        let mut retired = Vec::new();
+        let size = super::DERIVED_TEXTURE_CACHE_MAX_BYTES + 1;
+        super::cache_uploaded_texture(
+            &mut cache, &mut ranges, &mut bytes, &mut retired,
+            key, derived_cache_test_texture(size, 1),
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(bytes, size);
+        assert!(retired.is_empty());
+        super::trim_derived_texture_cache(&mut cache, &mut ranges, &mut bytes, &mut retired);
+        assert!(cache.is_empty());
+        assert!(ranges.overlapping(key.gpu_va, 1).is_empty());
+        assert_eq!(bytes, 0);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].allocation_size, size);
+        assert_eq!(retired[0].image, vk::Image::from_raw(2));
+    }
+
+    #[test]
+    fn derived_texture_cache_replacement_counts_only_live_allocation() {
+        let key = group_memo_test_key(0x10000);
+        let mut cache = nexium_common::fast_hash::FastMap::default();
+        let mut ranges = super::TextureRangeIndex::default();
+        let mut bytes = 0;
+        let mut retired = Vec::new();
+        for (size, generation) in [(4096, 1), (8192, 2)] {
+            super::cache_uploaded_texture(
+                &mut cache, &mut ranges, &mut bytes, &mut retired,
+                key, derived_cache_test_texture(size, generation),
+            );
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(bytes, 8192);
+        assert!(ranges.overlapping(key.gpu_va, 1) == vec![key]);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].allocation_size, 4096);
+        assert_eq!(retired[0].image, vk::Image::from_raw(2));
     }
 
     #[test]
@@ -35496,6 +35824,7 @@ mod tests {
             cpu_snapshot_hash: Some((10, 1024, 42)),
             invalidated: false,
             allocation_size: 4096,
+            last_use_generation: 0,
         };
         assert!(!sampled_texture_needs_upload(
             texture.invalidated, Some((texture.gen, texture.hash)), 7, 42, true, true,
