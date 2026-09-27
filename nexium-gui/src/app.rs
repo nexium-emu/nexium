@@ -6505,6 +6505,14 @@ impl HorizonApp {
         ctx.request_repaint();
     }
 
+    fn native_game_visible(&self, carousel_mode: bool) -> bool {
+        !carousel_mode && self.emulation_handle.as_ref().is_some_and(|h| h.is_running() && !h.is_paused())
+            && !self.modal_active() && !self.show_settings && !self.show_profile
+            && self.profile_anim == 0.0 && self.pause_anim.is_none() && self.resume_anim.is_none()
+            && !self.debugger.show_memory && !self.debugger.show_registers && !self.debugger.show_disasm
+            && !self.debugger.show_logs && !self.debugger.show_performance && !self.debugger.show_wait_tree
+    }
+
     fn game_display(&self) -> Option<(egui::TextureId, Vec2)> {
         if let Some(window) = self.native_game.as_ref().filter(|window| window.active) {
             return self.game_texture.as_ref().map(|texture| (texture.id(),
@@ -9171,10 +9179,14 @@ impl eframe::App for HorizonApp {
                     if let Some((tid, tsz)) = self.game_display() {
                         let draw_rect = self.game_draw_rect(ui.max_rect(), tsz);
                         self.last_game_rect = Some(draw_rect);
-                        let draw_size = draw_rect.size();
-                        ui.centered_and_justified(|ui| {
-                            ui.image((tid, draw_size));
-                        });
+                        ui.allocate_rect(draw_rect, egui::Sense::hover());
+                        if self.native_game.as_ref().is_some_and(|window| window.active)
+                            && self.native_game_visible(carousel_mode)
+                        {
+                            ui.painter().rect_filled(draw_rect, 0.0, Color32::BLACK);
+                        } else {
+                            egui::Image::new((tid, draw_rect.size())).paint_at(ui, draw_rect);
+                        }
                         if let Some(depth) = self.game_depth.clone() {
                             ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
                                 draw_rect,
@@ -9516,11 +9528,7 @@ impl eframe::App for HorizonApp {
             &mut self.app_settings,
         );
 
-        let native_visible = !carousel_mode && self.emulation_handle.as_ref().is_some_and(|h| h.is_running() && !h.is_paused())
-            && !self.modal_active() && !self.show_settings && !self.show_profile
-            && self.profile_anim == 0.0 && self.pause_anim.is_none() && self.resume_anim.is_none()
-            && !self.debugger.show_memory && !self.debugger.show_registers && !self.debugger.show_disasm
-            && !self.debugger.show_logs && !self.debugger.show_performance && !self.debugger.show_wait_tree;
+        let native_visible = self.native_game_visible(carousel_mode);
         if let Some(window) = &mut self.native_game {
             let mut holes: Vec<_> = self.native_overlay_rect.into_iter().collect();
             if self.download_toast.is_some() {
