@@ -466,7 +466,12 @@ fn color_alias_sync_identity(candidate: RtKey, want: RtKey) -> bool {
 }
 
 fn color_region_sync_identity(candidate: RtKey, want: RtKey) -> bool {
-    candidate.nvmap_id == want.nvmap_id
+    let same_cpu_mapping = candidate.cpu_addr == 0
+        || want.cpu_addr == 0
+        || want.gpu_va.checked_sub(candidate.gpu_va)
+            .and_then(|offset| candidate.cpu_addr.checked_add(offset)) == Some(want.cpu_addr);
+    same_cpu_mapping
+        && candidate.nvmap_id == want.nvmap_id
         && candidate.base_layer == want.base_layer
         && (want.mapping_epoch == 0 || candidate.mapping_epoch == want.mapping_epoch)
         && (want.layout_signature == 0 || candidate.layout_signature == want.layout_signature)
@@ -3374,6 +3379,11 @@ impl RtCache {
             };
             let area = stored.width as u64 * stored.height as u64;
             let replace = match best {
+                Some((_, _, best_stamp, _, _, _))
+                    if excluded.is_some() && stamp != best_stamp =>
+                {
+                    stamp > best_stamp
+                }
                 Some((best_key, _, best_stamp, _, _, best_exact)) => {
                     let best_area = best_key.width as u64 * best_key.height as u64;
                     (exact && !best_exact)
@@ -4337,6 +4347,36 @@ mod tests {
         assert_eq!(source.stamp, padded_stamp);
         assert_eq!((source.src_x, source.src_y), (0, 0));
 
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn region_sync_prefers_latest_write_over_smaller_cached_view() {
+        const VA: u64 = 0x6200_3000;
+        let target = RtKey::new(41, 1200, 675, VA);
+        let old = RtKey::new(41, 1216, 675, VA);
+        let current = RtKey::new(41, 1280, 720, VA);
+        let mut cache = RtCache::new();
+        for key in [target, old, current] {
+            cache.insert_color_image(
+                key,
+                test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+            );
+        }
+        let old_stamp = cache.mark_drawn(old);
+        cache.mark_synced_sample_from(target, old_stamp);
+        let current_stamp = cache.mark_drawn(current);
+        let source = cache
+            .find_drawn_color_region_at_excluding(1200, 675, VA, target)
+            .unwrap();
+        assert_eq!(source.key, current);
+        assert_eq!(source.stamp, current_stamp);
+        cache.mark_drawn(old);
+        assert_eq!(
+            cache.find_drawn_color_region_at_excluding(1200, 675, VA, target).unwrap().key,
+            old
+        );
         cache.cache.clear();
         cache.clear_color_lookup_index();
     }
