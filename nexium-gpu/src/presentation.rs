@@ -7,13 +7,38 @@ use std::time::{Duration, Instant};
 use crate::renderer::SubmitState;
 use crate::rt_cache::find_memory_type;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ScalingFilter {
+    #[default]
+    Nearest = 0,
+    Linear = 1,
+    Bicubic = 2,
+    ScaleForce = 3,
+    Fsr = 4,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceState {
     pub width: u32,
     pub height: u32,
     pub visible: bool,
     pub vsync: bool,
-    pub nearest: bool,
+    pub filter: ScalingFilter,
+    pub sharpness: u8,
+}
+
+impl Default for SurfaceState {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            visible: false,
+            vsync: false,
+            filter: ScalingFilter::default(),
+            sharpness: 87,
+        }
+    }
 }
 
 pub struct PresentationTarget {
@@ -600,6 +625,78 @@ struct RetiredSwapchain {
     images: Vec<SwapImage>,
 }
 
+struct ScalingImage {
+    device: ash::Device,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+    format: vk::Format,
+}
+
+impl ScalingImage {
+    fn new(
+        device: &ash::Device,
+        memory: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+        format: vk::Format,
+    ) -> Result<Self, String> {
+        let mut image = Self {
+            device: device.clone(),
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            extent,
+            format,
+        };
+        unsafe {
+            image.image = device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            ).map_err(err)?;
+            let requirements = device.get_image_memory_requirements(image.image);
+            let memory_type_index = find_memory_type(
+                memory, requirements.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            ).ok_or("no scaling image memory")?;
+            image.memory = device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type_index),
+                None,
+            ).map_err(err)?;
+            device.bind_image_memory(image.image, image.memory, 0).map_err(err)?;
+            image.view = device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(color_range()),
+                None,
+            ).map_err(err)?;
+        }
+        Ok(image)
+    }
+}
+
+impl Drop for ScalingImage {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_image_view(self.view, None);
+            self.device.destroy_image(self.image, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
 struct Worker {
     device: ash::Device,
     surface_api: ash::khr::surface::Instance,
@@ -612,7 +709,10 @@ struct Worker {
     retired: Vec<RetiredSwapchain>,
     present_fences: bool,
     extent: vk::Extent2D,
+    format: vk::Format,
     vsync: bool,
+    filter: ScalingFilter,
+    sharpness: u8,
     queue: vk::Queue,
     uses_render_queue: bool,
     timeline: vk::Semaphore,
@@ -626,10 +726,11 @@ struct Worker {
     acquired: vk::Semaphore,
     descriptors: vk::DescriptorPool,
     set_layout: vk::DescriptorSetLayout,
-    set: vk::DescriptorSet,
+    sets: [vk::DescriptorSet; 2],
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     samplers: [vk::Sampler; 2],
+    scaling_image: Option<ScalingImage>,
     last: Option<FrameSlot>,
     last_present_profile: Option<Instant>,
 }
@@ -659,7 +760,10 @@ impl Worker {
             retired: Vec::new(),
             present_fences,
             extent: vk::Extent2D::default(),
+            format: vk::Format::UNDEFINED,
             vsync: true,
+            filter: ScalingFilter::default(),
+            sharpness: 87,
             queue,
             timeline,
             uses_render_queue: queue == unsafe { device.get_device_queue(family, 0) },
@@ -673,10 +777,11 @@ impl Worker {
             acquired: vk::Semaphore::null(),
             descriptors: vk::DescriptorPool::null(),
             set_layout: vk::DescriptorSetLayout::null(),
-            set: vk::DescriptorSet::null(),
+            sets: [vk::DescriptorSet::null(); 2],
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
             samplers: [vk::Sampler::null(); 2],
+            scaling_image: None,
             last: None,
             last_present_profile: None,
         };
@@ -746,32 +851,33 @@ impl Worker {
             let sizes = [
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::SAMPLED_IMAGE,
-                    descriptor_count: 1,
+                    descriptor_count: 2,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::SAMPLER,
-                    descriptor_count: 1,
+                    descriptor_count: 2,
                 },
             ];
             worker.descriptors = device
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
+                        .max_sets(2)
                         .pool_sizes(&sizes),
                     None,
                 )
                 .map_err(err)?;
-            worker.set = device
+            let sets = device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(worker.descriptors)
-                        .set_layouts(&[worker.set_layout]),
+                        .set_layouts(&[worker.set_layout; 2]),
                 )
-                .map_err(err)?[0];
+                .map_err(err)?;
+            worker.sets.copy_from_slice(&sets);
             let push = [vk::PushConstantRange {
-                stage_flags: vk::ShaderStageFlags::VERTEX,
+                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 offset: 0,
-                size: 24,
+                size: 40,
             }];
             worker.pipeline_layout = device
                 .create_pipeline_layout(
@@ -859,7 +965,9 @@ impl Worker {
                             width: state.width,
                             height: state.height,
                         }
-                    || self.vsync != state.vsync)
+                    || self.vsync != state.vsync
+                    || self.filter != state.filter
+                    || (state.filter == ScalingFilter::Fsr && self.sharpness != state.sharpness.min(100)))
             {
                 self.present(state)?;
             }
@@ -946,6 +1054,7 @@ impl Worker {
 
     fn retire_swapchain(&mut self) {
         let _ = self.wait_submission();
+        self.scaling_image = None;
         if self.present_fences {
             self.drain();
         }
@@ -1026,6 +1135,7 @@ impl Worker {
                 return Ok(());
             }
             self.vsync = state.vsync;
+            self.format = format.format;
             let modes = self
                 .surface_api
                 .get_physical_device_surface_present_modes(self.physical, self.surface)
@@ -1123,6 +1233,87 @@ impl Worker {
         Ok(())
     }
 
+    fn prepare_scaling_image(&mut self, filter: ScalingFilter) -> Result<(), String> {
+        if filter != ScalingFilter::Fsr {
+            self.scaling_image = None;
+        } else if self.scaling_image.as_ref().is_none_or(|image| {
+            image.extent != self.extent || image.format != self.format
+        }) {
+            let memory = unsafe { self.instance.get_physical_device_memory_properties(self.physical) };
+            self.scaling_image = Some(ScalingImage::new(&self.device, &memory, self.extent, self.format)?);
+        }
+        Ok(())
+    }
+
+    fn bind_source(&self, set: vk::DescriptorSet, view: vk::ImageView, sampler: vk::Sampler) {
+        let image = [vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let filtering = [vk::DescriptorImageInfo::default().sampler(sampler)];
+        unsafe {
+            self.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&image),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&filtering),
+                ],
+                &[],
+            );
+        }
+    }
+
+    fn draw_filter_pass(&self, view: vk::ImageView, set: vk::DescriptorSet, mapping: [f32; 6], mode: u32, sharpness: u8) {
+        let color = [vk::RenderingAttachmentInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let rect = vk::Rect2D { offset: vk::Offset2D::default(), extent: self.extent };
+        let bytes = scaling_push_constants(mapping, mode, sharpness, self.extent);
+        unsafe {
+            self.device.cmd_begin_rendering(
+                self.cmd,
+                &vk::RenderingInfo::default()
+                    .render_area(rect)
+                    .layer_count(1)
+                    .color_attachments(&color),
+            );
+            self.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, 0, &[set], &[],
+            );
+            self.device.cmd_set_viewport(
+                self.cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: self.extent.width as f32,
+                    height: self.extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            self.device.cmd_set_scissor(self.cmd, 0, &[rect]);
+            self.device.cmd_push_constants(
+                self.cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                &bytes,
+            );
+            self.device.cmd_draw(self.cmd, 3, 1, 0, 0);
+            self.device.cmd_end_rendering(self.cmd);
+        }
+    }
+
     fn present(&mut self, mut state: SurfaceState) -> Result<(), String> {
         let profile = present_profile_enabled();
         let started = profile.then(Instant::now);
@@ -1171,21 +1362,22 @@ impl Worker {
         if let Some(started) = started {
             PRESENT_PROFILE.acquire.add(started.elapsed());
         }
-        let image = &mut self.images[index as usize];
-        let release_retired = !self.present_fences && image.pending_present;
-        let present_fence = image.present_fence;
-        unsafe {
-            if self.present_fences {
-                if image.pending_present {
-                    self.device
-                        .wait_for_fences(&[image.present_fence], true, u64::MAX)
-                        .map_err(err)?;
+        self.prepare_scaling_image(state.filter)?;
+        let (image, image_view, complete, present_fence, release_retired) = {
+            let image = &mut self.images[index as usize];
+            let release_retired = !self.present_fences && image.pending_present;
+            unsafe {
+                if self.present_fences {
+                    if image.pending_present {
+                        self.device.wait_for_fences(&[image.present_fence], true, u64::MAX).map_err(err)?;
+                    }
+                    self.device.reset_fences(&[image.present_fence]).map_err(err)?;
                 }
-                self.device
-                    .reset_fences(&[image.present_fence])
-                    .map_err(err)?;
             }
             image.pending_present = false;
+            (image.image, image.view, image.complete, image.present_fence, release_retired)
+        };
+        unsafe {
             self.device.reset_fences(&[self.fence]).map_err(err)?;
             self.device
                 .reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
@@ -1202,92 +1394,33 @@ impl Worker {
         let (mapping, _) = slot
             .parameters
             .mapping(slot.extent.width, slot.extent.height);
-        let view = [vk::DescriptorImageInfo::default()
-            .image_view(slot.view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let sampler =
-            [vk::DescriptorImageInfo::default().sampler(self.samplers[state.nearest as usize])];
-        unsafe {
-            self.device.update_descriptor_sets(
-                &[
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.set)
-                        .dst_binding(0)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&view),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.set)
-                        .dst_binding(1)
-                        .descriptor_type(vk::DescriptorType::SAMPLER)
-                        .image_info(&sampler),
-                ],
-                &[],
-            );
-        }
-        barrier(
-            &self.device,
-            self.cmd,
-            image.image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        self.bind_source(
+            self.sets[0], slot.view,
+            self.samplers[usize::from(state.filter == ScalingFilter::Nearest)],
         );
-        let color = [vk::RenderingAttachmentInfo::default()
-            .image_view(image.view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .store_op(vk::AttachmentStoreOp::STORE)];
-        let rect = vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent: self.extent,
+        let (final_set, final_mapping, final_mode) = if let Some(intermediate) = &self.scaling_image {
+            self.bind_source(self.sets[1], intermediate.view, self.samplers[0]);
+            barrier(
+                &self.device, self.cmd, intermediate.image,
+                vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+            self.draw_filter_pass(intermediate.view, self.sets[0], mapping, ScalingFilter::Fsr as u32, state.sharpness);
+            barrier(
+                &self.device, self.cmd, intermediate.image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            (self.sets[1], [0.0, 0.0, 1.0, 0.0, 0.0, 1.0], 5)
+        } else {
+            (self.sets[0], mapping, state.filter as u32)
         };
-        unsafe {
-            self.device.cmd_begin_rendering(
-                self.cmd,
-                &vk::RenderingInfo::default()
-                    .render_area(rect)
-                    .layer_count(1)
-                    .color_attachments(&color),
-            );
-            self.device
-                .cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-            self.device.cmd_bind_descriptor_sets(
-                self.cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &[self.set],
-                &[],
-            );
-            self.device.cmd_set_viewport(
-                self.cmd,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: self.extent.width as f32,
-                    height: self.extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
-            self.device.cmd_set_scissor(self.cmd, 0, &[rect]);
-            let bytes: [u8; 24] = std::array::from_fn(|i| mapping[i / 4].to_ne_bytes()[i % 4]);
-            self.device.cmd_push_constants(
-                self.cmd,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                &bytes,
-            );
-            self.device.cmd_draw(self.cmd, 3, 1, 0, 0);
-            self.device.cmd_end_rendering(self.cmd);
-        }
         barrier(
-            &self.device,
-            self.cmd,
-            image.image,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::PRESENT_SRC_KHR,
+            &self.device, self.cmd, image,
+            vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        self.draw_filter_pass(image_view, final_set, final_mapping, final_mode, state.sharpness);
+        barrier(
+            &self.device, self.cmd, image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR,
         );
         unsafe {
             self.device.end_command_buffer(self.cmd).map_err(err)?;
@@ -1300,7 +1433,7 @@ impl Worker {
             .wait_semaphore_values(&wait_values)
             .signal_semaphore_values(&signal_values);
         let commands = [self.cmd];
-        let signals = [image.complete];
+        let signals = [complete];
         let submit = vk::SubmitInfo::default()
             .command_buffers(&commands)
             .wait_semaphores(&waits)
@@ -1374,6 +1507,8 @@ impl Worker {
             }
         }
         self.wait_submission()?;
+        self.filter = state.filter;
+        self.sharpness = state.sharpness.min(100);
         if release_retired {
             self.release_retired();
         }
@@ -1571,6 +1706,18 @@ impl Drop for HostBuffer {
     }
 }
 
+fn scaling_push_constants(mapping: [f32; 6], mode: u32, sharpness: u8, extent: vk::Extent2D) -> [u8; 40] {
+    let mut bytes = [0; 40];
+    for (value, destination) in mapping.into_iter().zip(bytes[..24].chunks_exact_mut(4)) {
+        destination.copy_from_slice(&value.to_ne_bytes());
+    }
+    bytes[24..28].copy_from_slice(&mode.to_ne_bytes());
+    bytes[28..32].copy_from_slice(&(f32::from(sharpness.min(100)) / 100.0).to_ne_bytes());
+    bytes[32..36].copy_from_slice(&(extent.width as f32).to_ne_bytes());
+    bytes[36..40].copy_from_slice(&(extent.height as f32).to_ne_bytes());
+    bytes
+}
+
 fn create_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
@@ -1723,6 +1870,30 @@ mod tests {
             transform: 0,
             present_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn scaling_push_constants_match_shader_alignment_without_reapplying_rotation() {
+        let mut p = parameters();
+        p.transform = 4;
+        p.crop = Some([10, 20, 40, 60]);
+        let (mapping, _) = p.mapping(120, 80);
+        let extent = vk::Extent2D { width: 640, height: 360 };
+        let bytes = scaling_push_constants(mapping, ScalingFilter::Fsr as u32, 87, extent);
+        let read_float = |offset: usize| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(std::array::from_fn::<_, 6, _>(|index| read_float(index * 4)), mapping);
+        assert_eq!(u32::from_ne_bytes(bytes[24..28].try_into().unwrap()), 4);
+        assert_eq!(read_float(28), 0.87);
+        assert_eq!([read_float(32), read_float(36)], [640.0, 360.0]);
+        let sharpen = scaling_push_constants([0.0, 0.0, 1.0, 0.0, 0.0, 1.0], 5, 100, extent);
+        assert_eq!(u32::from_ne_bytes(sharpen[24..28].try_into().unwrap()), 5);
+        assert_eq!(&sharpen[32..40], &bytes[32..40]);
+        assert_eq!(f32::from_ne_bytes(sharpen[28..32].try_into().unwrap()), 1.0);
+        for (sharpness, expected) in [(0, 0.0), (100, 1.0), (255, 1.0)] {
+            let bytes = scaling_push_constants(mapping, 5, sharpness, extent);
+            assert_eq!(f32::from_ne_bytes(bytes[28..32].try_into().unwrap()), expected);
+        }
+        assert_eq!(SurfaceState::default().sharpness, 87);
     }
 
     #[test]

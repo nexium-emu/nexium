@@ -12,7 +12,11 @@ fn main() {
 fn compile(shader: &str, entries: &[(&str, naga::ShaderStage)]) {
     let path = format!("src/{shader}.wgsl");
     println!("cargo:rerun-if-changed={path}");
-    let source = std::fs::read_to_string(&path).unwrap();
+    let mut source = std::fs::read_to_string(&path).unwrap();
+    if shader == "present" {
+        println!("cargo:rerun-if-changed=src/scale.wgsl");
+        source.push_str(&std::fs::read_to_string("src/scale.wgsl").unwrap());
+    }
     let module = naga::front::wgsl::parse_str(&source).unwrap();
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
