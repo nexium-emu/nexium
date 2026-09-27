@@ -4262,12 +4262,12 @@ impl Translator {
                 let offset = ldg_offset(raw);
                 let size = ldg_size(raw);
                 let count = match size {
-                    4 => 1u32,
+                    0..=4 => 1u32,
                     5 => 2,
                     6 | 7 => 4,
                     _ => {
                         log::warn!(
-                            "LDG sub-word size not yet lifted raw={:#018x} size={}",
+                            "LDG unsupported size raw={:#018x} size={}",
                             raw,
                             size,
                         );
@@ -4295,7 +4295,36 @@ impl Translator {
                     } else {
                         dest.wrapping_add(w as u8)
                     };
-                    self.write_reg(dst, Op::Mov(Value::Inst(id)), pred);
+                    let value = if size < 4 {
+                        let address = self.emit_iadd_value(
+                            addr_lo,
+                            Value::ImmU32(off as u32),
+                            false,
+                            false,
+                        );
+                        let lane_bits = self.emit_ishl_imm_value(address, 3);
+                        let position = self.emit_value(Op::ILop {
+                            a: lane_bits,
+                            b: Value::ImmU32(if size < 2 { 24 } else { 16 }),
+                            op: LogicOp::And,
+                            not_a: false,
+                            not_b: false,
+                        });
+                        let control = self.emit_iadd_value(
+                            position,
+                            Value::ImmU32(if size < 2 { 8 << 8 } else { 16 << 8 }),
+                            false,
+                            false,
+                        );
+                        self.emit_value(Op::Bfe {
+                            a: Value::Inst(id),
+                            b: control,
+                            signed: size & 1 != 0,
+                        })
+                    } else {
+                        Value::Inst(id)
+                    };
+                    self.write_reg(dst, Op::Mov(value), pred);
                 }
             }
 

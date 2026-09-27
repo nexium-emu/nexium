@@ -63,7 +63,7 @@ impl CurrentPipeline {
     }
 }
 
-const SPEC_VERSION: u32 = 61;
+const SPEC_VERSION: u32 = 62;
 const MAX_SPEC_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
