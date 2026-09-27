@@ -219,9 +219,23 @@ pub fn find_texture_rt_mips(
     out
 }
 
+fn resolved_rt_mip_memo_value_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0"
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("no")
+    })
+}
+
 pub(crate) fn resolved_rt_mip_memo_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RESOLVED_RT_MIP_MEMO").is_some())
+    *ENABLED.get_or_init(|| {
+        resolved_rt_mip_memo_value_enabled(
+            std::env::var("NEXIUM_RESOLVED_RT_MIP_MEMO").ok().as_deref(),
+        )
+    })
 }
 
 fn resolved_mip_profile(hit: bool) {
@@ -589,6 +603,136 @@ mod tests {
         assert_resolved_memo_matches(&mut memo, &cache, &changed, base, format);
         assert_resolved_memo_matches(&mut memo, &cache, &tic, base, vk::Format::R8_UNORM);
         assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 2);
+    }
+
+    #[test]
+    fn resolved_memo_defaults_on_and_accepts_explicit_opt_outs() {
+        for value in [None, Some(""), Some("1"), Some("true"), Some("ON"), Some(" yes ")] {
+            assert!(resolved_rt_mip_memo_value_enabled(value));
+        }
+        for value in ["0", "false", "off", "no", " FALSE ", "Off", " NO "] {
+            assert!(!resolved_rt_mip_memo_value_enabled(Some(value)));
+        }
+    }
+
+    #[test]
+    fn resolved_memo_rejects_obsolete_mappings_before_and_after_retirement() {
+        let (tic, base) = height_texture();
+        let key = mip_key(&tic, base, 0);
+        let format = vk::Format::R16_SFLOAT;
+        let extent = vk::Extent2D { width: key.width, height: key.height };
+        let mut cache = RtCache::new();
+        let mut memo = ResolvedTextureRtMipMemo::default();
+        insert_source(&mut cache, key, format, extent);
+        let original = assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0];
+        assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
+        assert_eq!(memo.hits, 1);
+        cache.apply_mapping_epoch_transitions(&[], &[(key.gpu_va, key.guest_size_bytes)]);
+        let mut retired = Vec::new();
+        assert_eq!(cache.retire_redundant_views(&mut retired, &[key]), (0, 0));
+        assert!(cache.has_color_for_nvmap(key.nvmap_id));
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        cache.mark_drawn(key);
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        assert_eq!(cache.retire_redundant_views(&mut retired, &[]).0, 1);
+        assert_eq!(retired[0].image, original.image);
+        assert!(!cache.has_color_for_nvmap(key.nvmap_id));
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        insert_source(&mut cache, key, format, extent);
+        cache.get_existing(key).unwrap().image = vk::Image::from_raw(1234);
+        let replacement = assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0];
+        assert_eq!(replacement.image, vk::Image::from_raw(1234));
+        assert!(replacement.stamp > original.stamp);
+    }
+
+    #[test]
+    fn resolved_memo_tracks_promoted_source_epochs_without_replacing_images() {
+        let (tic, base) = height_texture();
+        let format = vk::Format::R16_SFLOAT;
+        let mut cache = RtCache::new();
+        let mut memo = ResolvedTextureRtMipMemo::default();
+        for level in 0..2 {
+            let key = mip_key(&tic, base, level);
+            insert_source(&mut cache, key, format,
+                vk::Extent2D { width: key.width, height: key.height });
+        }
+        let original = assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
+        assert_eq!(original.len(), 2);
+        let promoted = base.with_mapping_epoch(base.mapping_epoch + 1);
+        cache.apply_mapping_epoch_transitions(&[crate::rt_cache::RtMappingEpochTransition {
+            gpu_va: base.gpu_va,
+            size: base.guest_size_bytes,
+            old_epoch: base.mapping_epoch,
+            new_epoch: promoted.mapping_epoch,
+        }], &[]);
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        let current = assert_resolved_memo_matches(&mut memo, &cache, &tic, promoted, format);
+        assert_eq!(current.len(), original.len());
+        for (current, original) in current.iter().zip(original) {
+            assert_eq!(current.key.mapping_epoch, promoted.mapping_epoch);
+            assert_eq!((current.image, current.stamp), (original.image, original.stamp));
+        }
+        let misses = memo.misses;
+        assert_resolved_memo_matches(&mut memo, &cache, &tic, promoted, format);
+        assert_eq!(memo.misses, misses);
+    }
+
+    #[test]
+    fn resolved_memo_tracks_mutable_source_format_extent_and_layout() {
+        let (tic, base) = height_texture();
+        let key = mip_key(&tic, base, 0);
+        let format = vk::Format::R16_SFLOAT;
+        let extent = vk::Extent2D { width: key.width, height: key.height };
+        let mut cache = RtCache::new();
+        let mut memo = ResolvedTextureRtMipMemo::default();
+        insert_source(&mut cache, key, format, extent);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 1);
+        cache.get_existing(key).unwrap().format = vk::Format::R8_UNORM;
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        cache.get_existing(key).unwrap().format = format;
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 1);
+        cache.get_existing(key).unwrap().extent.width += 32;
+        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        let image = cache.get_existing(key).unwrap();
+        image.extent = extent;
+        image.layout = vk::ImageLayout::GENERAL;
+        let current = assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].layout, vk::ImageLayout::GENERAL);
+    }
+
+    #[test]
+    fn resolved_memo_survives_generation_table_rollover_and_version_reuse() {
+        let (tic, base) = height_texture();
+        let key = mip_key(&tic, base, 0);
+        let format = vk::Format::R16_SFLOAT;
+        let extent = vk::Extent2D { width: key.width, height: key.height };
+        let mut cache = RtCache::new();
+        let mut memo = ResolvedTextureRtMipMemo::default();
+        insert_source(&mut cache, key, format, extent);
+        let original = assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0];
+        let generation = cache.color_sampling_generation(key.nvmap_id);
+        for offset in 1..=4096 {
+            let unrelated = RtKey {
+                nvmap_id: key.nvmap_id + offset,
+                width: 1,
+                height: 1,
+                guest_size_bytes: 512,
+                layout_signature: 1,
+                gpu_va: key.gpu_va + u64::from(offset) * 0x100000,
+                cpu_addr: key.cpu_addr + u64::from(offset) * 0x100000,
+                ..key
+            };
+            insert_source(&mut cache, unrelated, format, vk::Extent2D { width: 1, height: 1 });
+        }
+        cache.get_existing(key).unwrap().image = vk::Image::from_raw(4321);
+        cache.mark_drawn(key);
+        let current_generation = cache.color_sampling_generation(key.nvmap_id);
+        assert_ne!(current_generation.0, generation.0);
+        assert_eq!(current_generation.1, generation.1);
+        let current = assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0];
+        assert_eq!(current.image, vk::Image::from_raw(4321));
+        assert!(current.stamp > original.stamp);
     }
 
     #[test]

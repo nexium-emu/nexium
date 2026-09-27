@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use nexium_gpu::presentation::{PresentParameters, PresentationTarget, SurfaceState};
+use nexium_gpu::presentation::{PresentParameters, PresentationTarget, ScalingFilter, SurfaceState};
 use nexium_gpu::{rt_cache::RtKey, Renderer};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -82,7 +82,8 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         height: 180,
         visible: false,
         vsync: true,
-        nearest: true,
+        filter: ScalingFilter::Nearest,
+        sharpness: 87,
     });
     let renderer = Renderer::new_with_presentation(Some(target.clone())).unwrap();
     let key = RtKey::new(1, 16, 8, 0x10000);
@@ -130,10 +131,10 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         present_at: Instant::now(),
     };
     assert!(!renderer
-        .present_image(key, stamp + 1, false, parameters)
+        .present_image(key, stamp + 1, false, parameters, None)
         .unwrap());
     assert!(renderer
-        .present_image(key, stamp, false, parameters)
+        .present_image(key, stamp, false, parameters, None)
         .unwrap());
     pump_until(&mut event_loop, || target.progress().0 >= 1);
     assert_eq!(target.metrics().2, 0);
@@ -152,6 +153,7 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
                             present_at: hidden_started + Duration::from_nanos(n * 16_666_667),
                             ..parameters
                         },
+                        None,
                     )
                     .unwrap());
             }
@@ -172,9 +174,26 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         height: 180,
         visible: true,
         vsync: true,
-        nearest: true,
+        filter: ScalingFilter::Nearest,
+        sharpness: 87,
     });
     pump_until(&mut event_loop, || target.metrics().1 >= 1);
+    for filter in [ScalingFilter::Linear, ScalingFilter::Bicubic, ScalingFilter::ScaleForce,
+        ScalingFilter::Fsr, ScalingFilter::Nearest]
+    {
+        let before = target.metrics().1;
+        target.configure(SurfaceState { width: 320, height: 180, visible: true, vsync: true, filter, sharpness: 87 });
+        pump_until(&mut event_loop, || target.metrics().1 > before);
+        if filter == ScalingFilter::Fsr {
+            for sharpness in [0, 100, 87] {
+                let before = target.metrics().1;
+                target.configure(SurfaceState {
+                    width: 320, height: 180, visible: true, vsync: true, filter, sharpness,
+                });
+                pump_until(&mut event_loop, || target.metrics().1 > before);
+            }
+        }
+    }
     target.request_snapshot();
     let mut snapshot = None;
     pump_until(&mut event_loop, || {
@@ -191,7 +210,8 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         height: 270,
         visible: true,
         vsync: false,
-        nearest: false,
+        filter: ScalingFilter::Linear,
+        sharpness: 87,
     });
     let initial_frames = target.progress().0;
     let producer = {
@@ -206,7 +226,8 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
                         PresentParameters {
                             transform: if n == 23 { 2 } else { 0 },
                             ..parameters
-                        }
+                        },
+                        None,
                     )
                     .unwrap());
             }
@@ -235,7 +256,8 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         height: 270,
         visible: true,
         vsync: true,
-        nearest: true,
+        filter: ScalingFilter::Nearest,
+        sharpness: 87,
     });
     let initial_frames = target.progress().0;
     let started = Instant::now();
@@ -251,7 +273,8 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
                         PresentParameters {
                             present_at: started + Duration::from_nanos(n * 16_666_667),
                             ..parameters
-                        }
+                        },
+                        None,
                     )
                     .unwrap());
             }
@@ -276,7 +299,9 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
             height,
             visible: true,
             vsync: n % 2 == 0,
-            nearest: true,
+            filter: [ScalingFilter::Nearest, ScalingFilter::Linear, ScalingFilter::Bicubic,
+                ScalingFilter::ScaleForce, ScalingFilter::Fsr][n as usize % 5],
+            sharpness: 87,
         });
         let before = target.metrics().1;
         let frames = if n < 6 { 1 } else { 6 };
@@ -285,7 +310,7 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
             std::thread::spawn(move || {
                 for _ in 0..frames {
                     assert!(renderer
-                        .present_image(key, stamp, false, parameters)
+                        .present_image(key, stamp, false, parameters, None)
                         .unwrap());
                 }
             })

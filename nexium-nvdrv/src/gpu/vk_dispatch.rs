@@ -6416,7 +6416,10 @@ pub(crate) fn enqueue_draws(
                     packetizer,
                 );
                 finish_ssbo_flush_boundary(ssbo_snapshot_cache);
-                packetizer.stage(render_thread, vec![prepare_clear_batch(renderer, clear)]);
+                let prepared = prepare_clear_batch(
+                    renderer, clear, mappings, mem_read, ssbo_snapshot_cache,
+                );
+                packetizer.stage(render_thread, vec![prepared]);
                 if let Some(writeback) = small_color_clear_writeback(draw, mappings) {
                     register_small_rts_after_prior_work(&[writeback], || {});
                 }
@@ -11015,17 +11018,81 @@ fn prepare_draw_batch_async(
     }
 }
 
+fn partial_clear_guest_snapshot_range(
+    clear: &nexium_gpu::renderer::GraphicsColorClear,
+    mappings: &GpuMappings,
+) -> Option<(u64, usize)> {
+    let key = clear.key;
+    let rect = clear.rect?;
+    let (x, y) = (rect[0].max(0) as u32, rect[1].max(0) as u32);
+    let (width, height) = (rect[2].max(0) as u32, rect[3].max(0) as u32);
+    if width == 0 || height == 0 || x >= key.width || y >= key.height
+        || (x == 0 && y == 0 && width >= key.width && height >= key.height)
+        || key.is_3d || key.depth != 1 || key.sample_width != 1 || key.sample_height != 1
+        || key.gpu_va == 0 || key.cpu_addr == 0 || key.mapping_epoch == 0
+        || nexium_gpu::rt_cache::is_synthetic_copy_key(key)
+    {
+        return None;
+    }
+    let bpp = nexium_gpu::renderer::exact_rt_copy_format_bpp(clear.format)?;
+    let len = nexium_gpu::texture::native_render_target_source_size(
+        key.width, key.height, 1, bpp, key.layout_signature,
+    )?;
+    if u64::try_from(len).ok()? > key.guest_size_bytes {
+        return None;
+    }
+    let mut offset = 0usize;
+    while offset < len {
+        let address = key.gpu_va.checked_add(offset as u64)?;
+        let (cpu, remaining) = mappings.cpu_range_for(address)?;
+        if cpu != key.cpu_addr.checked_add(offset as u64)?
+            || mappings.nvmap_id_for(address) != Some(key.nvmap_id)
+            || mappings.mapping_epoch_for(address) != Some(key.mapping_epoch)
+        {
+            return None;
+        }
+        let take = usize::try_from(remaining).unwrap_or(usize::MAX).min(len - offset);
+        if take == 0 { return None; }
+        offset += take;
+    }
+    Some((key.gpu_va, len))
+}
+
+fn snapshot_partial_clear_guest(
+    clear: &nexium_gpu::renderer::GraphicsClearOp,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    snapshot_cache: &mut SsboSnapshotCache,
+) -> DrawSnapshot {
+    let mut snapshot = DrawSnapshot::new();
+    let Some((address, len)) = clear.color.as_ref()
+        .and_then(|color| partial_clear_guest_snapshot_range(color, mappings))
+    else {
+        return snapshot;
+    };
+    let data = snapshot_cache.read_input_or_insert(mappings, address, len, mem_read)
+        .or_else(|| read_gpu_strict(mappings, mem_read, address, len).map(Arc::new));
+    if let Some(data) = data.filter(|data| data.len() >= len) {
+        snapshot.insert(address, data);
+    }
+    snapshot
+}
+
 fn prepare_clear_batch(
     renderer: &Arc<nexium_gpu::Renderer>,
     clear: nexium_gpu::renderer::GraphicsClearOp,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    snapshot_cache: &mut SsboSnapshotCache,
 ) -> PreparedDrawBatch {
+    let snapshot = snapshot_partial_clear_guest(&clear, mappings, mem_read, snapshot_cache);
     let clear_ops = vec![clear];
     PreparedDrawBatch {
         renderer: Arc::clone(renderer),
         calls: Vec::new(),
         compatibility: DrawBatchCompatibility::for_clear_ops(&clear_ops),
         clear_ops,
-        snapshot: DrawSnapshot::new(),
+        snapshot,
         snapshot_generations: HashMap::new(),
         trusted_texture_snapshot_identities: HashMap::new(),
         tic_summ: Vec::new(),
@@ -23572,6 +23639,112 @@ mod tests {
         code[0x50] ^= 1;
         sph[3] = 0;
         assert_eq!(super::passthrough_float_layer_slot(&sph, &code), None);
+    }
+
+    fn partial_clear_snapshot_fixture() -> (GpuMappings, nexium_gpu::renderer::GraphicsClearOp) {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x70000, 0x4000, 0x80000, 7);
+        let key = nexium_gpu::rt_cache::RtKey::with_cpu(7, 6, 3, 0x70100, 0x80100)
+            .with_mapping_epoch(mappings.mapping_epoch_for(0x70100).unwrap())
+            .with_pitch_linear_layout(32)
+            .with_guest_size_bytes(96);
+        let clear = nexium_gpu::renderer::GraphicsClearOp {
+            color: Some(nexium_gpu::renderer::GraphicsColorClear {
+                key, format: ash::vk::Format::R8G8B8A8_UNORM,
+                rgba: [0.0; 4], rect: Some([1, 1, 2, 1]),
+            }),
+            depth_stencil: None,
+        };
+        (mappings, clear)
+    }
+
+    #[test]
+    fn partial_clear_snapshot_captures_full_native_target_at_translated_address() {
+        let (mappings, clear) = partial_clear_snapshot_fixture();
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |address, bytes: &mut [u8]| {
+            reads.borrow_mut().push((address, bytes.len()));
+            for (index, byte) in bytes.iter_mut().enumerate() { *byte = index as u8; }
+            true
+        };
+        let snapshot = super::snapshot_partial_clear_guest(
+            &clear, &mappings, &read, &mut SsboSnapshotCache::default(),
+        );
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[&0x70100].as_slice(), (0..96).collect::<Vec<u8>>());
+        assert_eq!(*reads.borrow(), vec![(0x80100, 96)]);
+        let mut tiled = clear.color.unwrap();
+        tiled.key = tiled.key.with_block_linear_layout(0, 2, 0, 0).with_guest_size_bytes(2048);
+        assert_eq!(super::partial_clear_guest_snapshot_range(&tiled, &mappings), Some((0x70100, 2048)));
+    }
+
+    #[test]
+    fn full_and_empty_color_clears_do_not_capture_guest_bytes() {
+        let (mappings, mut clear) = partial_clear_snapshot_fixture();
+        for rect in [None, Some([0, 0, 6, 3]), Some([-2, -3, 20, 20]),
+            Some([6, 0, 1, 1]), Some([0, 3, 1, 1]), Some([0, 0, 0, 1]), Some([0, 0, 1, -1])]
+        {
+            clear.color.as_mut().unwrap().rect = rect;
+            let snapshot = super::snapshot_partial_clear_guest(
+                &clear, &mappings, &|_, _| panic!("full/no-op clear read guest memory"),
+                &mut SsboSnapshotCache::default(),
+            );
+            assert!(snapshot.is_empty(), "unexpected snapshot for {rect:?}");
+        }
+        clear.color = None;
+        assert!(super::snapshot_partial_clear_guest(
+            &clear, &mappings, &|_, _| panic!("depth-only clear read color memory"),
+            &mut SsboSnapshotCache::default(),
+        ).is_empty());
+    }
+
+    #[test]
+    fn partial_clear_snapshot_rejects_unsupported_or_changed_backing() {
+        let (mappings, clear) = partial_clear_snapshot_fixture();
+        let color = clear.color.unwrap();
+        let key = color.key;
+        let mut unsupported = Vec::new();
+        let mut changed = key; changed.mapping_epoch += 1; unsupported.push(changed);
+        let mut changed = key; changed.mapping_epoch = 0; unsupported.push(changed);
+        let mut changed = key; changed.cpu_addr += 1; unsupported.push(changed);
+        let mut changed = key; changed.nvmap_id += 1; unsupported.push(changed);
+        let mut changed = key; changed.depth = 2; unsupported.push(changed);
+        let mut changed = key; changed.is_3d = true; unsupported.push(changed);
+        let mut changed = key; changed.sample_width = 2; unsupported.push(changed);
+        let mut changed = key; changed.sample_height = 2; unsupported.push(changed);
+        let mut changed = key; changed.guest_size_bytes = 95; unsupported.push(changed);
+        let mut changed = key; changed.layout_signature = 1 << 56; unsupported.push(changed);
+        unsupported.push(key.with_pitch_linear_layout(16));
+        for key in unsupported {
+            let changed = nexium_gpu::renderer::GraphicsColorClear { key, ..color.clone() };
+            assert!(super::partial_clear_guest_snapshot_range(&changed, &mappings).is_none(), "{key:?}");
+        }
+        let unknown_format = nexium_gpu::renderer::GraphicsColorClear {
+            format: ash::vk::Format::UNDEFINED, ..color.clone()
+        };
+        assert!(super::partial_clear_guest_snapshot_range(&unknown_format, &mappings).is_none());
+        let mut short = GpuMappings::new();
+        short.add(key.gpu_va, 95, key.cpu_addr, key.nvmap_id);
+        let changed = nexium_gpu::renderer::GraphicsColorClear {
+            key: key.with_mapping_epoch(short.mapping_epoch_for(key.gpu_va).unwrap()), ..color
+        };
+        assert!(super::partial_clear_guest_snapshot_range(&changed, &short).is_none());
+    }
+
+    #[test]
+    fn partial_clear_failed_guest_read_does_not_publish_a_snapshot() {
+        let (mappings, clear) = partial_clear_snapshot_fixture();
+        let reads = std::cell::Cell::new(0);
+        let read = |_, bytes: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            bytes[..8].fill(0xab);
+            false
+        };
+        let snapshot = super::snapshot_partial_clear_guest(
+            &clear, &mappings, &read, &mut SsboSnapshotCache::default(),
+        );
+        assert!(snapshot.is_empty());
+        assert!(reads.get() > 0);
     }
 
     #[test]
