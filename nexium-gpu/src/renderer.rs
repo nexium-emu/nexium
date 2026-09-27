@@ -9736,7 +9736,7 @@ impl Renderer {
             }
             let direct_volume_rt = pending.map_or(false, |(key, _, _, _)| key.volume)
                 && sampled_rt_key_for_slot(call, slot).is_some_and(|key| key.is_3d);
-            let pending_special = pending.map_or(false, |(key, tic, _, _)| {
+            let pending_special = pending.map_or(true, |(key, tic, _, _)| {
                 texture_key_blocks_2d_rt_alias(
                     key,
                     &rt_alias_tic_for_slot(
@@ -12316,7 +12316,7 @@ impl Renderer {
                     let rp_sync_t0 = record_detail_profile.then(std::time::Instant::now);
                     let direct_volume_rt = pending.map_or(false, |(key, _, _, _)| key.volume)
                         && sampled_rt_key_for_slot(call, slot).is_some_and(|key| key.is_3d);
-                    let pending_special = pending.map_or(false, |(key, tic, _, _)| {
+                    let pending_special = pending.map_or(true, |(key, tic, _, _)| {
                         texture_key_blocks_2d_rt_alias(
                             key,
                             &rt_alias_tic_for_slot(
@@ -24243,7 +24243,7 @@ where
                 return Ok(None);
             };
             log_srgb_tic(call, *tex_id, tic);
-            pending_texture_for_tic(call, slot, tic_addr, tic).map(Some)
+            pending_texture_for_tic(call, slot, tic_addr, tic)
         })
         .collect()
 }
@@ -24286,7 +24286,8 @@ where
         let tic = memoized_group_tic(memo, route.tic_addr, read_guest, profile, profile_enabled);
         let pending = tic
             .map(|tic| pending_texture_for_tic(call, slot, route.tic_addr, tic))
-            .transpose()?;
+            .transpose()?
+            .flatten();
         memo.pendings.insert(route, pending);
         if let Some((_, tic, _, _)) = pending {
             log_srgb_tic(call, *tex_id, tic);
@@ -24349,7 +24350,7 @@ fn pending_texture_for_tic(
     slot: usize,
     tic_addr: u64,
     tic: crate::texture::TicEntry,
-) -> Result<PendingTexture, String> {
+) -> Result<Option<PendingTexture>, String> {
     let pitch_size = tic.format.linear_size(tic.width, tic.height);
     let volume = tic_is_volume(&tic);
     let cube = tic_is_cube(&tic);
@@ -24419,13 +24420,33 @@ fn pending_texture_for_tic(
         )),
     });
     let image_kind = texture_image_kind_for_slot(&call.texture_numeric_manifest, slot);
-    let key = route_texture_key_to_shader_image_kind(key, &tic, image_kind).map_err(|error| {
-        format!(
-            "texture slot {slot} shader image family {image_kind:?} is incompatible with TIC {} at {tic_addr:#x}: {error}",
-            tic.texture_type
-        )
-    })?;
-    Ok((key, tic, pitch_size, read_size))
+    match route_texture_key_to_shader_image_kind(key, &tic, image_kind) {
+        Ok(key) => Ok(Some((key, tic, pitch_size, read_size))),
+        Err(error) => {
+            static REPORTED: std::sync::OnceLock<
+                Mutex<HashSet<(u64, usize, u64, GraphicsTextureImageKind, crate::texture::TicEntry)>>,
+            > = std::sync::OnceLock::new();
+            let report = {
+                let mut reported = REPORTED.get_or_init(|| Mutex::new(HashSet::new())).lock();
+                reported.len() < 128
+                    && reported.insert((call.fs_hash, slot, tic_addr, image_kind, tic))
+            };
+            if report {
+                log_graphics_texture_rejection(
+                    call,
+                    slot,
+                    Some((key, tic, pitch_size, read_size)),
+                    texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
+                    "descriptor",
+                    &format!(
+                        "shader image family {image_kind:?} is incompatible with TIC {} at {tic_addr:#x}: {error}; using typed dummy",
+                        tic.texture_type,
+                    ),
+                );
+            }
+            Ok(None)
+        }
+    }
 }
 
 fn collect_tsc_entries<F, D>(
@@ -24593,8 +24614,8 @@ fn rt_alias_for_slot(
     tic: Option<&crate::texture::TicEntry>,
     tsc: Option<&crate::texture::TscEntry>,
 ) -> Option<RtAlias> {
-    let alias_tic = tic.map(|tic| rt_alias_tic_for_slot(call, slot, *tic, tsc));
-    let tic = alias_tic.as_ref();
+    let alias_tic = rt_alias_tic_for_slot(call, slot, *tic?, tsc);
+    let tic = Some(&alias_tic);
     let sk = sampled_rt_key_for_slot(call, slot)?;
     if let (Some(leases), Some(id), Some(token), Some(tic)) = (
         fermi_exact_rt_snapshot_leases,
@@ -32340,6 +32361,220 @@ mod tests {
         index.clear();
         keys.clear();
         check(&index, &keys);
+    }
+
+    fn texture_prepare_test_call() -> crate::draw::Maxwell3dDrawCall {
+        use crate::texture_manifest::{GraphicsTextureImageKind, TextureNumericBinding};
+        let attachment = crate::draw::BlendAttachmentState {
+            enabled: false,
+            src_factor: vk::BlendFactor::ONE,
+            dst_factor: vk::BlendFactor::ZERO,
+            op: vk::BlendOp::ADD,
+            src_alpha_factor: vk::BlendFactor::ONE,
+            dst_alpha_factor: vk::BlendFactor::ZERO,
+            alpha_op: vk::BlendOp::ADD,
+            color_write_mask: vk::ColorComponentFlags::RGBA,
+        };
+        crate::draw::Maxwell3dDrawCall {
+            vs_spirv: std::sync::Arc::new(Vec::new()),
+            gs_spirv: std::sync::Arc::new(Vec::new()),
+            fs_spirv: std::sync::Arc::new(Vec::new()),
+            vs_gpu_va: Default::default(),
+            fs_gpu_va: 0x4007_c8030,
+            vs_hash: Default::default(),
+            fs_hash: 0x3b38_6fb5_5028_d8b4,
+            vs_cbuf_mask: Default::default(),
+            fs_cbuf_mask: Default::default(),
+            fs_tex_ids: vec![0, 1, 2],
+            sprite_batch_mirror: Default::default(),
+            texture_numeric_manifest: vec![
+                TextureNumericBinding::new(0, 0, nexium_spirv::TextureNumericType::Float)
+                    .with_image_kind(GraphicsTextureImageKind::D2),
+                TextureNumericBinding::new(1, 1, nexium_spirv::TextureNumericType::Float)
+                    .with_image_kind(GraphicsTextureImageKind::Cube),
+                TextureNumericBinding::new(2, 2, nexium_spirv::TextureNumericType::Float)
+                    .with_image_kind(GraphicsTextureImageKind::D2),
+            ],
+            texture_sampled_only_mask: Default::default(),
+            texel_buffer_mask: Default::default(),
+            vs_tex_base: Default::default(),
+            vs_tex_count: Default::default(),
+            vertex_layout: crate::draw::VertexLayout { bindings: Vec::new(), attrs: Vec::new() },
+            cbuf_addr: Default::default(),
+            cbuf_size: Default::default(),
+            cbuf_data: Default::default(),
+            resident_cbuf: Default::default(),
+            vertex_addr: Default::default(),
+            vertex_bindings: Default::default(),
+            resident_vertex: Default::default(),
+            vertex_count: 3,
+            first_vertex: Default::default(),
+            instance_count: 1,
+            first_instance: Default::default(),
+            index_addr: Default::default(),
+            index_count: Default::default(),
+            index_type: Default::default(),
+            index_data: Default::default(),
+            resident_index: Default::default(),
+            primitive_restart_enabled: Default::default(),
+            primitive_restart_index: Default::default(),
+            quad_expand: Default::default(),
+            rt_key: RtKey::new(1, 64, 64, 0x90000),
+            small_color_rt_writebacks: Default::default(),
+            configured_color_rts: Default::default(),
+            color_rt_keys: Default::default(),
+            color_rt_formats: Default::default(),
+            rt_format: vk::Format::R8G8B8A8_UNORM,
+            vp_rect: Default::default(),
+            depth_range: [0.0, 1.0],
+            scissor: Default::default(),
+            state: crate::draw::DrawState { topology: vk::PrimitiveTopology::TRIANGLE_LIST, vertex_count: 3, index_count: 0, indexed: false },
+            blend: crate::draw::BlendState {
+                enabled: false,
+                src_factor: attachment.src_factor,
+                dst_factor: attachment.dst_factor,
+                op: attachment.op,
+                src_alpha_factor: attachment.src_alpha_factor,
+                dst_alpha_factor: attachment.dst_alpha_factor,
+                alpha_op: attachment.alpha_op,
+                color_write_mask: attachment.color_write_mask,
+                attachments: [attachment; 8],
+                constants: [0.0; 4],
+            },
+            depth: crate::draw::DepthState { test_enabled: false, write_enabled: false, compare_op: vk::CompareOp::ALWAYS },
+            depth_mode: Default::default(),
+            depth_format: Default::default(),
+            depth_aspects: Default::default(),
+            stencil: Default::default(),
+            depth_clamp_enabled: Default::default(),
+            depth_key: Default::default(),
+            clear_depth_hint: 1.0,
+            clear_stencil_hint: Default::default(),
+            sampled_rt_key: Default::default(),
+            sampled_rt_keys: Default::default(),
+            sampled_rt_slots: vec![Some(RtKey::new(2, 64, 64, 0x10000)), None, None],
+            sampled_rt_copy_sources: Default::default(),
+            sampled_rt_fermi_exact_slots: Default::default(),
+            sampled_rt_fermi_snapshot_slots: Default::default(),
+            sampled_rt_snapshot_slots: Default::default(),
+            fragment_barrier_after: Default::default(),
+            texture_cache_invalidate_after: Default::default(),
+            clear: Default::default(),
+            clear_color: Default::default(),
+            tic_pool_gpu_va: 0x1000,
+            tic_pool_limit: 2,
+            tsc_pool_gpu_va: Default::default(),
+            tsc_pool_limit: Default::default(),
+            fs_sampler_ids: vec![0, 1, 2],
+            fs_sampler_arrayed: true,
+            vs_sampler_arrayed: Default::default(),
+            depth_compare_2d_mask: Default::default(),
+            depth_compare_cube_mask: Default::default(),
+            depth_compare_cube_array_mask: Default::default(),
+            cull_test_enable: Default::default(),
+            cull_face: Default::default(),
+            front_face: Default::default(),
+            poly_offset_enable: Default::default(),
+            poly_offset_units: Default::default(),
+            poly_offset_factor: Default::default(),
+            ssbo_data: Default::default(),
+            storage_readback: Default::default(),
+            present_flip_y: Default::default(),
+        }
+    }
+
+    fn texture_prepare_test_raw(gpu_va: u32, texture_type: u32, depth: u32) -> Vec<u8> {
+        let words = [
+            0x1c | (2 << 7) | (2 << 10) | (2 << 13) | (2 << 16)
+                | (2 << 19) | (3 << 22) | (4 << 25) | (5 << 28),
+            gpu_va,
+            1 << 21,
+            8,
+            63 | (texture_type << 23),
+            63 | ((depth - 1) << 16) | (1 << 31),
+            0,
+            0,
+        ];
+        words.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn texture_prepare_rejects_only_incompatible_slot() {
+        let call = texture_prepare_test_call();
+        let read = |address: u64, len: usize| {
+            assert_eq!(len, 32);
+            let slot = (address - call.tic_pool_gpu_va) / 32;
+            Some(texture_prepare_test_raw(0x10000 + slot as u32 * 0x10000, 5, 1))
+        };
+        let pendings = super::collect_tex_pendings(&call, &read).unwrap();
+        assert_eq!(pendings.len(), 3);
+        assert_eq!(pendings[0].unwrap().0.gpu_va, 0x10000);
+        assert!(pendings[1].is_none());
+        assert_eq!(pendings[2].unwrap().0.gpu_va, 0x30000);
+        assert!(call.sampled_rt_slots[0].is_some());
+        assert!(!pendings[0].unwrap().0.cube);
+    }
+
+    #[test]
+    fn texture_prepare_group_rejection_preserves_later_draws_and_groups() {
+        use crate::texture_manifest::{GraphicsTextureImageKind, TextureNumericBinding};
+        let call = texture_prepare_test_call();
+        let read = |address: u64, _: usize| {
+            let slot = (address - call.tic_pool_gpu_va) / 32;
+            Some(texture_prepare_test_raw(0x10000 + slot as u32 * 0x10000, 5, 1))
+        };
+        let mut memo = GroupTexturePrepMemo::default();
+        let mut profile = RecordTextureMemoProfile::default();
+        for _ in 0..2 {
+            let pendings = super::collect_tex_pendings_with_group_memo(
+                &call, &read, &mut memo, &mut profile, true,
+            ).unwrap();
+            assert!(pendings[0].is_some());
+            assert!(pendings[1].is_none());
+            assert!(pendings[2].is_some());
+        }
+        assert_eq!(profile.pending_misses, 3);
+        assert_eq!(profile.pending_requests, 6);
+        let mut next_draw = call.clone();
+        next_draw.texture_numeric_manifest[1] = TextureNumericBinding::new(
+            1, 1, nexium_spirv::TextureNumericType::Float,
+        ).with_image_kind(GraphicsTextureImageKind::D2Array);
+        let pendings = super::collect_tex_pendings_with_group_memo(
+            &next_draw, &read, &mut memo, &mut profile, true,
+        ).unwrap();
+        assert!(pendings.iter().all(Option::is_some));
+        assert!(pendings[1].unwrap().0.arrayed);
+        assert_eq!(profile.pending_misses, 4);
+
+        let next_read = |address: u64, _: usize| {
+            let slot = (address - call.tic_pool_gpu_va) / 32;
+            Some(texture_prepare_test_raw(0x10000 + slot as u32 * 0x10000, 5, 6))
+        };
+        let mut next_group = GroupTexturePrepMemo::default();
+        let pendings = super::collect_tex_pendings_with_group_memo(
+            &call, &next_read, &mut next_group, &mut profile, true,
+        ).unwrap();
+        assert!(pendings.iter().all(Option::is_some));
+        assert!(pendings[1].unwrap().0.cube);
+        assert_eq!(pendings[1].unwrap().0.view_layers, 6);
+    }
+
+    #[test]
+    fn texture_prepare_keeps_invalid_backing_address_fatal() {
+        let call = texture_prepare_test_call();
+        let read = |_: u64, _: usize| {
+            let mut raw = texture_prepare_test_raw(1, 5, 1);
+            let word = u32::from_le_bytes(raw[16..20].try_into().unwrap()) | (1 << 16);
+            raw[16..20].copy_from_slice(&word.to_le_bytes());
+            Some(raw)
+        };
+        assert!(super::collect_tex_pendings(&call, &read)
+            .err().unwrap().contains("invalid base layer"));
+        let mut memo = GroupTexturePrepMemo::default();
+        let mut profile = RecordTextureMemoProfile::default();
+        assert!(super::collect_tex_pendings_with_group_memo(
+            &call, &read, &mut memo, &mut profile, false,
+        ).err().unwrap().contains("invalid base layer"));
     }
 
     #[test]
