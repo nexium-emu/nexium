@@ -6550,7 +6550,7 @@ impl Renderer {
         rt_cache.set_color_layout(color_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         rt_cache.set_depth_layout(depth_key, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
         rt_cache.mark_cleared(color_key, true);
-        rt_cache.mark_depth_written(depth_key);
+        rt_cache.mark_depth_cleared(depth_key, clear_aspects == depth_aspects);
         note_clear_profile(
             ClearProfileKind::Combined,
             clear_settle,
@@ -6642,7 +6642,10 @@ impl Renderer {
             key,
             format,
         )?;
-        let img = rt_cache.get_or_create_with_format(key, device, format)?;
+        let (image, view, old_layout, image_format) = {
+            let image = rt_cache.get_or_create_with_format(key, device, format)?;
+            (image.image, image.view, image.layout, image.format)
+        };
 
         let (clear_slot, clear_wait, clear_waited) =
             acquire_clear_slot(device, clear_slots, clear_slot_index)?;
@@ -6662,11 +6665,19 @@ impl Renderer {
                 .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(rect clear): {:?}", e))?;
         }
+        if !rt_texture_options().no_alias_sync {
+            if let Some(sync) = color_region_sync_pair(rt_cache, key, format) {
+                record_color_region_sync(
+                    device, cmd, rt_cache, key, sync, image, old_layout, image_format,
+                )?;
+            }
+        }
+        let old_layout = rt_cache.color_layout(key).unwrap_or(old_layout);
         transition_image(
             device,
             cmd,
-            img.image,
-            img.layout,
+            image,
+            old_layout,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         );
         let clear_value = vk::ClearValue {
@@ -6674,7 +6685,7 @@ impl Renderer {
         };
         let attachment = vk::RenderingAttachmentInfo {
             s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
-            image_view: img.view,
+            image_view: view,
             image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             resolve_mode: vk::ResolveModeFlags::NONE,
             resolve_image_view: vk::ImageView::null(),
@@ -6725,7 +6736,7 @@ impl Renderer {
             device.cmd_clear_attachments(cmd, &[clear_attachment], &[clear_rect]);
             device.cmd_end_rendering(cmd);
         }
-        img.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        rt_cache.set_color_layout(key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         unsafe {
             device
                 .end_command_buffer(cmd)
@@ -7701,7 +7712,7 @@ impl Renderer {
         )?;
         let clear_submit = clear_submit_started.elapsed();
         clear_slot.in_flight = true;
-        rt_cache.mark_depth_written(key);
+        rt_cache.mark_depth_cleared(key, clear_aspects == aspects);
         note_clear_profile(
             ClearProfileKind::Depth,
             clear_settle,
@@ -10668,7 +10679,7 @@ impl Renderer {
             color_bind.push((*key, rt.image, rt.view, rt.extent, rt.layout));
         }
         let mut depth_fresh = false;
-        let depth_bind: Option<(vk::Image, vk::ImageView, vk::ImageLayout, vk::Extent2D)> =
+        let mut depth_bind: Option<(vk::Image, vk::ImageView, vk::ImageLayout, vk::Extent2D)> =
             if use_depth {
                 let (d, fresh) = rt_cache.get_or_create_depth_retiring(
                     call.depth_key.unwrap(),
@@ -10700,6 +10711,41 @@ impl Renderer {
             device
                 .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(slot): {:?}", e))?;
+        }
+        if use_depth
+            && call.depth_format == vk::Format::D32_SFLOAT
+            && call.depth_aspects == vk::ImageAspectFlags::DEPTH
+        {
+            if let Some(alias) = sync_sampled_depth_region(
+                device,
+                cmd,
+                rt_cache,
+                &mut frame_slots[cur_idx].retired_rt_images,
+                call.depth_key.unwrap(),
+            )? {
+                if let Some((image, view, layout, _)) = depth_bind.as_mut() {
+                    *image = alias.image;
+                    *view = alias.view;
+                    *layout = alias.layout;
+                }
+                depth_fresh = false;
+            }
+        }
+        for (index, (key, image, view, _, layout)) in color_bind.iter_mut().enumerate() {
+            let format = color_formats.get(index).copied().unwrap_or(call.rt_format);
+            sync_sampled_color_alias(
+                device, cmd, rt_cache, mem_props, &mut frame_slots[cur_idx], *key,
+            )?;
+            sync_sampled_color_region(
+                device, cmd, rt_cache, &mut frame_slots[cur_idx].retired_rt_images, *key, format,
+            )?;
+            if let Some((_, current_image, current_view, current_layout, _, _)) =
+                rt_cache.color_exact_with_format(*key)
+            {
+                *image = current_image;
+                *view = current_view;
+                *layout = current_layout;
+            }
         }
         for pending in pending_rt_reinterprets {
             record_rt_alias_reinterpret(
@@ -10914,7 +10960,10 @@ impl Renderer {
             }
             device.cmd_end_rendering(cmd);
         }
-        if use_depth && (depth_fresh || call_writes_depth_stencil(call)) {
+        if use_depth && depth_fresh {
+            let full_target = depth_bind.is_some_and(|(_, _, _, extent)| extent == rt_extent);
+            rt_cache.mark_depth_cleared(call.depth_key.unwrap(), full_target);
+        } else if use_depth && call_writes_depth_stencil(call) {
             rt_cache.mark_depth_written(call.depth_key.unwrap());
         }
         for (_, image, _, _, _) in &color_bind {
@@ -11904,6 +11953,17 @@ impl Renderer {
             let depth_key = depth_source.and_then(|call| call.depth_key);
             let (depth_image, depth_view, depth_prev, depth_fresh, depth_extent) =
                 if let Some(call) = depth_source {
+                    if call.depth_format == vk::Format::D32_SFLOAT
+                        && call.depth_aspects == vk::ImageAspectFlags::DEPTH
+                    {
+                        sync_sampled_depth_region(
+                            device,
+                            cmd,
+                            rt_cache,
+                            &mut frame_slots[cur_idx].retired_rt_images,
+                            depth_key.unwrap(),
+                        )?;
+                    }
                     let (d, fresh) = rt_cache.get_or_create_depth_retiring(
                         depth_key.unwrap(),
                         device,
@@ -12038,6 +12098,7 @@ impl Renderer {
                         &mut color_layouts,
                         pass_rt_layout,
                         &mut pass_dirty,
+                        &mut color_sync_checked,
                         &pass_trace_calls,
                     );
                     pass_open = false;
@@ -12115,6 +12176,7 @@ impl Renderer {
                                         &mut color_layouts,
                                         pass_rt_layout,
                                         &mut pass_dirty,
+                                        &mut color_sync_checked,
                                         &pass_trace_calls,
                                     );
                                     pass_open = false;
@@ -12352,6 +12414,12 @@ impl Renderer {
                             let depth_self_needs_sync = depth_self
                                 && depth_self_read_only.is_none()
                                 && depth_self_shadow_needs_sync(rt_cache, call, sk);
+                            let depth_region = pending.is_some_and(|(_, tic, _, _)| {
+                                tic.format == crate::texture::TicFormat::Z32
+                                    && tic_can_use_2d_rt_alias_view(&tic)
+                            });
+                            let depth_region_needs_sync = depth_region
+                                && depth_region_sync_source(rt_cache, sk).is_some();
                             let depth_as_color = pending
                                 .map(|(_, tic, _, _)| tic_reads_depth_as_color(tic.format))
                                 .unwrap_or(false)
@@ -12402,9 +12470,15 @@ impl Renderer {
                             } else {
                                 sampled_color_needs_sync(rt_cache, sk, sampled_format)
                             };
+                            let color_write_pending = color_sync_pending_write(
+                                sk,
+                                &color_keys,
+                                &color_formats,
+                                &pass_dirty,
+                            );
                             let mut pass_finished = false;
                             if pass_open
-                                && (color_needs_sync || depth_self_needs_sync || depth_as_color || depth_array)
+                                && (color_write_pending || color_needs_sync || depth_self_needs_sync || depth_region_needs_sync || depth_as_color || depth_array)
                             {
                                 unsafe {
                                     device.cmd_end_rendering(cmd);
@@ -12417,6 +12491,7 @@ impl Renderer {
                                     &mut color_layouts,
                                     pass_rt_layout,
                                     &mut pass_dirty,
+                                    &mut color_sync_checked,
                                     &pass_trace_calls,
                                 );
                                 pass_open = false;
@@ -12442,7 +12517,7 @@ impl Renderer {
                                     device,
                                     cmd,
                                     rt_cache,
-                                    &mut frame_slots[cur_idx],
+                                    &mut frame_slots[cur_idx].retired_rt_images,
                                     sk,
                                     sampled_format,
                                 )?
@@ -12476,6 +12551,23 @@ impl Renderer {
                                 }
                             } else if !color_sync_checked.contains(&sync_key) {
                                 color_sync_checked.push(sync_key);
+                            }
+                            if depth_region {
+                                if let Some(alias) = sync_sampled_depth_region(
+                                    device,
+                                    cmd,
+                                    rt_cache,
+                                    &mut frame_slots[cur_idx].retired_rt_images,
+                                    sk,
+                                )? {
+                                    if depth_key == Some(sk) {
+                                        depth_layout = alias.layout;
+                                        depth_needs_clear = false;
+                                    }
+                                    if let Some(alias_slot) = rt_aliases.get_mut(slot) {
+                                        *alias_slot = Some(alias);
+                                    }
+                                }
                             }
                             if let Some(alias) = depth_self_read_only {
                                 if let Some(alias_slot) = rt_aliases.get_mut(slot) {
@@ -12689,6 +12781,7 @@ impl Renderer {
                                             &mut color_layouts,
                                             pass_rt_layout,
                                             &mut pass_dirty,
+                                            &mut color_sync_checked,
                                             &pass_trace_calls,
                                         );
                                         pass_open = false;
@@ -12720,6 +12813,7 @@ impl Renderer {
                                                 &mut color_layouts,
                                                 pass_rt_layout,
                                                 &mut pass_dirty,
+                                                &mut color_sync_checked,
                                                 &pass_trace_calls,
                                             );
                                             pass_open = false;
@@ -12844,6 +12938,7 @@ impl Renderer {
                             &mut color_layouts,
                             pass_rt_layout,
                             &mut pass_dirty,
+                            &mut color_sync_checked,
                             &pass_trace_calls,
                         );
                         pass_open = false;
@@ -13160,6 +13255,7 @@ impl Renderer {
                                         &mut color_layouts,
                                         pass_rt_layout,
                                         &mut pass_dirty,
+                                        &mut color_sync_checked,
                                         &pass_trace_calls,
                                     );
                                     pass_open = false;
@@ -13420,6 +13516,7 @@ impl Renderer {
                                         &mut color_layouts,
                                         pass_rt_layout,
                                         &mut pass_dirty,
+                                        &mut color_sync_checked,
                                         &pass_trace_calls,
                                     );
                                     pass_open = false;
@@ -13831,6 +13928,7 @@ impl Renderer {
                             &mut color_layouts,
                             pass_rt_layout,
                             &mut pass_dirty,
+                            &mut color_sync_checked,
                             &pass_trace_calls,
                         );
                         pass_open = false;
@@ -14455,6 +14553,7 @@ impl Renderer {
                             &mut color_layouts,
                             pass_rt_layout,
                             &mut pass_dirty,
+                            &mut color_sync_checked,
                             &pass_trace_calls,
                         );
                         pass_trace_calls.clear();
@@ -14515,7 +14614,10 @@ impl Renderer {
                         let clear_now = depth_needs_clear;
                         depth_needs_clear = false;
                         if clear_now {
-                            rt_cache.mark_depth_written(depth_key.unwrap());
+                            rt_cache.mark_depth_cleared(
+                                depth_key.unwrap(),
+                                depth_extent == Some(rt_extent),
+                            );
                         }
                         let depth_clear_far = if call.depth.compare_op == vk::CompareOp::GREATER
                             || call.depth.compare_op == vk::CompareOp::GREATER_OR_EQUAL
@@ -14737,11 +14839,11 @@ impl Renderer {
                 if prep.use_depth && call_writes_depth_stencil(call) {
                     rt_cache.mark_depth_written(call.depth_key.unwrap());
                 }
-                for (idx, dirty) in pass_dirty.iter_mut().enumerate() {
-                    if call_writes_color(call, idx) {
-                        *dirty = true;
-                    }
-                }
+                record_color_pass_writes(
+                    &mut pass_dirty,
+                    &mut color_sync_checked,
+                    |idx| call_writes_color(call, idx),
+                );
                 pass_trace_calls.push(call);
                 if call.fragment_barrier_after || call.texture_cache_invalidate_after {
                     if pass_open {
@@ -14756,6 +14858,7 @@ impl Renderer {
                             &mut color_layouts,
                             pass_rt_layout,
                             &mut pass_dirty,
+                            &mut color_sync_checked,
                             &pass_trace_calls,
                         );
                         pass_open = false;
@@ -14797,6 +14900,7 @@ impl Renderer {
                     &mut color_layouts,
                     pass_rt_layout,
                     &mut pass_dirty,
+                    &mut color_sync_checked,
                     &pass_trace_calls,
                 );
             }
@@ -16816,6 +16920,11 @@ fn record_inline_graphics_color_clear(
     if matches!(region, InlineGraphicsColorClearRegion::NoOp) {
         return Ok(());
     }
+    if matches!(region, InlineGraphicsColorClearRegion::Partial(_)) {
+        sync_sampled_color_region(
+            device, cmd, rt_cache, retired_rt_images, color.key, color.format,
+        )?;
+    }
     let (image, view, extent, old_layout) = {
         let image = rt_cache.get_or_create_with_format_retiring(
             color.key,
@@ -16952,7 +17061,10 @@ fn record_inline_graphics_clear(
             );
         }
         rt_cache.set_depth_layout(depth_stencil.key, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-        rt_cache.mark_depth_written(depth_stencil.key);
+        rt_cache.mark_depth_cleared(
+            depth_stencil.key,
+            depth_stencil.clear_aspects == depth_stencil.aspects,
+        );
     }
     Ok(())
 }
@@ -17087,8 +17199,12 @@ fn finish_color_pass(
     color_layouts: &mut [vk::ImageLayout],
     pass_rt_layout: vk::ImageLayout,
     pass_dirty: &mut [bool],
+    color_sync_checked: &mut Vec<(RtKey, vk::Format)>,
     trace_calls: &[&crate::draw::Maxwell3dDrawCall],
 ) {
+    if pass_dirty.iter().any(|dirty| *dirty) {
+        color_sync_checked.clear();
+    }
     for (idx, (key, image, _, _, _)) in color_bind.iter().enumerate() {
         barrier_color_attachment_after_pass(device, cmd, *image, pass_rt_layout);
         color_layouts[idx] = pass_rt_layout;
@@ -25109,7 +25225,7 @@ where
     }
     for (key, format) in prepared {
         sync_sampled_color_alias(device, cmd, rt_cache, mem_props, frame_slot, key)?;
-        sync_sampled_color_region(device, cmd, rt_cache, frame_slot, key, format)?;
+        sync_sampled_color_region(device, cmd, rt_cache, &mut frame_slot.retired_rt_images, key, format)?;
     }
     Ok(())
 }
@@ -25132,6 +25248,41 @@ fn trace_configured_rt_preflight(key: RtKey, format: vk::Format, outcome: &str) 
             outcome
         );
     }
+}
+
+fn record_color_pass_writes(
+    pass_dirty: &mut [bool],
+    color_sync_checked: &mut Vec<(RtKey, vk::Format)>,
+    mut writes_color: impl FnMut(usize) -> bool,
+) {
+    for (index, dirty) in pass_dirty.iter_mut().enumerate() {
+        if writes_color(index) {
+            *dirty = true;
+            color_sync_checked.clear();
+        }
+    }
+}
+
+fn color_sync_pending_write(
+    sampled: RtKey,
+    color_keys: &[RtKey],
+    color_formats: &[vk::Format],
+    pass_dirty: &[bool],
+) -> bool {
+    color_keys.iter().enumerate().any(|(index, attachment)| {
+        pass_dirty.get(index).copied().unwrap_or(false)
+            && !attachment.same_alias_view_identity(sampled)
+            && rt_color_region_covers(
+                *attachment,
+                color_formats
+                    .get(index)
+                    .copied()
+                    .unwrap_or(vk::Format::R8G8B8A8_UNORM),
+                sampled.width,
+                sampled.height,
+                sampled.gpu_va,
+            )
+    })
 }
 
 fn color_sync_clean_across_group(
@@ -25524,7 +25675,11 @@ fn sync_sampled_color_alias(
     }
     rt_cache.set_color_layout(sync.src_key, src_prev);
     rt_cache.set_color_layout(sync.dst_key, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    let stamp = rt_cache.mark_synced_sample_from(sync.dst_key, sync.src_stamp);
+    let stamp = if use_blit {
+        rt_cache.mark_synced_sample_from(sync.dst_key, sync.src_stamp)
+    } else {
+        rt_cache.mark_color_region_synced(sync.dst_key, sync.src_key, sync.src_stamp)
+    };
     if options.alias_sync_debug {
         log::warn!(
             "[rt-alias-sync] src={}#{}/{} {:?} dst={}#{}/{} {:?} src_width={} h={} bytes={} blit={}",
@@ -25554,7 +25709,7 @@ fn sync_sampled_color_region(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     rt_cache: &mut RtCache,
-    frame_slot: &mut FrameSlot,
+    retired_rt_images: &mut Vec<GpuImage>,
     key: RtKey,
     format: vk::Format,
 ) -> Result<bool, String> {
@@ -25570,10 +25725,24 @@ fn sync_sampled_color_region(
             key,
             device,
             sync.dst_format,
-            &mut frame_slot.retired_rt_images,
+            retired_rt_images,
         )?;
         (dst.image, dst.layout, dst.format)
     };
+    record_color_region_sync(device, cmd, rt_cache, key, sync, dst_image, dst_prev, dst_format)
+}
+
+fn record_color_region_sync(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    rt_cache: &mut RtCache,
+    key: RtKey,
+    sync: ColorRegionSync,
+    dst_image: vk::Image,
+    dst_prev: vk::ImageLayout,
+    dst_format: vk::Format,
+) -> Result<bool, String> {
+    let options = rt_texture_options();
     if !rt_formats_compatible(sync.src_format, dst_format) {
         return Ok(false);
     }
@@ -25650,7 +25819,7 @@ fn sync_sampled_color_region(
     }
     rt_cache.set_color_layout(sync.src_key, src_prev);
     rt_cache.set_color_layout(key, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    let stamp = rt_cache.mark_synced_sample_from(key, sync.src_stamp);
+    let stamp = rt_cache.mark_color_region_synced(key, sync.src_key, sync.src_stamp);
     if options.alias_sync_debug {
         log::warn!(
             "[rt-region-sync] src={}#{}/{} {:?} dst={}#{}/{} {:?} xy={},{}",
@@ -25667,6 +25836,111 @@ fn sync_sampled_color_region(
         );
     }
     Ok(true)
+}
+
+fn depth_region_sync_source(
+    rt_cache: &RtCache,
+    sampled: RtKey,
+) -> Option<crate::rt_cache::RtDepthRegion> {
+    if rt_cache.find_depth(sampled).is_some_and(|(_, _, _, _, format, aspects)| {
+        format != vk::Format::D32_SFLOAT || aspects != vk::ImageAspectFlags::DEPTH
+    }) {
+        return None;
+    }
+    let source = rt_cache.find_sampleable_d32_region(sampled)?;
+    (source.key != sampled).then_some(source)
+}
+
+fn sync_sampled_depth_region(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    rt_cache: &mut RtCache,
+    retired_rt_images: &mut Vec<GpuImage>,
+    sampled: RtKey,
+) -> Result<Option<RtAlias>, String> {
+    let Some(source) = depth_region_sync_source(rt_cache, sampled) else {
+        if rt_texture_options().alias_meta_debug
+            && rt_cache.find_sampleable_depth_for_exact_alias(sampled).is_none()
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static MISSES: AtomicU64 = AtomicU64::new(0);
+            let sequence = MISSES.fetch_add(1, Ordering::Relaxed);
+            if sequence < 16 || sequence % 1024 == 0 {
+                log::warn!("[depth-region-miss] #{} want={:?} {}", sequence, sampled,
+                    rt_cache.debug_depth_resolution(sampled));
+            }
+        }
+        return Ok(None);
+    };
+    let aspects = vk::ImageAspectFlags::DEPTH;
+    let (image, view, layout) = {
+        let (destination, _) = rt_cache.get_or_create_depth_retiring(
+            sampled,
+            device,
+            vk::Format::D32_SFLOAT,
+            aspects,
+            retired_rt_images,
+        )?;
+        (destination.image, destination.view, destination.layout)
+    };
+    transition_image_aspect(
+        device, cmd, source.image, source.layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, aspects,
+    );
+    transition_image_aspect(
+        device, cmd, image, layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL, aspects,
+    );
+    let subresource = vk::ImageSubresourceLayers {
+        aspect_mask: aspects,
+        mip_level: 0,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let copy = vk::ImageCopy {
+        src_subresource: subresource,
+        src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        dst_subresource: subresource,
+        dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        extent: vk::Extent3D { width: sampled.width, height: sampled.height, depth: 1 },
+    };
+    unsafe {
+        device.cmd_copy_image(
+            cmd,
+            source.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[copy],
+        );
+    }
+    transition_image_aspect(
+        device, cmd, source.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, source.layout, aspects,
+    );
+    transition_image_aspect(
+        device, cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, aspects,
+    );
+    rt_cache.set_depth_layout(sampled, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    rt_cache.mark_depth_region_synced(sampled, source.key, source.generation);
+    if rt_texture_options().alias_meta_debug {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COPIES: AtomicU64 = AtomicU64::new(0);
+        let sequence = COPIES.fetch_add(1, Ordering::Relaxed);
+        if sequence < 32 || sequence % 512 == 0 {
+            log::warn!("[depth-region-sync] #{} generation={} src={:?} dst={:?}",
+                sequence, source.generation, source.key, sampled);
+        }
+    }
+    Ok(Some(RtAlias {
+        key: sampled,
+        image,
+        view,
+        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        format: vk::Format::D32_SFLOAT,
+        aspects,
+        depth: true,
+        frozen: false,
+        fermi_exact_rt_snapshot_id: None,
+    }))
 }
 
 fn sampled_active_depth_key(
@@ -35002,6 +35276,62 @@ mod tests {
             &[],
             Some(RtKey::new(7, 1600, 900, 0xa000)),
         ));
+    }
+
+    #[test]
+    fn color_sync_check_is_invalidated_by_secondary_color_write() {
+        let sampled = RtKey::new(7, 1245, 700, 0x5000);
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let mut checked = vec![(sampled, format)];
+        let mut dirty = [false, false];
+
+        super::record_color_pass_writes(&mut dirty, &mut checked, |_| false);
+        assert_eq!(checked, vec![(sampled, format)]);
+        assert_eq!(dirty, [false, false]);
+
+        super::record_color_pass_writes(&mut dirty, &mut checked, |index| index == 1);
+        assert!(checked.is_empty());
+        assert_eq!(dirty, [false, true]);
+
+        checked.push((sampled, format));
+        super::record_color_pass_writes(&mut dirty, &mut checked, |index| index == 1);
+        assert!(checked.is_empty());
+        assert_eq!(dirty, [false, true]);
+    }
+
+    #[test]
+    fn color_sync_padded_read_finishes_pending_producer_pass() {
+        let producer = RtKey::new(7, 1248, 700, 0x5000)
+            .with_block_linear_layout(0, 4, 0, 0);
+        let sampled = RtKey { width: 1245, ..producer };
+        let unrelated = RtKey::new(8, 1248, 700, 0x800000);
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let mut cache = crate::rt_cache::RtCache::new();
+        let previous_write = cache.mark_drawn(producer);
+        cache.mark_synced_sample_from(sampled, previous_write);
+        let cached = Some((format, cache.writeback_stamp(sampled).unwrap()));
+        let mut dirty = [false, false];
+        let mut checked = vec![(sampled, format)];
+        let colors = [unrelated, producer];
+        let formats = [format, format];
+
+        super::record_color_pass_writes(&mut dirty, &mut checked, |index| index == 1);
+        assert!(super::color_region_sync_destination(
+            format, format, cache.writeback_stamp(producer).unwrap(), cached,
+        ).is_none());
+        assert!(super::color_sync_pending_write(sampled, &colors, &formats, &dirty));
+        assert!(!super::color_sync_pending_write(producer, &colors, &formats, &dirty));
+        assert!(!super::color_sync_pending_write(unrelated, &colors, &formats, &dirty));
+        assert!(!super::color_sync_pending_write(sampled, &colors, &formats, &[true, false]));
+
+        let completed_write = cache.mark_drawn(producer);
+        dirty.fill(false);
+        assert_eq!(super::color_region_sync_destination(
+            format, format, cache.writeback_stamp(producer).unwrap(), cached,
+        ), Some((format, previous_write)));
+        cache.mark_synced_sample_from(sampled, completed_write);
+        assert_eq!(cache.writeback_stamp(sampled), Some(completed_write));
+        assert!(!super::color_sync_pending_write(sampled, &colors, &formats, &dirty));
     }
 
     #[test]

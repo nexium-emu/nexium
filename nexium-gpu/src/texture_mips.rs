@@ -79,6 +79,33 @@ pub fn texture_rt_mip_candidate(tic: &TicEntry) -> bool {
         )
 }
 
+fn texture_rt_mip_source(
+    rt_cache: &RtCache,
+    want: RtKey,
+    format: vk::Format,
+) -> Option<(RtKey, vk::Image, vk::ImageLayout, u64)> {
+    let (key, image, _, layout, source_format) =
+        rt_cache.find_sampleable_color_for_exact_alias(want)?;
+    let stamp = rt_cache.writeback_stamp(key)?;
+    if !crate::renderer::rt_copy_formats_compatible(source_format, format)
+        || (want.depth > 1
+            && want.array_stride_bytes != 0
+            && key.array_stride_bytes != 0
+            && key.array_stride_bytes != want.array_stride_bytes)
+        || stamp == 0
+        || image == vk::Image::null()
+        || layout == vk::ImageLayout::UNDEFINED
+        || rt_cache.color_extent(key)
+            != Some(vk::Extent2D {
+                width: key.width,
+                height: key.height,
+            })
+    {
+        return None;
+    }
+    Some((key, image, layout, stamp))
+}
+
 pub fn find_texture_rt_mips(
     rt_cache: &RtCache,
     tic: &TicEntry,
@@ -127,11 +154,8 @@ pub fn find_texture_rt_mips(
                 width: padded_width as u32,
                 ..want
             };
-            let mut src_layer = 0;
-            let mut source = rt_cache
-                .find_drawn_color_for_exact_alias(want)
-                .or_else(|| rt_cache.find_drawn_color_for_exact_alias(padded));
-            if source.is_none() && layers > 1 {
+            let mut candidates = [Some((want, 0)), Some((padded, 0)), None, None];
+            if layers > 1 {
                 let level_va = tic.gpu_va.checked_add(mip.guest_offset as u64);
                 let level_cpu = base_key.cpu_addr.checked_add(mip.guest_offset as u64);
                 if let Some((level_va, level_cpu)) = level_va.zip(level_cpu) {
@@ -146,31 +170,20 @@ pub fn find_texture_rt_mips(
                     .with_guest_size_bytes(mip.guest_size as u64)
                     .with_block_linear_layout(0, mip.block_height_log2, 0, 0)
                     .with_array_layers(layers, layout.layer_stride as u64);
-                    let layered_padded = RtKey {
+                    candidates[2] = Some((layered, layer));
+                    candidates[3] = Some((RtKey {
                         width: padded_width as u32,
                         ..layered
-                    };
-                    source = rt_cache
-                        .find_drawn_color_for_exact_alias(layered)
-                        .or_else(|| rt_cache.find_drawn_color_for_exact_alias(layered_padded));
-                    src_layer = layer;
+                    }, layer));
                 }
             }
-            let Some((key, image, image_layout, source_format, stamp)) = source else {
+            let source = candidates.into_iter().flatten().filter_map(|(want, src_layer)| {
+                texture_rt_mip_source(rt_cache, want, format)
+                    .map(|(key, image, layout, stamp)| (key, image, layout, stamp, src_layer))
+            }).reduce(|best, candidate| if candidate.3 > best.3 { candidate } else { best });
+            let Some((key, image, image_layout, stamp, src_layer)) = source else {
                 continue;
             };
-            if !crate::renderer::rt_copy_formats_compatible(source_format, format)
-                || stamp == 0
-                || image == vk::Image::null()
-                || image_layout == vk::ImageLayout::UNDEFINED
-                || rt_cache.color_extent(key)
-                    != Some(vk::Extent2D {
-                        width: key.width,
-                        height: key.height,
-                    })
-            {
-                continue;
-            }
             out.push(TextureRtMip {
                 level: mip.level,
                 layer,
@@ -265,7 +278,7 @@ impl ResolvedTextureRtMipMemo {
     }
 }
 
-fn rt_mip_memo_enabled() -> bool {
+pub(crate) fn rt_mip_memo_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
@@ -277,7 +290,7 @@ fn rt_mip_memo_enabled() -> bool {
 
 #[derive(Clone)]
 struct TextureRtMipMemoEntry {
-    structure_generation: u64,
+    sampling_generation: (u64, u64),
     found: Vec<(u32, u32, u32, u32, u32, RtKey)>,
 }
 
@@ -302,16 +315,7 @@ fn resolve_memo_mip(
     entry: (u32, u32, u32, u32, u32, RtKey),
 ) -> Option<TextureRtMip> {
     let (level, layer, src_layer, width, height, key) = entry;
-    let (image, layout, source_format, extent, stamp) = rt_cache.resolve_drawn_color_exact(key)?;
-    if stamp == 0
-        || image == vk::Image::null()
-        || layout == vk::ImageLayout::UNDEFINED
-        || extent.width != key.width
-        || extent.height != key.height
-        || !crate::renderer::rt_copy_formats_compatible(source_format, format)
-    {
-        return None;
-    }
+    let (key, image, layout, stamp) = texture_rt_mip_source(rt_cache, key, format)?;
     Some(TextureRtMip {
         level,
         layer,
@@ -351,10 +355,10 @@ pub fn find_texture_rt_mips_memo(
         format.as_raw() as u32,
         tic.view_mip_levels(),
     );
-    let generation = rt_cache.structure_generation();
+    let generation = rt_cache.color_sampling_generation(base_key.nvmap_id);
     let mut memo = rt_mip_memo().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = memo.entries.get(&memo_key) {
-        if entry.structure_generation == generation {
+        if entry.sampling_generation == generation {
             let resolved: Option<Vec<TextureRtMip>> = entry
                 .found
                 .iter()
@@ -374,7 +378,7 @@ pub fn find_texture_rt_mips_memo(
     memo.entries.insert(
         memo_key,
         TextureRtMipMemoEntry {
-            structure_generation: generation,
+            sampling_generation: generation,
             found: out
                 .iter()
                 .map(|mip| (mip.level, mip.layer, mip.src_layer, mip.width, mip.height, mip.key))
@@ -512,7 +516,7 @@ mod tests {
         let second = mip_key(&tic, base, 1);
         insert_source(&mut cache, second, format, vk::Extent2D { width: second.width, height: second.height });
         cache.mark_cleared(second, true);
-        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 1);
+        assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 2);
         cache.mark_drawn(second);
         assert_eq!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).len(), 2);
         assert!(memo.misses > misses);
@@ -531,7 +535,9 @@ mod tests {
         assert_eq!(initial.len(), 1);
         assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
         cache.mark_cleared(key, true);
-        assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format).is_empty());
+        let cleared = assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format);
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].stamp > initial[0].stamp);
         cache.mark_drawn(key);
         assert!(assert_resolved_memo_matches(&mut memo, &cache, &tic, base, format)[0].stamp > initial[0].stamp);
         cache.mark_cleared(key, false);
@@ -622,6 +628,149 @@ mod tests {
         }
         assert_eq!(mips[7].key.width, 32);
         assert_eq!(mips[7].copy_region().extent.width, 4);
+    }
+
+    #[test]
+    fn newest_exact_or_padded_mip_write_wins_after_draws_and_clears() {
+        let (tic, base) = height_texture();
+        let exact = mip_key(&tic, base, 5);
+        let padded = RtKey { width: 32, ..exact };
+        let format = vk::Format::R16_SFLOAT;
+        let mut cache = RtCache::new();
+        let mut resolved = ResolvedTextureRtMipMemo::default();
+        for key in [exact, padded] {
+            insert_source(&mut cache, key, format,
+                vk::Extent2D { width: key.width, height: key.height });
+        }
+        for (key, clear) in [(padded, false), (exact, true), (padded, true), (exact, false)] {
+            if clear {
+                cache.mark_cleared(key, true);
+                assert_eq!(cache.drawn_stamp(key), None);
+            } else {
+                cache.mark_drawn(key);
+            }
+            let mips = assert_resolved_memo_matches(&mut resolved, &cache, &tic, base, format);
+            assert_eq!(mips.len(), 1);
+            assert_eq!(mips[0].key, key);
+            assert_eq!(mips[0].stamp, cache.writeback_stamp(key).unwrap());
+            assert_eq!(mips[0].width, exact.width);
+            assert_eq!(mips[0].src_layer, 0);
+            let memoized = find_texture_rt_mips_memo(&cache, || 0x8a547613, &tic, base, format);
+            assert_eq!(memoized.len(), 1);
+            assert_eq!(memoized[0].key, key);
+            assert_eq!(memoized[0].stamp, mips[0].stamp);
+        }
+    }
+
+    #[test]
+    fn newer_layered_mip_replaces_old_slices_and_preserves_source_layer() {
+        let (mut tic, mut base) = height_texture();
+        tic.texture_type = 5;
+        tic.depth = 3;
+        let layout = block_linear_mip_layout(&tic).unwrap();
+        base.guest_size_bytes = layout.guest_size_bytes(tic.depth) as u64;
+        let level = mip_key(&tic, base, 5);
+        let layered = level.with_array_layers(tic.depth, layout.layer_stride as u64);
+        let padded = RtKey { width: 32, ..layered };
+        let format = vk::Format::R16_SFLOAT;
+        let mut cache = RtCache::new();
+        let mut slices = Vec::new();
+        for layer in 0..tic.depth {
+            let offset = layer as u64 * layout.layer_stride as u64;
+            let key = RtKey {
+                gpu_va: level.gpu_va + offset,
+                cpu_addr: level.cpu_addr + offset,
+                ..level
+            };
+            slices.push(key);
+            insert_source(&mut cache, key, format,
+                vk::Extent2D { width: key.width, height: key.height });
+        }
+        for key in [layered, padded] {
+            insert_source(&mut cache, key, format,
+                vk::Extent2D { width: key.width, height: key.height });
+            let mips = find_texture_rt_mips(&cache, &tic, base, format);
+            assert_eq!(mips.len(), tic.depth as usize);
+            for (layer, mip) in mips.iter().enumerate() {
+                assert_eq!(mip.key, key);
+                assert_eq!(mip.layer, layer as u32);
+                assert_eq!(mip.src_layer, layer as u32);
+                assert_eq!(mip.copy_region().src_subresource.base_array_layer, layer as u32);
+            }
+        }
+        cache.mark_cleared(layered, true);
+        assert!(find_texture_rt_mips(&cache, &tic, base, format).iter()
+            .all(|mip| mip.key == layered));
+        cache.mark_drawn(slices[1]);
+        let mips = find_texture_rt_mips(&cache, &tic, base, format);
+        assert_eq!(mips[0].key, layered);
+        assert_eq!(mips[1].key, slices[1]);
+        assert_eq!(mips[1].src_layer, 0);
+        assert_eq!(mips[1].layer, 1);
+        assert_eq!(mips[2].key, layered);
+    }
+
+    #[test]
+    fn newer_layered_mip_with_wrong_stride_cannot_replace_valid_slices() {
+        let (mut tic, mut base) = height_texture();
+        tic.texture_type = 5;
+        tic.depth = 3;
+        let layout = block_linear_mip_layout(&tic).unwrap();
+        base.guest_size_bytes = layout.guest_size_bytes(tic.depth) as u64;
+        let level = mip_key(&tic, base, 5);
+        let format = vk::Format::R16_SFLOAT;
+        let mut cache = RtCache::new();
+        let mut slices = Vec::new();
+        for layer in 0..tic.depth {
+            let offset = layer as u64 * layout.layer_stride as u64;
+            let key = RtKey {
+                gpu_va: level.gpu_va + offset,
+                cpu_addr: level.cpu_addr + offset,
+                ..level
+            };
+            slices.push(key);
+            insert_source(&mut cache, key, format,
+                vk::Extent2D { width: key.width, height: key.height });
+        }
+        for width in [level.width, 32] {
+            let key = RtKey { width, ..level }
+                .with_array_layers(tic.depth, layout.layer_stride as u64 + 512);
+            insert_source(&mut cache, key, format,
+                vk::Extent2D { width: key.width, height: key.height });
+            cache.mark_cleared(key, true);
+            let mips = find_texture_rt_mips(&cache, &tic, base, format);
+            assert_eq!(mips.len(), slices.len());
+            for (mip, slice) in mips.iter().zip(&slices) {
+                assert_eq!(mip.key, *slice);
+                assert_eq!(mip.src_layer, 0);
+                assert!(mip.stamp < cache.writeback_stamp(key).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_ineligible_newer_mip_before_selecting_valid_alternate() {
+        let (tic, base) = height_texture();
+        let exact = mip_key(&tic, base, 5);
+        let padded = RtKey { width: 32, ..exact };
+        let format = vk::Format::R16_SFLOAT;
+        for invalid in 0..4 {
+            let mut cache = RtCache::new();
+            insert_source(&mut cache, padded, format,
+                vk::Extent2D { width: padded.width, height: padded.height });
+            insert_source(&mut cache, exact,
+                if invalid == 0 { vk::Format::R8G8B8A8_UNORM } else { format },
+                vk::Extent2D { width: exact.width, height: exact.height });
+            match invalid {
+                1 => cache.mark_guest_written(exact),
+                2 => cache.set_color_layout(exact, vk::ImageLayout::UNDEFINED),
+                3 => cache.get_existing(exact).unwrap().image = vk::Image::null(),
+                _ => {},
+            }
+            let mips = find_texture_rt_mips(&cache, &tic, base, format);
+            assert_eq!(mips.len(), 1);
+            assert_eq!(mips[0].key, padded);
+        }
     }
 
     #[test]

@@ -402,6 +402,14 @@ pub struct RtColorRegion {
     pub src_y: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RtDepthRegion {
+    pub key: RtKey,
+    pub image: vk::Image,
+    pub layout: vk::ImageLayout,
+    pub generation: u64,
+}
+
 fn dims_close(a: u32, b: u32) -> bool {
     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
     lo != 0 && hi <= lo.saturating_mul(2)
@@ -455,6 +463,39 @@ fn alias_view_metadata_changed(stored: RtKey, want: RtKey) -> bool {
         || (want.cpu_addr != 0 && stored.cpu_addr != want.cpu_addr)
         || (want.mapping_epoch != 0 && stored.mapping_epoch != want.mapping_epoch)
         || (want.layout_signature != 0 && stored.layout_signature != want.layout_signature)
+}
+
+fn color_sync_row_stride(key: RtKey, format: vk::Format) -> Option<u64> {
+    let bpp = usize::try_from(rt_format_bytes(format)).ok()?;
+    let size = u64::try_from(crate::texture::native_render_target_source_size(
+        key.width,
+        key.height,
+        key.depth,
+        bpp,
+        key.layout_signature,
+    )?).ok()?;
+    let (height, depth) = match key.layout_signature & 0xff {
+        1 => {
+            let block_height = 8u64.checked_shl(((key.layout_signature >> 16) & 0xff) as u32)?;
+            let block_depth = 1u64.checked_shl(((key.layout_signature >> 24) & 0xff) as u32)?;
+            (
+                u64::from(key.height).div_ceil(block_height).checked_mul(block_height)?,
+                u64::from(key.depth).div_ceil(block_depth).checked_mul(block_depth)?,
+            )
+        }
+        2 => (u64::from(key.height), u64::from(key.depth)),
+        _ => return None,
+    };
+    size.checked_div(height)?.checked_div(depth)
+}
+
+fn color_sync_layout_compatible(candidate: RtKey, want: RtKey, format: vk::Format) -> bool {
+    candidate.layout_signature == 0
+        || want.layout_signature == 0
+        || (candidate.layout_signature == want.layout_signature
+            && color_sync_row_stride(candidate, format)
+                .zip(color_sync_row_stride(want, format))
+                .is_some_and(|(source, destination)| source == destination))
 }
 
 fn color_alias_sync_identity(candidate: RtKey, want: RtKey) -> bool {
@@ -516,6 +557,12 @@ pub struct RtCache {
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     drawn_stamp: HashMap<RtKey, u64>,
     clear_stamp: HashMap<RtKey, u64>,
+    full_clear_stamp: HashMap<RtKey, u64>,
+    depth_full_clear_generation: HashMap<RtKey, u64>,
+    color_region_sources: HashMap<RtKey, (RtKey, vk::Image, u64)>,
+    depth_region_sources: HashMap<RtKey, (RtKey, vk::Image, u64)>,
+    pending_view_retirement: HashSet<(bool, RtKey)>,
+    view_retirement_epoch: u64,
     guest_stale_color: HashSet<RtKey>,
     guest_stale_depth: HashSet<RtKey>,
     present_excluded: HashSet<RtKey>,
@@ -808,6 +855,12 @@ impl RtCache {
             mem_properties: None,
             drawn_stamp: HashMap::default(),
             clear_stamp: HashMap::default(),
+            full_clear_stamp: HashMap::default(),
+            depth_full_clear_generation: HashMap::default(),
+            color_region_sources: HashMap::default(),
+            depth_region_sources: HashMap::default(),
+            pending_view_retirement: HashSet::default(),
+            view_retirement_epoch: 0,
             guest_stale_color: HashSet::default(),
             guest_stale_depth: HashSet::default(),
             present_excluded: HashSet::default(),
@@ -815,7 +868,9 @@ impl RtCache {
             drawn_counter: 0,
             structure_generation: 0,
             color_sampling_generation: 0,
-            color_sampling_versions: (cfg!(test) || crate::texture_mips::resolved_rt_mip_memo_enabled()).then(HashMap::default),
+            color_sampling_versions: (cfg!(test)
+                || crate::texture_mips::resolved_rt_mip_memo_enabled()
+                || crate::texture_mips::rt_mip_memo_enabled()).then(HashMap::default),
             frame_draws: HashMap::default(),
             frame_real_draws: HashMap::default(),
             depth_frame_draws: HashMap::default(),
@@ -1023,6 +1078,8 @@ impl RtCache {
         rekey_hash_map_value(&mut self.snapshots, canonical, key);
         rekey_hash_map_value(&mut self.drawn_stamp, canonical, key);
         rekey_hash_map_value(&mut self.clear_stamp, canonical, key);
+        rekey_hash_map_value(&mut self.full_clear_stamp, canonical, key);
+        self.rekey_retirement_state(false, canonical, key);
         rekey_hash_set(&mut self.guest_stale_color, canonical, key);
         rekey_hash_set(&mut self.present_excluded, canonical, key);
         rekey_hash_map_value(&mut self.present_flip_y, canonical, key);
@@ -1060,6 +1117,8 @@ impl RtCache {
         }
         rekey_hash_set(&mut self.guest_stale_depth, canonical, key);
         rekey_hash_map_value(&mut self.depth_generations, canonical, key);
+        rekey_hash_map_value(&mut self.depth_full_clear_generation, canonical, key);
+        self.rekey_retirement_state(true, canonical, key);
         let shadow_generations = std::mem::take(&mut self.depth_shadow_generations);
         for (mut shadow, (mut source, generation)) in shadow_generations {
             if shadow == canonical {
@@ -1147,6 +1206,9 @@ impl RtCache {
             .map(|entry| entry.key);
         let (canonical, image) = self.cache.remove_entry(&key)?;
         self.clear_stamp.remove(&canonical);
+        self.full_clear_stamp.remove(&canonical);
+        self.color_region_sources.retain(|key, (source, _, _)| *key != canonical && *source != canonical);
+        self.pending_view_retirement.remove(&(false, canonical));
         self.unindex_color_lookup(indexed_key.unwrap_or(canonical), image.format);
         if remove_guest_range(
             &mut self.color_guest_ranges,
@@ -1184,6 +1246,9 @@ impl RtCache {
     fn forget_depth_tracking(&mut self, key: RtKey) {
         let canonical = self.canonical_depth_key(key);
         self.depth_generations.remove(&canonical);
+        self.depth_full_clear_generation.remove(&canonical);
+        self.depth_region_sources.retain(|key, (source, _, _)| *key != canonical && *source != canonical);
+        self.pending_view_retirement.remove(&(true, canonical));
         self.guest_stale_depth.remove(&canonical);
         self.depth_shadow_generations.retain(|shadow, (source, _)| {
             *shadow != canonical
@@ -1195,10 +1260,42 @@ impl RtCache {
     pub(crate) fn mark_depth_written(&mut self, key: RtKey) -> u64 {
         let canonical = self.canonical_depth_key(key);
         self.guest_stale_depth.remove(&canonical);
+        self.depth_region_sources.remove(&canonical);
         *self.depth_frame_draws.entry(canonical).or_insert(0) += 1;
         let generation = self.next_depth_generation();
         self.depth_generations.insert(canonical, generation);
         generation
+    }
+
+    pub(crate) fn mark_depth_synced_from(&mut self, key: RtKey, generation: u64) {
+        let canonical = self.canonical_depth_key(key);
+        self.guest_stale_depth.remove(&canonical);
+        self.depth_full_clear_generation.remove(&canonical);
+        self.depth_region_sources.remove(&canonical);
+        self.depth_generations.insert(canonical, generation);
+        self.depth_generation_counter = self.depth_generation_counter.max(generation);
+    }
+
+    pub(crate) fn mark_depth_cleared(&mut self, key: RtKey, full_target: bool) -> u64 {
+        let generation = self.mark_depth_written(key);
+        let canonical = self.canonical_depth_key(key);
+        if full_target {
+            self.depth_full_clear_generation.insert(canonical, generation);
+            self.pending_view_retirement.insert((true, canonical));
+        }
+        generation
+    }
+
+    pub(crate) fn mark_depth_region_synced(&mut self, key: RtKey, source: RtKey, generation: u64) {
+        self.mark_depth_synced_from(key, generation);
+        let key = self.canonical_depth_key(key);
+        let source = self.canonical_depth_key(source);
+        if key != source {
+            if let Some(image) = self.depth_cache.get(&source) {
+                self.depth_region_sources.insert(key, (source, image.image, self.view_retirement_epoch));
+                self.pending_view_retirement.insert((true, key));
+            }
+        }
     }
 
     pub(crate) fn depth_generation(&self, key: RtKey) -> Option<u64> {
@@ -1372,6 +1469,7 @@ impl RtCache {
 
     pub fn mark_drawn(&mut self, key: RtKey) -> u64 {
         self.note_color_sampling_changed(key.nvmap_id);
+        self.color_region_sources.remove(&key);
         self.clear_stamp.remove(&key);
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
@@ -1407,6 +1505,8 @@ impl RtCache {
 
     pub fn mark_synced_sample(&mut self, key: RtKey) -> u64 {
         self.note_color_sampling_changed(key.nvmap_id);
+        self.full_clear_stamp.remove(&key);
+        self.color_region_sources.remove(&key);
         self.clear_stamp.remove(&key);
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
@@ -1417,6 +1517,8 @@ impl RtCache {
 
     pub fn mark_synced_sample_from(&mut self, key: RtKey, source_stamp: u64) -> u64 {
         self.note_color_sampling_changed(key.nvmap_id);
+        self.full_clear_stamp.remove(&key);
+        self.color_region_sources.remove(&key);
         debug_assert_ne!(source_stamp, 0);
         self.clear_stamp.remove(&key);
         self.drawn_counter = self.drawn_counter.max(source_stamp);
@@ -1424,6 +1526,17 @@ impl RtCache {
         self.guest_stale_color.remove(&key);
         self.present_excluded.insert(key);
         source_stamp
+    }
+
+    pub(crate) fn mark_color_region_synced(&mut self, key: RtKey, source: RtKey, stamp: u64) -> u64 {
+        self.mark_synced_sample_from(key, stamp);
+        if key != source {
+            if let Some((source, image)) = self.cache.get_key_value(&source) {
+                self.color_region_sources.insert(key, (*source, image.image, self.view_retirement_epoch));
+                self.pending_view_retirement.insert((false, key));
+            }
+        }
+        stamp
     }
 
     pub fn mark_guest_uploaded(&mut self, key: RtKey) {
@@ -1435,6 +1548,8 @@ impl RtCache {
             .unwrap_or(key);
         self.drawn_stamp.remove(&canonical);
         self.clear_stamp.remove(&canonical);
+        self.full_clear_stamp.remove(&canonical);
+        self.color_region_sources.retain(|key, (source, _, _)| *key != canonical && *source != canonical);
         self.guest_stale_color.remove(&canonical);
         self.present_excluded.insert(canonical);
         self.frame_draws.remove(&canonical);
@@ -1452,6 +1567,8 @@ impl RtCache {
         for stale_key in stale {
             self.drawn_stamp.remove(&stale_key);
             self.clear_stamp.remove(&stale_key);
+            self.full_clear_stamp.remove(&stale_key);
+            self.color_region_sources.retain(|key, (source, _, _)| *key != stale_key && *source != stale_key);
             self.guest_stale_color.insert(stale_key);
             self.present_excluded.insert(stale_key);
             self.frame_draws.remove(&stale_key);
@@ -1465,6 +1582,8 @@ impl RtCache {
             .collect();
         for stale_key in stale_depth {
             self.mark_depth_written(stale_key);
+            self.depth_full_clear_generation.remove(&stale_key);
+            self.depth_region_sources.retain(|key, (source, _, _)| *key != stale_key && *source != stale_key);
             self.guest_stale_depth.insert(stale_key);
         }
     }
@@ -1475,6 +1594,8 @@ impl RtCache {
         for key in stale_color {
             self.drawn_stamp.remove(&key);
             self.clear_stamp.remove(&key);
+            self.full_clear_stamp.remove(&key);
+            self.color_region_sources.retain(|target, (source, _, _)| *target != key && *source != key);
             self.guest_stale_color.insert(key);
             self.present_excluded.insert(key);
             self.frame_draws.remove(&key);
@@ -1483,6 +1604,8 @@ impl RtCache {
         let stale_depth = self.depth_cache.keys().copied().collect::<Vec<_>>();
         for key in stale_depth {
             self.mark_depth_written(key);
+            self.depth_full_clear_generation.remove(&key);
+            self.depth_region_sources.retain(|target, (source, _, _)| *target != key && *source != key);
             self.guest_stale_depth.insert(key);
         }
     }
@@ -1518,6 +1641,8 @@ impl RtCache {
             self.note_color_sampling_changed(stale_key.nvmap_id);
             self.drawn_stamp.remove(&stale_key);
             self.clear_stamp.remove(&stale_key);
+            self.full_clear_stamp.remove(&stale_key);
+            self.color_region_sources.retain(|key, (source, _, _)| *key != stale_key && *source != stale_key);
             self.guest_stale_color.insert(stale_key);
             self.present_excluded.insert(stale_key);
             self.frame_draws.remove(&stale_key);
@@ -1525,6 +1650,8 @@ impl RtCache {
         }
         for stale_key in stale_depth {
             self.mark_depth_written(stale_key);
+            self.depth_full_clear_generation.remove(&stale_key);
+            self.depth_region_sources.retain(|key, (source, _, _)| *key != stale_key && *source != stale_key);
             self.guest_stale_depth.insert(stale_key);
         }
     }
@@ -1650,9 +1777,12 @@ impl RtCache {
 
     pub fn mark_cleared(&mut self, key: RtKey, full_target: bool) {
         self.note_color_sampling_changed(key.nvmap_id);
+        self.color_region_sources.remove(&key);
         self.drawn_counter += 1;
         self.clear_stamp.insert(key, self.drawn_counter);
         if full_target {
+            self.full_clear_stamp.insert(key, self.drawn_counter);
+            self.pending_view_retirement.insert((false, key));
             self.drawn_stamp.remove(&key);
             self.guest_stale_color.remove(&key);
         } else if self.drawn_stamp.contains_key(&key) {
@@ -1973,6 +2103,19 @@ impl RtCache {
             .copied()
     }
 
+    fn rekey_retirement_state(&mut self, depth: bool, old: RtKey, new: RtKey) {
+        let sources = if depth { &mut self.depth_region_sources } else { &mut self.color_region_sources };
+        rekey_hash_map_value(sources, old, new);
+        for (source, _, _) in sources.values_mut() {
+            if *source == old {
+                *source = new;
+            }
+        }
+        if self.pending_view_retirement.remove(&(depth, old)) {
+            self.pending_view_retirement.insert((depth, new));
+        }
+    }
+
     pub fn debug_all(&self) -> Vec<(RtKey, u64)> {
         let mut out: Vec<(RtKey, u64)> = self
             .cache
@@ -2256,10 +2399,14 @@ impl RtCache {
             if stored == key
                 || (!same_gpu_base && !same_physical_backing(stored, key))
                 || !color_alias_sync_identity(stored, key)
+                || !color_sync_layout_compatible(stored, key, img.format)
             {
                 continue;
             }
-            let Some(stamp) = self.drawn_stamp.get(&stored).copied() else {
+            if self.color_is_guest_stale(stored) || img.layout == vk::ImageLayout::UNDEFINED {
+                continue;
+            }
+            let Some(stamp) = self.writeback_stamp(stored) else {
                 continue;
             };
             out.push((stored, img.image, img.layout, img.format, stamp));
@@ -2284,10 +2431,14 @@ impl RtCache {
                 || *stored == key
                 || (!same_gpu_base && !same_physical_backing(*stored, key))
                 || !color_alias_sync_identity(*stored, key)
+                || !color_sync_layout_compatible(*stored, key, img.format)
             {
                 continue;
             }
-            let Some(stamp) = self.drawn_stamp.get(stored).copied() else {
+            if self.color_is_guest_stale(*stored) || img.layout == vk::ImageLayout::UNDEFINED {
+                continue;
+            }
+            let Some(stamp) = self.writeback_stamp(*stored) else {
                 continue;
             };
             out.push((*stored, img.image, img.layout, img.format, stamp));
@@ -2801,6 +2952,55 @@ impl RtCache {
             image.format,
             image.aspects,
         ))
+    }
+
+    pub(crate) fn find_sampleable_d32_region(&self, want: RtKey) -> Option<RtDepthRegion> {
+        if want.gpu_va == 0
+            || want.layout_signature == 0
+            || want.depth != 1
+            || want.is_3d
+            || want.sample_width != 1
+            || want.sample_height != 1
+        {
+            return None;
+        }
+        self.depth_cache
+            .iter()
+            .filter_map(|(key, image)| {
+                if key.nvmap_id != want.nvmap_id
+                    || key.gpu_va != want.gpu_va
+                    || key.layout_signature == 0
+                    || alias_view_metadata_changed(*key, want)
+                    || key.depth != 1
+                    || key.is_3d
+                    || key.sample_width != 1
+                    || key.sample_height != 1
+                    || key.width < want.width
+                    || key.height < want.height
+                    || !color_sync_layout_compatible(*key, want, vk::Format::D32_SFLOAT)
+                    || image.base_format != vk::Format::D32_SFLOAT
+                    || image.format != vk::Format::D32_SFLOAT
+                    || image.aspects != vk::ImageAspectFlags::DEPTH
+                    || image.layout == vk::ImageLayout::UNDEFINED
+                    || self.depth_is_guest_stale(*key)
+                {
+                    return None;
+                }
+                let generation = self.depth_generations.get(key).copied().filter(|stamp| *stamp != 0)?;
+                Some(RtDepthRegion {
+                    key: *key,
+                    image: image.image,
+                    layout: image.layout,
+                    generation,
+                })
+            })
+            .max_by_key(|region| {
+                (
+                    region.generation,
+                    region.key.same_alias_view_identity(want),
+                    std::cmp::Reverse(u64::from(region.key.width) * u64::from(region.key.height)),
+                )
+            })
     }
 
     pub fn find_d24_depth_covering(
@@ -3366,7 +3566,13 @@ impl RtCache {
             if is_synthetic_copy_key(stored) || excluded == Some(stored) {
                 continue;
             }
-            if excluded.is_some_and(|want| !color_region_sync_identity(stored, want)) {
+            if excluded.is_some_and(|want| {
+                !color_region_sync_identity(stored, want)
+                    || !color_sync_layout_compatible(stored, want, img.format)
+                    || (stored.layout_signature != 0
+                        && want.layout_signature != 0
+                        && stored.gpu_va != want.gpu_va)
+            }) {
                 continue;
             }
             let Some((src_x, src_y, exact)) =
@@ -3374,7 +3580,15 @@ impl RtCache {
             else {
                 continue;
             };
-            let Some(stamp) = self.drawn_stamp.get(&stored).copied() else {
+            let stamp = if excluded.is_some() {
+                if self.color_is_guest_stale(stored) || img.layout == vk::ImageLayout::UNDEFINED {
+                    continue;
+                }
+                self.writeback_stamp(stored)
+            } else {
+                self.drawn_stamp.get(&stored).copied()
+            };
+            let Some(stamp) = stamp else {
                 continue;
             };
             let area = stored.width as u64 * stored.height as u64;
@@ -3660,6 +3874,12 @@ impl RtCache {
         }
         self.clear_color_lookup_index();
         self.clear_stamp.clear();
+        self.full_clear_stamp.clear();
+        self.depth_full_clear_generation.clear();
+        self.color_region_sources.clear();
+        self.depth_region_sources.clear();
+        self.pending_view_retirement.clear();
+        self.view_retirement_epoch = 0;
         self.note_guest_ranges_changed();
         self.guest_hit_memo.clear();
         self.color_guest_ranges.clear();
@@ -4126,6 +4346,90 @@ mod tests {
         }
     }
 
+    fn test_d32_image(key: RtKey) -> GpuImage {
+        GpuImage {
+            format: vk::Format::D32_SFLOAT,
+            base_format: vk::Format::D32_SFLOAT,
+            aspects: vk::ImageAspectFlags::DEPTH,
+            extent: vk::Extent2D { width: key.width, height: key.height },
+            ..test_depth_image()
+        }
+    }
+
+    #[test]
+    fn d32_region_uses_newest_padded_write_and_inherits_generation() {
+        let source = RtKey::with_cpu(12, 1616, 908, 0x520000000, 0x800000)
+            .with_mapping_epoch(3)
+            .with_block_linear_layout(0, 4, 0, 0);
+        let sampled = RtKey { width: 1614, ..source };
+        let mut cache = RtCache::new();
+        cache.depth_cache.insert(source, test_d32_image(source));
+        cache.depth_cache.insert(sampled, test_d32_image(sampled));
+        cache.mark_depth_written(sampled);
+        let producer_write = cache.mark_depth_written(source);
+        assert_eq!(cache.find_sampleable_d32_region(sampled).unwrap().key, source);
+
+        cache.mark_depth_synced_from(sampled, producer_write);
+        assert_eq!(cache.depth_generation(sampled), Some(producer_write));
+        assert_eq!(cache.find_sampleable_d32_region(sampled).unwrap().key, sampled);
+
+        let cleared = cache.mark_depth_written(source);
+        assert!(cleared > producer_write);
+        let region = cache.find_sampleable_d32_region(sampled).unwrap();
+        assert_eq!(region.key, source);
+        assert_eq!(region.generation, cleared);
+        cache.mark_depth_synced_from(sampled, cleared);
+        cache.mark_depth_written(sampled);
+        assert_eq!(cache.find_sampleable_d32_region(sampled).unwrap().key, sampled);
+        cache.depth_cache.clear();
+    }
+
+    #[test]
+    fn d32_region_requires_known_matching_physical_rows() {
+        let source = RtKey::with_cpu(12, 1632, 916, 0x520000000, 0x800000)
+            .with_mapping_epoch(3)
+            .with_block_linear_layout(0, 4, 0, 0);
+        let sampled = RtKey { width: 1630, ..source };
+        let mut cache = RtCache::new();
+        cache.depth_cache.insert(source, test_d32_image(source));
+        cache.mark_depth_written(source);
+        assert_eq!(cache.find_sampleable_d32_region(sampled).unwrap().key, source);
+        for rejected in [
+            RtKey { width: 1614, ..sampled },
+            RtKey { layout_signature: 0, ..sampled },
+            sampled.with_block_linear_layout(0, 3, 0, 0),
+            sampled.with_mapping_epoch(4),
+            sampled.with_base_layer(1),
+            sampled.with_sample_grid(2, 1),
+            sampled.with_array_layers(2, 0x800000),
+            RtKey { gpu_va: sampled.gpu_va + 64, ..sampled },
+            RtKey { cpu_addr: sampled.cpu_addr + 64, ..sampled },
+        ] {
+            assert!(cache.find_sampleable_d32_region(rejected).is_none(), "{rejected:?}");
+        }
+        cache.guest_stale_depth.insert(source);
+        assert!(cache.find_sampleable_d32_region(sampled).is_none());
+        cache.guest_stale_depth.remove(&source);
+        cache.depth_cache.get_mut(&source).unwrap().layout = vk::ImageLayout::UNDEFINED;
+        assert!(cache.find_sampleable_d32_region(sampled).is_none());
+        cache.depth_cache.get_mut(&source).unwrap().layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        cache.depth_cache.get_mut(&source).unwrap().base_format = vk::Format::D24_UNORM_S8_UINT;
+        assert!(cache.find_sampleable_d32_region(sampled).is_none());
+        cache.depth_cache.clear();
+    }
+
+    #[test]
+    fn d32_region_rejects_full_size_depth_with_a_different_pitch() {
+        let source = RtKey::new(12, 1920, 1080, 0x520000000)
+            .with_block_linear_layout(0, 4, 0, 0);
+        let sampled = RtKey { width: 1614, height: 908, ..source };
+        let mut cache = RtCache::new();
+        cache.depth_cache.insert(source, test_d32_image(source));
+        cache.mark_depth_written(source);
+        assert!(cache.find_sampleable_d32_region(sampled).is_none());
+        cache.depth_cache.clear();
+    }
+
     fn test_color_image(format: vk::Format, base_format: vk::Format) -> GpuImage {
         GpuImage {
             image: vk::Image::null(),
@@ -4392,6 +4696,175 @@ mod tests {
             cache.find_drawn_color_region_at_excluding(1200, 675, VA, target).unwrap().key,
             old
         );
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn alias_sync_tracks_full_clears_without_presenting_them() {
+        const CPU: u64 = 0x1710_0000;
+        let source = RtKey::with_cpu(43, 32, 32, 0x6200_8000, CPU);
+        let target = RtKey::with_cpu(43, 32, 32, 0x6201_8000, CPU);
+        let mut cache = RtCache::new();
+        for key in [source, target] {
+            cache.insert_color_image(
+                key,
+                test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+            );
+        }
+        let old_stamp = cache.mark_drawn(source);
+        cache.mark_synced_sample_from(target, old_stamp);
+        cache.mark_cleared(source, true);
+        let clear_stamp = cache.writeback_stamp(source).unwrap();
+        let aliases = cache.drawn_color_aliases(target);
+        assert_eq!(aliases.len(), 1);
+        assert_eq!((aliases[0].0, aliases[0].4), (source, clear_stamp));
+        assert!(clear_stamp > old_stamp);
+        assert_eq!(aliases, cache.drawn_color_aliases_full_scan(target));
+        assert_eq!(cache.drawn_stamp(source), None);
+        assert_eq!(cache.present_candidates(source), vec![(source, 0)]);
+        assert_eq!(
+            cache.newest_exact_present_key_at_vas(43, 32, 32, &[source.gpu_va]),
+            None
+        );
+        assert!(cache.find_drawn_color_at(32, 32, source.gpu_va).is_none());
+
+        cache.cache.get_mut(&source).unwrap().layout = vk::ImageLayout::UNDEFINED;
+        assert!(cache.drawn_color_aliases(target).is_empty());
+        assert!(cache.drawn_color_aliases_full_scan(target).is_empty());
+        cache.cache.get_mut(&source).unwrap().layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        cache.mark_guest_written(source);
+        assert!(cache.drawn_color_aliases(target).is_empty());
+        assert!(cache.drawn_color_aliases_full_scan(target).is_empty());
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn region_sync_prefers_a_new_full_clear_over_old_draws() {
+        const VA: u64 = 0x6200_3000;
+        let target = RtKey::new(41, 1200, 675, VA);
+        let old = RtKey::new(41, 1216, 675, VA);
+        let current = RtKey::new(41, 1280, 720, VA);
+        let mut cache = RtCache::new();
+        for key in [target, old, current] {
+            cache.insert_color_image(
+                key,
+                test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+            );
+        }
+        let old_stamp = cache.mark_drawn(old);
+        cache.mark_synced_sample_from(target, old_stamp);
+        cache.mark_drawn(current);
+        cache.mark_cleared(current, true);
+        let clear_stamp = cache.writeback_stamp(current).unwrap();
+        let source = cache
+            .find_drawn_color_region_at_excluding(1200, 675, VA, target)
+            .unwrap();
+        assert_eq!((source.key, source.stamp), (current, clear_stamp));
+        assert!(clear_stamp > old_stamp);
+        assert_eq!(
+            region_signature(Some(source)),
+            region_signature(cache.find_drawn_color_region_at_full_scan(1200, 675, VA, Some(target)))
+        );
+        assert_eq!(cache.find_drawn_color_region_at(1200, 675, VA).unwrap().key, target);
+        assert!(cache.find_drawn_color_region_at(1280, 720, VA).is_none());
+
+        cache.cache.get_mut(&current).unwrap().layout = vk::ImageLayout::UNDEFINED;
+        assert_eq!(
+            cache.find_drawn_color_region_at_excluding(1200, 675, VA, target).unwrap().key,
+            old
+        );
+        cache.cache.get_mut(&current).unwrap().layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        cache.mark_guest_written(current);
+        assert_eq!(
+            cache.find_drawn_color_region_at_excluding(1200, 675, VA, target).unwrap().key,
+            old
+        );
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn color_sync_layout_matches_physical_row_stride() {
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let key = RtKey::new(41, 1280, 720, 0x6200_3000);
+        let tiled = key.with_block_linear_layout(0, 4, 0, 0);
+        let half = RtKey { width: 640, height: 360, ..tiled };
+        assert!(!super::color_sync_layout_compatible(tiled, half, format));
+        assert_eq!(super::color_sync_row_stride(tiled, format), Some(5120));
+        let padded = RtKey { width: 1248, height: 700, ..tiled };
+        let logical = RtKey { width: 1245, ..padded };
+        assert!(super::color_sync_layout_compatible(padded, logical, format));
+        assert_eq!(super::color_sync_row_stride(logical, format), Some(4992));
+
+        let block_wide = tiled.with_block_linear_layout(4, 4, 0, 0);
+        let logical = RtKey { width: 1200, height: 675, ..block_wide };
+        assert!(super::color_sync_layout_compatible(block_wide, logical, format));
+        assert_eq!(super::color_sync_row_stride(logical, format), Some(5120));
+        assert!(!super::color_sync_layout_compatible(
+            tiled, RtKey { width: 1200, height: 675, ..tiled }, format
+        ));
+
+        let spaced = padded.with_block_linear_layout(0, 4, 0, 3);
+        let logical = RtKey { width: 1200, height: 675, ..spaced };
+        assert!(super::color_sync_layout_compatible(spaced, logical, format));
+        assert!(!super::color_sync_layout_compatible(
+            spaced, RtKey { height: 64, ..logical }, format
+        ));
+        let volume = padded.with_volume_depth(2).with_block_linear_layout(0, 4, 1, 3);
+        assert!(!super::color_sync_layout_compatible(
+            volume, RtKey { width: 1200, depth: 1, ..volume }, format
+        ));
+
+        let pitched = key.with_pitch_linear_layout(5120);
+        assert!(super::color_sync_layout_compatible(
+            pitched, RtKey { width: 640, height: 360, ..pitched }, format
+        ));
+        assert!(!super::color_sync_layout_compatible(
+            pitched, half.with_pitch_linear_layout(2560), format
+        ));
+        let invalid_pitch = key.with_pitch_linear_layout(2560);
+        assert!(!super::color_sync_layout_compatible(invalid_pitch, invalid_pitch, format));
+        let invalid_layout = RtKey { layout_signature: 3, ..key };
+        assert!(!super::color_sync_layout_compatible(invalid_layout, invalid_layout, format));
+        assert!(super::color_sync_layout_compatible(
+            key, RtKey { width: 640, height: 360, ..key }, format
+        ));
+        assert!(super::color_sync_layout_compatible(tiled, key, format));
+    }
+
+    #[test]
+    fn region_sync_rejects_resized_backing_but_accepts_row_padding() {
+        const VA: u64 = 0x6200_3000;
+        let target = RtKey::new(41, 1245, 700, VA).with_block_linear_layout(0, 4, 0, 0);
+        let padded = RtKey { width: 1248, ..target };
+        let resized = RtKey { width: 1280, height: 720, ..target };
+        let mut cache = RtCache::new();
+        for key in [padded, resized] {
+            cache.insert_color_image(
+                key,
+                test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+            );
+            cache.mark_drawn(key);
+        }
+        let source = cache.find_drawn_color_region_at_excluding(1245, 700, VA, target).unwrap();
+        assert_eq!(source.key, padded);
+        assert_eq!(
+            cache.drawn_color_aliases(target).iter().map(|entry| entry.0).collect::<Vec<_>>(),
+            vec![padded]
+        );
+        assert_eq!(cache.drawn_color_aliases(target), cache.drawn_color_aliases_full_scan(target));
+        let half = RtKey { width: 640, height: 360, ..target };
+        assert!(cache.find_drawn_color_region_at_excluding(640, 360, VA, half).is_none());
+        assert!(cache.find_drawn_color_region_at(640, 360, VA).is_some());
+        let unknown = RtKey { layout_signature: 0, ..half };
+        assert_eq!(
+            cache.find_drawn_color_region_at_excluding(640, 360, VA, unknown).unwrap().key,
+            resized
+        );
+        let offset = RtKey { gpu_va: VA + 64, ..half };
+        assert!(cache.find_drawn_color_region_at_excluding(640, 360, VA + 64, offset).is_none());
         cache.cache.clear();
         cache.clear_color_lookup_index();
     }
