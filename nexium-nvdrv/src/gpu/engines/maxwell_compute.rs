@@ -506,10 +506,10 @@ impl PendingComputeId {
         match self {
             PendingComputeId::Ready(id) => Some(id),
             PendingComputeId::Deferred(rx) => {
-                match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                match rx.recv() {
                     Ok(id) => id,
                     Err(_) => {
-                        log::error!("[compute-offload] deferred dispatch id wait timed out");
+                        log::error!("[compute-offload] dispatch channel disconnected before completion ID");
                         None
                     }
                 }
