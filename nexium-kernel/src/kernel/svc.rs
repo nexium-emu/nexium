@@ -2148,8 +2148,11 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
         0x6f => svc_create_port(kernel),
         0x70 => svc_manage_named_port(kernel),
         0x71 => svc_connect_to_port(kernel),
+        0x73 => svc_set_process_memory_permission(kernel),
         0x74 => svc_process_memory_alias(kernel, false),
         0x75 => svc_process_memory_alias(kernel, true),
+        0x77 => svc_process_code_memory(kernel, false),
+        0x78 => svc_process_code_memory(kernel, true),
         0x7c => svc_create_resource_limit(kernel),
         0x7d => svc_set_resource_limit_limit_value(kernel),
         0x7e => svc_call_secure_monitor(kernel),
@@ -3287,6 +3290,170 @@ fn svc_process_memory_alias(kernel: &mut Kernel, unmap: bool) -> u32 {
         if unmap { "Unmap" } else { "Map" });
     if let Some(cpu) = cpu_mut() { cpu.set_register(0, u64::from(result)); }
     result
+}
+
+fn code_memory_permission(perm: u32) -> Option<nexium_memory::Perm> {
+    match perm {
+        0 => Some(nexium_memory::Perm::empty()),
+        1 => Some(nexium_memory::Perm::R),
+        3 => Some(nexium_memory::Perm::RW),
+        5 => Some(nexium_memory::Perm::RX),
+        _ => None,
+    }
+}
+
+fn code_memory_region_name(perm: nexium_memory::Perm) -> &'static str {
+    if perm.contains(nexium_memory::Perm::W) {
+        "aliascodedata_process_code"
+    } else {
+        "aliascode_process_code"
+    }
+}
+
+fn code_mapping_source(kernel: &Kernel, address: u64, size: u64) -> Option<u64> {
+    kernel.code_mappings.iter().find_map(|(&dst, &(src, len))| {
+        (address >= dst && address.checked_add(size)? <= dst.checked_add(len)?)
+            .then(|| src + (address - dst))
+    })
+}
+
+fn retire_code_mapping(kernel: &mut Kernel, dst: u64, size: u64) {
+    let end = dst + size;
+    let overlapping: Vec<(u64, (u64, u64))> = kernel
+        .code_mappings
+        .iter()
+        .filter(|(&base, &(_, len))| base < end && dst < base + len)
+        .map(|(&base, &mapping)| (base, mapping))
+        .collect();
+    for (base, (src, len)) in overlapping {
+        kernel.code_mappings.remove(&base);
+        if base < dst {
+            kernel.code_mappings.insert(base, (src, dst - base));
+        }
+        if base + len > end {
+            kernel.code_mappings.insert(end, (src + (end - base), base + len - end));
+        }
+    }
+}
+
+fn svc_process_code_memory(kernel: &mut Kernel, unmap: bool) -> u32 {
+    let Some(cpu) = cpu_ref() else { return 1; };
+    let (handle, dst, src, size) = (
+        cpu.get_register(0) as u32, cpu.get_register(1),
+        cpu.get_register(2), cpu.get_register(3),
+    );
+    let valid_handle = kernel.handles.get_handle(handle)
+        .is_some_and(|entry| entry.handle_type == HandleType::Process);
+    let mut result = process_memory_alias_validation(valid_handle, kernel.address_space_end, dst, src, size);
+    if result == SUCCESS && nexium_memory::fastmem::direct_va_base().is_some() {
+        result = KERNEL_NOT_IMPLEMENTED;
+    }
+    if result == SUCCESS {
+        let generation = kernel.address_space.generation();
+        let update = if unmap {
+            kernel.address_space.unmap_alias(dst, src, size)
+        } else {
+            kernel.address_space.map_alias(dst, src, size, nexium_memory::Perm::RW, "aliascode_process_code")
+        };
+        match update {
+            Ok(()) => {
+                if let Err(error) = sync_process_alias_cpu(kernel.address_space.host_region_changes_since(generation)) {
+                    log::error!("Process code memory CPU mapping failed: {error}");
+                    if !unmap {
+                        let rollback_generation = kernel.address_space.generation();
+                        let _ = kernel.address_space.unmap_alias(dst, src, size);
+                        let _ = sync_process_alias_cpu(kernel.address_space.host_region_changes_since(rollback_generation));
+                    }
+                    result = 0xd401;
+                } else if unmap {
+                    retire_code_mapping(kernel, dst, size);
+                } else {
+                    kernel.code_mappings.insert(dst, (src, size));
+                }
+            }
+            Err(error) => {
+                log::warn!("Process code memory {} rejected: {error}", if unmap { "unmap" } else { "map" });
+                result = 0xd401;
+            }
+        }
+    }
+    log::debug!("svc{}ProcessCodeMemory handle={handle:#x} dst={dst:#x} src={src:#x} size={size:#x} -> {result:#x}",
+        if unmap { "Unmap" } else { "Map" });
+    if let Some(cpu) = cpu_mut() { cpu.set_register(0, u64::from(result)); }
+    result
+}
+
+fn svc_set_process_memory_permission(kernel: &mut Kernel) -> u32 {
+    let Some(cpu) = cpu_ref() else { return 1; };
+    let (handle, address, size, perm) = (
+        cpu.get_register(0) as u32, cpu.get_register(1),
+        cpu.get_register(2), cpu.get_register(3) as u32,
+    );
+    let valid_handle = kernel.handles.get_handle(handle)
+        .is_some_and(|entry| entry.handle_type == HandleType::Process);
+    let mut result = process_memory_alias_validation(valid_handle, kernel.address_space_end, address, address, size);
+    let permission = code_memory_permission(perm);
+    if result == SUCCESS && permission.is_none() {
+        result = KERNEL_INVALID_ENUM_VALUE;
+    }
+    if result == SUCCESS && nexium_memory::fastmem::direct_va_base().is_some() {
+        result = KERNEL_NOT_IMPLEMENTED;
+    }
+    if let (SUCCESS, Some(permission)) = (result, permission) {
+        let generation = kernel.address_space.generation();
+        let update = match code_mapping_source(kernel, address, size) {
+            Some(source) => kernel.address_space.unmap_alias(address, source, size).and_then(|()| {
+                kernel.address_space.map_alias(address, source, size, permission, code_memory_region_name(permission))
+            }),
+            None => kernel.address_space.protect(address, size, permission),
+        };
+        match update {
+            Ok(()) => {
+                if let Err(error) = sync_process_alias_cpu(kernel.address_space.host_region_changes_since(generation)) {
+                    log::error!("Process memory permission CPU update failed: {error}");
+                    result = 0xd401;
+                }
+            }
+            Err(error) => {
+                log::warn!("Process memory permission change rejected: {error}");
+                result = 0xd401;
+            }
+        }
+    }
+    log::debug!("svcSetProcessMemoryPermission handle={handle:#x} address={address:#x} size={size:#x} perm={perm:#x} -> {result:#x}");
+    if let Some(cpu) = cpu_mut() { cpu.set_register(0, u64::from(result)); }
+    result
+}
+
+#[cfg(test)]
+mod code_memory_tests {
+    use super::{code_mapping_source, code_memory_permission, retire_code_mapping, Kernel};
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::Arc;
+
+    #[test]
+    fn code_mappings_split_on_partial_unmap_and_resolve_sources() {
+        let base = 0x1000_0000_0000;
+        let memory = Arc::new(AddressSpace::new());
+        memory.map(base, 0x20000, Perm::RW, "code_memory_test").unwrap();
+        let mut kernel = Kernel::new(
+            memory, base, 0x1000, base + 0x10000, 0x1000, base + 0x18000, 0x1000,
+            base + 0x19000, base + 0x1a000,
+        );
+        kernel.code_mappings.insert(0x8000_0000, (0x4000_0000, 0x4000));
+        assert_eq!(code_mapping_source(&kernel, 0x8000_1000, 0x2000), Some(0x4000_1000));
+        assert_eq!(code_mapping_source(&kernel, 0x8000_3000, 0x2000), None);
+        retire_code_mapping(&mut kernel, 0x8000_1000, 0x1000);
+        assert_eq!(kernel.code_mappings.get(&0x8000_0000), Some(&(0x4000_0000, 0x1000)));
+        assert_eq!(kernel.code_mappings.get(&0x8000_2000), Some(&(0x4000_2000, 0x2000)));
+        assert_eq!(code_mapping_source(&kernel, 0x8000_1000, 0x1000), None);
+        retire_code_mapping(&mut kernel, 0x8000_0000, 0x4000);
+        assert!(kernel.code_mappings.is_empty());
+        assert_eq!(code_memory_permission(5), Some(Perm::RX));
+        assert_eq!(code_memory_permission(3), Some(Perm::RW));
+        assert_eq!(code_memory_permission(0), Some(Perm::empty()));
+        assert_eq!(code_memory_permission(2), None);
+    }
 }
 
 fn svc_query_memory(kernel: &mut Kernel) -> u32 {
