@@ -6173,6 +6173,9 @@ fn dispatch_service_v2(
                 let info = kernel.services.mii.build_default(index);
                 return build_ipc_response(ctx, 0, &info, &[]);
             }
+            5 | 10 | 21 => return build_ipc_response(ctx, 0x87e, &[], &[]),
+            11 => return build_ipc_response(ctx, 0, &(-1i32).to_le_bytes(), &[]),
+            20 => return build_ipc_response(ctx, 0, &[0], &[]),
             22 => {
                 let version = ipc_input_u32(ctx, 0).unwrap_or(0);
                 kernel.services.mii.set_interface_version(version);
