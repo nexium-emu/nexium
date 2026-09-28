@@ -686,9 +686,12 @@ fn storage_accessor(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
 
 static PENDING_APPLET_ID: AtomicU32 = AtomicU32::new(0);
 static CONTROLLER_SELECTED_ID: AtomicU32 = AtomicU32::new(0);
+static MII_EDIT_MODE: AtomicU32 = AtomicU32::new(u32::MAX);
+static LAST_STORAGE_WRITE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
 
 pub const APPLET_ID_CONTROLLER: u32 = 0x0c;
 pub const APPLET_ID_SWKBD: u32 = 0x11;
+pub const APPLET_ID_MII_EDIT: u32 = 0x12;
 pub const APPLET_ID_OFFLINE_WEB: u32 = 0x17;
 
 pub fn set_pending_applet_id(id: u32) {
@@ -703,6 +706,42 @@ pub fn set_controller_selected_id(id: u32) {
     CONTROLLER_SELECTED_ID.store(id, Ordering::Relaxed);
 }
 
+pub fn reset_mii_edit_mode() {
+    MII_EDIT_MODE.store(u32::MAX, Ordering::Relaxed);
+    let last = LAST_STORAGE_WRITE.lock().map(|bytes| bytes.clone()).unwrap_or_default();
+    if last.len() >= 0x20 {
+        log::info!("am: MiiEdit input head {:02x?}", &last[..0x20]);
+    }
+    capture_mii_edit_input(&last);
+}
+
+pub fn record_storage_write(bytes: &[u8]) {
+    if let Ok(mut last) = LAST_STORAGE_WRITE.lock() {
+        last.clear();
+        last.extend_from_slice(&bytes[..bytes.len().min(0x200)]);
+    }
+}
+
+pub fn capture_mii_edit_input(bytes: &[u8]) {
+    if let Some(mode) = bytes.get(4..8).map(|mode| u32::from_le_bytes(mode.try_into().unwrap())) {
+        if mode <= 5 {
+            MII_EDIT_MODE.store(mode, Ordering::Relaxed);
+            log::info!("am: MiiEdit applet mode {mode}");
+        }
+    }
+}
+
+fn mii_edit_output(mode: u32) -> Vec<u8> {
+    let mut output = vec![0u8; if matches!(mode, 4 | 5) { 0x80 } else { 0x20 }];
+    if matches!(mode, 1 | 4 | 5) {
+        output[..4].copy_from_slice(&1u32.to_le_bytes());
+        if mode == 1 {
+            output[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        }
+    }
+    output
+}
+
 pub fn applet_out_data() -> Vec<u8> {
     match PENDING_APPLET_ID.load(Ordering::Relaxed) {
         APPLET_ID_CONTROLLER => {
@@ -713,6 +752,7 @@ pub fn applet_out_data() -> Vec<u8> {
             v
         }
         APPLET_ID_SWKBD => crate::swkbd_state::out_data(),
+        APPLET_ID_MII_EDIT => mii_edit_output(MII_EDIT_MODE.load(Ordering::Relaxed)),
         APPLET_ID_OFFLINE_WEB => {
             let mut result = vec![0u8; 0x1010];
             result[..4].copy_from_slice(&4u32.to_le_bytes());
@@ -1018,4 +1058,33 @@ pub fn queue_message(kernel: &mut Kernel, msg: u32) {
         msg,
         kernel.applet_messages.len()
     );
+}
+
+#[cfg(test)]
+mod mii_edit_tests {
+    use super::{capture_mii_edit_input, mii_edit_output};
+
+    #[test]
+    fn mii_edit_output_matches_the_requested_mode_layout() {
+        for mode in [4, 5] {
+            let character = mii_edit_output(mode);
+            assert_eq!(character.len(), 0x80);
+            assert_eq!(&character[..4], &1u32.to_le_bytes());
+            assert!(character[4..].iter().all(|byte| *byte == 0));
+        }
+        let append = mii_edit_output(1);
+        assert_eq!(append.len(), 0x20);
+        assert_eq!(&append[..4], &1u32.to_le_bytes());
+        assert_eq!(&append[4..8], &(-1i32).to_le_bytes());
+        for mode in [0, 2, 3, u32::MAX] {
+            let image = mii_edit_output(mode);
+            assert_eq!(image.len(), 0x20);
+            assert!(image.iter().all(|byte| *byte == 0));
+        }
+        let mut common = [0u8; 0x20];
+        common[..4].copy_from_slice(&1u32.to_le_bytes());
+        common[4..8].copy_from_slice(&0x20u32.to_le_bytes());
+        capture_mii_edit_input(&common);
+        capture_mii_edit_input(&[0; 4]);
+    }
 }

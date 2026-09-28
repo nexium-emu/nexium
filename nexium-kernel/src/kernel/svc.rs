@@ -5907,6 +5907,30 @@ fn dispatch_service_v2(
         }
     }
 
+    if port_name == "IStorageAccessor"
+        && cmd_id == 10
+        && crate::services::am::pending_applet_id() != crate::services::am::APPLET_ID_MII_EDIT
+    {
+        if let Some(buffer) = ctx.send_buffers.iter().chain(ctx.send_statics.iter()).find(|buffer| buffer.size > 0 && buffer.addr != 0).copied() {
+            let mut bytes = vec![0u8; (buffer.size as usize).min(0x200)];
+            if kernel.address_space.read(buffer.addr, &mut bytes).is_ok() {
+                crate::services::am::record_storage_write(&bytes);
+            }
+        }
+    }
+
+    if port_name == "IStorageAccessor"
+        && cmd_id == 10
+        && crate::services::am::pending_applet_id() == crate::services::am::APPLET_ID_MII_EDIT
+    {
+        if let Some(buffer) = ctx.send_buffers.iter().chain(ctx.send_statics.iter()).find(|buffer| buffer.size > 0 && buffer.addr != 0).copied() {
+            let mut bytes = vec![0u8; (buffer.size as usize).min(0x200)];
+            if kernel.address_space.read(buffer.addr, &mut bytes).is_ok() {
+                crate::services::am::capture_mii_edit_input(&bytes);
+            }
+        }
+    }
+
     if port_name == "ILibraryAppletCreator"
         && cmd_id == 11
         && crate::services::am::pending_applet_id() == crate::services::am::APPLET_ID_SWKBD
@@ -6011,6 +6035,9 @@ fn dispatch_service_v2(
                 applet_mode
             );
             crate::services::am::set_pending_applet_id(applet_id);
+            if applet_id == crate::services::am::APPLET_ID_MII_EDIT {
+                crate::services::am::reset_mii_edit_mode();
+            }
             if applet_id == crate::services::am::APPLET_ID_SWKBD {
                 let generation = crate::swkbd_state::begin_applet();
                 kernel.swkbd_workbuf = None;
