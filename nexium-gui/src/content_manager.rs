@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use nexium_loader::content::{self, ContentId, ContentKind, GameContent, InstalledContent};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Updates,
     Dlc,
@@ -16,6 +16,13 @@ enum Action {
     Update(Option<ContentId>),
     Dlc(ContentId, bool),
     Remove(ContentId),
+    RemoveAll(Vec<ContentId>),
+}
+
+#[derive(Clone)]
+enum Removal {
+    One(InstalledContent),
+    All { tab: Tab, ids: Vec<ContentId>, filtered: bool },
 }
 
 enum Event {
@@ -36,7 +43,7 @@ pub struct ContentManager {
     status: String,
     errors: Vec<String>,
     query: String,
-    removal: Option<InstalledContent>,
+    removal: Option<Removal>,
     selected: usize,
     held_buttons: u64,
 }
@@ -84,7 +91,7 @@ impl ContentManager {
         self.status = match &action {
             Action::Refresh => "Reading installed content...",
             Action::Install(_) => "Checking package...",
-            Action::Remove(_) => "Removing installed content...",
+            Action::Remove(_) | Action::RemoveAll(_) => "Removing installed content...",
             _ => "Saving your selection...",
         }
         .into();
@@ -105,6 +112,10 @@ impl ContentManager {
                     None => nexium_loader::read_application_title_id(&game)?
                         .ok_or("This file has no game title ID for updates or DLC.")?,
                 };
+                let finished = match &action {
+                    Action::RemoveAll(ids) => removed_message(ids.len()),
+                    _ => String::new(),
+                };
                 let loaded = match action {
                     Action::Refresh => content::list_game_content(&root, application_id)?,
                     Action::Update(id) => content::select_update(&root, application_id, id)?,
@@ -112,6 +123,7 @@ impl ContentManager {
                         content::set_dlc_enabled(&root, application_id, id, enabled)?
                     }
                     Action::Remove(id) => content::remove_content(&root, application_id, id)?,
+                    Action::RemoveAll(ids) => content::remove_contents(&root, application_id, &ids)?,
                     Action::Install(paths) => {
                         let mut errors = Vec::new();
                         let mut installed = 0;
@@ -162,7 +174,7 @@ impl ContentManager {
                     }
                 };
                 send(Event::Loaded(loaded));
-                send(Event::Finished(String::new(), Vec::new()));
+                send(Event::Finished(finished, Vec::new()));
                 Ok(())
             })();
             if let Err(error) = result {
@@ -236,6 +248,7 @@ impl ContentManager {
             self.selected = 0;
         }
         let mut pick_files = edge(SwitchButton::X) && editable && self.removal.is_none();
+        let mut remove_all = edge(SwitchButton::Y) && editable && self.removal.is_none();
         let mut action = None;
         let entries = self
             .loaded
@@ -259,6 +272,7 @@ impl ContentManager {
             .find(|entry| entry.kind == ContentKind::Update && entry.enabled)
             .map(version_label)
             .unwrap_or_else(|| "Base game".into());
+        let listed = if self.tab == Tab::Updates { updates } else { dlcs };
         let accent = self.accent;
         let frame = egui::Frame::popup(&ctx.global_style())
             .corner_radius(18)
@@ -302,6 +316,9 @@ impl ContentManager {
                         if ui.add_enabled(editable && self.removal.is_none(), egui::Button::new(RichText::new("Install files...").strong()).fill(accent.gamma_multiply(0.25))).clicked() {
                             pick_files = true;
                         }
+                        if ui.add_enabled(editable && self.removal.is_none() && listed != 0, egui::Button::new("Remove all")).clicked() {
+                            remove_all = true;
+                        }
                     });
                 });
                 if game_running {
@@ -313,6 +330,9 @@ impl ContentManager {
                     ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Find DLC...").desired_width(f32::INFINITY));
                 }
                 let rows = visible_entries(self.loaded.as_ref(), self.tab, &self.query);
+                if remove_all && self.removal.is_none() {
+                    self.removal = remove_all_request(self.loaded.as_ref(), self.tab, &self.query);
+                }
                 let base_row = usize::from(self.tab == Tab::Updates && self.loaded.is_some());
                 let row_count = rows.len() + base_row;
                 if edge(SwitchButton::DUp) { self.selected = self.selected.saturating_sub(1); }
@@ -365,7 +385,7 @@ impl ContentManager {
                                         }
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             if ui.add_enabled(row_editable, egui::Button::new("Remove").small()).clicked() {
-                                                self.removal = Some(entry.clone());
+                                                self.removal = Some(Removal::One(entry.clone()));
                                             }
                                             if entry.enabled { badge(ui, if entry.kind == ContentKind::Update { "ACTIVE" } else { "ENABLED" }, accent); }
                                         });
@@ -397,16 +417,33 @@ impl ContentManager {
                             ui.add_space(14.0);
                         }
                     });
-                if let Some(entry) = self.removal.clone() {
+                if let Some(removal) = self.removal.clone() {
+                    let (title, detail, confirm, keep, removal_action) = match removal {
+                        Removal::One(entry) => (
+                            format!("Remove {}?", if entry.kind == ContentKind::Update { version_label(&entry) } else { content_name(&entry) }),
+                            "Removes the installed copy from NeXium. Your original file stays where it is.",
+                            "Remove installed copy",
+                            "Keep it",
+                            Action::Remove(entry.id),
+                        ),
+                        Removal::All { tab, ids, filtered } => (
+                            remove_all_prompt(tab, ids.len(), filtered),
+                            "Removes NeXium's installed copies. Your original files stay where they are.",
+                            "Remove all",
+                            "Keep them",
+                            Action::RemoveAll(ids),
+                        ),
+                    };
+                    let confirm_pressed = editable && edge(SwitchButton::A);
                     egui::Frame::new().fill(ui.visuals().faint_bg_color).inner_margin(12).corner_radius(10).show(ui, |ui| {
-                        ui.label(RichText::new(format!("Remove {}?", if entry.kind == ContentKind::Update { version_label(&entry) } else { content_name(&entry) })).strong());
-                        ui.weak("Removes the installed copy from NeXium. Your original file stays where it is.");
+                        ui.label(RichText::new(title).strong());
+                        ui.weak(detail);
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(editable, egui::Button::new("Remove installed copy")).clicked() {
-                                action = Some(Action::Remove(entry.id));
+                            if ui.add_enabled(editable, egui::Button::new(confirm)).clicked() || confirm_pressed {
+                                action = Some(removal_action);
                                 self.removal = None;
                             }
-                            if ui.button("Keep it").clicked() { self.removal = None; }
+                            if ui.button(keep).clicked() { self.removal = None; }
                         });
                     });
                 }
@@ -424,7 +461,7 @@ impl ContentManager {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if input.connected { ui.weak("L / R tabs  ·  A select  ·  X install  ·  B done"); }
+                    if input.connected { ui.weak(if self.removal.is_some() { "A remove  ·  B keep" } else { "L / R tabs  ·  A select  ·  X install  ·  Y remove all  ·  B done" }); }
                     else if let Some(loaded) = &self.loaded { ui.weak(format!("{:016X}", loaded.application_id)); }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add_enabled(!busy, egui::Button::new("Done").min_size(egui::vec2(76.0, 32.0))).clicked() { close = true; }
@@ -481,6 +518,40 @@ fn content_name(entry: &InstalledContent) -> String {
     } else {
         entry.name.clone()
     }
+}
+
+fn remove_all_prompt(tab: Tab, count: usize, filtered: bool) -> String {
+    let noun = match (tab, count) {
+        (Tab::Updates, 1) => "update",
+        (Tab::Updates, _) => "updates",
+        (Tab::Dlc, _) => "DLC",
+    };
+    if filtered {
+        format!("Remove the {count} matching {noun}?")
+    } else if count == 1 {
+        format!("Remove 1 {noun}?")
+    } else {
+        format!("Remove all {count} {noun}?")
+    }
+}
+
+fn removed_message(count: usize) -> String {
+    if count == 1 {
+        "Removed 1 installed item.".into()
+    } else {
+        format!("Removed {count} installed items.")
+    }
+}
+
+fn remove_all_request(loaded: Option<&GameContent>, tab: Tab, query: &str) -> Option<Removal> {
+    let rows = visible_entries(loaded, tab, query);
+    let kind = if tab == Tab::Updates { ContentKind::Update } else { ContentKind::Dlc };
+    let total = loaded.map_or(0, |game| game.entries.iter().filter(|entry| entry.kind == kind).count());
+    (!rows.is_empty()).then(|| Removal::All {
+        tab,
+        filtered: rows.len() < total,
+        ids: rows.into_iter().map(|entry| entry.id).collect(),
+    })
 }
 
 fn visible_entries(loaded: Option<&GameContent>, tab: Tab, query: &str) -> Vec<InstalledContent> {
@@ -654,6 +725,43 @@ mod tests {
         assert_eq!(manager.loaded.as_ref().unwrap().entries[0].id.version, 2);
         assert_eq!(manager.errors, ["Wrong game"]);
         assert_eq!(manager.status, "Installed 1 package.");
+    }
+
+    #[test]
+    fn remove_all_targets_the_listed_rows_and_names_them() {
+        let mut first = entry(0x2001, 1, ContentKind::Dlc, "Adventure Pack");
+        first.enabled = false;
+        let game = GameContent {
+            application_id: 0x0100_0000_0000_0000,
+            entries: vec![
+                entry(0x1000, 1, ContentKind::Update, "Update"),
+                entry(0x1000, 2, ContentKind::Update, "Update"),
+                first,
+                entry(0x2002, 1, ContentKind::Dlc, "Adventure Pack Two"),
+                entry(0x2003, 1, ContentKind::Dlc, "Bonus Costume"),
+            ],
+        };
+        let Some(Removal::All { tab, ids, filtered }) = remove_all_request(Some(&game), Tab::Dlc, "") else {
+            panic!("expected a remove-all request");
+        };
+        assert_eq!((tab, ids.len(), filtered), (Tab::Dlc, 3, false));
+        assert_eq!(remove_all_prompt(tab, ids.len(), filtered), "Remove all 3 DLC?");
+        let Some(Removal::All { ids, filtered, .. }) = remove_all_request(Some(&game), Tab::Dlc, "adventure") else {
+            panic!("expected a filtered remove-all request");
+        };
+        assert_eq!(ids.iter().map(|id| id.title_id).collect::<Vec<_>>(), [0x2001, 0x2002]);
+        assert!(filtered);
+        assert_eq!(remove_all_prompt(Tab::Dlc, ids.len(), filtered), "Remove the 2 matching DLC?");
+        let Some(Removal::All { ids, filtered, .. }) = remove_all_request(Some(&game), Tab::Updates, "bonus") else {
+            panic!("expected an update remove-all request");
+        };
+        assert_eq!((ids.len(), filtered), (2, false));
+        assert_eq!(remove_all_prompt(Tab::Updates, 2, false), "Remove all 2 updates?");
+        assert_eq!(remove_all_prompt(Tab::Updates, 1, false), "Remove 1 update?");
+        assert!(remove_all_request(Some(&GameContent { application_id: 1, entries: Vec::new() }), Tab::Dlc, "").is_none());
+        assert!(remove_all_request(None, Tab::Updates, "").is_none());
+        assert_eq!(removed_message(26), "Removed 26 installed items.");
+        assert_eq!(removed_message(1), "Removed 1 installed item.");
     }
 
     #[test]

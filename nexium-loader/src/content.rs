@@ -399,9 +399,13 @@ pub fn set_dlc_enabled(root: &Path, application_id: u64, id: ContentId, enabled:
 }
 
 pub fn remove_content(root: &Path, application_id: u64, id: ContentId) -> Result<GameContent, String> {
+    remove_contents(root, application_id, &[id])
+}
+
+pub fn remove_contents(root: &Path, application_id: u64, ids: &[ContentId]) -> Result<GameContent, String> {
     let previous = list_game_content(root, application_id)?;
     let mut content = previous.clone();
-    content.entries.retain(|entry| entry.id != id);
+    content.entries.retain(|entry| !ids.contains(&entry.id));
     if content.entries.len() == previous.entries.len() { return Err("This content is no longer installed".into()) }
     save_content(root, &content)?;
     remove_unreferenced(&previous, &content);
@@ -586,6 +590,37 @@ mod tests {
         fs::write(directory.join("content.json"), serde_json::to_vec(&content).unwrap()).unwrap();
         assert!(remove_content(&root, TITLE, content.entries[0].id).unwrap_err().contains("filename"));
         assert!(source.exists());
+    }
+
+    #[test]
+    fn removing_several_packages_updates_the_registry_once_and_keeps_sources() {
+        let temporary = TestDirectory::new();
+        let root = temporary.0.join("installed");
+        let mut sources = Vec::new();
+        for (name, kind, version) in [
+            ("update1.dnsp", ContentKind::Update, 65536),
+            ("update2.dnsp", ContentKind::Update, 131072),
+            ("dlc1.dnsp", ContentKind::Dlc, 1),
+            ("dlc2.dnsp", ContentKind::Dlc, 2),
+        ] {
+            let source = temporary.package(name, kind, version, TITLE);
+            install_package(&root, TITLE, &source, |_| {}).unwrap();
+            sources.push(source);
+        }
+        let installed = list_game_content(&root, TITLE).unwrap();
+        let dlc: Vec<_> = installed.entries.iter().filter(|entry| entry.kind == ContentKind::Dlc).collect();
+        let dlc_ids: Vec<_> = dlc.iter().map(|entry| entry.id).collect();
+        let dlc_paths: Vec<_> = dlc.iter().map(|entry| entry.path.clone()).collect();
+        assert_eq!(dlc_ids.len(), 2);
+        let remaining = remove_contents(&root, TITLE, &dlc_ids).unwrap();
+        assert!(remaining.entries.iter().all(|entry| entry.kind == ContentKind::Update));
+        assert_eq!(list_game_content(&root, TITLE).unwrap().entries.len(), 2);
+        assert!(dlc_paths.iter().all(|path| !path.exists()));
+        assert!(remove_contents(&root, TITLE, &dlc_ids).unwrap_err().contains("no longer installed"));
+        let update_ids: Vec<_> = remaining.entries.iter().map(|entry| entry.id).collect();
+        assert!(remove_contents(&root, TITLE, &update_ids).unwrap().entries.is_empty());
+        assert!(list_game_content(&root, TITLE).unwrap().entries.is_empty());
+        assert!(sources.iter().all(|source| source.exists()));
     }
 
     #[test]
