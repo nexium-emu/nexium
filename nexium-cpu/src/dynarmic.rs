@@ -215,9 +215,9 @@ impl DynarmicCpu {
 
         if let Some((cpu_va, len)) = initial_cpu_watch() {
             if nexium_memory::fastmem::watch_mark(cpu_va, len) {
-                log::warn!("[watch-write] ARMED cpu_va={:#x} len={:#x}", cpu_va, len);
+                log::warn!(target: "watch_write", "[watch-write] ARMED cpu_va={:#x} len={:#x}", cpu_va, len);
             } else {
-                log::warn!(
+                log::warn!(target: "watch_write",
                     "[watch-write] arm FAILED cpu_va={:#x} len={:#x}",
                     cpu_va,
                     len
@@ -260,12 +260,12 @@ impl DynarmicCpu {
                     let limit = watch_write_limit();
                     if limit == 0 || n < limit {
                         if let Some(regs) = watch_write_reg_summary(dyn_) {
-                            log::warn!(
+                            log::warn!(target: "watch_write",
                                 "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x} {}",
                                 n, addr, size, value, pc, lr, regs
                             );
                         } else {
-                            log::warn!(
+                            log::warn!(target: "watch_write",
                                 "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x}",
                                 n, addr, size, value, pc, lr
                             );
@@ -274,12 +274,12 @@ impl DynarmicCpu {
                     let stop = limit != 0 && n + 1 >= limit;
                     if stop || (value != 0 && !watch_keep_after_hit()) {
                         if value != 0 {
-                            log::warn!(
+                            log::warn!(target: "watch_write",
                                 "[watch-write] NONZERO writer pc={:#x} lr={:#x} — disarming",
                                 pc, lr
                             );
                         } else {
-                            log::warn!("[watch-write] cap reached, disarming");
+                            log::warn!(target: "watch_write", "[watch-write] cap reached, disarming");
                         }
                         nexium_memory::fastmem::watch_disarm();
                         if let Some(base) = nexium_memory::fastmem::base() {
@@ -646,7 +646,7 @@ impl DynarmicCpu {
         if nexium_memory::fastmem::watch_range().is_none() {
             if let Some((cpu_va, len)) = delayed_cpu_watch() {
                 if nexium_memory::fastmem::watch_mark(cpu_va, len) {
-                    log::warn!("[watch-write] ARMED cpu_va={:#x} len={:#x}", cpu_va, len);
+                    log::warn!(target: "watch_write", "[watch-write] ARMED cpu_va={:#x} len={:#x}", cpu_va, len);
                     self.watch_protected.set(false);
                 }
             }
@@ -813,14 +813,14 @@ impl DynarmicCpu {
         if let Some((lo, hi)) = desired {
             if page_protect {
                 if nexium_memory::fastmem::watch_reprotect() {
-                    log::warn!(
+                    log::warn!(target: "watch_write",
                         "[watch-write] fastmem read-only armed va={:#x} len={:#x}",
                         lo,
                         hi - lo
                     );
                     self.watch_protected.set(true);
                 } else {
-                    log::warn!(
+                    log::warn!(target: "watch_write",
                         "[watch-write] fastmem read-only arm failed va={:#x} len={:#x}",
                         lo,
                         hi - lo
@@ -828,7 +828,7 @@ impl DynarmicCpu {
                     self.watch_protected.set(false);
                 }
             } else {
-                log::warn!(
+                log::warn!(target: "watch_write",
                     "[watch-write] dynarmic watch callbacks unavailable; set NEXIUM_WATCH_PAGE_PROTECT=1 for va={:#x} len={:#x}",
                     lo,
                     hi - lo
