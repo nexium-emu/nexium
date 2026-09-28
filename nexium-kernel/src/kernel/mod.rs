@@ -125,6 +125,7 @@ pub struct Kernel {
     pub swkbd_interactive_event: Option<u32>,
     pub swkbd_workbuf: Option<(u64, u64)>,
     pub transfer_memories: HashMap<u32, (u64, u64)>,
+    pub loaded_nros: HashMap<u64, svc::ro::LoadedNro>,
 
     pub nro_mmap: Option<Arc<memmap2::Mmap>>,
     pub nro_romfs_range: Option<std::ops::Range<usize>>,
@@ -385,6 +386,7 @@ impl Kernel {
             swkbd_interactive_event: None,
             swkbd_workbuf: None,
             transfer_memories: HashMap::new(),
+            loaded_nros: HashMap::new(),
             nro_mmap: None,
             nro_romfs_range: None,
             application_romfs: None,

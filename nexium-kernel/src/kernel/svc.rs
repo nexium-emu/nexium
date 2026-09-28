@@ -1,5 +1,7 @@
 #[path = "content.rs"]
 mod content;
+#[path = "ro.rs"]
+pub(crate) mod ro;
 
 use super::{Kernel, MUTEX_HAS_LISTENERS};
 use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
@@ -3353,6 +3355,10 @@ fn memory_info_for_regions(
         if address >= r.base && address < r.base + r.size {
             let mem_type = if r.name.starts_with("process_alias") {
                 0x0f
+            } else if r.name.starts_with("aliascodedata") {
+                0x09
+            } else if r.name.starts_with("aliascode") {
+                0x08
             } else if r.name.starts_with("codestatic") {
                 0x03
             } else if r.name.starts_with("codemutable") {
@@ -5850,6 +5856,12 @@ fn dispatch_service_v2(
 
     if let Some(response) = content::dispatch_file_system(kernel, ctx, session_handle, port_name, cmd_id) {
         return response;
+    }
+
+    if matches!(port_name, "ldr:ro" | "ro:1") {
+        if let Some(response) = ro::dispatch(kernel, ctx, cmd_id) {
+            return response;
+        }
     }
 
     if let Some(response) = dispatch_aoc_bcat(kernel, port_name, ctx, cmd_id) {
