@@ -13126,6 +13126,11 @@ fn svc_break(kernel: &mut Kernel) -> u32 {
         0
     };
 
+    if reason & 0x8000_0000 != 0 {
+        log::debug!("svcBreak notification reason={reason:#x} info_va={info_va:#x} info_size={info_size:#x}");
+        return SUCCESS;
+    }
+
     log::warn!(
         "svcBreak: reason={:#x}, info_va={:#x}, info_size={:#x}",
         reason,
