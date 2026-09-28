@@ -432,7 +432,7 @@ impl BootContext {
                     0x3E00_0000u64,
                     0x3F00_0000u64,
                     0x20_0000u64,
-                    0x3FE0_0000u64,
+                    0xFFE0_0000u64,
                 )
             } else {
                 let alias_size: u64 = if bits == 39 {

@@ -3501,7 +3501,43 @@ struct SynthMemInfo {
 }
 
 fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
-    memory_info_for_regions(&kernel.address_space.regions(), address, kernel.address_space_end)
+    let info = memory_info_for_regions(&kernel.address_space.regions(), address, kernel.address_space_end);
+    if !kernel.is_application {
+        return info;
+    }
+    heap_view(info, kernel.heap_base, kernel.heap_size, kernel.heap_committed, address)
+}
+
+fn heap_view(info: SynthMemInfo, heap_base: u64, heap_limit: u64, heap_committed: u64, address: u64) -> SynthMemInfo {
+    if info.mem_type != 0x05 || info.addr != heap_base || info.size != heap_limit || heap_committed >= heap_limit {
+        return info;
+    }
+    let committed_end = heap_base + heap_committed;
+    if address < committed_end {
+        SynthMemInfo { addr: heap_base, size: heap_committed, ..info }
+    } else {
+        SynthMemInfo { addr: committed_end, size: heap_base + heap_limit - committed_end, mem_type: 0, attr: 0, perm: 0 }
+    }
+}
+
+#[cfg(test)]
+mod heap_view_tests {
+    use super::{heap_view, SynthMemInfo};
+
+    fn heap(addr: u64, size: u64, mem_type: u32, perm: u32) -> SynthMemInfo {
+        SynthMemInfo { addr, size, mem_type, attr: 0, perm }
+    }
+
+    #[test]
+    fn only_the_committed_heap_is_reported_as_heap() {
+        let view = |address, committed| heap_view(heap(0x4000_0000, 0x4000, 0x05, 3), 0x4000_0000, 0x4000, committed, address);
+        assert_eq!(view(0x4000_0800, 0x1000), heap(0x4000_0000, 0x1000, 0x05, 3));
+        assert_eq!(view(0x4000_1000, 0x1000), heap(0x4000_1000, 0x3000, 0, 0));
+        assert_eq!(view(0x4000_3fff, 0x1000), heap(0x4000_1000, 0x3000, 0, 0));
+        assert_eq!(view(0x4000_0000, 0), heap(0x4000_0000, 0x4000, 0, 0));
+        assert_eq!(view(0x4000_3000, 0x4000), heap(0x4000_0000, 0x4000, 0x05, 3));
+        assert_eq!(heap_view(heap(0x3000_0000, 0x1000, 0x07, 3), 0x4000_0000, 0x4000, 0x1000, 0x3000_0000), heap(0x3000_0000, 0x1000, 0x07, 3));
+    }
 }
 
 fn memory_info_for_regions(
@@ -13306,14 +13342,14 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         13 => kernel.aslr_size,
         14 => {
             if matches!(kernel.guest_isa, nexium_cpu::GuestIsa::AArch32) {
-                kernel.aslr_base
+                0x20_0000
             } else {
                 kernel.stack_base
             }
         }
         15 => {
             if matches!(kernel.guest_isa, nexium_cpu::GuestIsa::AArch32) {
-                kernel.aslr_size
+                0x3FE0_0000
             } else {
                 0x8000_0000
             }
