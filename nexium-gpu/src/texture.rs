@@ -1351,6 +1351,12 @@ pub fn unpack_native_render_target(
     let depth = usize::try_from(depth_px).ok()?;
     let row_bytes = width.checked_mul(bpp)?;
     let tight_size = row_bytes.checked_mul(height)?.checked_mul(depth)?;
+    if depth > 1 && std::env::var_os("NEXIUM_DUMP_VOLUME_TEX").is_some() {
+        log::warn!(
+            "[dump-volume] native-rt unpack {}x{}x{} bpp={} sig={:#x} src_len={} guest_size={}",
+            width, height, depth, bpp, layout_signature, src.len(), guest_size
+        );
+    }
 
     match layout_signature & 0xff {
         0 if layout_signature == 0 => Some(src[..tight_size].to_vec()),

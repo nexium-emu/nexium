@@ -5,6 +5,29 @@ pub const MAXWELL3D_CLASS: u32 = 0xB197;
 pub const GRAPHICS_CBUF_SLOTS: usize = nexium_spirv::GFX_CBUF_STAGE_SLOTS as usize;
 pub type GraphicsCbufBinds = [[(u64, u32); GRAPHICS_CBUF_SLOTS]; 5];
 
+fn rt_method_trace_window() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static WINDOW: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let raw = std::env::var("NEXIUM_RT_METHOD_TRACE").ok()?;
+        let mut parts = raw.split(':');
+        let after_secs = parts.next()?.trim().parse().ok()?;
+        let limit = parts
+            .next()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(20_000);
+        Some((after_secs, limit))
+    })
+}
+
+fn rt_method_trace_wanted(method: u32) -> bool {
+    matches!(method, 0x49 | 0x487 | 0x48a | 0x48b | 0x54e | 0x586 | 0x674)
+        || (0x200..0x280).contains(&method)
+        || (0x360..0x364).contains(&method)
+        || (0x380..0x384).contains(&method)
+        || (0x3f8..0x3fe).contains(&method)
+}
+
 fn replay_macro_writes(
     output: super::macro_engine::MacroOutput,
     mut writer: impl FnMut(u32, u32),
@@ -1024,6 +1047,16 @@ fn cbuf_bind_trace() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_CBUF_BIND_TRACE").is_some())
 }
 
+fn cbuf_bind_trace_limit() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("NEXIUM_CBUF_BIND_TRACE")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(2048)
+    })
+}
+
 fn raw_counter_reports() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_RAW_COUNTER_REPORTS").is_some())
@@ -1032,6 +1065,60 @@ fn raw_counter_reports() -> bool {
 fn wf_state_log() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_WATER_FORENSICS").is_some())
+}
+
+fn trace_unknown_method(method: u32) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    static STATE: OnceLock<Option<Mutex<(Instant, HashMap<u32, u64>)>>> = OnceLock::new();
+    let Some(state) = STATE.get_or_init(|| {
+        std::env::var_os("NEXIUM_UNKNOWN_METHOD_TRACE")
+            .map(|_| Mutex::new((Instant::now(), HashMap::new())))
+    }) else {
+        return;
+    };
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    *state.1.entry(method).or_insert(0) += 1;
+    if state.0.elapsed().as_secs() >= 5 {
+        let mut top: Vec<(u32, u64)> = state.1.drain().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        top.truncate(48);
+        let summary = top
+            .iter()
+            .map(|(method, count)| format!("{method:#x}:{count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        log::warn!("[unknown-methods] {summary}");
+        state.0 = Instant::now();
+    }
+}
+
+fn trace_zero_count_draw(
+    topology: u32,
+    first: u32,
+    count: u32,
+    indexed: bool,
+    index_count: u32,
+    instance_count: u32,
+    fs: u64,
+    draw_count: u64,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_ZERO_DRAW_TRACE").is_some()) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 200 || n % 500 == 0 {
+        log::warn!(
+            "[zero-draw] #{n} draw={draw_count} topo={topology} first={first} count={count} indexed={indexed} index_count={index_count} instances={instance_count} fs={fs:#x}"
+        );
+    }
 }
 
 fn synthetic_counter_step() -> u32 {
@@ -1439,6 +1526,12 @@ impl Maxwell3D {
             }
         };
 
+        if let Some((after_secs, limit)) = rt_method_trace_window() {
+            if rt_method_trace_wanted(method) {
+                self.trace_rt_method(method, incoming_arg, arg, after_secs, limit);
+            }
+        }
+
         let m = method as usize;
         let state_value_changed = m >= self.reg_file.len() || self.reg_file[m] != arg;
         let register_changed =
@@ -1489,6 +1582,37 @@ impl Maxwell3D {
         }
 
         Some((arg, register_changed))
+    }
+
+    fn trace_rt_method(&self, method: u32, incoming: u32, applied: u32, after_secs: u64, limit: u64) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        static LINES: AtomicU64 = AtomicU64::new(0);
+        let start = START.get_or_init(std::time::Instant::now);
+        if start.elapsed().as_secs() < after_secs {
+            return;
+        }
+        if LINES.fetch_add(1, Ordering::Relaxed) >= limit {
+            return;
+        }
+        let rt0 = &self.regs.rt[0];
+        log::warn!(
+            "[rtmethod] m={:#05x} in={:#010x} app={:#010x} mme={} hash={:#x} shadow={} draws={} clears={} rt0={:#x}{:08x} {}x{} rtc={:#x}",
+            method,
+            incoming,
+            applied,
+            self.mme_active,
+            self.mme_hash,
+            self.shadow_ram_control,
+            self.regs.draw_count,
+            self.regs.clear_count,
+            rt0.address_hi,
+            rt0.address_lo,
+            rt0.width,
+            rt0.height,
+            self.regs.rt_control
+        );
     }
 
     fn apply_register_value(&mut self, method: u32, arg: u32) {
@@ -2091,7 +2215,7 @@ impl Maxwell3D {
                     } else {
                         0
                     };
-                    if n < 2048 || (hot && hot_n < 512) || n % 65536 == 0 {
+                    if n < cbuf_bind_trace_limit() || (hot && hot_n < 512) || n % 65536 == 0 {
                         log::warn!(
                             "[cbuf-bind] #{} stage={} slot={} valid={} addr={:#x} size={} mme={}",
                             n,
@@ -2301,6 +2425,7 @@ impl Maxwell3D {
             }
             _ => {
                 log::trace!("maxwell3d: write method {:#x} = {:#x}", method, arg);
+                trace_unknown_method(method);
             }
         }
     }
@@ -2429,6 +2554,18 @@ impl Maxwell3D {
         };
         let ps = f32::from_bits(self.reg_file.get(0x546).copied().unwrap_or(0));
         let point_size = if ps.is_finite() && ps > 0.0 { ps } else { 1.0 };
+        if (indexed && index_count == 0) || (!indexed && count == 0) {
+            trace_zero_count_draw(
+                topology,
+                first,
+                count,
+                indexed,
+                index_count,
+                instance_count,
+                fs_shader_gpu_va,
+                self.regs.draw_count as u64,
+            );
+        }
         self.pending_draws.push(DrawCall {
             topology,
             first_vertex: first,

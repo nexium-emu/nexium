@@ -23914,6 +23914,33 @@ fn tic_is_volume(tic: &crate::texture::TicEntry) -> bool {
     tic.texture_type == 2
 }
 
+fn dump_volume_texture_once(raw: &[u8], tic: &crate::texture::TicEntry, layers: usize, read_size: usize) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Option<Mutex<std::collections::HashSet<u64>>>> = OnceLock::new();
+    let Some(seen) = SEEN.get_or_init(|| {
+        std::env::var_os("NEXIUM_DUMP_VOLUME_TEX").map(|_| Mutex::new(std::collections::HashSet::new()))
+    }) else {
+        return;
+    };
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    if !seen.insert(tic.gpu_va) {
+        return;
+    }
+    let base = std::env::var_os("HOME")
+        .map(|home| std::path::PathBuf::from(home).join(".config/NeXium/dump"))
+        .filter(|path| std::fs::create_dir_all(path).is_ok())
+        .unwrap_or_else(std::env::temp_dir);
+    let stem = format!("volume_{:x}_{}x{}x{}", tic.gpu_va, tic.width, tic.height, layers);
+    let _ = std::fs::write(base.join(format!("{stem}.bin")), raw);
+    let _ = std::fs::write(
+        base.join(format!("{stem}.txt")),
+        format!("raw_len={} read_size={} layers={layers}\n{tic:#?}\n", raw.len(), read_size),
+    );
+    log::warn!("[dump-volume] wrote {} raw_len={} read_size={read_size}", base.join(stem).display(), raw.len());
+}
+
 fn tic_is_cube(tic: &crate::texture::TicEntry) -> bool {
     tic.texture_type == 3
 }
@@ -24046,6 +24073,7 @@ fn linear_texture_layers(
     if effective_block_linear && !force_pitch && tic_is_volume(tic) {
         let (storage_width, storage_height, bpp) = tic.format.storage_extent(tic.width, tic.height);
         let read_size = block_linear_volume_byte_size(tic, layers as u32).min(raw.len());
+        dump_volume_texture_once(raw, tic, layers, read_size);
         let mut out = crate::texture::unswizzle_block_linear_3d(
             &raw[..read_size],
             storage_width,
@@ -24210,6 +24238,12 @@ fn texture_upload_data_with_layout(
     format: vk::Format,
 ) -> Result<TextureUploadData, String> {
     let layers = layer_count.max(1);
+    if tic_is_volume(tic) && std::env::var_os("NEXIUM_DUMP_VOLUME_TEX").is_some() {
+        log::warn!(
+            "[dump-volume] upload va={:#x} {}x{}x{} bl={} effective_bl={} force_pitch={} raw_len={}",
+            tic.gpu_va, tic.width, tic.height, layers, tic.is_block_linear, effective_block_linear, force_pitch, raw.len()
+        );
+    }
     if tic.is_sparse {
         return Err("sparse guest texture upload requires an explicit sparse layout".to_string());
     }
