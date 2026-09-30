@@ -357,8 +357,8 @@ impl TicEntry {
         if gpu_va == 0
             || width == 0
             || height == 0
-            || (!is_buffer_header && width > 16384)
-            || (!is_buffer_header && height > 16384)
+            || (!is_buffer_header && width > 32768)
+            || (!is_buffer_header && height > 32768)
         {
             return None;
         }
