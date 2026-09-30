@@ -796,6 +796,7 @@ impl Worker {
                     None,
                 )
                 .map_err(err)?;
+            renderdoc_hook::set_active_window(instance, worker.target.hwnd);
         }
         if worker.surface == vk::SurfaceKHR::null() {
             return Err("unsupported native presentation surface".into());
@@ -1505,6 +1506,10 @@ impl Worker {
                     self.target.snapshots.load(Ordering::Relaxed)
                 );
             }
+            #[cfg(windows)]
+            if renderdoc_hook::capture_present() == Some(count) || renderdoc_hook::trigger_file_fired(count) {
+                renderdoc_hook::trigger_capture(renderdoc_hook::capture_frames());
+            }
         }
         self.wait_submission()?;
         self.filter = state.filter;
@@ -1927,5 +1932,106 @@ mod tests {
             [0, 0, 100, 50]
         );
         assert_eq!(valid_rect(Some([0, 0, 0, 2]), 100, 50), [0, 0, 100, 50]);
+    }
+}
+
+#[cfg(windows)]
+mod renderdoc_hook {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    type GetApiFn = unsafe extern "C" fn(u32, *mut *const c_void) -> i32;
+    type SetActiveWindowFn = unsafe extern "C" fn(*const c_void, *const c_void);
+    type TriggerCaptureFn = unsafe extern "C" fn();
+    type TriggerMultiFrameCaptureFn = unsafe extern "C" fn(u32);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *const c_void;
+    }
+
+    fn api() -> Option<*const *const c_void> {
+        static API: OnceLock<usize> = OnceLock::new();
+        let table = *API.get_or_init(|| unsafe {
+            let name: Vec<u16> = "renderdoc.dll\0".encode_utf16().collect();
+            let module = GetModuleHandleW(name.as_ptr());
+            if module.is_null() {
+                return 0;
+            }
+            let get_api = GetProcAddress(module, b"RENDERDOC_GetAPI\0".as_ptr());
+            if get_api.is_null() {
+                return 0;
+            }
+            let get_api: GetApiFn = std::mem::transmute(get_api);
+            let mut table: *const c_void = std::ptr::null();
+            if get_api(10102, &mut table) != 1 {
+                return 0;
+            }
+            table as usize
+        });
+        (table != 0).then_some(table as *const *const c_void)
+    }
+
+    pub fn capture_present() -> Option<u64> {
+        static VALUE: OnceLock<Option<u64>> = OnceLock::new();
+        *VALUE.get_or_init(|| {
+            std::env::var("NEXIUM_RENDERDOC_CAPTURE_PRESENT")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+    }
+
+    pub fn set_active_window(instance: &ash::Instance, hwnd: isize) {
+        let Some(table) = api() else {
+            return;
+        };
+        unsafe {
+            use ash::vk::Handle;
+            let set_active_window: SetActiveWindowFn = std::mem::transmute(*table.add(18));
+            let device = *(instance.handle().as_raw() as *const *const c_void);
+            set_active_window(device, hwnd as *const c_void);
+        }
+        log::warn!("[renderdoc] active window set to the guest presenter hwnd={hwnd:#x}");
+    }
+
+    pub fn trigger_file_fired(count: u64) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        let Some(path) = PATH
+            .get_or_init(|| std::env::var_os("NEXIUM_RENDERDOC_TRIGGER_FILE").map(Into::into))
+            .as_ref()
+        else {
+            return false;
+        };
+        count % 15 == 0 && !FIRED.load(Ordering::Relaxed) && path.is_file() && !FIRED.swap(true, Ordering::Relaxed)
+    }
+
+    pub fn capture_frames() -> u32 {
+        static VALUE: OnceLock<u32> = OnceLock::new();
+        *VALUE.get_or_init(|| {
+            std::env::var("NEXIUM_RENDERDOC_CAPTURE_FRAMES")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1)
+        })
+    }
+
+    pub fn trigger_capture(frames: u32) {
+        let Some(table) = api() else {
+            return;
+        };
+        unsafe {
+            if frames > 1 {
+                let trigger_multi: TriggerMultiFrameCaptureFn = std::mem::transmute(*table.add(22));
+                trigger_multi(frames);
+            } else {
+                let trigger_capture: TriggerCaptureFn = std::mem::transmute(*table.add(15));
+                trigger_capture();
+            }
+        }
+        log::warn!("[renderdoc] capture triggered frames={frames}");
     }
 }
