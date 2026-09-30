@@ -1236,7 +1236,34 @@ pub(crate) fn execute_vertex_memory_store(
             resolve_pending_writebacks(renderer, mappings, mem_write);
             MaxwellComputeOutcome::Executed
         }
-        Err(ExecuteError::Unsupported(reason)) => MaxwellComputeOutcome::Unsupported(reason),
+        Err(ExecuteError::Unsupported(reason)) => {
+            if reason.contains("LoadGlobal") || reason.contains("StoreGlobal") {
+                let mut cpu_qmd = qmd;
+                cpu_qmd[0x0c] = draw.vertex_count;
+                cpu_qmd[0x12] = 1 << 16;
+                let cpu_texture = super::compute_cpu::ComputeTextureState {
+                    tic_pool_gpu_va: texture.tic_pool_gpu_va,
+                    tic_limit: texture.tic_limit,
+                    tsc_pool_gpu_va: texture.tsc_pool_gpu_va,
+                    tsc_limit: texture.tsc_limit,
+                    tex_cb_index: texture.tex_cb_index,
+                };
+                if super::compute_cpu::try_execute_with_code(
+                    &cpu_qmd,
+                    draw.program_region_gpu_va,
+                    cpu_texture,
+                    Some(renderer.as_ref()),
+                    mappings,
+                    mem_read,
+                    mem_write,
+                    0,
+                    Some(code),
+                ) {
+                    return MaxwellComputeOutcome::Executed;
+                }
+            }
+            MaxwellComputeOutcome::Unsupported(reason)
+        }
         Err(ExecuteError::Submitted(reason)) => MaxwellComputeOutcome::SubmittedFailure(reason),
     }
 }

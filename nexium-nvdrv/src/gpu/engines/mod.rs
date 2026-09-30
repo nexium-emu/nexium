@@ -1,3 +1,4 @@
+pub(crate) mod compute_cpu;
 pub mod fermi_2d;
 pub mod kepler_compute;
 pub mod kepler_memory;

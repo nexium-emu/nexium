@@ -17,11 +17,6 @@ fn compute_cpu_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_COMPUTE_CPU").is_some())
 }
 
-fn tic_video_backing_trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_TIC_VIDEO_BACKING_TRACE").is_some())
-}
-
 fn is_pps_b6300_buffer_sust(raw: u64) -> bool {
     matches!(
         raw,
@@ -251,7 +246,7 @@ pub struct ComputeTextureState {
     pub tex_cb_index: u32,
 }
 
-pub fn try_execute(
+pub fn try_execute_with_code(
     qmd: &[u32; 0x40],
     code_base: u64,
     texture: ComputeTextureState,
@@ -260,6 +255,7 @@ pub fn try_execute(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
     launch_count: u64,
+    code_override: Option<&[u8]>,
 ) -> bool {
     if !is_candidate(qmd) {
         return false;
@@ -278,8 +274,14 @@ pub fn try_execute(
         * block_y.max(1) as u64
         * block_z.max(1) as u64;
     let code_gpu = code_base.wrapping_add(qmd[0x08] as u64);
-    let Some(code) = read_gpu_vec(mappings, mem_read, code_gpu, 0x3000) else {
-        return false;
+    let code = match code_override {
+        Some(code) => code.to_vec(),
+        None => {
+            let Some(code) = read_gpu_vec(mappings, mem_read, code_gpu, 0x3000) else {
+                return false;
+            };
+            code
+        }
     };
     let decoded_code = decode_code(&code);
     let cbuf_data = snapshot_compute_cbufs(qmd, mappings, mem_read);
@@ -2527,38 +2529,6 @@ impl ComputeExec<'_> {
             return None;
         }
         let tic = nexium_gpu::texture::TicEntry::parse(&tic_raw)?;
-        if tic_video_backing_trace_enabled() {
-            let read_size = nexium_gpu::texture::texture_guest_size_bytes(&tic, 1)
-                .unwrap_or_else(|| tic.format.linear_size(tic.width, tic.height));
-            if let Some((target, cpu_va, nvmap_id)) =
-                super::super::vk_dispatch::video_tic_cpu_target_match(
-                    self.mappings,
-                    tic.gpu_va,
-                    read_size as u64,
-                )
-            {
-                use std::sync::{Mutex, OnceLock};
-                static SEEN: OnceLock<Mutex<HashSet<(u32, u32, u64)>>> = OnceLock::new();
-                if let Ok(mut seen) = SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock() {
-                    if seen.len() < 128 && seen.insert((self.qmd[0x08], tic_index, tic.gpu_va)) {
-                        log::warn!(
-                            "[compute-tic-cpu-target] program={:#x} tic={} target={:#x} gpu={:#x} cpu={:#x} nvmap={} fmt={:?} {}x{} type={} block_linear={}",
-                            self.qmd[0x08],
-                            tic_index,
-                            target,
-                            tic.gpu_va,
-                            cpu_va,
-                            nvmap_id,
-                            tic.format,
-                            tic.width,
-                            tic.height,
-                            tic.texture_type,
-                            tic.is_block_linear,
-                        );
-                    }
-                }
-            }
-        }
         let layers = texture_layer_count(&tic);
         let effective_block_linear =
             tic.is_block_linear && !nexium_gpu::pitch_oracle::is_pitch_dst(tic.gpu_va);
