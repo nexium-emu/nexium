@@ -2006,7 +2006,7 @@ impl PrepState {
         }
         let target = renderer.submitted_generation();
         let blocked_started = super::pusher::kickprof::rate_start();
-        let mut completed = renderer.wait_submit_generation(target, Duration::from_secs(3));
+        let mut completed = renderer.wait_submit_generation_patiently(target, reason);
         super::pusher::kickprof::add_blocked(blocked_started);
         if !completed {
             log::error!(

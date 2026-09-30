@@ -132,7 +132,7 @@ pub(crate) fn submit_renderer_completion(
             let waited = run_completion_after_wait(
                 || {
                     if timeline_available {
-                        renderer.wait_submit_generation(target, Duration::from_secs(3))
+                        renderer.wait_submit_generation_patiently(target, "completion")
                     } else {
                         renderer.wait_idle_checked()
                     }

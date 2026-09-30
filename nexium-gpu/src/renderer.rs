@@ -4995,14 +4995,82 @@ impl Renderer {
     }
 
     pub fn wait_submit_generation(&self, target: u64, timeout: std::time::Duration) -> bool {
+        match self.wait_submit_generation_status(target, timeout) {
+            Ok(done) => {
+                if !done {
+                    log::warn!(
+                        "[gpu-sync] timeline wait timeout target={} completed={:?}",
+                        target,
+                        self.completed_generation()
+                    );
+                }
+                done
+            }
+            Err(error) => {
+                log::warn!("[gpu-sync] timeline wait error {:?}", error);
+                false
+            }
+        }
+    }
+
+    pub fn wait_submit_generation_patiently(&self, target: u64, what: &str) -> bool {
+        const SLICE: std::time::Duration = std::time::Duration::from_secs(3);
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        loop {
+            match self.wait_submit_generation_status(target, SLICE) {
+                Ok(true) => {
+                    let waited = started.elapsed();
+                    if waited >= SLICE {
+                        log::error!(
+                            "[gpu-sync] {} target={} finished after {:.1}s",
+                            what,
+                            target,
+                            waited.as_secs_f64()
+                        );
+                    }
+                    return true;
+                }
+                Ok(false) => {
+                    let waited = started.elapsed();
+                    log::error!(
+                        "[gpu-sync] {} target={} still running after {:.0}s completed={:?}",
+                        what,
+                        target,
+                        waited.as_secs_f64(),
+                        self.completed_generation()
+                    );
+                    if waited >= LIMIT {
+                        return false;
+                    }
+                }
+                Err(error) => {
+                    log::error!(
+                        "[gpu-sync] {} target={} wait error {:?} completed={:?}",
+                        what,
+                        target,
+                        error,
+                        self.completed_generation()
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+
+    fn wait_submit_generation_status(
+        &self,
+        target: u64,
+        timeout: std::time::Duration,
+    ) -> Result<bool, vk::Result> {
         if self.submit_timeline == vk::Semaphore::null() {
-            return self.wait_idle_checked();
+            return Ok(self.wait_idle_checked());
         }
         if self
             .completed_generation()
             .is_some_and(|done| done >= target)
         {
-            return true;
+            return Ok(true);
         }
         let semaphore = self.submit_timeline;
         let info = vk::SemaphoreWaitInfo {
@@ -5014,19 +5082,9 @@ impl Renderer {
         };
         let nanos = timeout.as_nanos().min(u64::MAX as u128) as u64;
         match unsafe { self.device.wait_semaphores(&info, nanos) } {
-            Ok(()) => true,
-            Err(vk::Result::TIMEOUT) => {
-                log::warn!(
-                    "[gpu-sync] timeline wait timeout target={} completed={:?}",
-                    target,
-                    self.completed_generation()
-                );
-                false
-            }
-            Err(error) => {
-                log::warn!("[gpu-sync] timeline wait error {:?}", error);
-                false
-            }
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
