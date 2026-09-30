@@ -537,8 +537,14 @@ pub(super) fn dispatch_storage(
             let offset = offset as u64;
             let size = size as u64;
             if offset > storage.len() || size > storage.len() - offset || size > target.size {
+                log::debug!(
+                    "{port_name}.Read rejected offset={offset:#x} size={size:#x} storage_len={:#x} target={:#x}",
+                    storage.len(),
+                    target.size
+                );
                 return Some(build_ipc_response(ctx, INVALID_INPUT, &[], &[]));
             }
+            log::debug!("{port_name}.Read offset={offset:#x} size={size:#x} target={:#x}", target.size);
             let Ok(amount) = usize::try_from(size) else {
                 return Some(build_ipc_response(ctx, INVALID_INPUT, &[], &[]));
             };
@@ -549,6 +555,13 @@ pub(super) fn dispatch_storage(
                     return Some(build_ipc_response(ctx, INVALID_INPUT, &[], &[]));
                 }
             };
+            if port_name.starts_with("IFsStorageData:") {
+                log::debug!(
+                    "{port_name}.Read head={:02x?} nonzero={}",
+                    &bytes[..bytes.len().min(16)],
+                    bytes.iter().filter(|b| **b != 0).count()
+                );
+            }
             if !bytes.is_empty()
                 && kernel
                     .address_space

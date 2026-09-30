@@ -6149,6 +6149,7 @@ fn dispatch_service_v2(
     }
 
     if port_name == "IDatabaseService" {
+        log::debug!("IDatabaseService.cmd_{} in={:?}", cmd_id, ipc_input_u32(ctx, 0));
         match cmd_id {
             0 => return build_ipc_response(ctx, 0, &[0], &[]),
             1 => return build_ipc_response(ctx, 0, &[0], &[]),
