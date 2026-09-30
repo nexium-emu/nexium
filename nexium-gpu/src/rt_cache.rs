@@ -558,6 +558,9 @@ pub struct RtCache {
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     drawn_stamp: HashMap<RtKey, u64>,
     clear_stamp: HashMap<RtKey, u64>,
+    last_use: std::sync::Mutex<HashMap<RtKey, (u64, u64)>>,
+    use_counter: AtomicU64,
+    use_frame: u64,
     full_clear_stamp: HashMap<RtKey, u64>,
     depth_full_clear_generation: HashMap<RtKey, u64>,
     color_region_sources: HashMap<RtKey, (RtKey, vk::Image, u64)>,
@@ -852,6 +855,9 @@ impl RtCache {
             color_gpu_page_index: HashMap::default(),
             depth_cache: HashMap::default(),
             depth_cpu_base_index: HashMap::default(),
+            last_use: std::sync::Mutex::new(HashMap::default()),
+            use_counter: AtomicU64::new(0),
+            use_frame: 0,
             depth_formats: crate::depth::DepthFormats::default(),
             depth_pack_pipeline: None,
             snapshots: HashMap::default(),
@@ -1664,6 +1670,10 @@ impl RtCache {
         size: u64,
         gpu_ranges: &[(u64, u64)],
     ) {
+        fn rt_invalidate_trace_enabled() -> bool {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RT_INVALIDATE_TRACE").is_some())
+        }
         let has_cpu_range = cpu_addr != 0 && size != 0;
         let has_gpu_range = gpu_ranges.iter().any(|(_, gpu_size)| *gpu_size != 0);
         if !has_cpu_range && !has_gpu_range {
@@ -1685,6 +1695,15 @@ impl RtCache {
         };
         let (stale_color, stale_depth) =
             self.guest_range_hits_memoized(cpu_addr, cpu_end, gpu_ranges);
+        if !stale_color.is_empty() && rt_invalidate_trace_enabled() {
+            log::warn!(
+                "[rt-invalidate] cpu={:#x}+{:#x} gpu={:x?} stale=[{}]",
+                cpu_addr,
+                size,
+                gpu_ranges,
+                stale_color.iter().map(|key| key.label()).collect::<Vec<_>>().join(",")
+            );
+        }
         for stale_key in stale_color {
             self.note_color_sampling_changed(stale_key.nvmap_id);
             self.drawn_stamp.remove(&stale_key);
@@ -1762,6 +1781,7 @@ impl RtCache {
     }
 
     pub fn reset_frame_draws(&mut self) {
+        self.use_frame = self.use_frame.wrapping_add(1);
         self.frame_draws.clear();
         self.frame_real_draws.clear();
         self.depth_frame_draws.clear();
@@ -2282,6 +2302,87 @@ impl RtCache {
         (count, bytes)
     }
 
+    pub fn touch_use(&self, key: RtKey) {
+        let stamp = self.use_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut uses) = self.last_use.lock() {
+            uses.insert(key, (self.use_frame, stamp));
+        }
+    }
+
+    pub(crate) fn over_budget(&self) -> bool {
+        self.cached_bytes() > rt_cache_budget_bytes()
+    }
+
+    fn cached_bytes(&self) -> u64 {
+        let [(_, color_bytes), (_, depth_bytes), (_, snapshot_bytes)] = self.memory_estimates();
+        color_bytes
+            .saturating_add(depth_bytes)
+            .saturating_add(snapshot_bytes)
+    }
+
+    pub(crate) fn retire_over_budget(
+        &mut self,
+        retired: &mut Vec<GpuImage>,
+        protected: &[RtKey],
+    ) -> (usize, u64) {
+        let budget = rt_cache_budget_bytes();
+        let total = self.cached_bytes();
+        if total <= budget {
+            return (0, 0);
+        }
+        let now = self.use_frame;
+        let mut candidates: Vec<((u64, u64), bool, RtKey, u64)> = Vec::new();
+        if let Ok(uses) = self.last_use.lock() {
+            let entries = self
+                .cache
+                .iter()
+                .map(|(key, image)| (false, *key, image_estimated_bytes(*key, image)))
+                .chain(
+                    self.depth_cache
+                        .iter()
+                        .map(|(key, image)| (true, *key, image_estimated_bytes(*key, image))),
+                );
+            for (depth, key, bytes) in entries {
+                if protected.contains(&key) || is_synthetic_copy_key(key) {
+                    continue;
+                }
+                let last = uses.get(&key).copied().unwrap_or((0, 0));
+                if now.saturating_sub(last.0) < RT_CACHE_MIN_IDLE_FRAMES {
+                    continue;
+                }
+                candidates.push((last, depth, key, bytes));
+            }
+        }
+        candidates.sort_by_key(|(last, _, _, _)| *last);
+        let mut excess = total - budget;
+        let mut count = 0usize;
+        let mut bytes_total = 0u64;
+        for (_, depth, key, bytes) in candidates {
+            if excess == 0 {
+                break;
+            }
+            let (retired_count, retired_bytes) = self.retire_view(depth, key, retired);
+            count += retired_count;
+            bytes_total = bytes_total.saturating_add(retired_bytes);
+            excess = excess.saturating_sub(bytes.max(retired_bytes));
+        }
+        if let Ok(mut uses) = self.last_use.lock() {
+            uses.retain(|key, _| self.cache.contains_key(key) || self.depth_cache.contains_key(key));
+        }
+        if count != 0 {
+            static EVICTIONS: AtomicU64 = AtomicU64::new(0);
+            let total_evictions =
+                EVICTIONS.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
+            if total_evictions <= 64 || total_evictions % 512 < count as u64 {
+                log::info!(
+                    "[rt-cache-evict] retired={count} bytes={bytes_total} total_evictions={total_evictions} cached_bytes={} budget={budget}",
+                    self.cached_bytes()
+                );
+            }
+        }
+        (count, bytes_total)
+    }
+
     pub(crate) fn retire_redundant_views(
         &mut self,
         retired: &mut Vec<GpuImage>,
@@ -2378,6 +2479,53 @@ impl RtCache {
             });
             (cache.len(), bytes)
         })
+    }
+
+    pub fn orphan_memory_summary<'a>(&self, retired: impl Iterator<Item = &'a GpuImage>) -> Option<String> {
+        use vk::Handle;
+        let live = rt_live_memory()?.lock().ok()?;
+        let mut owned: HashSet<u64> = HashSet::default();
+        for image in self
+            .cache
+            .values()
+            .chain(self.depth_cache.values())
+            .chain(self.snapshots.values())
+        {
+            owned.insert(image.memory.as_raw());
+        }
+        for image in retired {
+            owned.insert(image.memory.as_raw());
+        }
+        let mut live_bytes = 0u64;
+        let mut orphan_count = 0usize;
+        let mut orphan_bytes = 0u64;
+        let mut dims: HashMap<(u32, u32, u64), (usize, u64)> = HashMap::default();
+        for (memory, (size, key)) in live.iter() {
+            live_bytes = live_bytes.saturating_add(*size);
+            if owned.contains(memory) {
+                continue;
+            }
+            orphan_count += 1;
+            orphan_bytes = orphan_bytes.saturating_add(*size);
+            let entry = dims.entry((key.width, key.height, key.gpu_va)).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(*size);
+        }
+        let mut dims = dims.into_iter().collect::<Vec<_>>();
+        dims.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+        let top = dims
+            .iter()
+            .take(8)
+            .map(|((w, h, va), (count, bytes))| format!("{w}x{h}@{va:x}:{count}/{}MB", bytes >> 20))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(format!(
+            "live={} live_mb={} owned={} orphans={orphan_count} orphan_mb={} top=[{top}]",
+            live.len(),
+            live_bytes >> 20,
+            owned.len(),
+            orphan_bytes >> 20
+        ))
     }
 
     pub fn debug_all(&self) -> Vec<(RtKey, u64)> {
@@ -2847,6 +2995,7 @@ impl RtCache {
         if let Some(image) = self.get_or_create_color_image(key, device, format)? {
             retired.push(image);
         }
+        self.touch_use(key);
         Ok(self.cache.get_mut(&key).unwrap())
     }
 
@@ -2970,6 +3119,7 @@ impl RtCache {
                 .find(|existing| same_physical_backing(*existing, key))
                 .unwrap_or(key)
         };
+        self.touch_use(cache_key);
         let recreate = self.depth_cache.get(&cache_key).is_some_and(|image| {
             self.obsolete_mapping_views.contains(&(true, cache_key))
                 || render_target_backing_changed(cache_key, key)
@@ -4142,6 +4292,7 @@ impl RtCache {
         };
         let mut views = std::collections::HashMap::default();
         views.insert(format, view);
+        note_rt_memory_alloc(memory, req.size, key);
 
         Ok(GpuImage {
             image,
@@ -4189,6 +4340,19 @@ impl RtCache {
         self.depth_generations.clear();
         self.depth_shadow_generations.clear();
     }
+}
+
+const RT_CACHE_MIN_IDLE_FRAMES: u64 = 4;
+
+fn rt_cache_budget_bytes() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("NEXIUM_RT_CACHE_BUDGET_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(2048)
+            .saturating_mul(1024 * 1024)
+    })
 }
 
 fn image_estimated_bytes(key: RtKey, image: &GpuImage) -> u64 {
@@ -4295,7 +4459,35 @@ fn destroy_gpu_image(device: &ash::Device, image: GpuImage) {
             device.destroy_image_view(view, None);
         }
         device.destroy_image(image.image, None);
+        note_rt_memory_free(image.memory);
         device.free_memory(image.memory, None);
+    }
+}
+
+fn rt_live_memory() -> Option<&'static std::sync::Mutex<HashMap<u64, (u64, RtKey)>>> {
+    static LIVE: OnceLock<Option<std::sync::Mutex<HashMap<u64, (u64, RtKey)>>>> = OnceLock::new();
+    LIVE.get_or_init(|| {
+        std::env::var_os("NEXIUM_GPU_MEMORY_PROFILE")
+            .map(|_| std::sync::Mutex::new(HashMap::default()))
+    })
+    .as_ref()
+}
+
+fn note_rt_memory_alloc(memory: vk::DeviceMemory, size: u64, key: RtKey) {
+    use vk::Handle;
+    if let Some(live) = rt_live_memory() {
+        if let Ok(mut live) = live.lock() {
+            live.insert(memory.as_raw(), (size, key));
+        }
+    }
+}
+
+fn note_rt_memory_free(memory: vk::DeviceMemory) {
+    use vk::Handle;
+    if let Some(live) = rt_live_memory() {
+        if let Ok(mut live) = live.lock() {
+            live.remove(&memory.as_raw());
+        }
     }
 }
 

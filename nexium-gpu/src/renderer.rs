@@ -2696,6 +2696,34 @@ fn trace_gpu_memory(
     log::info!(
         "[gpu-memory] textures={texture_count} texture_bytes={texture_bytes} retired_textures={retired_count} retired_texture_bytes={retired_bytes} rt_colors={color_count} rt_color_estimated_bytes={color_bytes} rt_depths={depth_count} rt_depth_estimated_bytes={depth_bytes} rt_snapshots={snapshot_count} rt_snapshot_estimated_bytes={snapshot_bytes} retired_rts={retired_rt_count} retired_rt_total={retired_rt_total} retired_rt_estimated_bytes_total={retired_rt_bytes_total} rt_guest_stale_colors={stale_color_count} rt_guest_stale_depths={stale_depth_count} rt_small_colors={small_color_count} rt_small_guest_stale_colors={stale_small_color_count} rt_small_writeback_stamped_colors={stamped_small_color_count} rt_small_undefined_colors={undefined_small_color_count} rt_small_present_excluded_colors={present_excluded_small_color_count} uploads={upload_count} upload_bytes={upload_bytes}"
     );
+    if let Some(summary) =
+        rt_cache.orphan_memory_summary(slots.iter().flat_map(|slot| slot.retired_rt_images.iter()))
+    {
+        log::info!("[rt-orphans] {summary}");
+    }
+    if color_count + depth_count > 600 {
+        let colors = rt_cache.debug_all();
+        let newest = colors
+            .iter()
+            .rev()
+            .take(6)
+            .map(|(key, stamp)| format!("{}#{stamp}", key.label()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut depth_dims: HashMap<(u32, u32), usize> = HashMap::new();
+        for (key, _, _, _, _) in rt_cache.debug_depth_all() {
+            *depth_dims.entry((key.width, key.height)).or_insert(0) += 1;
+        }
+        let mut depth_dims = depth_dims.into_iter().collect::<Vec<_>>();
+        depth_dims.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let depths = depth_dims
+            .iter()
+            .take(6)
+            .map(|((width, height), count)| format!("{width}x{height}:{count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        log::info!("[gpu-memory-keys] newest_colors=[{newest}] depth_dims=[{depths}]");
+    }
 }
 
 fn can_retain_invalidated_texture(count: usize, bytes: u64, size: u64) -> bool {
@@ -9798,6 +9826,14 @@ impl Renderer {
             let protected = protected_render_target_keys(std::iter::once(call), std::iter::empty());
             rt_cache.retire_redundant_views(&mut frame_slots[cur_idx].retired_rt_images, &protected)
         };
+        let rt_retirement = if rt_cache.over_budget() {
+            let protected = protected_render_target_keys(std::iter::once(call), std::iter::empty());
+            let evicted =
+                rt_cache.retire_over_budget(&mut frame_slots[cur_idx].retired_rt_images, &protected);
+            (rt_retirement.0 + evicted.0, rt_retirement.1.saturating_add(evicted.1))
+        } else {
+            rt_retirement
+        };
         trace_gpu_memory(rt_cache, tex_cache.len(), *tex_cache_bytes, frame_slots, rt_retirement);
         let texture_use_generation = submit_state.generation.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(cache) = aurora_resident_ssbos.as_mut() {
@@ -11877,6 +11913,17 @@ impl Renderer {
                 clear_groups.iter().flat_map(|clears| clears.iter()),
             );
             rt_cache.retire_redundant_views(&mut frame_slots[cur_idx].retired_rt_images, &protected)
+        };
+        let rt_retirement = if rt_cache.over_budget() {
+            let protected = protected_render_target_keys(
+                group_preps.iter().flat_map(|(_, preps)| preps.iter().map(|(call, _)| *call)),
+                clear_groups.iter().flat_map(|clears| clears.iter()),
+            );
+            let evicted =
+                rt_cache.retire_over_budget(&mut frame_slots[cur_idx].retired_rt_images, &protected);
+            (rt_retirement.0 + evicted.0, rt_retirement.1.saturating_add(evicted.1))
+        } else {
+            rt_retirement
         };
         trace_gpu_memory(rt_cache, tex_cache.len(), *tex_cache_bytes, frame_slots, rt_retirement);
         let texture_use_generation = submit_state.generation.load(std::sync::atomic::Ordering::Relaxed);
@@ -25219,6 +25266,9 @@ fn rt_alias_for_slot(
         filtered.is_some(),
         used_copy_color,
     );
+    if let Some(alias) = &filtered {
+        rt_cache.touch_use(alias.key);
+    }
     filtered
 }
 
