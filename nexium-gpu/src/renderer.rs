@@ -3119,6 +3119,49 @@ struct StagingBuffer {
     size: u64,
 }
 
+struct StorageReadbackStaging {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    size: u64,
+    mapped: *mut u8,
+}
+
+unsafe impl Send for StorageReadbackStaging {}
+unsafe impl Sync for StorageReadbackStaging {}
+
+fn ensure_storage_readback_staging<'a>(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    slot: &'a mut FrameSlot,
+    needed: u64,
+) -> Result<&'a StorageReadbackStaging, String> {
+    if slot
+        .storage_readback_staging
+        .as_ref()
+        .is_some_and(|staging| staging.size >= needed)
+    {
+        return Ok(slot.storage_readback_staging.as_ref().unwrap());
+    }
+    if let Some(old) = slot.storage_readback_staging.take() {
+        unsafe { device.unmap_memory(old.memory) };
+        slot.retired_buffers.push((old.buffer, old.memory));
+    }
+    let size = needed.max(1 << 20).next_power_of_two();
+    let staging = create_staging_owned(device, mem_props, size)?;
+    let mapped = unsafe {
+        device
+            .map_memory(staging.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            .map_err(|error| format!("map_memory(storage readback staging): {error:?}"))? as *mut u8
+    };
+    slot.storage_readback_staging = Some(StorageReadbackStaging {
+        buffer: staging.buffer,
+        memory: staging.memory,
+        size,
+        mapped,
+    });
+    Ok(slot.storage_readback_staging.as_ref().unwrap())
+}
+
 struct HostBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -3184,6 +3227,7 @@ struct FrameSlot {
     retired_rt_images: Vec<GpuImage>,
     retired_views: Vec<vk::ImageView>,
     fermi_exact_rt_snapshot_leases: Vec<u64>,
+    storage_readback_staging: Option<StorageReadbackStaging>,
 }
 
 const FERMI_EXACT_RT_SNAPSHOT_LEASE_CAPACITY: usize = 32;
@@ -6037,6 +6081,7 @@ impl Renderer {
                 retired_rt_images: Vec::new(),
                 retired_views: Vec::new(),
                 fermi_exact_rt_snapshot_leases: Vec::new(),
+                storage_readback_staging: None,
             })
             .collect::<Vec<_>>();
         let utility_slot = FrameSlot {
@@ -6058,6 +6103,7 @@ impl Renderer {
             retired_rt_images: Vec::new(),
             retired_views: Vec::new(),
             fermi_exact_rt_snapshot_leases: Vec::new(),
+            storage_readback_staging: None,
         };
 
         let clear_slot_count = clear_slot_count();
@@ -11442,19 +11488,13 @@ impl Renderer {
                 .filter_map(|call| call.storage_readback.as_ref().map(|request| request.sender.clone()))
                 .collect(),
         };
-        if storage_readback_completion.senders.len() > 1 {
-            return Err("graphics storage readback requires a separate submission per writer draw".to_string());
-        }
-        let storage_readback_call = groups.iter()
-            .flat_map(|calls| calls.iter())
-            .find(|call| call.storage_readback.is_some());
-        let mut storage_readback_canonical = std::array::from_fn(|binding| binding as u32);
-        if let Some(call) = storage_readback_call {
-            let last_call = groups.iter().flat_map(|calls| calls.iter()).last();
-            if !last_call.is_some_and(|last| std::ptr::eq(last, call)) {
-                return Err("graphics storage writer must end its submitted draw batch".to_string());
-            }
-            storage_readback_canonical = validate_graphics_storage_readback(call)?;
+        let mut storage_readback_writers: Vec<(usize, usize)> = Vec::new();
+        for call in groups.iter().flat_map(|calls| calls.iter()).filter(|call| call.storage_readback.is_some()) {
+            validate_graphics_storage_readback(call)?;
+            storage_readback_writers.push((
+                std::ptr::from_ref(call) as usize,
+                call.storage_readback.as_ref().unwrap().bindings.len(),
+            ));
         }
         if groups.len() != clear_groups.len() {
             return Err(format!(
@@ -12142,7 +12182,10 @@ impl Renderer {
             Vec::<u32>::with_capacity(crate::descriptor::MAX_SSBO as usize);
         let mut readonly_ssbo_uploads =
             HashMap::<ReadonlySsboUploadKey, vk::DescriptorBufferInfo>::new();
-        let mut storage_readback_ranges = Vec::<(u32, u64, usize)>::new();
+        let mut storage_readback_ranges = Vec::<(usize, u32, u64, usize)>::new();
+        let mut shared_writer_uploads = HashMap::<(u64, usize), vk::DescriptorBufferInfo>::new();
+        let mut storage_readback_staging_ranges = Vec::<(u64, usize, u64)>::new();
+        let mut storage_readback_staging_mapped: *mut u8 = std::ptr::null_mut();
         let mut descriptor_writes = Vec::with_capacity(17 + crate::descriptor::MAX_SSBO as usize);
         let mut sparse_sampled_image_infos =
             Vec::<vk::DescriptorImageInfo>::with_capacity(MAX_TEXTURE_DESCRIPTOR_COUNT);
@@ -12300,6 +12343,13 @@ impl Renderer {
             let mut recorded_texture_memo_epoch = None;
             for (draw_index, (call, prep)) in preps.iter().enumerate() {
                 let call = *call;
+                let storage_readback_key = std::ptr::from_ref(call) as usize;
+                let storage_readback_canonical: [u32; crate::descriptor::MAX_SSBO as usize] =
+                    if call.storage_readback.is_some() {
+                        validate_graphics_storage_readback(call)?
+                    } else {
+                        std::array::from_fn(|binding| binding as u32)
+                    };
                 let storage_only = graphics_storage_only_draw(call);
                 let rt_extent = if storage_only {
                     vk::Extent2D { width: call.rt_key.width, height: call.rt_key.height }
@@ -14565,7 +14615,7 @@ impl Renderer {
                         if call.storage_readback.as_ref()
                             .is_some_and(|request| request.bindings.contains(&idx))
                         {
-                            storage_readback_ranges.push((idx, info.offset, snapshot.logical_size));
+                            storage_readback_ranges.push((storage_readback_key, idx, info.offset, snapshot.logical_size));
                         }
                         continue;
                     }
@@ -14601,6 +14651,19 @@ impl Renderer {
                         }
                         continue;
                     }
+                    if let Some(info) = call
+                        .storage_readback
+                        .as_ref()
+                        .filter(|request| request.bindings.contains(&idx) && snapshot.data_offset == 0)
+                        .and_then(|_| shared_writer_uploads.get(&(snapshot.guest_addr, snapshot.logical_size)).copied())
+                    {
+                        storage_alias_uploads[canonical] = Some(info);
+                        storage_readback_ranges.push((storage_readback_key, idx, info.offset, snapshot.logical_size));
+                        ssbo_infos.push(info);
+                        ssbo_bindings.push(idx);
+                        ssbo_provided[idx as usize] = true;
+                        continue;
+                    }
                     let sz = snapshot.logical_size as u64;
                     let sz_al = align_up(sz, 16);
                     if !ring_allocation_fits(ubo_ring, sz_al, 16) {
@@ -14629,7 +14692,10 @@ impl Renderer {
                     if call.storage_readback.as_ref()
                         .is_some_and(|request| request.bindings.contains(&idx))
                     {
-                        storage_readback_ranges.push((idx, soff, snapshot.logical_size));
+                        storage_readback_ranges.push((storage_readback_key, idx, soff, snapshot.logical_size));
+                        if snapshot.data_offset == 0 {
+                            shared_writer_uploads.insert((snapshot.guest_addr, snapshot.logical_size), info);
+                        }
                     }
                     if let Some(key) = readonly_key {
                         readonly_ssbo_uploads.insert(key, info);
@@ -15266,26 +15332,69 @@ impl Renderer {
             }
             next_clear_group += 1;
         }
-        if let Some(call) = storage_readback_call {
-            let request = call.storage_readback.as_ref().unwrap();
-            if storage_readback_ranges.len() != request.bindings.len() {
-                return Err("graphics storage writer did not record every requested binding".to_string());
+        if !storage_readback_writers.is_empty() {
+            for &(key, expected) in &storage_readback_writers {
+                let recorded = storage_readback_ranges.iter().filter(|range| range.0 == key).count();
+                if recorded != expected {
+                    return Err("graphics storage writer did not record every requested binding".to_string());
+                }
             }
-            for &(_, offset, len) in &storage_readback_ranges {
+            for &(_, _, offset, len) in &storage_readback_ranges {
                 if offset.checked_add(len as u64).is_none_or(|end| end > ubo_ring.size) {
                     return Err("graphics storage readback exceeds its ring allocation".to_string());
                 }
             }
-            let barrier = vk::MemoryBarrier::default()
+            let mut staging_total = 0u64;
+            for &(_, _, offset, len) in &storage_readback_ranges {
+                if !storage_readback_staging_ranges
+                    .iter()
+                    .any(|range| range.0 == offset && range.1 == len)
+                {
+                    storage_readback_staging_ranges.push((offset, len, staging_total));
+                    staging_total += align_up(len as u64, 16);
+                }
+            }
+            let (staging_buffer, staging_mapped) = {
+                let staging = ensure_storage_readback_staging(
+                    device,
+                    mem_props,
+                    &mut frame_slots[cur_idx],
+                    staging_total,
+                )?;
+                (staging.buffer, staging.mapped)
+            };
+            storage_readback_staging_mapped = staging_mapped;
+            let regions: Vec<vk::BufferCopy> = storage_readback_staging_ranges
+                .iter()
+                .map(|&(offset, len, dst)| vk::BufferCopy {
+                    src_offset: offset,
+                    dst_offset: dst,
+                    size: len as u64,
+                })
+                .collect();
+            let to_transfer = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            let to_host = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
             unsafe {
                 device.cmd_pipeline_barrier(
                     cmd,
                     vk::PipelineStageFlags::ALL_GRAPHICS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[to_transfer],
+                    &[],
+                    &[],
+                );
+                device.cmd_copy_buffer(cmd, ubo_ring.buffer, staging_buffer, &regions);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::HOST,
                     vk::DependencyFlags::empty(),
-                    &[barrier],
+                    &[to_host],
                     &[],
                     &[],
                 );
@@ -15412,21 +15521,42 @@ impl Renderer {
         ubo_ring.slot_head[next_idx] = ubo_ring.head;
         *frame_index = next_idx;
         pipeline_cache.maybe_save(device);
-        if storage_readback_call.is_some() {
+        if !storage_readback_writers.is_empty() {
+            let wait_started = std::time::Instant::now();
             unsafe {
                 device.wait_for_fences(&[slot_fence], true, 10_000_000_000)
                     .map_err(|error| format!("graphics storage readback fence wait: {error:?}"))?;
             }
-            let results = storage_readback_ranges.into_iter()
-                .map(|(binding, offset, len)| {
-                    let data = unsafe {
-                        std::slice::from_raw_parts(ubo_ring.mapped.add(offset as usize), len).to_vec()
-                    };
-                    crate::draw::GraphicsStorageReadback { binding, data }
-                })
-                .collect();
-            if let Some(sender) = storage_readback_completion.senders.pop() {
+            let wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+            let copy_started = std::time::Instant::now();
+            let senders = std::mem::take(&mut storage_readback_completion.senders);
+            for ((key, _), sender) in storage_readback_writers.iter().zip(senders) {
+                let results = storage_readback_ranges
+                    .iter()
+                    .filter(|range| range.0 == *key)
+                    .map(|&(_, binding, offset, len)| {
+                        let dst = storage_readback_staging_ranges
+                            .iter()
+                            .find(|range| range.0 == offset && range.1 == len)
+                            .map_or(0, |range| range.2);
+                        let data = unsafe {
+                            std::slice::from_raw_parts(storage_readback_staging_mapped.add(dst as usize), len).to_vec()
+                        };
+                        crate::draw::GraphicsStorageReadback { binding, data }
+                    })
+                    .collect();
                 let _ = sender.send(Ok(results));
+            }
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 || n % 512 == 0 {
+                let bytes: usize = storage_readback_ranges.iter().map(|range| range.3).sum();
+                log::info!(
+                    "[graphics-ssbo-readback] #{n} writers={} ranges={} bytes={bytes} fence_wait_ms={wait_ms:.3} copy_ms={:.3}",
+                    storage_readback_writers.len(),
+                    storage_readback_ranges.len(),
+                    copy_started.elapsed().as_secs_f64() * 1000.0
+                );
             }
         }
         Ok(true)
@@ -32218,6 +32348,13 @@ impl Drop for RendererInner {
                 unsafe {
                     self.device.destroy_buffer(buffer, None);
                     self.device.free_memory(memory, None);
+                }
+            }
+            if let Some(staging) = slot.storage_readback_staging.take() {
+                unsafe {
+                    self.device.unmap_memory(staging.memory);
+                    self.device.destroy_buffer(staging.buffer, None);
+                    self.device.free_memory(staging.memory, None);
                 }
             }
             destroy_descriptor_pools(&self.device, &mut slot.retired_dset_pools);

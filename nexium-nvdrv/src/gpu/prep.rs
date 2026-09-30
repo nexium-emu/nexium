@@ -74,6 +74,7 @@ pub(crate) enum PrepEvent {
     },
     SetRenderer(Option<Arc<nexium_gpu::Renderer>>),
     SetGuestMemory(Option<super::GuestMemoryAccess>),
+    CompleteAfterGuestWrites(Box<dyn FnOnce() + Send>),
 }
 
 fn eager_clear_resolve_enabled() -> bool {
@@ -384,12 +385,14 @@ pub(crate) struct PrepState {
     pub(crate) prepared_draw_packets: PreparedDrawPacketizer,
     vk_flush_completed: bool,
     pub(crate) ssbo_snapshot_cache: SsboSnapshotCache,
+    pending_storage_readbacks: Vec<super::vk_dispatch::PendingStorageReadback>,
     pub(crate) inline_upload: KeplerMemory,
     pub(crate) constbuf_invalidation_scratch: Vec<(u64, usize)>,
     pub(crate) constbuf_patched_scratch: Vec<(u64, u64, usize)>,
     pub(crate) constbuf_bytes_scratch: Vec<u8>,
     compute_snapshot_revision: Option<(u64, u64)>,
     compute_barrier_cache: ComputeBarrierCache,
+    renderer_guest_writes_pending: bool,
     #[cfg(test)]
     pub(crate) prepared_packet_drain_counts: PreparedPacketDrainCounts,
 }
@@ -438,6 +441,16 @@ impl PrepState {
         }
     }
 
+    pub(crate) fn complete_after_guest_writes(&mut self, callback: Box<dyn FnOnce() + Send>) {
+        if std::mem::take(&mut self.renderer_guest_writes_pending) {
+            if let Some(renderer) = self.renderer.clone() {
+                super::completion::submit_renderer_completion(renderer, callback);
+                return;
+            }
+        }
+        callback();
+    }
+
     pub(crate) fn run_event(
         &mut self,
         event: PrepEvent,
@@ -452,11 +465,13 @@ impl PrepState {
         use super::pusher::kickprof;
         match event {
             PrepEvent::InlineUploadMethods(methods) => {
+                self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
                 self.process_inline_upload_methods(methods, mappings, mem_read, mem_write);
                 true
             }
             PrepEvent::KickBegin => {
                 self.drain_landed_compute(mappings);
+                self.publish_pending_storage_readbacks(false, mappings, mem_read, mem_write);
                 self.begin_ssbo_snapshot_epoch();
                 true
             }
@@ -486,6 +501,7 @@ impl PrepState {
                     self.record_flush_reason(kickprof::FLUSH_HARD_TAIL);
                 }
                 self.flush_vk_with_boundary(mappings, mem_read, mem_write, hard_after);
+                self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
                 let submitted = self.finish_prepared_draw_packet_tail(hard_after);
                 self.post_compute_overlay_retire();
                 let writeback_completed = if !joined {
@@ -537,6 +553,7 @@ impl PrepState {
             } => {
                 let kp_wb = super::pusher::kickprof::start();
                 let joined = self.join_small_rt_writeback(mappings);
+                self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
                 let kp_flush = super::pusher::kickprof::start();
                 let flushed = self.flush_prepared_draw_packets();
                 super::pusher::kickprof::add(super::pusher::kickprof::PRES_WB_FLUSH, kp_flush);
@@ -610,6 +627,7 @@ impl PrepState {
             } => {
                 let joined = self.join_small_rt_writeback(mappings);
                 let flushed = self.flush_prepared_draw_packets();
+                self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
                 let writeback_completed = if !joined || !flushed {
                     false
                 } else if flush_small_rts && super::vk_dispatch::has_pending_small_rt_writebacks() {
@@ -673,6 +691,10 @@ impl PrepState {
                 self.set_renderer(renderer);
                 true
             }
+            PrepEvent::CompleteAfterGuestWrites(callback) => {
+                self.complete_after_guest_writes(callback);
+                true
+            }
             PrepEvent::SetGuestMemory(memory) => {
                 self.set_guest_memory_access(memory);
                 true
@@ -689,6 +711,7 @@ impl PrepState {
                 long,
             } => {
                 super::watchdog::phase(super::watchdog::Phase::Semaphore, gpu_va);
+                self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
                 self.resolve_pending_compute(mappings, mem_write);
                 self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
                 self.ssbo_snapshot_cache.invalidate_gpu_write(
@@ -796,6 +819,7 @@ impl PrepState {
             }
             PrepEvent::SemRelease(writes) => {
                 super::watchdog::phase(super::watchdog::Phase::Semaphore, writes.len() as u64);
+                self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
                 let can_complete_asynchronously =
                     super::completion::async_semaphore_completion_enabled()
                         && self
@@ -857,6 +881,7 @@ impl PrepState {
                         },
                     );
                     if scheduled {
+                        self.renderer_guest_writes_pending = true;
                         stats
                             .fence_releases
                             .fetch_add(count as u64, AtomicOrdering::Relaxed);
@@ -901,7 +926,9 @@ impl PrepState {
                                 );
                             },
                         );
-                        if !scheduled {
+                        if scheduled {
+                            self.renderer_guest_writes_pending = true;
+                        } else {
                             if self.sync_renderer_idle("report-semaphore-fallback") {
                                 super::pusher::write_payload_fences(&pending, |gpu_va, bytes| {
                                     memory.write_gpu_with_mappings(mappings, gpu_va, bytes)
@@ -986,6 +1013,7 @@ impl PrepState {
                 constbuf_trace,
             } => {
                 self.drain_landed_compute(mappings);
+                self.publish_pending_storage_readbacks(false, mappings, mem_read, mem_write);
                 let kp_pre = kickprof::start();
                 let compute_spans =
                     super::engines::maxwell_compute::pending_writeback_spans_snapshot();
@@ -1043,6 +1071,7 @@ impl PrepState {
                             &mut self.vk_batch,
                             &mut self.prepared_draw_packets,
                             &mut self.ssbo_snapshot_cache,
+                            &mut self.pending_storage_readbacks,
                             mappings,
                             gs_debug.as_ref(),
                             &r,
@@ -1082,6 +1111,7 @@ impl PrepState {
                                 &mut self.vk_batch,
                                 &mut self.prepared_draw_packets,
                                 &mut self.ssbo_snapshot_cache,
+                                &mut self.pending_storage_readbacks,
                                 mappings,
                                 gs_debug.as_ref(),
                                 &r,
@@ -1162,6 +1192,9 @@ impl PrepState {
                     super::watchdog::Phase::Methods,
                     (u64::from(class) << 32) | methods.first().map_or(0, |m| u64::from(m.0)),
                 );
+                if class != super::engines::maxwell3d::MAXWELL3D_CLASS {
+                    self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
+                }
                 let started = engb_prof_enabled().then(std::time::Instant::now);
                 let count = methods.len();
                 if class == super::engines::KEPLER_COMPUTE_CLASS {
@@ -1210,10 +1243,15 @@ impl PrepState {
                 method,
                 arg,
                 is_last,
-            } => self.run_engine_method(
-                class, method, arg, is_last, engines, mappings, stats, mem_read, mem_write,
-                mem_copy,
-            ),
+            } => {
+                if class != super::engines::maxwell3d::MAXWELL3D_CLASS {
+                    self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
+                }
+                self.run_engine_method(
+                    class, method, arg, is_last, engines, mappings, stats, mem_read, mem_write,
+                    mem_copy,
+                )
+            }
         }
     }
 
@@ -1680,6 +1718,52 @@ impl PrepState {
         self.prepared_draw_packets.has_pending()
     }
 
+    pub(crate) fn has_pending_storage_readbacks(&self) -> bool {
+        !self.pending_storage_readbacks.is_empty()
+    }
+
+    pub(crate) fn pending_storage_readbacks_overlap(&self, gpu_va: u64, len: u64) -> bool {
+        super::vk_dispatch::pending_storage_readbacks_overlap(&self.pending_storage_readbacks, gpu_va, len)
+    }
+
+    pub(crate) fn publish_pending_storage_readbacks(
+        &mut self,
+        blocking: bool,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) -> bool {
+        if self.pending_storage_readbacks.is_empty() {
+            return true;
+        }
+        let Some(renderer) = self.renderer.clone() else {
+            self.pending_storage_readbacks.clear();
+            return false;
+        };
+        let flush_started = std::time::Instant::now();
+        if blocking {
+            self.flush_vk_with_boundary(mappings, mem_read, mem_write, false);
+            self.flush_prepared_draw_packets();
+        }
+        let flush_ms = flush_started.elapsed().as_secs_f64() * 1000.0;
+        if blocking && flush_ms > 2.0 {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 || n % 512 == 0 {
+                log::info!("[graphics-ssbo-writeback] blocking publish flush #{n} took {flush_ms:.3} ms");
+            }
+        }
+        super::vk_dispatch::publish_pending_storage_readbacks(
+            &mut self.pending_storage_readbacks,
+            blocking,
+            &renderer,
+            mappings,
+            &mut self.ssbo_snapshot_cache,
+            mem_read,
+            mem_write,
+        )
+    }
+
     pub(crate) fn flush_prepared_draw_packets(&mut self) -> bool {
         #[cfg(test)]
         {
@@ -2079,12 +2163,14 @@ impl PrepState {
             prepared_draw_packets: PreparedDrawPacketizer::default(),
             vk_flush_completed: true,
             ssbo_snapshot_cache: SsboSnapshotCache::default(),
+            pending_storage_readbacks: Vec::new(),
             inline_upload: KeplerMemory::new(),
             constbuf_invalidation_scratch: Vec::new(),
             constbuf_patched_scratch: Vec::new(),
             constbuf_bytes_scratch: Vec::new(),
             compute_snapshot_revision: None,
             compute_barrier_cache: ComputeBarrierCache::default(),
+            renderer_guest_writes_pending: false,
             #[cfg(test)]
             prepared_packet_drain_counts: PreparedPacketDrainCounts::default(),
         }

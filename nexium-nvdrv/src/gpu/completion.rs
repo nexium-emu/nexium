@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -81,13 +82,52 @@ fn record_gpu_lag(waited: Duration) {
     }
 }
 
+static PENDING_GUEST_WRITES: AtomicUsize = AtomicUsize::new(0);
+
+struct PendingGuestWriteGuard;
+
+impl PendingGuestWriteGuard {
+    fn new() -> Self {
+        PENDING_GUEST_WRITES.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for PendingGuestWriteGuard {
+    fn drop(&mut self) {
+        PENDING_GUEST_WRITES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn wait_for_pending_guest_writes(timeout: Duration) -> bool {
+    if PENDING_GUEST_WRITES.load(Ordering::Acquire) == 0 {
+        return true;
+    }
+    let started = std::time::Instant::now();
+    let mut spins = 0u32;
+    while PENDING_GUEST_WRITES.load(Ordering::Acquire) != 0 {
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        if spins < 256 {
+            spins += 1;
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+    true
+}
+
 pub(crate) fn submit_renderer_completion(
     renderer: std::sync::Arc<nexium_gpu::Renderer>,
     completion: impl FnOnce() + Send + 'static,
 ) -> bool {
+    let guard = PendingGuestWriteGuard::new();
     let marker = move || {
         let target = renderer.submitted_generation();
         let completion_job = Box::new(move || {
+            let _guard = guard;
             let timeline_available = renderer.timeline_sync_available();
             let waited = run_completion_after_wait(
                 || {

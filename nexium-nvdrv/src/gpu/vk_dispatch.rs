@@ -29,6 +29,7 @@ const SPH_SIZE: usize = 0x50;
 const MAX_SASS_BYTES: usize = 64 * 1024;
 const PACKED_CBUF_SLOTS: usize = nexium_spirv::GFX_CBUF_SLOTS as usize;
 const FRAGMENT_CBUF_BASE: usize = GRAPHICS_CBUF_SLOTS;
+const GEOMETRY_CBUF_BASE: usize = GRAPHICS_CBUF_SLOTS * 2;
 const MAX_ACCUMULATED_DRAWS: usize = 2048;
 const INPUT_SNAPSHOT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const INPUT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 65536;
@@ -297,6 +298,18 @@ fn unimplemented_samples(cfg: &nexium_shader::Cfg) -> Vec<String> {
     samples
 }
 
+fn cfg_unimplemented_summary(cfg: &nexium_shader::Cfg) -> String {
+    let mut parts = Vec::new();
+    for inst in cfg.blocks.iter().flat_map(|block| &block.program.instructions) {
+        if let nexium_shader::IrOp::Unimplemented { opcode, raw } = &inst.op {
+            if parts.len() < 8 {
+                parts.push(format!("{opcode:?}@{raw:#018x}"));
+            }
+        }
+    }
+    parts.join(",")
+}
+
 fn graphics_cfg_has_unimplemented(cfg: &nexium_shader::Cfg) -> bool {
     cfg.unimplemented != 0
         || cfg.blocks.iter().any(|block| {
@@ -515,8 +528,17 @@ struct GraphicsSsboWrites {
 }
 
 fn graphics_ssbo_writes(vs: &nexium_shader::Cfg, fs: &nexium_shader::Cfg) -> GraphicsSsboWrites {
+    let vertex = cfg_ssbo_writes(vs);
+    let fragment = cfg_ssbo_writes(fs);
+    GraphicsSsboWrites {
+        mask: vertex.mask | fragment.mask,
+        unknown: vertex.unknown || fragment.unknown,
+    }
+}
+
+fn cfg_ssbo_writes(cfg: &nexium_shader::Cfg) -> GraphicsSsboWrites {
     let mut writes = GraphicsSsboWrites::default();
-    for instruction in vs.blocks.iter().chain(&fs.blocks).flat_map(|block| &block.program.instructions) {
+    for instruction in cfg.blocks.iter().flat_map(|block| &block.program.instructions) {
         match instruction.op {
             nexium_shader::IrOp::StoreStorage { buffer_index, .. }
             | nexium_shader::IrOp::StorageAtomic { buffer_index, .. } if buffer_index < 8 => {
@@ -594,6 +616,7 @@ struct GraphicsStorageWritebackTarget {
 const GRAPHICS_STORAGE_READBACK_ERROR: &str = "graphics storage readback:";
 
 fn graphics_storage_writeback_targets(
+    force_writeback: bool,
     writes: GraphicsSsboWrites,
     descriptors: &[nexium_shader::StorageBufferAddr],
     resolved: &[Option<ResolvedStorageBufferDescriptor>],
@@ -601,7 +624,7 @@ fn graphics_storage_writeback_targets(
     snapshot_reads: &[(u64, usize, bool)],
     mappings: &GpuMappings,
 ) -> Result<Vec<GraphicsStorageWritebackTarget>, String> {
-    if !graphics_ssbo_writeback_enabled() || (writes.mask == 0 && !writes.unknown) {
+    if !(graphics_ssbo_writeback_enabled() || force_writeback) || (writes.mask == 0 && !writes.unknown) {
         return Ok(Vec::new());
     }
     let unsupported = |reason: String| format!("{GRAPHICS_STORAGE_READBACK_ERROR} {reason}");
@@ -6224,11 +6247,101 @@ fn vertex_memory_store_candidate(draw: &DrawCall) -> bool {
         })
 }
 
+pub(crate) struct PendingStorageReadback {
+    receiver: std::sync::mpsc::Receiver<Result<Vec<nexium_gpu::draw::GraphicsStorageReadback>, String>>,
+    targets: Vec<GraphicsStorageWritebackTarget>,
+    vs: u64,
+    fs: u64,
+}
+
+fn graphics_ssbo_writeback_sync_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_GRAPHICS_SSBO_WRITEBACK_SYNC").is_some())
+}
+
+pub(crate) fn pending_storage_readbacks_overlap(
+    pending: &[PendingStorageReadback],
+    gpu_va: u64,
+    len: u64,
+) -> bool {
+    let end = gpu_va.saturating_add(len);
+    pending.iter().flat_map(|entry| entry.targets.iter()).any(|target| {
+        target.gpu_addr < end && gpu_va < target.gpu_addr.saturating_add(target.len as u64)
+    })
+}
+
+pub(crate) fn publish_pending_storage_readbacks(
+    pending: &mut Vec<PendingStorageReadback>,
+    blocking: bool,
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    ssbo_snapshot_cache: &mut SsboSnapshotCache,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    let started = std::time::Instant::now();
+    let mut published = 0usize;
+    let mut bytes = 0usize;
+    let mut ok = true;
+    let mut index = 0;
+    while index < pending.len() {
+        let result = if blocking {
+            pending[index]
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|error| format!("GPU completion receive failed: {error}"))
+        } else {
+            match pending[index].receiver.try_recv() {
+                Ok(result) => Ok(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(error) => Err(format!("GPU completion receive failed: {error}")),
+            }
+        };
+        let entry = pending.remove(index);
+        match result.and_then(|result| result).and_then(|readbacks| {
+            publish_graphics_storage_readback(
+                &entry.targets, readbacks, renderer, mappings, ssbo_snapshot_cache, entry.vs, entry.fs,
+                mem_read, mem_write,
+            )
+        }) {
+            Ok(written) => {
+                published += 1;
+                bytes += written;
+            }
+            Err(error) => {
+                ok = false;
+                log::error!("[graphics-ssbo-writeback] deferred vs={:#x} fs={:#x} {error}", entry.vs, entry.fs);
+            }
+        }
+    }
+    if published != 0 {
+        finish_ssbo_flush_boundary(ssbo_snapshot_cache);
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PUBLISHES: AtomicU64 = AtomicU64::new(0);
+        let n = PUBLISHES.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n % 512 == 0 {
+            log::info!(
+                "[graphics-ssbo-writeback] deferred publish #{n} buffers={published} bytes={bytes} blocking={blocking} left={} ms={:.3}",
+                pending.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+    ok
+}
+
 pub(crate) fn enqueue_draws(
     draws: &[DrawCall],
     batch: &mut PendingDrawBatch,
     packetizer: &mut PreparedDrawPacketizer,
     ssbo_snapshot_cache: &mut SsboSnapshotCache,
+    pending_storage_readbacks: &mut Vec<PendingStorageReadback>,
     mappings: &GpuMappings,
     gs_debug: Option<&GsDebugRegs>,
     renderer: &Arc<nexium_gpu::Renderer>,
@@ -6631,6 +6744,14 @@ pub(crate) fn enqueue_draws(
                 };
                 batch.push(call);
                 if let Some((receiver, vs, fs)) = storage_readback {
+                    if !graphics_ssbo_writeback_sync_enabled() {
+                        pending_storage_readbacks.push(PendingStorageReadback {
+                            receiver,
+                            targets: storage_writeback_targets.clone(),
+                            vs,
+                            fs,
+                        });
+                    } else {
                     derived_state_cache.clear();
                     if !flush_accum(
                         batch, renderer, mappings, mem_read, mem_write,
@@ -6668,6 +6789,7 @@ pub(crate) fn enqueue_draws(
                         log::info!("[graphics-ssbo-writeback] writers={writers} total_bytes={bytes} vs={vs:#x} fs={fs:#x} buffers={} bytes={bytes_written} wait_publish_ms={:.3}", storage_writeback_targets.len(), started.elapsed().as_secs_f64() * 1000.0);
                     }
                     continue;
+                    }
                 }
                 let stream_ready = stream_prepared_draws_enabled()
                     && batch.len() >= streamed_draw_limit();
@@ -6860,7 +6982,17 @@ fn render_enable_needs_ordered_read(draw: &DrawCall) -> bool {
 
 fn strict_cond_render() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("NEXIUM_STRICT_COND_RENDER").is_some())
+    *V.get_or_init(|| {
+        !std::env::var("NEXIUM_STRICT_COND_RENDER")
+            .ok()
+            .is_some_and(|value| {
+                let value = value.trim();
+                value == "0"
+                    || value.eq_ignore_ascii_case("false")
+                    || value.eq_ignore_ascii_case("off")
+                    || value.eq_ignore_ascii_case("no")
+            })
+    })
 }
 
 fn trace_depth_target_request(draw: &DrawCall, mappings: &GpuMappings) {
@@ -6955,6 +7087,11 @@ fn render_enabled(
                 if !strict_cond_render() {
                     log_render_enable_miss(draw, "conditional-fail-open");
                     return true;
+                }
+                if !super::completion::wait_for_pending_guest_writes(std::time::Duration::from_millis(
+                    250,
+                )) {
+                    log_render_enable_miss(draw, "pending-guest-writes-timeout");
                 }
                 let Some(cpu) = mappings.cpu_address_for(draw.render_enable_addr) else {
                     log_render_enable_miss(draw, "unmapped");
@@ -11270,6 +11407,8 @@ struct GeometryShader {
     spirv: std::sync::Arc<Vec<u32>>,
     cbuf_mask: u64,
     requirements: PackedCbufReadRequirements,
+    ssbo_descs: Vec<nexium_shader::StorageBufferAddr>,
+    ssbo_writes: GraphicsSsboWrites,
 }
 
 fn prepare_geometry_shader(
@@ -11278,29 +11417,78 @@ fn prepare_geometry_shader(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     vertex: nexium_spirv::VertexOptions,
+    forward_locations: &[u32],
+    ssbo_base: u32,
 ) -> Result<std::sync::Arc<GeometryShader>, String> {
     use std::sync::{Arc, Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, Arc<GeometryShader>>>> = OnceLock::new();
     let sph = fetch_sph(address, mappings, mem_read).ok_or_else(|| format!("unmapped GS header {address:#x}"))?;
     let options = nexium_spirv::GeometryOptions::from_header(topology, &sph)?;
     let code = fetch_sass(address, mappings, mem_read).ok_or_else(|| format!("unmapped GS code {address:#x}"))?;
+    let forward_mask = forward_locations
+        .iter()
+        .fold(0u32, |mask, location| mask | 1u32 << (location & 31));
     let scalars = [topology, vertex.vptx_scale_z.to_bits(), vertex.vptx_translate_z.to_bits(),
         vertex.apply_z_remap as u32, vertex.window_ndc.map_or(0, |v| v.0.to_bits()),
-        vertex.window_ndc.map_or(0, |v| v.1.to_bits())];
+        vertex.window_ndc.map_or(0, |v| v.1.to_bits()),
+        if options.passthrough { forward_mask } else { 0 }, ssbo_base];
     let key = bundle_content_key(&code, &[], Some(&sph), &scalars);
     let mut cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().unwrap();
     if let Some(shader) = cache.get(&key) { return Ok(shader.clone()); }
-    let cfg = nexium_shader::cfg::build_geometry_cfg(&code);
+    let mut cfg = nexium_shader::cfg::build_geometry_cfg(&code);
     if graphics_cfg_has_unimplemented(&cfg) {
-        return Err(format!("unsupported GS instructions at {address:#x}: {}", cfg.unimplemented));
+        if env_dump_shader("NEXIUM_DUMP_GS", address) {
+            let path = shader_dump_path(&format!("target_gs_{:x}.txt", address));
+            match std::fs::write(&path, format_shader_dump(&code, Some(&sph), None, 0)) {
+                Ok(()) => log::warn!("[dump-gs] wrote {} (unsupported GS)", path.display()),
+                Err(err) => log::warn!("[dump-gs] failed to write {}: {}", path.display(), err),
+            }
+        }
+        return Err(format!(
+            "unsupported GS instructions at {address:#x}: {} [{}]",
+            cfg.unimplemented,
+            cfg_unimplemented_summary(&cfg)
+        ));
     }
+    let mut ssbo_descs = nexium_shader::collect_storage_buffers(&mut cfg);
+    if ssbo_base as usize + ssbo_descs.len() > 8 {
+        return Err(format!(
+            "GS {address:#x} needs {} storage buffers but only {} graphics bindings remain",
+            ssbo_descs.len(),
+            8usize.saturating_sub(ssbo_base as usize)
+        ));
+    }
+    if ssbo_base != 0 {
+        for block in &mut cfg.blocks {
+            for instruction in &mut block.program.instructions {
+                match &mut instruction.op {
+                    nexium_shader::IrOp::LoadStorage { buffer_index, .. }
+                    | nexium_shader::IrOp::StoreStorage { buffer_index, .. }
+                    | nexium_shader::IrOp::StorageAtomic { buffer_index, .. } => {
+                        *buffer_index += ssbo_base;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for descriptor in &mut ssbo_descs {
+        descriptor.cbuf_binding += GEOMETRY_CBUF_BASE as u8;
+        if let Some(indirect) = &mut descriptor.indirect {
+            indirect.parent_buffer_index += ssbo_base;
+        }
+    }
+    let ssbo_writes = cfg_ssbo_writes(&cfg);
     let reads = collect_cbuf_reads(&cfg, nexium_spirv::GFX_CBUF_STAGE_SLOTS * 2);
+    let outputs: &[u32] = if options.passthrough { forward_locations } else { &[] };
     let (spirv, cbuf_mask) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        nexium_spirv::emit_geometry(&cfg, &[], vertex, options)
+        nexium_spirv::emit_geometry_with_ssbos(&cfg, outputs, vertex, options, ssbo_base, ssbo_descs.len() as u32)
     })).map_err(|panic| format!("GS emit {address:#x}: {}", shader_panic_message(panic)))?;
+    log::info!("compiled GS {address:#x}: {} input vertices, {} output vertices, passthrough={} forwarded={:?} ssbos={}@{} writes={:#x}{}",
+        options.input_vertices, options.output_vertices, options.passthrough, outputs, ssbo_descs.len(), ssbo_base,
+        ssbo_writes.mask, if ssbo_writes.unknown { "+unknown" } else { "" });
     let shader = Arc::new(GeometryShader { spirv: Arc::new(spirv), cbuf_mask,
-        requirements: packed_cbuf_read_requirements(&reads) });
-    log::info!("compiled GS {address:#x}: {} input vertices, {} output vertices", options.input_vertices, options.output_vertices);
+        requirements: packed_cbuf_read_requirements(&reads), ssbo_descs, ssbo_writes });
     cache.insert(key, shader.clone());
     Ok(shader)
 }
@@ -13708,6 +13896,7 @@ fn execute_one_inner(
     let fs_prog = &draw.shader_programs[5];
     let vs_cbuf_group = vs_prog.cbuf_group(0);
     let fs_cbuf_group = fs_prog.cbuf_group(4);
+    let gs_cbuf_group = gs_prog.cbuf_group(3);
     if shader_map_debug_enabled() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
@@ -15032,9 +15221,26 @@ fn execute_one_inner(
     };
     let fs_hash = effective_fragment_pipeline_hash(bundle.fs_hash, &fs_spirv, solid_fs_probe);
     let geometry = if geometry_enabled {
+        let forward_locations = nexium_spirv::scan_input_locations(&fs_spirv);
         Some(prepare_geometry_shader(gs_addr, draw.topology, mappings, mem_read,
-            nexium_spirv::VertexOptions { vptx_scale_z, vptx_translate_z, apply_z_remap, window_ndc, ..Default::default() })?)
+            nexium_spirv::VertexOptions { vptx_scale_z, vptx_translate_z, apply_z_remap, window_ndc, ..Default::default() },
+            &forward_locations, bundle.ssbo_descs.len() as u32)?)
     } else { None };
+    let gs_storage = geometry.as_ref().filter(|shader| !shader.ssbo_descs.is_empty());
+    let ssbo_descs: std::borrow::Cow<'_, [nexium_shader::StorageBufferAddr]> = match gs_storage {
+        Some(shader) => {
+            let mut descs = bundle.ssbo_descs.clone();
+            descs.extend_from_slice(&shader.ssbo_descs);
+            std::borrow::Cow::Owned(descs)
+        }
+        None => std::borrow::Cow::Borrowed(bundle.ssbo_descs.as_slice()),
+    };
+    let mut ssbo_writes = bundle.ssbo_writes;
+    if let Some(shader) = gs_storage {
+        ssbo_writes.mask |= shader.ssbo_writes.mask;
+        ssbo_writes.unknown |= shader.ssbo_writes.unknown;
+    }
+    let gs_storage_writer = gs_storage.is_some_and(|shader| shader.ssbo_writes.mask != 0);
     let gs_spirv = geometry.as_ref().map(|shader| shader.spirv.clone()).unwrap_or_default();
     let vs_cbuf_mask = bundle.vs_cbuf_mask | geometry.as_ref().map_or(0, |shader| shader.cbuf_mask);
     let mut graphics_cbuf_requirements = bundle.graphics_cbuf_requirements;
@@ -15986,7 +16192,7 @@ fn execute_one_inner(
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_STATE, enq_phase_started);
     enq_phase_started = super::pusher::kickprof::start();
 
-    let writeback_writers = graphics_ssbo_writeback_enabled() && bundle.ssbo_writes.mask != 0;
+    let writeback_writers = (graphics_ssbo_writeback_enabled() || gs_storage_writer) && ssbo_writes.mask != 0;
     if writeback_writers {
         let spans = super::engines::maxwell_compute::pending_writeback_spans_snapshot();
         let landed = super::engines::maxwell_compute::resolve_pending_writebacks_checked(
@@ -16007,7 +16213,7 @@ fn execute_one_inner(
         }
     }
     let ssbo_dbg = ssbo_debug_enabled();
-    if ssbo_dbg && !bundle.ssbo_descs.is_empty() {
+    if ssbo_dbg && !ssbo_descs.is_empty() {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
         let s = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
@@ -16035,22 +16241,24 @@ fn execute_one_inner(
                 log::warn!(
                     "[ssbo] vs={:#x} num_ssbo={} descs=[{}]",
                     vs_addr,
-                    bundle.ssbo_descs.len(),
+                    ssbo_descs.len(),
                     descs.join(" ")
                 );
             }
         }
     }
-    let mut ssbo_data: Vec<StorageBufferSnapshot> = Vec::with_capacity(bundle.ssbo_descs.len());
-    let mut ssbo_meta: Vec<(u64, usize, bool)> = Vec::with_capacity(bundle.ssbo_descs.len());
-    let ssbo_pointer_sources = storage_pointer_source_mask(&bundle.ssbo_descs);
-    let mut resolved_actual_bases: Vec<Option<u64>> = Vec::with_capacity(bundle.ssbo_descs.len());
-    let mut resolved_descriptors = Vec::with_capacity(bundle.ssbo_descs.len());
-    for (idx, d) in bundle.ssbo_descs.iter().enumerate() {
+    let mut ssbo_data: Vec<StorageBufferSnapshot> = Vec::with_capacity(ssbo_descs.len());
+    let mut ssbo_meta: Vec<(u64, usize, bool)> = Vec::with_capacity(ssbo_descs.len());
+    let ssbo_pointer_sources = storage_pointer_source_mask(&ssbo_descs);
+    let mut resolved_actual_bases: Vec<Option<u64>> = Vec::with_capacity(ssbo_descs.len());
+    let mut resolved_descriptors = Vec::with_capacity(ssbo_descs.len());
+    for (idx, d) in ssbo_descs.iter().enumerate() {
         let stage = if usize::from(d.cbuf_binding) < FRAGMENT_CBUF_BASE {
             vs_cbuf_group
-        } else {
+        } else if usize::from(d.cbuf_binding) < GEOMETRY_CBUF_BASE {
             fs_cbuf_group
+        } else {
+            gs_cbuf_group
         };
         let binding = usize::from(d.cbuf_binding) % GRAPHICS_CBUF_SLOTS;
         let resolved = resolve_storage_buffer_descriptor(
@@ -16062,13 +16270,13 @@ fn execute_one_inner(
     let retain_ssbos = retained_ssbo_enabled();
     let mut alias_spans = [None; 8];
     let mut writable_spans = Vec::new();
-    let mut writes_known = !bundle.ssbo_writes.unknown;
+    let mut writes_known = !ssbo_writes.unknown;
     if retain_ssbos || writeback_writers {
-        for (idx, (&descriptor, &resolved)) in bundle.ssbo_descs.iter()
+        for (idx, (&descriptor, &resolved)) in ssbo_descs.iter()
             .zip(&resolved_descriptors).enumerate().take(8)
         {
             alias_spans[idx] = resolved.and_then(|resolved| ssbo_alias_span(descriptor, resolved, mappings));
-            if bundle.ssbo_writes.mask & (1 << idx) != 0 {
+            if ssbo_writes.mask & (1 << idx) != 0 {
                 if let Some(span) = alias_spans[idx] {
                     writable_spans.push(span);
                 } else {
@@ -16082,7 +16290,7 @@ fn execute_one_inner(
             writes_known.then_some(writable_spans.as_slice()),
         );
     }
-    let mut writeback_full_mask = if writeback_writers { bundle.ssbo_writes.mask } else { 0 };
+    let mut writeback_full_mask = if writeback_writers { ssbo_writes.mask } else { 0 };
     if writeback_writers {
         for (index, span) in alias_spans.iter().enumerate() {
             if span.is_some_and(|span| writable_spans.iter().any(|write| span.overlaps(*write))) {
@@ -16093,7 +16301,7 @@ fn execute_one_inner(
     let graphics_storage_residency = !writeback_writers
         && super::graphics_storage::residency_enabled()
         && renderer.timeline_sync_available();
-    for (idx, d) in bundle.ssbo_descs.iter().enumerate() {
+    for (idx, d) in ssbo_descs.iter().enumerate() {
         let writeback_full_payload = writeback_full_mask & (1 << idx) != 0;
         let mut bytes = None;
         let mut readonly_noalias = false;
@@ -16102,8 +16310,10 @@ fn execute_one_inner(
         let mut data_offset = 0usize;
         let stage = if usize::from(d.cbuf_binding) < FRAGMENT_CBUF_BASE {
             vs_cbuf_group
-        } else {
+        } else if usize::from(d.cbuf_binding) < GEOMETRY_CBUF_BASE {
             fs_cbuf_group
+        } else {
+            gs_cbuf_group
         };
         let binding = usize::from(d.cbuf_binding) % GRAPHICS_CBUF_SLOTS;
         let (cb_va, _cb_sz) = cbuf_binds[stage][binding];
@@ -16211,7 +16421,7 @@ fn execute_one_inner(
                     && !writeback_full_payload
                     && writes_known
                     && !requires_fresh_pointer_data
-                    && bundle.ssbo_writes.mask & (1 << idx) == 0
+                    && ssbo_writes.mask & (1 << idx) == 0
                     && !is_aurora_fixed_ssbo(*d, size)
                     && data_offset == 0
                     && read_size == logical_size
@@ -16263,7 +16473,7 @@ fn execute_one_inner(
                         logical_size,
                     )?;
                     let writes =
-                        !bundle.ssbo_writes.unknown && bundle.ssbo_writes.mask & (1 << idx) != 0;
+                        !ssbo_writes.unknown && ssbo_writes.mask & (1 << idx) != 0;
                     super::graphics_storage::bind(key, writes, data, data_offset, &mut |range| {
                         let size = usize::try_from(range.size).ok()?;
                         let pending_before = super::engines::maxwell_compute::pending_writeback_overlaps(
@@ -16284,14 +16494,14 @@ fn execute_one_inner(
         if resident.is_none()
             && graphics_storage_residency
             && idx < 8
-            && bundle.ssbo_writes.mask & (1 << idx) != 0
+            && ssbo_writes.mask & (1 << idx) != 0
         {
             super::graphics_storage::note_unresident_writer(
                 guest_addr,
                 logical_size,
                 idx,
                 d.indirect.is_some(),
-                bundle.ssbo_writes.unknown,
+                ssbo_writes.unknown,
                 bytes.is_some(),
             );
         }
@@ -16307,7 +16517,7 @@ fn execute_one_inner(
         ssbo_meta.push((dbg_base, dbg_slack, dbg_readok));
     }
     *storage_writeback_targets = graphics_storage_writeback_targets(
-        bundle.ssbo_writes, &bundle.ssbo_descs, &resolved_descriptors, &ssbo_data, &ssbo_meta, mappings,
+        gs_storage_writer, ssbo_writes, &ssbo_descs, &resolved_descriptors, &ssbo_data, &ssbo_meta, mappings,
     ).map_err(|error| format!("{error} vs={vs_addr:#x} fs={fs_addr:#x}"))?;
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_SSBO, enq_phase_started);
     enq_phase_started = super::pusher::kickprof::start();
@@ -19387,11 +19597,11 @@ fn trace_draw(
     log::warn!(
         "[drawtrace] op={} #{} rt={} va={:#x} keys=[{}] {}x{} topo={} first={} v={} i={} indexed={} pos={} \
          vp_en={} vp={:?} scale=({:.3},{:.3},{:.3}) trans=({:.3},{:.3},{:.3}) clip=({},{} {}x{}) scissor={}:({},{})->({},{}) origin={:#x} ll={} fy={} sw={:#x}/{} \
-         depth={}/{} mode={} export={} zkey={:?} clamp={} vclip={:#x}/{} func={:#x} zeta={} zraw={:#x}/{}x{}/{:#x} progs=[{}] cull={} ff={:#x} \
+         depth={}/{} mode={} export={} zkey={:?} clamp={} vclip={:#x}/{} func={:#x} zeta={} zraw={:#x}/{}x{}/{:#x} progs=[{}] at={}/{:#x}/{:#x} cull={} ff={:#x} \
          tex={:?} tics=[{}] sampled={:?} \
          blend={} per={} rgb=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
          a=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
-         vb={:#x} attrs={} {} cbuf={:#x}/{} masks={:#x}/{:#x} {} vs={:#x} fs={:#x} inst={}/{} binds=[{}]",
+         ib={:#x} vb={:#x} attrs={} {} cbuf={:#x}/{} masks={:#x}/{:#x} {} vs={:#x} fs={:#x} inst={}/{} binds=[{}]",
         op_seq,
         seq,
         nvmap_id,
@@ -19442,6 +19652,9 @@ fn trace_draw(
         draw.zeta.height,
         draw.zeta.format,
         programs,
+        draw.alpha_test_enabled,
+        draw.alpha_test_func,
+        draw.alpha_test_ref,
         draw.cull_test_enable,
         draw.front_face,
         fs_tex_ids,
@@ -19461,6 +19674,7 @@ fn trace_draw(
         blend.src_alpha_factor,
         blend.dst_alpha_factor,
         blend.alpha_op,
+        draw.index_gpu_va,
         vertex_addr,
         layout.attrs.len(),
         attr,
@@ -19545,7 +19759,12 @@ fn tic_trace_summary(
             continue;
         }
         let Some(tic) = nexium_gpu::texture::TicEntry::parse(&raw) else {
-            out.push(format!("s{}:tic{}=parse", slot, tex_id));
+            let words = raw
+                .chunks_exact(4)
+                .map(|word| format!("{:08x}", u32::from_le_bytes([word[0], word[1], word[2], word[3]])))
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push(format!("s{}:tic{}=parse[{}]", slot, tex_id, words));
             continue;
         };
         out.push(format!(

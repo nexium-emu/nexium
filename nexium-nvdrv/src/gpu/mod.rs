@@ -1885,6 +1885,42 @@ pub(crate) fn gate_syncpoint_completion(
     (Some(wrapped), Some(gate))
 }
 
+fn push_embedded_syncpt_incrs(
+    pending_syncpoint_events: &Mutex<VecDeque<PendingSyncpointEvent>>,
+    incrs: Vec<(u32, u32)>,
+) {
+    if incrs.is_empty() {
+        return;
+    }
+    let mut events = pending_syncpoint_events.lock();
+    let mut recorded = false;
+    for (id, count) in incrs {
+        if id == 0 || count == 0 {
+            if id == 0 && count != 0 {
+                log::warn!("[syncpt-orphan] rejected increment id=0 count={}", count);
+            }
+            continue;
+        }
+        if crate::kick_timeline_enabled() {
+            log::warn!(
+                "[ktl] us={} incr syncpt={} count={}",
+                crate::timeline_us(),
+                id,
+                count
+            );
+        }
+        events.push_back(PendingSyncpointEvent::Increment {
+            syncpt_id: id,
+            count,
+        });
+        recorded = true;
+    }
+    drop(events);
+    if recorded {
+        nexium_common::host_wake::signal();
+    }
+}
+
 fn merge_engine_syncpt_incrs(incrs: &mut Vec<(u32, u32)>, engine_incrs: Vec<u32>) {
     for id in engine_incrs {
         match incrs.iter_mut().find(|(pending_id, _)| *pending_id == id) {
@@ -1906,7 +1942,7 @@ pub struct GpuContext {
     pub big_alloc: Arc<Mutex<flat_allocator::FlatAllocator>>,
     pub channels: Arc<Mutex<HashMap<u32, ChannelState>>>,
     pub stats: Arc<super::PipelineStats>,
-    pending_syncpoint_events: Mutex<VecDeque<PendingSyncpointEvent>>,
+    pending_syncpoint_events: Arc<Mutex<VecDeque<PendingSyncpointEvent>>>,
     guest_memory: GuestMemoryAccess,
     decoder_stub_engines: Mutex<StubEngines>,
 }
@@ -2043,7 +2079,7 @@ impl GpuContext {
             ))),
             channels: Arc::new(Mutex::new(HashMap::new())),
             stats,
-            pending_syncpoint_events: Mutex::new(VecDeque::new()),
+            pending_syncpoint_events: Arc::new(Mutex::new(VecDeque::new())),
             guest_memory,
             decoder_stub_engines: Mutex::new(StubEngines {
                 maxwell_dma: MaxwellDma::new(),
@@ -2499,10 +2535,7 @@ impl GpuContext {
         }
         let mut embedded_incrs = std::mem::take(&mut pusher.pending_syncpt_incrs);
         merge_engine_syncpt_incrs(&mut embedded_incrs, maxwell.take_pending_syncpt_incrs());
-        self.record_embedded_syncpt_incrs(embedded_incrs);
-        if let Some(gate) = completion_gate {
-            gate.release();
-        }
+        self.finish_kick_syncpoints(&mut pusher, embedded_incrs, completion_gate);
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
 
@@ -2511,37 +2544,30 @@ impl GpuContext {
         (syncpt_id, syncpt_value)
     }
 
-    pub(crate) fn record_embedded_syncpt_incrs(&self, incrs: Vec<(u32, u32)>) {
+    fn finish_kick_syncpoints(
+        &self,
+        pusher: &mut Pusher,
+        incrs: Vec<(u32, u32)>,
+        completion_gate: Option<Arc<GatedSyncpointCompletion>>,
+    ) {
         if incrs.is_empty() {
+            if let Some(gate) = completion_gate {
+                gate.release();
+            }
             return;
         }
-        let mut events = self.pending_syncpoint_events.lock();
-        let mut recorded = false;
-        for (id, count) in incrs {
-            if id == 0 || count == 0 {
-                if id == 0 && count != 0 {
-                    log::warn!("[syncpt-orphan] rejected increment id=0 count={}", count);
-                }
-                continue;
+        let events = Arc::clone(&self.pending_syncpoint_events);
+        pusher.prep_complete_after_guest_writes(Box::new(move || {
+            push_embedded_syncpt_incrs(&events, incrs);
+            if let Some(gate) = completion_gate {
+                gate.release();
             }
-            if crate::kick_timeline_enabled() {
-                log::warn!(
-                    "[ktl] us={} incr syncpt={} count={}",
-                    crate::timeline_us(),
-                    id,
-                    count
-                );
-            }
-            events.push_back(PendingSyncpointEvent::Increment {
-                syncpt_id: id,
-                count,
-            });
-            recorded = true;
-        }
-        drop(events);
-        if recorded {
-            nexium_common::host_wake::signal();
-        }
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_embedded_syncpt_incrs(&self, incrs: Vec<(u32, u32)>) {
+        push_embedded_syncpt_incrs(&self.pending_syncpoint_events, incrs);
     }
 
     pub fn process_inline_gpfifo(
@@ -2766,10 +2792,7 @@ impl GpuContext {
         let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
         let mut embedded_incrs = std::mem::take(&mut pusher.pending_syncpt_incrs);
         merge_engine_syncpt_incrs(&mut embedded_incrs, maxwell.take_pending_syncpt_incrs());
-        self.record_embedded_syncpt_incrs(embedded_incrs);
-        if let Some(gate) = completion_gate {
-            gate.release();
-        }
+        self.finish_kick_syncpoints(&mut pusher, embedded_incrs, completion_gate);
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
         if profile {

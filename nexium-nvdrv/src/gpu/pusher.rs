@@ -1154,6 +1154,84 @@ impl Pusher {
         }
     }
 
+    fn sync_prep_for_continued_method(
+        &mut self,
+        address: u64,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_PB_CONTINUE_SYNC").is_some()) {
+            return;
+        }
+        {
+            static HITS: AtomicU64 = AtomicU64::new(0);
+            let hits = HITS.fetch_add(1, Ordering::Relaxed);
+            if hits < 8 || hits % 4096 == 0 {
+                let (lane, pending) = match &self.prep {
+                    super::prep::PrepLane::Inline(state) => ("inline", state.has_pending_storage_readbacks()),
+                    super::prep::PrepLane::Threaded(_) => ("threaded", true),
+                };
+                log::info!(
+                    "[pb-continue] hit #{hits} entry={address:#x} method={:#x} count_left={} lane={lane} pending={pending}",
+                    self.state.method,
+                    self.state.method_count
+                );
+            }
+        }
+        if let super::prep::PrepLane::Inline(state) = &mut self.prep {
+            if !state.has_pending_storage_readbacks() {
+                return;
+            }
+            let started = std::time::Instant::now();
+            let completed = state.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n % 4096 == 0 {
+                log::info!(
+                    "[pb-continue] #{n} inline entry={address:#x} method={:#x} count_left={} completed={completed} wait_ms={:.3}",
+                    self.state.method,
+                    self.state.method_count,
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return;
+        }
+        self.flush_engine_event_batch();
+        let super::prep::PrepLane::Threaded(handle) = &mut self.prep else {
+            unreachable!()
+        };
+        let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+        if handle
+            .send_recover(super::prep::PrepEvent::DrainBarrier {
+                done: done_tx,
+                flush_small_rts: false,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let completed = match done_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(completed) => completed,
+            Err(error) => {
+                log::warn!("[pb-continue] drain barrier failed before entry {address:#x}: {error}");
+                false
+            }
+        };
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n % 4096 == 0 {
+            log::info!(
+                "[pb-continue] #{n} entry={address:#x} method={:#x} count_left={} completed={completed} wait_ms={:.3}",
+                self.state.method,
+                self.state.method_count,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
     fn flush_engine_event_batch(&mut self) {
         let Some((class, methods)) = self.engine_event_batch.take() else {
             return;
@@ -1242,6 +1320,20 @@ impl Pusher {
             }
             super::prep::PrepLane::Threaded(handle) => {
                 handle.send(super::prep::PrepEvent::HardFlush { reason, clear_ssbo })
+            }
+        }
+    }
+
+    pub(crate) fn prep_complete_after_guest_writes(&mut self, callback: Box<dyn FnOnce() + Send>) {
+        match &mut self.prep {
+            super::prep::PrepLane::Inline(state) => state.complete_after_guest_writes(callback),
+            super::prep::PrepLane::Threaded(handle) => {
+                match handle.send_recover(super::prep::PrepEvent::CompleteAfterGuestWrites(callback))
+                {
+                    Ok(()) => {}
+                    Err(super::prep::PrepEvent::CompleteAfterGuestWrites(callback)) => callback(),
+                    Err(_) => unreachable!("prep completion returned a different event"),
+                }
             }
         }
     }
@@ -1576,6 +1668,23 @@ impl Pusher {
         if word_count == 0 {
             return;
         }
+        if self.state.method_count > 0 {
+            self.sync_prep_for_continued_method(address, mappings, mem_read, mem_write);
+        }
+        if let super::prep::PrepLane::Inline(state) = &mut self.prep {
+            if state.pending_storage_readbacks_overlap(address, u64::from(word_count) * 4) {
+                let started = std::time::Instant::now();
+                let completed = state.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n % 4096 == 0 {
+                    log::info!(
+                        "[pb-storage-sync] #{n} entry={address:#x} words={word_count} completed={completed} wait_ms={:.3}",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+        }
 
         let cpu_addr = match mappings.cpu_address_for(address) {
             Some(c) => c,
@@ -1642,6 +1751,18 @@ impl Pusher {
 
         self.active_entry_gpu_va = address;
         self.active_entry_cpu_va = cpu_addr;
+        if word_count <= 8 && small_entry_trace_triggered() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 400 {
+                log::info!(
+                    "[pb-small] #{n} entry={address:#x} words={word_count} pending_method={:#x} count_left={} data={:08x?}",
+                    self.state.method,
+                    self.state.method_count,
+                    &words[..]
+                );
+            }
+        }
         let entry_state_in = (
             self.state.method,
             self.state.subchannel,
@@ -2828,6 +2949,26 @@ fn puller_method_requires_hard_boundary(method: u32) -> bool {
             | METHOD_SEMAPHORE_RELEASE
             | METHOD_SYNCPOINT_OPERATION
     )
+}
+
+fn small_entry_trace_triggered() -> bool {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CHECKS: AtomicU64 = AtomicU64::new(0);
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os("NEXIUM_PB_SMALL_ENTRY_TRACE").map(Into::into))
+        .as_ref()
+    else {
+        return false;
+    };
+    if ACTIVE.load(Ordering::Relaxed) {
+        return true;
+    }
+    if CHECKS.fetch_add(1, Ordering::Relaxed) & 0x3f == 0 && path.is_file() {
+        ACTIVE.store(true, Ordering::Relaxed);
+    }
+    ACTIVE.load(Ordering::Relaxed)
 }
 
 pub(crate) fn direct_forensics() -> bool {
