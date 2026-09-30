@@ -7,10 +7,19 @@ fn fast_gpu_time_value_enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+static TITLE_FAST_GPU_TIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_title_fast_gpu_time(enabled: bool) {
+    TITLE_FAST_GPU_TIME.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn fast_gpu_time_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let enabled = fast_gpu_time_value_enabled(std::env::var("NEXIUM_FAST_GPU_TIME").ok().as_deref());
+        let enabled = match std::env::var("NEXIUM_FAST_GPU_TIME").ok() {
+            Some(value) => fast_gpu_time_value_enabled(Some(value.as_str())),
+            None => TITLE_FAST_GPU_TIME.load(std::sync::atomic::Ordering::Relaxed),
+        };
         if enabled {
             log::info!("gpu: fast GPU time compatibility mode enabled; guest GPU report timestamps scaled by 1/256; CPU and ioctl clocks unchanged");
         }

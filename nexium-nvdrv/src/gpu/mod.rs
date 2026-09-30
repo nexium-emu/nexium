@@ -1958,6 +1958,10 @@ pub(crate) fn eager_small_rt_writeback_enabled() -> bool {
     })
 }
 
+pub fn set_title_fast_gpu_time(enabled: bool) {
+    clock::set_title_fast_gpu_time(enabled);
+}
+
 pub(crate) fn gpu_pipeline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {

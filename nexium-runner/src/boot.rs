@@ -12,6 +12,7 @@ use std::thread;
 pub static EMU_ALIVE: AtomicBool = AtomicBool::new(false);
 
 const METROID_DREAD_TITLE_ID: u64 = 0x0100_9380_1237_C000;
+const SWITCH_SPORTS_TITLE_ID: u64 = 0x0100_D2F0_0D5C_0000;
 
 pub fn emu_alive() -> bool {
     EMU_ALIVE.load(Ordering::Acquire)
@@ -837,6 +838,7 @@ impl EmulationHandle {
                     Arc::clone(&stop_flag_clone),
                 )?;
                 let title_id = boot_ctx.kernel.lock().title_id;
+                nexium_nvdrv::gpu::set_title_fast_gpu_time(title_id == SWITCH_SPORTS_TITLE_ID);
 
                 let mut cpu = boot_ctx
                     .cpu
