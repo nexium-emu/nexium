@@ -5871,6 +5871,7 @@ fn dispatch_service_v2(
                     && u32::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3]]) == 0x14
                 {
                     let style_set = u32::from_le_bytes([tmp[0xc], tmp[0xd], tmp[0xe], tmp[0xf]]);
+                    kernel.services.hid.p1_assignment_joy_dual = None;
                     let sel = crate::hid_state::apply_controller_applet_style(style_set);
                     crate::services::am::set_controller_selected_id(sel);
                     let events: Vec<u32> = kernel.services.hid.style_change_events.clone();

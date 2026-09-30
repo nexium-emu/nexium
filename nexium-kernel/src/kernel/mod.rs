@@ -881,6 +881,17 @@ impl Kernel {
                 if docked { "Docked" } else { "Handheld" }
             );
         }
+        if crate::hid_motion::take_presentation_dirty() && self.services.hid.npad_style_set != 0 {
+            crate::hid_state::apply_p1_presentation(
+                self.services.hid.npad_style_set,
+                self.services.hid.p1_assignment_joy_dual,
+            );
+            let events: Vec<u32> = self.services.hid.style_change_events.clone();
+            for h in events {
+                self.event_signals.insert(h, true);
+                self.threads.signal_handle(h);
+            }
+        }
         let vsyncs: Vec<u32> = self.vsync_handles.iter().copied().collect();
         for h in vsyncs {
             self.event_signals.insert(h, true);

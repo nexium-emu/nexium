@@ -92,6 +92,57 @@ pub fn get_joy_six_axis_sensor_lifo_handle(
 pub fn start_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {
 }
 pub fn stop_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+
+const SIX_AXIS_CALIBRATION_SIZE: usize = 0x744;
+
+fn six_axis_device_key(handle: u32) -> u32 {
+    handle & 0x00FF_FF00
+}
+
+fn write_output(kernel: &mut Kernel, ctx: &IpcCtx, bytes: &[u8]) {
+    let target = ctx
+        .recv_buffers
+        .iter()
+        .chain(ctx.recv_statics.iter())
+        .find(|buffer| buffer.size > 0 && buffer.addr != 0)
+        .copied();
+    if let Some(buffer) = target {
+        let mut out = vec![0u8; (buffer.size as usize).min(0x1000)];
+        let len = bytes.len().min(out.len());
+        out[..len].copy_from_slice(&bytes[..len]);
+        let _ = kernel.address_space.write(buffer.addr, &out);
+    }
+}
+
+fn read_input(kernel: &mut Kernel, ctx: &IpcCtx, size: usize) -> Option<Vec<u8>> {
+    let source = ctx
+        .send_buffers
+        .iter()
+        .chain(ctx.send_statics.iter())
+        .find(|buffer| buffer.size > 0 && buffer.addr != 0)
+        .copied()?;
+    let mut bytes = vec![0u8; (source.size as usize).min(size)];
+    kernel.address_space.read(source.addr, &mut bytes).ok()?;
+    Some(bytes)
+}
+
+fn six_axis_ic_information() -> Vec<u8> {
+    let gyro_min = [0.95f32, -0.003, -0.003, -0.003, 0.95, -0.003, -0.003, -0.003, 0.95];
+    let gyro_max = [1.05f32, 0.003, 0.003, 0.003, 1.05, 0.003, 0.003, 0.003, 1.05];
+    let accel_min = [0.95f32, -0.016, -0.016, -0.016, 0.95, -0.016, -0.016, -0.016, 0.95];
+    let accel_max = [1.05f32, 0.016, 0.016, 0.016, 1.05, 0.016, 0.016, 0.016, 1.05];
+    let mut values = Vec::with_capacity(50);
+    values.push(2000.0f32);
+    values.extend_from_slice(&[-10.0, -10.0, -10.0, 10.0, 10.0, 10.0]);
+    values.extend_from_slice(&gyro_min);
+    values.extend_from_slice(&gyro_max);
+    values.push(8.0);
+    values.extend_from_slice(&[-0.0612, -0.0612, -0.0612, 0.0612, 0.0612, 0.0612]);
+    values.extend_from_slice(&accel_min);
+    values.extend_from_slice(&accel_max);
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
 pub fn is_six_axis_sensor_fusion_enabled(
     _k: &mut Kernel,
     _c: &mut IpcCtx,
@@ -99,7 +150,7 @@ pub fn is_six_axis_sensor_fusion_enabled(
     _handle: u32,
     _aruid: u64,
 ) -> bool {
-    false
+    true
 }
 pub fn enable_six_axis_sensor_fusion(
     _k: &mut Kernel,
@@ -127,7 +178,7 @@ pub fn get_six_axis_sensor_fusion_parameters(
     _handle: u32,
     _aruid: u64,
 ) -> (u32, u32) {
-    (0, 0)
+    (0.03f32.to_bits(), 0.4f32.to_bits())
 }
 pub fn reset_six_axis_sensor_fusion_parameters(
     _k: &mut Kernel,
@@ -191,39 +242,43 @@ pub fn reset_accelerometer_play_mode(
 ) {
 }
 pub fn set_gyroscope_zero_drift_mode(
-    _k: &mut Kernel,
+    kernel: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
-    _mode: u32,
+    handle: u32,
+    mode: u32,
     _aruid: u64,
 ) {
+    kernel.services.hid.six_axis_zero_drift.insert(handle, mode);
 }
 pub fn get_gyroscope_zero_drift_mode(
-    _k: &mut Kernel,
+    kernel: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
 ) -> u32 {
-    0
+    kernel.services.hid.six_axis_zero_drift.get(&handle).copied().unwrap_or(1)
 }
 pub fn reset_gyroscope_zero_drift_mode(
-    _k: &mut Kernel,
+    kernel: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
 ) {
+    kernel.services.hid.six_axis_zero_drift.remove(&handle);
 }
 pub fn is_six_axis_sensor_at_rest(
     _k: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
 ) -> bool {
-    true
+    crate::hid_state::sixaxis_handle_slot(handle)
+        .and_then(|(_, index)| crate::hid_state::sixaxis_route(crate::hid_motion::connected_sources())[index])
+        .map_or(true, crate::hid_motion::source_at_rest)
 }
 pub fn is_firmware_update_available_for_six_axis_sensor(
     _k: &mut Kernel,
@@ -235,54 +290,76 @@ pub fn is_firmware_update_available_for_six_axis_sensor(
     false
 }
 pub fn enable_six_axis_sensor_unaltered_passthrough(
-    _k: &mut Kernel,
+    kernel: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
-    _enabled: bool,
+    enabled: bool,
+    handle: u32,
     _aruid: u64,
 ) {
+    if enabled {
+        kernel.services.hid.six_axis_passthrough.insert(handle);
+    } else {
+        kernel.services.hid.six_axis_passthrough.remove(&handle);
+    }
+    crate::hid_state::get_hid_state().lock().set_sixaxis_passthrough(handle, enabled);
+    log::debug!("HID::EnableSixAxisSensorUnalteredPassthrough handle={:#x} enabled={}", handle, enabled);
 }
 pub fn is_six_axis_sensor_unaltered_passthrough_enabled(
-    _k: &mut Kernel,
+    kernel: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
 ) -> bool {
-    false
+    kernel.services.hid.six_axis_passthrough.contains(&handle)
 }
 pub fn store_six_axis_sensor_calibration_parameter(
-    _k: &mut Kernel,
-    _c: &mut IpcCtx,
+    kernel: &mut Kernel,
+    ctx: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
 ) {
+    if let Some(bytes) = read_input(kernel, ctx, SIX_AXIS_CALIBRATION_SIZE) {
+        kernel.services.hid.six_axis_calibration.insert(six_axis_device_key(handle), bytes);
+    }
 }
 pub fn load_six_axis_sensor_calibration_parameter(
-    _k: &mut Kernel,
-    _c: &mut IpcCtx,
+    kernel: &mut Kernel,
+    ctx: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
 ) {
+    let bytes = kernel
+        .services
+        .hid
+        .six_axis_calibration
+        .get(&six_axis_device_key(handle))
+        .cloned()
+        .unwrap_or_else(|| vec![0u8; SIX_AXIS_CALIBRATION_SIZE]);
+    write_output(kernel, ctx, &bytes);
 }
 pub fn get_six_axis_sensor_ic_information(
-    _k: &mut Kernel,
-    _c: &mut IpcCtx,
+    kernel: &mut Kernel,
+    ctx: &mut IpcCtx,
     _s: u32,
     _handle: u32,
     _aruid: u64,
 ) {
+    write_output(kernel, ctx, &six_axis_ic_information());
 }
 pub fn reset_is_six_axis_sensor_device_newly_assigned(
     _k: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
 ) {
+    if crate::hid_state::get_hid_state().lock().reset_sixaxis_newly_assigned(handle) {
+        log::info!("HID::ResetIsSixAxisSensorDeviceNewlyAssigned handle={:#x}", handle);
+    }
 }
 
 pub fn activate_gesture(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _unk: u32, _aruid: u64) {}
@@ -304,6 +381,7 @@ pub fn set_supported_npad_style_set(
     _aruid: u64,
 ) {
     kernel.services.hid.npad_style_set = style_set;
+    kernel.services.hid.p1_assignment_joy_dual = None;
     crate::hid_state::apply_controller_applet_style(style_set);
     let events: Vec<u32> = kernel.services.hid.style_change_events.clone();
     for h in events {

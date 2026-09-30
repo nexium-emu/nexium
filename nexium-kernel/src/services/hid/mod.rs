@@ -1,5 +1,5 @@
 use nexium_common::result::SUCCESS;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod handlers;
 
@@ -31,8 +31,12 @@ pub struct HidService {
     pub npad_handheld_activation_mode: u64,
     pub npad_joy_hold_type: u64,
     pub npad_style_set: u32,
+    pub p1_assignment_joy_dual: Option<bool>,
     pub vibration_permitted: bool,
     pub style_change_events: Vec<u32>,
+    pub six_axis_passthrough: HashSet<u32>,
+    pub six_axis_calibration: HashMap<u32, Vec<u8>>,
+    pub six_axis_zero_drift: HashMap<u32, u32>,
 }
 
 impl HidService {
@@ -44,8 +48,12 @@ impl HidService {
             npad_handheld_activation_mode: 0,
             npad_joy_hold_type: 0,
             npad_style_set: 0,
+            p1_assignment_joy_dual: None,
             vibration_permitted: true,
             style_change_events: Vec::new(),
+            six_axis_passthrough: HashSet::new(),
+            six_axis_calibration: HashMap::new(),
+            six_axis_zero_drift: HashMap::new(),
         }
     }
 
@@ -72,6 +80,7 @@ impl HidService {
         entry.mode = NpadAssignmentMode::Single;
         entry.device_type = 0;
         if npad_id == 0 {
+            self.p1_assignment_joy_dual = Some(false);
             crate::hid_state::set_player1_joy_dual(false);
         }
         log::info!(
@@ -85,6 +94,7 @@ impl HidService {
         entry.mode = NpadAssignmentMode::Single;
         entry.device_type = device_type;
         if npad_id == 0 {
+            self.p1_assignment_joy_dual = Some(false);
             crate::hid_state::set_player1_joy_dual(false);
         }
         log::info!(
@@ -99,6 +109,7 @@ impl HidService {
         entry.mode = NpadAssignmentMode::Dual;
         entry.device_type = 0;
         if npad_id == 0 {
+            self.p1_assignment_joy_dual = Some(true);
             crate::hid_state::set_player1_joy_dual(true);
         }
         log::info!("HID::SetNpadJoyAssignmentModeDual npad_id={:#x}", npad_id);
@@ -117,6 +128,7 @@ impl HidService {
         r.mode = NpadAssignmentMode::Dual;
         r.device_type = 0;
         if npad_id_left == 0 || npad_id_right == 0 {
+            self.p1_assignment_joy_dual = Some(true);
             crate::hid_state::set_player1_joy_dual(true);
         }
         log::info!(
@@ -133,6 +145,7 @@ impl HidService {
 
     pub fn set_npad_joy_hold_type(&mut self, ty: u64) {
         self.npad_joy_hold_type = ty;
+        crate::hid_state::set_npad_joy_hold_horizontal(ty == 1);
         log::info!("HID::SetNpadJoyHoldType type={}", ty);
     }
 

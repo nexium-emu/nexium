@@ -45,7 +45,7 @@ service hid {
     [81] ResetGyroscopeZeroDriftMode(pid, u32 handle, u64 aruid);
     [82] IsSixAxisSensorAtRest(pid, u32 handle, u64 aruid) -> bool;
     [83] IsFirmwareUpdateAvailableForSixAxisSensor(pid, u32 handle, u64 aruid) -> bool;
-    [84] EnableSixAxisSensorUnalteredPassthrough(pid, u32 handle, bool enabled, u64 aruid);
+    [84] EnableSixAxisSensorUnalteredPassthrough(pid, bool enabled, u32 handle, u64 aruid);
     [85] IsSixAxisSensorUnalteredPassthroughEnabled(pid, u32 handle, u64 aruid) -> bool;
     # NOTE: takes in_buffer<SixAxisSensorCalibrationParameter[0x744]>
     [86] StoreSixAxisSensorCalibrationParameter(pid, u32 handle, u64 aruid);
