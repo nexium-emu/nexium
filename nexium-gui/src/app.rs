@@ -1,4 +1,6 @@
-use crate::app_settings::{AppSettings, AspectMode, CpuBackend, FilterMode, LogLevel};
+use crate::app_settings::{
+    AppSettings, AspectMode, CpuBackend, FilterMode, LogLevel, MotionRecenterButton,
+};
 use crate::audio::{
     current_stream_info, list_output_devices, push_test_tone, set_master_volume, AudioStreamInfo,
 };
@@ -180,6 +182,33 @@ fn take_ctrl_shortcut(input: &mut egui::InputState, shortcut: egui::Key) -> bool
         true
     });
     toggle
+}
+
+fn take_plain_shortcut(input: &mut egui::InputState, shortcut: egui::Key) -> bool {
+    let mut hit = false;
+    input.events.retain(|event| {
+        if let egui::Event::Key { key, pressed: true, repeat, modifiers, .. } = event {
+            if *key == shortcut && !modifiers.ctrl && !modifiers.alt {
+                hit |= !repeat;
+                return false;
+            }
+        }
+        true
+    });
+    hit
+}
+
+fn motion_recenter_key(name: &str) -> Option<egui::Key> {
+    egui::Key::ALL
+        .iter()
+        .copied()
+        .find(|key| format!("{:?}", key).eq_ignore_ascii_case(name))
+}
+
+fn rising_edge(held: &mut bool, down: bool) -> bool {
+    let edge = down && !*held;
+    *held = down;
+    edge
 }
 
 fn request_game_frame_repaint(ctx: &egui::Context) {
@@ -375,6 +404,367 @@ mod frame_receive_tests {
     }
 }
 
+#[cfg(test)]
+mod motion_settings_tests {
+    use super::{
+        motion_calibration_text, motion_note, motion_recenter_key, motion_recenter_text,
+        motion_row_values, motion_status_text, motion_summary, recenter_key_conflict,
+        recenter_key_label, recenter_key_press, rising_edge, take_plain_shortcut, InputDevice,
+        MotionKeyCapture, MOTION_CALIBRATING, MOTION_MISSING, MOTION_NO_DATA, MOTION_NO_DATA_NOTE,
+        MOTION_UNCALIBRATED,
+    };
+    use crate::app_settings::{AppSettings, MotionRecenterButton};
+    use crate::controller_config::{ControllerConfig, SwitchButton};
+    use egui::{Event, InputState, Key, Modifiers};
+    use nexium_core::hid_motion::CalibrationState;
+
+    fn key_event(key: Key, ctrl: bool, repeat: bool) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: Modifiers { ctrl, ..Default::default() },
+        }
+    }
+
+    #[test]
+    fn recenter_hotkey_fires_once_per_press_and_ignores_ctrl_chords() {
+        let mut input = InputState::default();
+        input.events = vec![key_event(Key::F8, false, false)];
+        assert!(take_plain_shortcut(&mut input, Key::F8));
+        assert!(input.events.is_empty());
+        input.events = vec![key_event(Key::F8, false, true)];
+        assert!(!take_plain_shortcut(&mut input, Key::F8));
+        assert!(input.events.is_empty());
+        input.events = vec![key_event(Key::F8, true, false), key_event(Key::F9, false, false)];
+        assert!(!take_plain_shortcut(&mut input, Key::F8));
+        assert_eq!(input.events.len(), 2);
+    }
+
+    #[test]
+    fn recenter_button_fires_on_the_rising_edge_only() {
+        let mut held = false;
+        let edges: Vec<bool> = [false, true, true, false, true]
+            .into_iter()
+            .map(|down| rising_edge(&mut held, down))
+            .collect();
+        assert_eq!(edges, [false, true, false, false, true]);
+    }
+
+    #[test]
+    fn recenter_key_names_resolve_like_bindings() {
+        assert_eq!(motion_recenter_key("F8"), Some(Key::F8));
+        assert_eq!(motion_recenter_key("f8"), Some(Key::F8));
+        assert_eq!(motion_recenter_key("ArrowUp"), Some(Key::ArrowUp));
+        assert_eq!(motion_recenter_key(""), None);
+        assert_eq!(motion_recenter_key("NotAKey"), None);
+    }
+
+    #[test]
+    fn motion_rows_show_status_capture_and_feedback() {
+        let defaults = AppSettings::default();
+        assert_eq!(
+            motion_row_values(
+                &defaults,
+                Some("Nintendo Switch Joy-Con (L/R)"),
+                false,
+                false,
+                "Calibrated"
+            ),
+            ["On", "Joy-Con (L/R)", "F8", "SL / SR", "", "Calibrated"]
+        );
+        assert_eq!(
+            motion_row_values(&defaults, None, true, true, "")[1..],
+            ["No motion controller", "Press a key\u{2026}", "SL / SR", "Done", ""]
+        );
+        let off = AppSettings {
+            motion_enabled: false,
+            motion_recenter_key: String::new(),
+            motion_recenter_button: MotionRecenterButton::Unbound,
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            motion_row_values(&off, Some("Pro Controller"), false, false, ""),
+            ["Off", "Off", "\u{2014}", "None", "", ""]
+        );
+        assert_eq!(
+            motion_status_text(true, Some("DualSense Wireless Controller")),
+            "DualSense Wireless Controller"
+        );
+    }
+
+    #[test]
+    fn recenter_key_capture_refuses_menu_home_and_bound_keys() {
+        let mut config = ControllerConfig::default();
+        let capture = |config: &ControllerConfig, keys: &[(Key, bool)]| {
+            let events: Vec<Event> =
+                keys.iter().map(|(key, repeat)| key_event(*key, false, *repeat)).collect();
+            recenter_key_press(&events, config)
+        };
+        assert!(matches!(
+            capture(&config, &[(Key::F8, false)]),
+            Some(MotionKeyCapture::Set(key)) if key == "F8"
+        ));
+        for key in [Key::Backspace, Key::Delete] {
+            assert!(matches!(
+                capture(&config, &[(key, false)]),
+                Some(MotionKeyCapture::Set(key)) if key.is_empty()
+            ));
+        }
+        assert!(matches!(
+            capture(&config, &[(Key::Escape, false)]),
+            Some(MotionKeyCapture::Cancel)
+        ));
+        assert!(capture(&config, &[(Key::F8, true)]).is_none());
+        assert!(capture(&config, &[]).is_none());
+        for (key, notice) in [
+            (Key::Enter, "Enter is used by the menus."),
+            (Key::Space, "Space is used by the menus."),
+            (Key::Tab, "Tab is used by the menus."),
+            (Key::ArrowDown, "ArrowDown is used by the menus."),
+            (Key::Home, "Home opens the Home menu."),
+            (Key::Backtick, "Backtick opens the Home menu."),
+            (Key::R, "R is already bound to ZL."),
+            (Key::C, "C is already bound to A."),
+        ] {
+            assert!(matches!(
+                capture(&config, &[(key, false)]),
+                Some(MotionKeyCapture::Refuse(text)) if text == notice
+            ));
+        }
+        assert!(matches!(
+            capture(&config, &[(Key::ArrowDown, false), (Key::P, false)]),
+            Some(MotionKeyCapture::Set(key)) if key == "P"
+        ));
+        assert_eq!(recenter_key_conflict(Key::F8, &config), None);
+        config.set_binding(SwitchButton::X, "f8".to_string());
+        assert!(matches!(
+            capture(&config, &[(Key::F8, false)]),
+            Some(MotionKeyCapture::Refuse(text)) if text == "F8 is already bound to X."
+        ));
+        assert_eq!(
+            recenter_key_conflict(Key::F8, &config).as_deref(),
+            Some("F8 is already bound to X.")
+        );
+    }
+
+    #[test]
+    fn motion_hints_share_the_recenter_text_and_missing_button_note() {
+        let defaults = AppSettings::default();
+        let mut config = ControllerConfig::default();
+        assert_eq!(motion_recenter_text(&defaults, &config, false), "F8 or SL / SR");
+        assert_eq!(
+            motion_recenter_text(&defaults, &config, true),
+            "F8 or SL / SR (not on this controller)"
+        );
+        let cleared = AppSettings {
+            motion_recenter_key: String::new(),
+            motion_recenter_button: MotionRecenterButton::Unbound,
+            ..AppSettings::default()
+        };
+        assert_eq!(motion_recenter_text(&cleared, &config, false), "\u{2014}");
+        assert_eq!(motion_note(&defaults, &config, None, false), None);
+        assert_eq!(motion_note(&cleared, &config, None, true), None);
+        assert_eq!(
+            motion_note(&defaults, &config, None, true).as_deref(),
+            Some("SL / SR is not on this controller.")
+        );
+        assert_eq!(
+            motion_note(&defaults, &config, Some("Enter is used by the menus."), true).as_deref(),
+            Some("Enter is used by the menus.")
+        );
+        let stale = AppSettings {
+            motion_recenter_key: "ArrowDown".to_string(),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            motion_note(&stale, &config, None, true).as_deref(),
+            Some("ArrowDown is used by the menus.")
+        );
+        assert_eq!(
+            motion_summary(&defaults, &config),
+            "Motion controls: On \u{b7} Recenter key: F8 \u{b7} change under Input Device \u{203a} Motion"
+        );
+        assert_eq!(
+            motion_summary(&cleared, &config),
+            "Motion controls: On \u{b7} Recenter key: \u{2014} \u{b7} change under Input Device \u{203a} Motion"
+        );
+        assert_eq!(motion_status_text(true, None), MOTION_MISSING);
+        assert_eq!(recenter_key_label(&defaults, &config), "F8");
+        config.set_binding(SwitchButton::X, "F8".to_string());
+        assert_eq!(recenter_key_label(&defaults, &config), "F8 (off)");
+        assert_eq!(recenter_key_label(&cleared, &config), "\u{2014}");
+        assert_eq!(motion_recenter_text(&defaults, &config, false), "F8 (off) or SL / SR");
+        assert_eq!(
+            motion_summary(&defaults, &config),
+            "Motion controls: On \u{b7} Recenter key: F8 (off) \u{b7} change under Input Device \u{203a} Motion"
+        );
+        assert_eq!(
+            motion_note(&defaults, &config, None, false).as_deref(),
+            Some("F8 is already bound to X.")
+        );
+    }
+
+    #[test]
+    fn calibration_text_reports_the_least_calibrated_source() {
+        let hint = "SDL HIDAPI disabled by environment; Joy-Con motion unavailable";
+        let uncalibrated = Some(CalibrationState::Uncalibrated);
+        let capturing = Some(CalibrationState::Capturing);
+        let calibrated = Some(CalibrationState::Calibrated);
+        let fresh = [false; 3];
+        assert_eq!(
+            motion_calibration_text(false, [uncalibrated; 3], [true; 3], Some(hint)),
+            ("", None)
+        );
+        assert_eq!(motion_calibration_text(true, [None; 3], fresh, None), ("", None));
+        assert_eq!(motion_calibration_text(true, [None; 3], fresh, Some(hint)), ("", Some(hint)));
+        assert_eq!(
+            motion_calibration_text(true, [None, calibrated, capturing], fresh, None),
+            ("Calibrating\u{2026}", Some(MOTION_CALIBRATING))
+        );
+        assert_eq!(
+            motion_calibration_text(true, [None, uncalibrated, capturing], fresh, Some(hint)),
+            ("Not calibrated", Some(MOTION_UNCALIBRATED))
+        );
+        assert_eq!(
+            motion_calibration_text(true, [calibrated, None, None], fresh, None),
+            ("Calibrated", None)
+        );
+        let right_silent = [false, true, false];
+        let primary_silent = [true, false, false];
+        assert_eq!(
+            motion_calibration_text(true, [None, uncalibrated, calibrated], right_silent, None),
+            (MOTION_NO_DATA, Some(MOTION_NO_DATA_NOTE))
+        );
+        assert_eq!(
+            motion_calibration_text(true, [None, calibrated, calibrated], primary_silent, None),
+            ("Calibrated", None)
+        );
+    }
+
+    #[test]
+    fn input_device_selector_cycles_through_motion() {
+        assert!(InputDevice::Keyboard.cycle(1) == InputDevice::Gamepad);
+        assert!(InputDevice::Gamepad.cycle(1) == InputDevice::Motion);
+        assert!(InputDevice::Motion.cycle(1) == InputDevice::Vibration);
+        assert!(InputDevice::Vibration.cycle(1) == InputDevice::Keyboard);
+        assert!(InputDevice::Keyboard.cycle(-1) == InputDevice::Vibration);
+    }
+}
+
+#[cfg(test)]
+mod vibration_settings_tests {
+    use super::{bar_toggle_label, shader_build_label, step_vibration_strength, vibration_row_values};
+    use crate::app_settings::AppSettings;
+
+    #[test]
+    fn vibration_rows_and_strength_steps() {
+        assert_eq!(
+            vibration_row_values(&AppSettings::default(), "HD \u{b7} Joy-Con (L/R)"),
+            ["On", "HD \u{b7} Joy-Con (L/R)", "100%", ""]
+        );
+        let off = AppSettings {
+            vibration_enabled: false,
+            vibration_strength: 40,
+            ..AppSettings::default()
+        };
+        assert_eq!(vibration_row_values(&off, "Off"), ["Off", "Off", "40%", ""]);
+        assert_eq!(step_vibration_strength(100, 1), 100);
+        assert_eq!(step_vibration_strength(10, -1), 10);
+        assert_eq!(step_vibration_strength(100, -1), 90);
+        assert_eq!(step_vibration_strength(40, 1), 50);
+        assert_eq!(step_vibration_strength(37, -1), 30);
+        assert_eq!(step_vibration_strength(0, 1), 20);
+    }
+
+    #[test]
+    fn compact_bar_labels_drop_the_state() {
+        assert_eq!(bar_toggle_label("Motion", true, false), "Motion: On");
+        assert_eq!(bar_toggle_label("Motion", false, false), "Motion: Off");
+        assert_eq!(bar_toggle_label("Vibration", true, false), "Vibration: On");
+        assert_eq!(bar_toggle_label("Vibration", false, true), "Vibration");
+        assert_eq!(shader_build_label(12, false), "Building shaders: 12");
+        assert_eq!(shader_build_label(12, true), "Shaders: 12");
+    }
+}
+
+#[cfg(test)]
+mod controller_choice_tests {
+    use super::{pad_choice_row, pad_choice_text};
+
+    #[test]
+    fn controller_pickers_name_the_automatic_choice() {
+        let pads = [
+            (1, "Nintendo Switch Joy-Con (L/R)".to_string()),
+            (2, "Nintendo N64 Controller".to_string()),
+        ];
+        let pair = Some("Nintendo Switch Joy-Con (L/R)");
+        let n64 = Some("Nintendo N64 Controller");
+        let pro = Some("Nintendo Switch Pro Controller");
+        assert_eq!(
+            pad_choice_text(None, &pads, Some(1)),
+            "Automatic \u{b7} Joy-Con (L/R)"
+        );
+        assert_eq!(
+            pad_choice_text(None, &pads, Some(2)),
+            "Automatic \u{b7} N64 Controller"
+        );
+        assert_eq!(
+            pad_choice_text(None, &pads, Some(3)),
+            "Automatic \u{b7} Gamepad"
+        );
+        assert_eq!(
+            pad_choice_text(None, &pads, None),
+            "Automatic \u{b7} No Gamepad Connected"
+        );
+        assert_eq!(
+            pad_choice_text(pair, &pads, Some(1)),
+            "Nintendo Switch Joy-Con (L/R)"
+        );
+        assert_eq!(
+            pad_choice_text(pro, &pads, Some(1)),
+            "Pro Controller \u{b7} not connected"
+        );
+        assert_eq!(
+            pad_choice_text(pro, &pads[..0], None),
+            "Pro Controller \u{b7} not connected"
+        );
+        assert_eq!(
+            pad_choice_text(n64, &pads, Some(1)),
+            "N64 Controller \u{b7} not responding"
+        );
+        assert_eq!(
+            pad_choice_text(n64, &pads[..0], None),
+            "N64 Controller \u{b7} not connected"
+        );
+        assert_eq!(
+            pad_choice_text(pair, &pads, None),
+            "Joy-Con (L/R) \u{b7} not responding"
+        );
+    }
+
+    #[test]
+    fn controller_pickers_mark_the_saved_choice() {
+        let pads = [
+            (1, "Nintendo Switch Pro Controller".to_string()),
+            (2, "Nintendo N64 Controller".to_string()),
+            (3, "Nintendo Switch Pro Controller".to_string()),
+        ];
+        let pro = Some("Nintendo Switch Pro Controller");
+        let n64 = Some("Nintendo N64 Controller");
+        let pair = Some("Nintendo Switch Joy-Con (L/R)");
+        assert_eq!(pad_choice_row(None, &pads, Some(2)), 0);
+        assert_eq!(pad_choice_row(None, &pads, None), 0);
+        assert_eq!(pad_choice_row(pro, &pads, Some(3)), 3);
+        assert_eq!(pad_choice_row(pro, &pads, Some(1)), 1);
+        assert_eq!(pad_choice_row(pro, &pads, Some(2)), 1);
+        assert_eq!(pad_choice_row(n64, &pads, None), 2);
+        assert_eq!(pad_choice_row(pair, &pads, Some(1)), 4);
+        assert_eq!(pad_choice_row(pro, &pads[..0], None), 1);
+    }
+}
+
 fn diagnostics_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DIAG").is_some())
@@ -435,7 +825,10 @@ pub struct HorizonApp {
     prefs_rebind_cool: bool,
     prefs_enter_held: bool,
     input_device: InputDevice,
+    motion_key_capture: bool,
+    motion_key_notice: Option<String>,
     startup_gpu_device: Option<String>,
+    startup_motion_enabled: bool,
     app_settings: AppSettings,
     last_buttons_logged: u64,
     last_sticks_logged: [i32; 4],
@@ -449,6 +842,7 @@ pub struct HorizonApp {
     pill_fade: Option<std::time::Instant>,
     playing_path: Option<std::path::PathBuf>,
     last_home: bool,
+    motion_recenter_held: bool,
     profile_texture: Option<egui::TextureHandle>,
     profile_reload: bool,
     show_profile: bool,
@@ -464,6 +858,15 @@ pub struct HorizonApp {
         std::sync::Arc<std::sync::Mutex<crate::library::DownloadInfo>>,
     )>,
     download_toast: Option<(String, std::time::Instant)>,
+    motion_toast: Option<(&'static str, std::time::Instant)>,
+    game_bar_spare: f32,
+    game_bar_compact: bool,
+    game_bar_terse: bool,
+    game_bar_terse_spare: f32,
+    top_bar_spare: f32,
+    top_bar_compact: bool,
+    top_bar_terse: bool,
+    top_bar_terse_spare: f32,
     carousel_settings_open: bool,
     cs_anim: f32,
     cs_tab: usize,
@@ -634,6 +1037,349 @@ fn start_icon_fetch(key: String, query: String) -> std::sync::Arc<std::sync::Mut
 pub enum InputDevice {
     Keyboard,
     Gamepad,
+    Motion,
+    Vibration,
+}
+
+impl InputDevice {
+    fn cycle(self, dir: i32) -> Self {
+        const ORDER: [InputDevice; 4] = [
+            InputDevice::Keyboard,
+            InputDevice::Gamepad,
+            InputDevice::Motion,
+            InputDevice::Vibration,
+        ];
+        let index = ORDER.iter().position(|device| *device == self).unwrap_or(0) as i32;
+        ORDER[(index + dir).rem_euclid(ORDER.len() as i32) as usize]
+    }
+}
+
+const PAD_AUTOMATIC: &str = "Automatic";
+
+fn short_pad_name(name: &str) -> &str {
+    name.strip_prefix("Nintendo Switch ")
+        .or_else(|| name.strip_prefix("Nintendo "))
+        .unwrap_or(name)
+}
+
+fn pad_choice_text<T: PartialEq>(
+    saved: Option<&str>,
+    pads: &[(T, String)],
+    active: Option<T>,
+) -> String {
+    let name = active.map(|id| {
+        pads.iter()
+            .find(|(pad, _)| *pad == id)
+            .map_or("Gamepad", |(_, name)| name.as_str())
+    });
+    match (saved, name) {
+        (None, Some(name)) => format!("{} \u{b7} {}", PAD_AUTOMATIC, short_pad_name(name)),
+        (None, None) => format!("{} \u{b7} No Gamepad Connected", PAD_AUTOMATIC),
+        (Some(saved), Some(name)) if name == saved => name.to_string(),
+        (Some(saved), _) => format!(
+            "{} \u{b7} {}",
+            short_pad_name(saved),
+            if pads.iter().any(|(_, name)| name == saved) {
+                "not responding"
+            } else {
+                "not connected"
+            }
+        ),
+    }
+}
+
+fn pad_choice_row<T: PartialEq>(
+    saved: Option<&str>,
+    pads: &[(T, String)],
+    active: Option<T>,
+) -> usize {
+    let Some(saved) = saved else {
+        return 0;
+    };
+    pads.iter()
+        .position(|(pad, name)| Some(pad) == active.as_ref() && name == saved)
+        .or_else(|| pads.iter().position(|(_, name)| name == saved))
+        .map_or(pads.len() + 1, |index| index + 1)
+}
+
+const MOTION_ROW_LABELS: [&str; 6] = [
+    "Motion Controls",
+    "Motion Source",
+    "Recenter Key",
+    "Recenter Button",
+    "Recenter Now",
+    "Calibrate Gyro",
+];
+
+const MOTION_HELP: [&str; 6] = [
+    "Hold the controller pointing at the screen, then recenter.",
+    "Joy-Con pair: one-Joy-Con games read the right Joy-Con.",
+    "Motion uses the Controller choice when it has a gyro.",
+    "The key and button recenter while a game is running.",
+    "Setting the key: Backspace clears it, Esc cancels.",
+    "Off: games see the controller lying still.",
+];
+
+const MOTION_RECENTERED: &str = "Motion recentered";
+
+const MOTION_OFF: &str = "Motion controls are off";
+
+const MOTION_MISSING: &str = "No motion controller";
+
+const MOTION_CALIBRATING: &str = "Calibrating: keep still";
+
+const MOTION_PUT_DOWN: &str = "Put the controller down to calibrate";
+
+const MOTION_RESTART: &str = "Single Joy-Con layout changes after restarting NeXium.";
+
+const MOTION_RECENTER_ACTION: &str = "Recenter";
+
+const MOTION_CALIBRATE_ACTION: &str = "Calibrate";
+
+const MOTION_UNCALIBRATED: &str = "Not calibrated: put the controller on a flat surface for 2 s";
+
+const MOTION_NO_DATA: &str = "No motion data";
+
+const MOTION_NO_DATA_NOTE: &str = "No motion data: reconnect it or pick another controller";
+
+const MOTION_BUTTON_MISSING: &str = "not on this controller";
+
+fn motion_key_label(name: &str) -> &str {
+    if name.is_empty() {
+        "\u{2014}"
+    } else {
+        name
+    }
+}
+
+fn motion_status_text(enabled: bool, source: Option<&str>) -> String {
+    if !enabled {
+        return "Off".to_string();
+    }
+    source.map_or_else(
+        || MOTION_MISSING.to_string(),
+        |name| name.trim_start_matches("Nintendo Switch ").to_string(),
+    )
+}
+
+fn motion_calibration_text(
+    enabled: bool,
+    states: [Option<nexium_core::hid_motion::CalibrationState>; 3],
+    stale: [bool; 3],
+    hint_note: Option<&'static str>,
+) -> (&'static str, Option<&'static str>) {
+    if !enabled {
+        return ("", None);
+    }
+    if states.iter().all(Option::is_none) {
+        return ("", hint_note);
+    }
+    if states.iter().zip(stale).any(|(state, stale)| state.is_some() && stale) {
+        return (MOTION_NO_DATA, Some(MOTION_NO_DATA_NOTE));
+    }
+    if states.contains(&Some(nexium_core::hid_motion::CalibrationState::Uncalibrated)) {
+        ("Not calibrated", Some(MOTION_UNCALIBRATED))
+    } else if states.contains(&Some(nexium_core::hid_motion::CalibrationState::Capturing)) {
+        ("Calibrating\u{2026}", Some(MOTION_CALIBRATING))
+    } else {
+        ("Calibrated", None)
+    }
+}
+
+fn motion_row_values(
+    settings: &AppSettings,
+    source: Option<&str>,
+    capturing: bool,
+    recentered: bool,
+    calibration: &str,
+) -> [String; 6] {
+    [
+        String::from(if settings.motion_enabled { "On" } else { "Off" }),
+        motion_status_text(settings.motion_enabled, source),
+        if capturing {
+            "Press a key\u{2026}".to_string()
+        } else {
+            motion_key_label(&settings.motion_recenter_key).to_string()
+        },
+        settings.motion_recenter_button.label().to_string(),
+        String::from(if recentered { "Done" } else { "" }),
+        calibration.to_string(),
+    ]
+}
+
+enum MotionKeyCapture {
+    Cancel,
+    Set(String),
+    Refuse(String),
+}
+
+fn recenter_key_conflict(key: egui::Key, config: &ControllerConfig) -> Option<String> {
+    let name = format!("{:?}", key);
+    match key {
+        egui::Key::Home | egui::Key::Backtick => Some(format!("{} opens the Home menu.", name)),
+        egui::Key::Enter
+        | egui::Key::Space
+        | egui::Key::Tab
+        | egui::Key::ArrowUp
+        | egui::Key::ArrowDown
+        | egui::Key::ArrowLeft
+        | egui::Key::ArrowRight => Some(format!("{} is used by the menus.", name)),
+        _ => SwitchButton::all()
+            .iter()
+            .find(|button| {
+                config
+                    .binding_for(**button)
+                    .is_some_and(|binding| binding.eq_ignore_ascii_case(&name))
+            })
+            .map(|button| format!("{} is already bound to {}.", name, button.display_name())),
+    }
+}
+
+fn recenter_key_press(
+    events: &[egui::Event],
+    config: &ControllerConfig,
+) -> Option<MotionKeyCapture> {
+    let mut refused = None;
+    for event in events {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            repeat: false,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        match key {
+            egui::Key::Escape => return Some(MotionKeyCapture::Cancel),
+            egui::Key::Backspace | egui::Key::Delete => {
+                return Some(MotionKeyCapture::Set(String::new()));
+            }
+            _ => match recenter_key_conflict(*key, config) {
+                Some(notice) => refused = Some(notice),
+                None => return Some(MotionKeyCapture::Set(format!("{:?}", key))),
+            },
+        }
+    }
+    refused.map(MotionKeyCapture::Refuse)
+}
+
+fn recenter_key_label(settings: &AppSettings, config: &ControllerConfig) -> String {
+    let label = motion_key_label(&settings.motion_recenter_key);
+    if motion_recenter_key(&settings.motion_recenter_key)
+        .and_then(|key| recenter_key_conflict(key, config))
+        .is_some()
+    {
+        format!("{} (off)", label)
+    } else {
+        label.to_string()
+    }
+}
+
+fn motion_recenter_text(
+    settings: &AppSettings,
+    config: &ControllerConfig,
+    button_missing: bool,
+) -> String {
+    let button = settings.motion_recenter_button;
+    let mut ways = Vec::new();
+    if !settings.motion_recenter_key.is_empty() {
+        ways.push(recenter_key_label(settings, config));
+    }
+    if button != MotionRecenterButton::Unbound {
+        ways.push(if button_missing {
+            format!("{} ({})", button.label(), MOTION_BUTTON_MISSING)
+        } else {
+            button.label().to_string()
+        });
+    }
+    if ways.is_empty() {
+        motion_key_label("").to_string()
+    } else {
+        ways.join(" or ")
+    }
+}
+
+fn motion_note(
+    settings: &AppSettings,
+    config: &ControllerConfig,
+    key_notice: Option<&str>,
+    button_missing: bool,
+) -> Option<String> {
+    let button = settings.motion_recenter_button;
+    key_notice
+        .map(str::to_string)
+        .or_else(|| {
+            motion_recenter_key(&settings.motion_recenter_key)
+                .and_then(|key| recenter_key_conflict(key, config))
+        })
+        .or_else(|| {
+            (button_missing && button != MotionRecenterButton::Unbound)
+                .then(|| format!("{} is {}.", button.label(), MOTION_BUTTON_MISSING))
+        })
+}
+
+fn motion_summary(settings: &AppSettings, config: &ControllerConfig) -> String {
+    format!(
+        "Motion controls: {} \u{b7} Recenter key: {} \u{b7} change under Input Device \u{203a} Motion",
+        if settings.motion_enabled { "On" } else { "Off" },
+        recenter_key_label(settings, config),
+    )
+}
+
+const VIBRATION_ROW_LABELS: [&str; 4] = [
+    "Vibration",
+    "Vibration Output",
+    "Vibration Strength",
+    "Test Vibration",
+];
+
+const VIBRATION_HELP: [&str; 3] = [
+    "HD Rumble plays game vibration on Joy-Con and Pro Controllers.",
+    "Other controllers use their standard rumble motors.",
+    "Off: games and menus never vibrate the controller.",
+];
+
+const VIBRATION_TEST_ACTION: &str = "Test";
+
+const VIBRATION_NO_CONTROLLER: &str = "No controller";
+
+fn vibration_row_values(settings: &AppSettings, status: &str) -> [String; 4] {
+    [
+        String::from(if settings.vibration_enabled { "On" } else { "Off" }),
+        status.to_string(),
+        format!("{}%", settings.vibration_strength),
+        String::new(),
+    ]
+}
+
+fn step_vibration_strength(current: u8, dir: i32) -> u8 {
+    let current = (current.clamp(10, 100) + 5) / 10 * 10;
+    (i32::from(current) + dir.signum() * 10).clamp(10, 100) as u8
+}
+
+fn bar_toggle_label(name: &str, on: bool, compact: bool) -> String {
+    if compact {
+        name.to_string()
+    } else {
+        format!("{}: {}", name, if on { "On" } else { "Off" })
+    }
+}
+
+fn shader_build_label(building: i64, compact: bool) -> String {
+    if compact {
+        format!("Shaders: {building}")
+    } else {
+        format!("Building shaders: {building}")
+    }
+}
+
+fn motion_toast_rect(screen: egui::Rect, below_download: bool) -> egui::Rect {
+    let top = screen.min.y + if below_download { 98.0 } else { 24.0 };
+    egui::Rect::from_min_size(
+        egui::pos2(screen.center().x - 130.0, top),
+        egui::vec2(260.0, 44.0),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -653,7 +1399,8 @@ impl HorizonApp {
     ) -> Self {
         Self::apply_theme(&cc.egui_ctx);
         crate::ui_audio::init(app_settings.audio_output_device.as_deref());
-        let input = InputBackend::new().or_else(|| {
+        let gamepad = app_settings.gamepad.clone();
+        let input = InputBackend::new(app_settings.motion_enabled, gamepad).or_else(|| {
             log::warn!("SDL3 gamepad init failed");
             None
         });
@@ -713,7 +1460,10 @@ impl HorizonApp {
             prefs_rebind_cool: false,
             prefs_enter_held: false,
             input_device: InputDevice::Keyboard,
+            motion_key_capture: false,
+            motion_key_notice: None,
             startup_gpu_device: app_settings.gpu_device.clone(),
+            startup_motion_enabled: app_settings.motion_enabled,
             app_settings,
             last_buttons_logged: 0,
             last_sticks_logged: [0; 4],
@@ -727,6 +1477,7 @@ impl HorizonApp {
             pill_fade: None,
             playing_path: None,
             last_home: false,
+            motion_recenter_held: false,
             profile_texture: None,
             profile_reload: false,
             show_profile: false,
@@ -739,6 +1490,15 @@ impl HorizonApp {
             shop: crate::shop::ShopState::new(),
             active_downloads: Vec::new(),
             download_toast: None,
+            motion_toast: None,
+            game_bar_spare: f32::MAX,
+            game_bar_compact: false,
+            game_bar_terse: false,
+            game_bar_terse_spare: f32::MAX,
+            top_bar_spare: f32::MAX,
+            top_bar_compact: false,
+            top_bar_terse: false,
+            top_bar_terse_spare: f32::MAX,
             carousel_settings_open: false,
             cs_anim: 0.0,
             cs_tab: 0,
@@ -1529,6 +2289,39 @@ impl HorizonApp {
             || self.mod_manager.is_some()
             || self.content_manager.is_some()
             || self.vkeyboard.open
+    }
+
+    fn rebind_in_progress(&self) -> bool {
+        self.rebinding.is_some() || self.rebinding_pad.is_some() || self.motion_key_capture
+    }
+
+    fn game_input_active(&self) -> bool {
+        self.emulation_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_running() && !handle.is_paused())
+            && self.game_display().is_some()
+            && !self.modal_active()
+            && !self.show_settings
+            && !self.show_profile
+            && self.profile_anim == 0.0
+            && self.pause_anim.is_none()
+            && self.resume_anim.is_none()
+            && !(self.vk_target == VkTarget::Swkbd && self.vkeyboard.active())
+    }
+
+    fn motion_present(&self) -> bool {
+        self.input.as_ref().is_some_and(|ib| ib.motion_attached())
+            || nexium_core::hid_motion::any_source_connected()
+    }
+
+    fn motion_button_missing(&self) -> bool {
+        let button = self.app_settings.motion_recenter_button;
+        self.app_settings.motion_enabled
+            && button != MotionRecenterButton::Unbound
+            && self
+                .input
+                .as_ref()
+                .is_some_and(|ib| ib.motion_attached() && !ib.recenter_button_available(button))
     }
 
     fn update_icon_picker(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -3944,9 +4737,10 @@ impl HorizonApp {
         let r_bumper_edge = gp_r && !self.prefs_lr_held;
         self.prefs_lr_held = gp_l || gp_r;
 
-        let rebinding_active = self.rebinding.is_some() || self.rebinding_pad.is_some();
+        let rebinding_active = self.rebind_in_progress();
         let editing = self.prefs_key_editing;
         let block = self.prefs_key_menu || rebinding_active || self.vkeyboard.open;
+        let cancel_edge = b_edge;
         let (a_edge, b_edge, nu, nd, nl, nr, l_bumper_edge, r_bumper_edge) = if editing || block {
             (false, false, false, false, false, false, false, false)
         } else {
@@ -4099,6 +4893,9 @@ impl HorizonApp {
             egui::pos2(full.max.x - mx, footer_y - 20.0 * s),
         );
 
+        if self.settings_tab != SettingsTab::Controller || self.input_device != InputDevice::Motion {
+            self.motion_key_capture = false;
+        }
         if self.settings_tab == SettingsTab::General {
             let backends = crate::app_settings::CpuBackend::all();
             let rows: [(&str, String, bool); 3] = [
@@ -4696,15 +5493,50 @@ impl HorizonApp {
                     self.rebinding_pad = None;
                     crate::ui_audio::play(crate::ui_audio::Sfx::Back);
                 }
+            } else if self.motion_key_capture {
+                let outcome = if cancel_edge {
+                    Some(MotionKeyCapture::Cancel)
+                } else {
+                    recenter_key_press(&events, &self.controller_config)
+                };
+                match outcome {
+                    Some(MotionKeyCapture::Cancel) => {
+                        self.motion_key_capture = false;
+                        self.prefs_rebind_cool = true;
+                        crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                    }
+                    Some(MotionKeyCapture::Set(key)) => {
+                        self.app_settings.motion_recenter_key = key;
+                        self.motion_key_capture = false;
+                        self.prefs_rebind_cool = true;
+                        let _ = self.app_settings.save();
+                        crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                    }
+                    Some(MotionKeyCapture::Refuse(notice)) => {
+                        self.motion_key_notice = Some(notice);
+                        crate::ui_audio::play(crate::ui_audio::Sfx::Error);
+                    }
+                    None => {}
+                }
             }
 
             let kb = self.input_device == InputDevice::Keyboard;
-            let binds: Vec<SwitchButton> = if kb {
+            let motion_page = self.input_device == InputDevice::Motion;
+            let vibration_page = self.input_device == InputDevice::Vibration;
+            let binds: Vec<SwitchButton> = if motion_page || vibration_page {
+                Vec::new()
+            } else if kb {
                 SwitchButton::all().to_vec()
             } else {
                 ControllerConfig::pad_list().to_vec()
             };
-            let n = binds.len() + 1;
+            let n = if motion_page {
+                MOTION_ROW_LABELS.len() + 1
+            } else if vibration_page {
+                VIBRATION_ROW_LABELS.len() + 1
+            } else {
+                binds.len() + 1
+            };
             if !self.prefs_focus {
                 self.prefs_row = 0;
                 self.prefs_col = 0;
@@ -4715,6 +5547,11 @@ impl HorizonApp {
                 .as_ref()
                 .map(|ib| ib.list_gamepads())
                 .unwrap_or_default();
+            let nav_choice = pad_choice_row(
+                self.app_settings.gamepad.as_deref(),
+                &nav_gamepads,
+                self.input.as_ref().and_then(|ib| ib.get_active_id()),
+            );
 
             if self.prefs_focus && !rebinding_active && !self.prefs_dropdown_open {
                 if r_bumper_edge {
@@ -4735,7 +5572,12 @@ impl HorizonApp {
                         }
                         crate::ui_audio::play_move();
                     }
-                } else if self.prefs_col == 0 && self.prefs_row >= 1 && nr {
+                } else if self.prefs_col == 0
+                    && self.prefs_row >= 1
+                    && nr
+                    && !(motion_page && (self.prefs_row == 1 || self.prefs_row == 4))
+                    && !(vibration_page && (self.prefs_row == 1 || self.prefs_row == 3))
+                {
                     self.prefs_col = 1;
                     self.prefs_col1_row = 0;
                     crate::ui_audio::play_move();
@@ -4760,7 +5602,7 @@ impl HorizonApp {
 
             if self.prefs_focus && self.prefs_col == 1 && !rebinding_active {
                 if self.prefs_dropdown_open {
-                    let cnt = nav_gamepads.len().max(1);
+                    let cnt = nav_gamepads.len().max(nav_choice) + 1;
                     if nu {
                         self.prefs_dropdown_sel = (self.prefs_dropdown_sel + cnt - 1) % cnt;
                         crate::ui_audio::play_move();
@@ -4770,11 +5612,14 @@ impl HorizonApp {
                         crate::ui_audio::play_move();
                     }
                     if a_edge {
-                        if let Some((gid, _)) = nav_gamepads.get(self.prefs_dropdown_sel) {
-                            let gid = *gid;
-                            if let Some(ref mut ib) = self.input {
-                                ib.set_active_id(gid);
-                            }
+                        let pick = match self.prefs_dropdown_sel {
+                            sel if sel == nav_choice => None,
+                            0 => Some(None),
+                            sel => nav_gamepads.get(sel - 1).map(|(gid, _)| Some(*gid)),
+                        };
+                        if let (Some(pick), Some(ib)) = (pick, self.input.as_mut()) {
+                            self.app_settings.gamepad = ib.set_active_id(pick);
+                            let _ = self.app_settings.save();
                         }
                         self.prefs_dropdown_open = false;
                         crate::ui_audio::play(crate::ui_audio::Sfx::Select);
@@ -4796,11 +5641,7 @@ impl HorizonApp {
                     match self.prefs_col1_row {
                         0 => {
                             if a_edge {
-                                let active_id =
-                                    self.input.as_ref().and_then(|ib| ib.get_active_id());
-                                self.prefs_dropdown_sel = active_id
-                                    .and_then(|id| nav_gamepads.iter().position(|(g, _)| *g == id))
-                                    .unwrap_or(0);
+                                self.prefs_dropdown_sel = nav_choice;
                                 self.prefs_dropdown_open = true;
                                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                             }
@@ -4881,7 +5722,12 @@ impl HorizonApp {
                 egui::FontId::proportional(18.0 * s * sf),
                 text,
             );
-            let dev_val = if kb { "Keyboard" } else { "Gamepad" };
+            let dev_val = match self.input_device {
+                InputDevice::Keyboard => "Keyboard",
+                InputDevice::Gamepad => "Gamepad",
+                InputDevice::Motion => "Motion",
+                InputDevice::Vibration => "Vibration",
+            };
             let dvcol = if head_sel { accent } else { muted };
             let hlx = head.max.x - 150.0 * s;
             let hrx = head.max.x - 22.0 * s;
@@ -4914,7 +5760,7 @@ impl HorizonApp {
                 egui::FontId::proportional(22.0 * s * sf),
                 dvcol,
             );
-            let mut dev_toggle = false;
+            let mut dev_step = 0i32;
             if !rebinding_active && ui.rect_contains_pointer(hr) {
                 let hc = ui.allocate_rect(hr, egui::Sense::click()).clicked();
                 let hlc = ui.allocate_rect(sr(hla), egui::Sense::click()).clicked();
@@ -4923,23 +5769,23 @@ impl HorizonApp {
                     self.prefs_focus = true;
                     self.prefs_row = 0;
                     self.prefs_col = 0;
-                    dev_toggle = true;
+                    dev_step = if hlc { -1 } else { 1 };
                 }
             }
-            if self.prefs_focus
+            if dev_step == 0
+                && self.prefs_focus
                 && self.prefs_col == 0
                 && self.prefs_row == 0
                 && !rebinding_active
-                && (nl || nr || a_edge)
             {
-                dev_toggle = true;
+                if nl {
+                    dev_step = -1;
+                } else if nr || a_edge {
+                    dev_step = 1;
+                }
             }
-            if dev_toggle {
-                self.input_device = if kb {
-                    InputDevice::Gamepad
-                } else {
-                    InputDevice::Keyboard
-                };
+            if dev_step != 0 {
+                self.input_device = self.input_device.cycle(dev_step);
                 self.prefs_row = 0;
                 crate::ui_audio::play_move();
             }
@@ -5142,11 +5988,319 @@ impl HorizonApp {
                     egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 200),
                 );
             }
+            if !motion_page && !vibration_page {
+                let start = sp(egui::pos2(full.min.x + mx, hy));
+                let end_x = sp(egui::pos2(full.max.x - mx, hy)).x - hint_w - 40.0 * s;
+                p.with_clip_rect(egui::Rect::from_min_max(
+                    egui::pos2(start.x, start.y - 14.0 * s),
+                    egui::pos2(end_x, start.y + 14.0 * s),
+                ))
+                .text(
+                    start,
+                    egui::Align2::LEFT_CENTER,
+                    motion_summary(&self.app_settings, &self.controller_config),
+                    egui::FontId::proportional(13.0 * s * sf),
+                    muted,
+                );
+            }
+            if motion_page || vibration_page {
+                let labels: &[&str] = if motion_page {
+                    &MOTION_ROW_LABELS
+                } else {
+                    &VIBRATION_ROW_LABELS
+                };
+                let help: &[&str] = if motion_page { &MOTION_HELP } else { &VIBRATION_HELP };
+                let cycle_rows: [usize; 2] = if motion_page { [0, 3] } else { [0, 2] };
+                let page_enabled = if motion_page {
+                    self.app_settings.motion_enabled
+                } else {
+                    self.app_settings.vibration_enabled
+                };
+                let (values, calibration_note): (Vec<String>, Option<&str>) = if motion_page {
+                    let source = self.input.as_ref().and_then(|ib| ib.motion_source());
+                    let (calibration, calibration_note) = motion_calibration_text(
+                        self.app_settings.motion_enabled,
+                        nexium_core::hid_motion::calibration_states(),
+                        nexium_core::hid_motion::stale_sources(),
+                        self.input.as_ref().and_then(|ib| ib.motion_hint_note()),
+                    );
+                    let values = motion_row_values(
+                        &self.app_settings,
+                        source.as_deref(),
+                        self.motion_key_capture,
+                        self.motion_recently_recentered(),
+                        calibration,
+                    );
+                    (Vec::from(values), calibration_note)
+                } else {
+                    let status = self.vibration_status();
+                    (Vec::from(vibration_row_values(&self.app_settings, &status)), None)
+                };
+                let key_note = if motion_page {
+                    motion_note(
+                        &self.app_settings,
+                        &self.controller_config,
+                        self.motion_key_notice
+                            .as_deref()
+                            .filter(|_| self.motion_key_capture),
+                        self.motion_button_missing(),
+                    )
+                } else {
+                    None
+                };
+                let restart_note = (motion_page
+                    && self.app_settings.motion_enabled != self.startup_motion_enabled)
+                    .then_some(MOTION_RESTART);
+                let notes = [key_note.as_deref(), restart_note, calibration_note];
+                let text_lines = help.len() + notes.iter().flatten().count();
+                let row_h = ((content.max.y - list_top - 6.0 * s - text_lines as f32 * 20.0 * s)
+                    / labels.len() as f32)
+                    .clamp(34.0 * s, row_h);
+                let mut motion_act: Option<(usize, i32)> = None;
+                for (i, value) in values.iter().enumerate() {
+                    let base = egui::Rect::from_min_size(
+                        egui::pos2(content.min.x, list_top + i as f32 * row_h),
+                        egui::Vec2::new(list_w - 10.0 * s, row_h - 8.0 * s),
+                    );
+                    let r = sr(base);
+                    let selrow = self.prefs_focus && self.prefs_col == 0 && self.prefs_row == i + 1;
+                    let capturing = motion_page && i == 2 && self.motion_key_capture;
+                    let dim = i >= 2 && !page_enabled;
+                    let action = match (motion_page, i) {
+                        (true, 4) => Some(MOTION_RECENTER_ACTION),
+                        (true, 5) => Some(MOTION_CALIBRATE_ACTION),
+                        (false, 3) => Some(VIBRATION_TEST_ACTION),
+                        _ => None,
+                    };
+                    let value = match action {
+                        Some(text) if value.is_empty() => text,
+                        _ => value.as_str(),
+                    };
+                    if capturing {
+                        p.rect_filled(
+                            r,
+                            egui::CornerRadius::from(10.0 * s),
+                            egui::Color32::from_rgba_unmultiplied(
+                                accent.r(),
+                                accent.g(),
+                                accent.b(),
+                                40,
+                            ),
+                        );
+                        p.rect_stroke(
+                            r,
+                            egui::CornerRadius::from(10.0 * s),
+                            egui::Stroke::new(2.0_f32, accent),
+                            egui::StrokeKind::Outside,
+                        );
+                    } else if selrow {
+                        p.rect_filled(r, egui::CornerRadius::from(10.0 * s), sel);
+                        p.rect_stroke(
+                            r,
+                            egui::CornerRadius::from(10.0 * s),
+                            egui::Stroke::new(2.0_f32, accent),
+                            egui::StrokeKind::Outside,
+                        );
+                    } else {
+                        p.rect_filled(
+                            r,
+                            egui::CornerRadius::from(10.0 * s),
+                            egui::Color32::from_rgba_unmultiplied(
+                                panel.r(),
+                                panel.g(),
+                                panel.b(),
+                                (ease * 70.0) as u8,
+                            ),
+                        );
+                        p.rect_stroke(
+                            r,
+                            egui::CornerRadius::from(10.0 * s),
+                            egui::Stroke::new(1.0_f32, border),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    let label_end = p
+                        .text(
+                            sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)),
+                            egui::Align2::LEFT_CENTER,
+                            labels[i],
+                            egui::FontId::proportional(16.0 * s * sf),
+                            if dim { muted } else { text },
+                        )
+                        .max
+                        .x;
+                    let vcol = if capturing || (selrow && i != 1 && !dim) {
+                        accent
+                    } else {
+                        muted
+                    };
+                    if cycle_rows.contains(&i) {
+                        let lx = base.max.x - 150.0 * s;
+                        let rx = base.max.x - 22.0 * s;
+                        p.text(
+                            sp(egui::pos2((lx + rx) * 0.5, base.center().y)),
+                            egui::Align2::CENTER_CENTER,
+                            value,
+                            egui::FontId::proportional(15.0 * s * sf),
+                            vcol,
+                        );
+                        let la = egui::Rect::from_center_size(
+                            egui::pos2(lx, base.center().y),
+                            egui::Vec2::splat(34.0 * s),
+                        );
+                        let ra = egui::Rect::from_center_size(
+                            egui::pos2(rx, base.center().y),
+                            egui::Vec2::splat(34.0 * s),
+                        );
+                        p.text(
+                            sp(la.center()),
+                            egui::Align2::CENTER_CENTER,
+                            "\u{2039}",
+                            egui::FontId::proportional(22.0 * s * sf),
+                            vcol,
+                        );
+                        p.text(
+                            sp(ra.center()),
+                            egui::Align2::CENTER_CENTER,
+                            "\u{203A}",
+                            egui::FontId::proportional(22.0 * s * sf),
+                            vcol,
+                        );
+                        if !rebinding_active && ui.rect_contains_pointer(r) {
+                            let rc = ui.allocate_rect(r, egui::Sense::click()).clicked();
+                            let lc = ui.allocate_rect(sr(la), egui::Sense::click()).clicked();
+                            let rtc = ui.allocate_rect(sr(ra), egui::Sense::click()).clicked();
+                            if rc || lc || rtc {
+                                motion_act = Some((i, if lc { -1 } else { 1 }));
+                            }
+                        }
+                    } else {
+                        let anchor = sp(egui::pos2(base.max.x - 22.0 * s, base.center().y));
+                        let mut job = egui::text::LayoutJob::simple_singleline(
+                            value.to_string(),
+                            egui::FontId::proportional(15.0 * s * sf),
+                            vcol,
+                        );
+                        job.wrap = egui::text::TextWrapping::truncate_at_width(
+                            anchor.x - label_end - 16.0 * s * sf,
+                        );
+                        let galley = p.layout_job(job);
+                        let at = egui::Align2::RIGHT_CENTER.anchor_size(anchor, galley.size());
+                        p.galley(at.min, galley, vcol);
+                        if (!rebinding_active || capturing)
+                            && ui.rect_contains_pointer(r)
+                            && ui.allocate_rect(r, egui::Sense::click()).clicked()
+                        {
+                            motion_act = Some((i, 1));
+                        }
+                    }
+                }
+                let mut help_y = list_top + labels.len() as f32 * row_h + 6.0 * s;
+                for note in notes.into_iter().flatten() {
+                    p.text(
+                        sp(egui::pos2(content.min.x + 2.0 * s, help_y)),
+                        egui::Align2::LEFT_TOP,
+                        note,
+                        egui::FontId::proportional(13.0 * s * sf),
+                        AMBER,
+                    );
+                    help_y += 20.0 * s;
+                }
+                for (k, line) in help.iter().enumerate() {
+                    let line_y = help_y + k as f32 * 20.0 * s;
+                    if line_y + 16.0 * s > content.max.y {
+                        break;
+                    }
+                    p.text(
+                        sp(egui::pos2(content.min.x + 2.0 * s, line_y)),
+                        egui::Align2::LEFT_TOP,
+                        *line,
+                        egui::FontId::proportional(13.0 * s * sf),
+                        muted,
+                    );
+                }
+                if let Some((i, _)) = motion_act {
+                    self.prefs_focus = true;
+                    self.prefs_col = 0;
+                    self.prefs_row = i + 1;
+                } else if self.prefs_focus
+                    && self.prefs_col == 0
+                    && self.prefs_row >= 1
+                    && !rebinding_active
+                {
+                    let i = self.prefs_row - 1;
+                    let cycles = cycle_rows.contains(&i);
+                    if cycles && nl {
+                        motion_act = Some((i, -1));
+                    } else if (cycles && nr) || a_edge {
+                        motion_act = Some((i, 1));
+                    }
+                }
+                if motion_page {
+                    match motion_act {
+                        Some((0, _)) => {
+                            self.app_settings.motion_enabled = !self.app_settings.motion_enabled;
+                            let _ = self.app_settings.save();
+                            crate::ui_audio::play_move();
+                        }
+                        Some((2, _)) => {
+                            if self.motion_key_capture {
+                                self.motion_key_capture = false;
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                            } else {
+                                self.motion_key_capture = true;
+                                self.motion_key_notice = None;
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                            }
+                        }
+                        Some((3, dir)) => {
+                            let button = self.app_settings.motion_recenter_button;
+                            self.app_settings.motion_recenter_button =
+                                if dir < 0 { button.prev() } else { button.next() };
+                            let _ = self.app_settings.save();
+                            crate::ui_audio::play_move();
+                        }
+                        Some((4, _)) => {
+                            self.recenter_motion();
+                            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                        }
+                        Some((5, _)) => {
+                            self.calibrate_motion();
+                            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match motion_act {
+                        Some((0, _)) => {
+                            self.app_settings.vibration_enabled = !self.app_settings.vibration_enabled;
+                            let _ = self.app_settings.save();
+                            crate::ui_audio::play_move();
+                            self.test_vibration();
+                        }
+                        Some((2, dir)) if self.app_settings.vibration_enabled => {
+                            let strength =
+                                step_vibration_strength(self.app_settings.vibration_strength, dir);
+                            crate::ui_audio::play_move();
+                            if strength != self.app_settings.vibration_strength {
+                                self.app_settings.vibration_strength = strength;
+                                let _ = self.app_settings.save();
+                                self.test_vibration();
+                            }
+                        }
+                        Some((3, _)) if self.app_settings.vibration_enabled => {
+                            self.test_vibration();
+                            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             let hl_btn: Option<SwitchButton> = if kb {
                 self.rebinding.or(
                     if self.prefs_focus && self.prefs_col == 0 && self.prefs_row >= 1 {
-                        Some(binds[selb])
+                        binds.get(selb).copied()
                     } else {
                         None
                     },
@@ -5154,7 +6308,7 @@ impl HorizonApp {
             } else {
                 self.rebinding_pad.or(
                     if self.prefs_focus && self.prefs_col == 0 && self.prefs_row >= 1 {
-                        Some(binds[selb])
+                        binds.get(selb).copied()
                     } else {
                         None
                     },
@@ -5231,15 +6385,10 @@ impl HorizonApp {
                 text,
             );
 
-            let selected_name = if let Some(id) = active_id {
-                gamepads
-                    .iter()
-                    .find(|(gid, _)| *gid == id)
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| "Gamepad".to_string())
-            } else {
-                "No Gamepad Connected".to_string()
-            };
+            let choice_row =
+                pad_choice_row(self.app_settings.gamepad.as_deref(), &gamepads, active_id);
+            let selected_name =
+                pad_choice_text(self.app_settings.gamepad.as_deref(), &gamepads, active_id);
             let name_col = if gamepads.is_empty() { muted } else { text };
             let name_x = divider_x + 12.0 * s * sf;
             let name_clip = egui::Rect::from_min_max(
@@ -5301,9 +6450,7 @@ impl HorizonApp {
                 if self.prefs_dropdown_open {
                     self.prefs_dropdown_open = false;
                 } else {
-                    self.prefs_dropdown_sel = active_id
-                        .and_then(|id| gamepads.iter().position(|(g, _)| *g == id))
-                        .unwrap_or(0);
+                    self.prefs_dropdown_sel = choice_row;
                     self.prefs_dropdown_open = true;
                 }
             }
@@ -5311,7 +6458,13 @@ impl HorizonApp {
             draw_controller(&p, sr(cbase), hl_btn, accent, lightish, &self.last_input);
 
             if self.prefs_dropdown_open {
-                let items = gamepads.len().max(1);
+                let missing = self
+                    .app_settings
+                    .gamepad
+                    .as_ref()
+                    .filter(|_| choice_row > gamepads.len())
+                    .map(|name| format!("{} (not connected)", name));
+                let items = gamepads.len().max(1) + 1 + usize::from(missing.is_some());
                 let ih = 40.0 * s;
                 let dd = egui::Rect::from_min_max(
                     egui::pos2(tab_rect.min.x, tab_rect.max.y + 5.0 * s),
@@ -5329,63 +6482,75 @@ impl HorizonApp {
                     egui::StrokeKind::Outside,
                 );
                 if gamepads.is_empty() {
+                    let y = dd.min.y + 4.0 * s + ih * (items as f32 - 0.5);
                     p.text(
-                        sp(egui::pos2(dd.center().x, dd.min.y + 4.0 * s + ih * 0.5)),
+                        sp(egui::pos2(dd.center().x, y)),
                         egui::Align2::CENTER_CENTER,
                         "No gamepads detected",
                         egui::FontId::proportional(13.0 * s * sf),
                         muted,
                     );
-                } else {
-                    for (i, (gid, gname)) in gamepads.iter().enumerate() {
-                        let ib_rect = egui::Rect::from_min_size(
-                            egui::pos2(dd.min.x + 6.0 * s, dd.min.y + 4.0 * s + i as f32 * ih),
-                            egui::vec2(dd.width() - 12.0 * s, ih - 2.0 * s),
+                }
+                let rows = gamepads
+                    .iter()
+                    .map(|(gid, gname)| (Some(*gid), gname.as_str()));
+                let choices = std::iter::once((None, PAD_AUTOMATIC))
+                    .chain(rows)
+                    .chain(missing.as_deref().map(|label| (None, label)));
+                for (i, (gid, gname)) in choices.enumerate() {
+                    let ib_rect = egui::Rect::from_min_size(
+                        egui::pos2(dd.min.x + 6.0 * s, dd.min.y + 4.0 * s + i as f32 * ih),
+                        egui::vec2(dd.width() - 12.0 * s, ih - 2.0 * s),
+                    );
+                    let ir = sr(ib_rect);
+                    let sel_item = self.prefs_dropdown_sel == i;
+                    let is_active = i == choice_row;
+                    if sel_item {
+                        p.rect_filled(
+                            ir,
+                            egui::CornerRadius::from(6.0 * s),
+                            egui::Color32::from_rgba_unmultiplied(
+                                accent.r(),
+                                accent.g(),
+                                accent.b(),
+                                70,
+                            ),
                         );
-                        let ir = sr(ib_rect);
-                        let sel_item = self.prefs_dropdown_sel == i;
-                        let is_active = Some(*gid) == active_id;
+                    } else if ui.rect_contains_pointer(ir) {
+                        p.rect_filled(ir, egui::CornerRadius::from(6.0 * s), hover);
+                    }
+                    let ip = p.with_clip_rect(ir);
+                    ip.text(
+                        sp(egui::pos2(ib_rect.min.x + 12.0 * s, ib_rect.center().y)),
+                        egui::Align2::LEFT_CENTER,
+                        gname,
+                        egui::FontId::proportional(13.0 * s * sf),
                         if sel_item {
-                            p.rect_filled(
-                                ir,
-                                egui::CornerRadius::from(6.0 * s),
-                                egui::Color32::from_rgba_unmultiplied(
-                                    accent.r(),
-                                    accent.g(),
-                                    accent.b(),
-                                    70,
-                                ),
-                            );
-                        } else if ui.rect_contains_pointer(ir) {
-                            p.rect_filled(ir, egui::CornerRadius::from(6.0 * s), hover);
-                        }
-                        let ip = p.with_clip_rect(ir);
-                        ip.text(
-                            sp(egui::pos2(ib_rect.min.x + 12.0 * s, ib_rect.center().y)),
-                            egui::Align2::LEFT_CENTER,
-                            gname,
-                            egui::FontId::proportional(13.0 * s * sf),
-                            if sel_item { accent } else { text },
+                            accent
+                        } else if i > gamepads.len() {
+                            muted
+                        } else {
+                            text
+                        },
+                    );
+                    if is_active {
+                        p.text(
+                            sp(egui::pos2(ib_rect.max.x - 12.0 * s, ib_rect.center().y)),
+                            egui::Align2::RIGHT_CENTER,
+                            "\u{2022}",
+                            egui::FontId::proportional(18.0 * s * sf),
+                            accent,
                         );
-                        if is_active {
-                            p.text(
-                                sp(egui::pos2(ib_rect.max.x - 12.0 * s, ib_rect.center().y)),
-                                egui::Align2::RIGHT_CENTER,
-                                "\u{2022}",
-                                egui::FontId::proportional(18.0 * s * sf),
-                                accent,
-                            );
+                    }
+                    if !rebinding_active
+                        && ui.rect_contains_pointer(ir)
+                        && ui.allocate_rect(ir, egui::Sense::click()).clicked()
+                    {
+                        if let Some(ib) = self.input.as_mut().filter(|_| i != choice_row) {
+                            self.app_settings.gamepad = ib.set_active_id(gid);
+                            let _ = self.app_settings.save();
                         }
-                        if !rebinding_active
-                            && ui.rect_contains_pointer(ir)
-                            && ui.allocate_rect(ir, egui::Sense::click()).clicked()
-                        {
-                            let gid = *gid;
-                            if let Some(ref mut ib) = self.input {
-                                ib.set_active_id(gid);
-                            }
-                            self.prefs_dropdown_open = false;
-                        }
+                        self.prefs_dropdown_open = false;
                     }
                 }
                 let outside = ui.input(|i| i.pointer.primary_clicked())
@@ -5621,6 +6786,8 @@ impl HorizonApp {
                 && !rebinding_active
                 && !self.prefs_dropdown_open
                 && a_edge
+                && !motion_page
+                && !vibration_page
             {
                 start_rebind(self, self.prefs_row - 1);
             }
@@ -6749,27 +7916,194 @@ impl HorizonApp {
         }
     }
 
-    fn draw_docked_toggle(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+    fn recenter_motion(&mut self) {
+        let message = if !self.app_settings.motion_enabled {
+            MOTION_OFF
+        } else if !self.motion_present() {
+            MOTION_MISSING
+        } else {
+            nexium_core::hid_state::recenter_motion();
+            if let Some(ib) = self.input.as_mut() {
+                ib.rumble_motion(20000, 20000, 45);
+            }
+            log::info!("motion: recentered");
+            MOTION_RECENTERED
+        };
+        self.motion_toast = Some((message, std::time::Instant::now()));
+        self.egui_ctx.request_repaint();
+    }
+
+    fn calibrate_motion(&mut self) {
+        let message = if !self.app_settings.motion_enabled {
+            MOTION_OFF
+        } else if !self.motion_present() {
+            MOTION_MISSING
+        } else {
+            nexium_core::hid_motion::request_calibration();
+            log::info!("motion: calibration requested");
+            if nexium_core::hid_motion::stale_sources().contains(&true) {
+                MOTION_NO_DATA
+            } else if nexium_core::hid_motion::MotionSource::ALL
+                .into_iter()
+                .all(nexium_core::hid_motion::source_at_rest)
+            {
+                MOTION_CALIBRATING
+            } else {
+                MOTION_PUT_DOWN
+            }
+        };
+        self.motion_toast = Some((message, std::time::Instant::now()));
+        self.egui_ctx.request_repaint();
+    }
+
+    fn motion_recently_recentered(&self) -> bool {
+        self.motion_toast.is_some_and(|(message, at)| {
+            message == MOTION_RECENTERED && at.elapsed() < std::time::Duration::from_millis(1200)
+        })
+    }
+
+    fn draw_motion_toast(&mut self, ctx: &egui::Context) {
+        let Some((message, since)) = self.motion_toast else {
+            return;
+        };
+        let el = since.elapsed().as_secs_f32();
+        if el > 1.6 {
+            self.motion_toast = None;
+            return;
+        }
+        let fade = (el.min(0.15) / 0.15).min((1.6 - el) / 0.3).clamp(0.0, 1.0);
+        let rect = motion_toast_rect(ctx.viewport_rect(), self.download_toast.is_some());
+        let mut tp = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("motion_toast"),
+        ));
+        tp.set_opacity(fade);
+        tp.rect_filled(
+            rect.translate(egui::Vec2::new(0.0, 4.0)),
+            egui::CornerRadius::same(14),
+            egui::Color32::from_black_alpha(90),
+        );
+        tp.rect_filled(rect, egui::CornerRadius::same(14), BG_RAISED);
+        tp.rect_stroke(
+            rect,
+            egui::CornerRadius::same(14),
+            egui::Stroke::new(1.5_f32, self.theme_accent()),
+            egui::StrokeKind::Outside,
+        );
+        tp.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            message,
+            egui::FontId::proportional(15.0),
+            TEXT,
+        );
+        ctx.request_repaint();
+    }
+
+    fn draw_motion_toggle(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, compact: bool) {
+        let enabled = self.app_settings.motion_enabled;
+        let resp = ui.add(
+            egui::Label::new(
+                egui::RichText::new(bar_toggle_label("Motion", enabled, compact))
+                    .size(12.0)
+                    .color(if enabled { GREEN } else { AMBER }),
+            )
+            .sense(egui::Sense::click()),
+        );
+        if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let mut hover = format!(
+            "Toggle motion controls. Recenter: {}",
+            motion_recenter_text(
+                &self.app_settings,
+                &self.controller_config,
+                self.motion_button_missing(),
+            )
+        );
+        if compact {
+            hover = format!("{}. {}", bar_toggle_label("Motion", enabled, false), hover);
+        }
+        if enabled != self.startup_motion_enabled {
+            hover = format!("{}. {}", hover, MOTION_RESTART);
+        }
+        if resp.on_hover_text(hover).clicked() {
+            self.app_settings.motion_enabled = !enabled;
+            let _ = self.app_settings.save();
+        }
+    }
+
+    fn vibration_status(&self) -> String {
+        self.input.as_ref().map_or_else(
+            || VIBRATION_NO_CONTROLLER.to_string(),
+            |ib| ib.rumble_status_text(self.app_settings.vibration_enabled),
+        )
+    }
+
+    fn test_vibration(&self) {
+        if !self.app_settings.vibration_enabled {
+            return;
+        }
+        if let Some(ib) = self.input.as_ref() {
+            ib.preview_rumble(self.app_settings.vibration_strength);
+        }
+    }
+
+    fn draw_vibration_toggle(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, compact: bool) {
+        let enabled = self.app_settings.vibration_enabled;
+        let resp = ui.add(
+            egui::Label::new(
+                egui::RichText::new(bar_toggle_label("Vibration", enabled, compact))
+                    .size(12.0)
+                    .color(if enabled { GREEN } else { AMBER }),
+            )
+            .sense(egui::Sense::click()),
+        );
+        if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let mut hover = format!(
+            "Toggle controller vibration (strength {}%)",
+            self.app_settings.vibration_strength
+        );
+        if compact {
+            hover = format!("{}. {}", bar_toggle_label("Vibration", enabled, false), hover);
+        }
+        if resp.on_hover_text(hover).clicked() {
+            self.app_settings.vibration_enabled = !enabled;
+            let _ = self.app_settings.save();
+            self.test_vibration();
+        }
+    }
+
+    fn draw_docked_toggle(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, compact: bool) {
         let docked = nexium_core::hid_state::is_docked();
         let (mode_icon, mode_txt, mode_col) = if docked {
             (StatusIcon::Dock, "Docked", GREEN)
         } else {
             (StatusIcon::Handheld, "Handheld", AMBER)
         };
-        let label_resp = ui.add(
-            egui::Label::new(egui::RichText::new(mode_txt).size(12.0).color(mode_col))
-                .sense(egui::Sense::click()),
-        );
-        ui.add_space(2.0);
-        let icon_resp = status_icon(ui, mode_icon, mode_col);
-        let mode_resp = label_resp.union(icon_resp);
+        let mode_resp = if compact {
+            status_icon(ui, mode_icon, mode_col)
+        } else {
+            let label_resp = ui.add(
+                egui::Label::new(egui::RichText::new(mode_txt).size(12.0).color(mode_col))
+                    .sense(egui::Sense::click()),
+            );
+            ui.add_space(2.0);
+            let icon_resp = status_icon(ui, mode_icon, mode_col);
+            label_resp.union(icon_resp)
+        };
         if mode_resp.hovered() {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        if mode_resp
-            .on_hover_text("Toggle Docked / Handheld (Pro Controller vs Handheld)")
-            .clicked()
-        {
+        let mut hover =
+            "Toggle Docked / Handheld (Pro Controller vs Handheld; a Joy-Con pair stays Dual Joy-Con)"
+                .to_string();
+        if compact {
+            hover = format!("{}. {}", mode_txt, hover);
+        }
+        if mode_resp.on_hover_text(hover).clicked() {
             let docked = !docked;
             nexium_core::hid_state::set_docked(docked);
             self.app_settings.docked = docked;
@@ -6811,17 +8145,46 @@ impl HorizonApp {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}  {}",
-                            self.app_settings.gpu_backend.label(),
-                            self.active_gpu_name()
-                        ))
-                        .size(12.0)
-                        .color(MUTED),
-                    );
+                    let gpu_name = self.active_gpu_name();
+                    let building = nexium_common::shader_progress::in_flight();
+                    let motion_enabled = self.app_settings.motion_enabled;
+                    let vibration_enabled = self.app_settings.vibration_enabled;
+                    let (name_saving, state_saving) = ui.fonts_mut(|f| {
+                        let mut width = |text: String| {
+                            f.layout_no_wrap(text, egui::FontId::proportional(12.0), MUTED)
+                                .size()
+                                .x
+                        };
+                        let mut name_saving = width(format!("  {}", gpu_name));
+                        if building > 0 {
+                            name_saving += width(shader_build_label(building, false))
+                                - width(shader_build_label(building, true));
+                        }
+                        let mut state_saving = width(bar_toggle_label("Motion", motion_enabled, false))
+                            - width(bar_toggle_label("Motion", motion_enabled, true));
+                        state_saving += width(bar_toggle_label("Vibration", vibration_enabled, false))
+                            - width(bar_toggle_label("Vibration", vibration_enabled, true));
+                        (name_saving, state_saving)
+                    });
+                    let compact = self.game_bar_spare < if self.game_bar_compact { 24.0 } else { 0.0 };
+                    let terse = self.game_bar_terse_spare < if self.game_bar_terse { 24.0 } else { 0.0 };
+                    let backend = self.app_settings.gpu_backend.label();
+                    if compact {
+                        ui.label(egui::RichText::new(backend).size(12.0).color(MUTED))
+                            .on_hover_text(gpu_name);
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!("{}  {}", backend, gpu_name))
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    }
                     bar_divider(ui);
-                    self.draw_docked_toggle(ctx, ui);
+                    self.draw_docked_toggle(ctx, ui, false);
+                    bar_divider(ui);
+                    self.draw_motion_toggle(ctx, ui, terse);
+                    bar_divider(ui);
+                    self.draw_vibration_toggle(ctx, ui, terse);
                     bar_divider(ui);
                     let aspect = self.app_settings.aspect;
                     if bar_item(
@@ -6915,16 +8278,19 @@ impl HorizonApp {
                         self.app_settings.perf_overlay_hidden = !self.app_settings.perf_overlay_hidden;
                         let _ = self.app_settings.save();
                     }
-                    let building = nexium_common::shader_progress::in_flight();
                     if building > 0 {
                         bar_divider(ui);
-                        ui.label(egui::RichText::new(format!("Building shaders: {building}")).size(12.0).color(AMBER));
+                        let label = ui.label(egui::RichText::new(shader_build_label(building, compact)).size(12.0).color(AMBER));
+                        if compact {
+                            label.on_hover_text(shader_build_label(building, false));
+                        }
                     } else if nexium_common::shader_progress::recently_active() {
                         bar_divider(ui);
                         ui.label(egui::RichText::new(format!("Built {} shaders", nexium_common::shader_progress::burst_built())).size(12.0).color(MUTED));
                     }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let left_end = ui.min_rect().max.x;
+                    let right_start = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(12.0);
                         if bar_item(ctx, ui, "Hide".to_string(), MUTED, "Hide this bar (Ctrl+B shows it again)")
                             .clicked()
@@ -6953,7 +8319,20 @@ impl HorizonApp {
                                 .size(12.0)
                                 .color(TEXT),
                         );
-                    });
+                        ui.min_rect().min.x
+                    }).inner;
+                    let spare = right_start - left_end - 12.0;
+                    self.game_bar_spare = spare
+                        - if terse {
+                            name_saving + state_saving
+                        } else if compact {
+                            name_saving
+                        } else {
+                            0.0
+                        };
+                    self.game_bar_terse_spare = self.game_bar_spare + name_saving;
+                    self.game_bar_compact = compact;
+                    self.game_bar_terse = terse;
                 });
             });
     }
@@ -7240,6 +8619,7 @@ fn guest_keyboard_input(
     blocked: bool,
     speed_shortcut: bool,
     overlay_shortcut: bool,
+    recenter_key: Option<egui::Key>,
 ) -> nexium_core::hid_state::KeyboardInput {
     use nexium_core::hid_state::{KeyboardInput, KEYBOARD_MOD_CONTROL, KEYBOARD_MOD_SHIFT, KEYBOARD_MOD_LEFT_ALT};
     let mut keyboard = KeyboardInput { connected: enabled, ..KeyboardInput::default() };
@@ -7249,6 +8629,7 @@ fn guest_keyboard_input(
     for key in &input.keys_down {
         if (speed_shortcut && *key == egui::Key::U)
             || (overlay_shortcut && *key == egui::Key::O)
+            || recenter_key == Some(*key)
         {
             continue;
         }
@@ -7272,19 +8653,19 @@ mod guest_input_tests {
         let mut input = InputState::default();
         input.focused = true;
         input.keys_down.insert(Key::F12);
-        let keyboard = guest_keyboard_input(&input, true, false, false, false);
+        let keyboard = guest_keyboard_input(&input, true, false, false, false, None);
         assert!(keyboard.connected);
         assert_eq!(keyboard.keys[8], 1 << 5);
         assert_eq!(keyboard.keys.iter().map(|byte| byte.count_ones()).sum::<u32>(), 1);
         for (enabled, blocked, focused) in [(false, false, true), (true, true, true), (true, false, false)] {
             input.focused = focused;
-            let keyboard = guest_keyboard_input(&input, enabled, blocked, false, false);
+            let keyboard = guest_keyboard_input(&input, enabled, blocked, false, false, None);
             assert_eq!(keyboard.keys, [0; 32]);
             assert_eq!(keyboard.modifiers, 0);
         }
         input.focused = true;
         input.keys_down.clear();
-        assert_eq!(guest_keyboard_input(&input, true, false, false, false).keys, [0; 32]);
+        assert_eq!(guest_keyboard_input(&input, true, false, false, false, None).keys, [0; 32]);
     }
 
     #[test]
@@ -7292,7 +8673,17 @@ mod guest_input_tests {
         let mut input = InputState::default();
         input.focused = true;
         input.keys_down.extend([Key::U, Key::O, Key::F12]);
-        let keyboard = guest_keyboard_input(&input, true, false, true, true);
+        let keyboard = guest_keyboard_input(&input, true, false, true, true, None);
+        assert_eq!(keyboard.keys[8], 1 << 5);
+        assert_eq!(keyboard.keys.iter().map(|byte| byte.count_ones()).sum::<u32>(), 1);
+    }
+
+    #[test]
+    fn recenter_hotkey_does_not_press_a_guest_key() {
+        let mut input = InputState::default();
+        input.focused = true;
+        input.keys_down.extend([Key::F8, Key::F12]);
+        let keyboard = guest_keyboard_input(&input, true, false, false, false, Some(Key::F8));
         assert_eq!(keyboard.keys[8], 1 << 5);
         assert_eq!(keyboard.keys.iter().map(|byte| byte.count_ones()).sum::<u32>(), 1);
     }
@@ -8507,6 +9898,7 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
 
 impl eframe::App for HorizonApp {
     fn on_exit(&mut self) {
+        if let Some(ib) = self.input.as_mut() { ib.shutdown_rumble(); }
         if let Some(mut handle) = self.emulation_handle.take() { handle.stop_blocking(); }
         while crate::boot::emu_alive() { std::thread::sleep(std::time::Duration::from_millis(5)); }
         self.native_game.take();
@@ -8603,6 +9995,7 @@ impl eframe::App for HorizonApp {
         }
 
         if let Some(ref mut ib) = self.input {
+            ib.set_motion_enabled(self.app_settings.motion_enabled);
             self.last_input = ib.poll(
                 &self.controller_config,
                 self.app_settings.left_deadzone,
@@ -8719,6 +10112,11 @@ impl eframe::App for HorizonApp {
             }
         }
 
+        if !self.show_settings {
+            self.motion_key_capture = false;
+            self.rebinding = None;
+            self.rebinding_pad = None;
+        }
         {
             let kb_home =
                 ctx.input(|i| i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::Backtick));
@@ -8734,8 +10132,7 @@ impl eframe::App for HorizonApp {
             if home_edge
                 && running
                 && !self.modal_active()
-                && self.rebinding.is_none()
-                && self.rebinding_pad.is_none()
+                && !self.rebind_in_progress()
             {
                 if paused {
                     if let Some(h) = self.emulation_handle.as_ref() {
@@ -8769,7 +10166,7 @@ impl eframe::App for HorizonApp {
         }
 
         let speed_shortcut_active = self.emulation_handle.as_ref().is_some_and(|h| h.is_running())
-            && self.rebinding.is_none() && self.rebinding_pad.is_none()
+            && !self.rebind_in_progress()
             && !self.modal_active() && !ctx.text_edit_focused();
         if speed_shortcut_active && ctx.input_mut(take_speed_limit_shortcut) {
             let limited = nexium_common::speed_limit::toggle();
@@ -8797,11 +10194,31 @@ impl eframe::App for HorizonApp {
             let _ = self.app_settings.save();
             ctx.request_repaint();
         }
+        let recenter_key = motion_recenter_key(&self.app_settings.motion_recenter_key)
+            .filter(|key| recenter_key_conflict(*key, &self.controller_config).is_none())
+            .filter(|_| {
+                speed_shortcut_active
+                    && self.game_input_active()
+                    && !self.prefs_key_editing
+                    && !self.profile.name_editing
+            });
+        let key_recenter = recenter_key
+            .is_some_and(|key| ctx.input_mut(|input| take_plain_shortcut(input, key)));
+        let button_down = self.input.as_ref().is_some_and(|ib| {
+            ib.motion_attached() && ib.recenter_button_down(self.app_settings.motion_recenter_button)
+        });
+        let button_recenter = rising_edge(&mut self.motion_recenter_held, button_down);
+        let button_active = self.emulation_handle.as_ref().is_some_and(|h| h.is_running())
+            && !self.rebind_in_progress()
+            && !self.modal_active();
+        if key_recenter || (button_active && button_recenter) {
+            self.recenter_motion();
+        }
 
         if !self.app_settings.emulate_mouse {
             self.mouse_wheel_accum = egui::Vec2::ZERO;
         }
-        if self.rebinding.is_none() && self.rebinding_pad.is_none() {
+        if !self.rebind_in_progress() {
             let pressed: Vec<String> = ctx.input(|i| {
                 let mut v = Vec::new();
                 for ev in &i.events {
@@ -8811,6 +10228,7 @@ impl eframe::App for HorizonApp {
                     {
                         if !(speed_key_held && *key == egui::Key::U)
                             && !(overlay_key_held && *key == egui::Key::O)
+                            && recenter_key != Some(*key)
                         {
                             v.push(format!("{:?}", key));
                         }
@@ -8864,6 +10282,7 @@ impl eframe::App for HorizonApp {
                 ] {
                     if i.key_down(k) && !(speed_key_held && k == egui::Key::U)
                         && !(overlay_key_held && k == egui::Key::O)
+                        && recenter_key != Some(k)
                     {
                         let s = format!("{:?}", k);
                         if !v.contains(&s) {
@@ -8925,13 +10344,9 @@ impl eframe::App for HorizonApp {
                 stick_r_x: sticks[2],
                 stick_r_y: sticks[3],
             });
+            hid.publish_motion();
 
-            let game_input_active = self.emulation_handle.as_ref()
-                .is_some_and(|handle| handle.is_running() && !handle.is_paused())
-                && self.game_display().is_some()
-                && !self.modal_active() && !self.show_settings && !self.show_profile
-                && self.profile_anim == 0.0 && self.pause_anim.is_none()
-                && self.resume_anim.is_none() && !swkbd_open;
+            let game_input_active = self.game_input_active();
             let keyboard_blocked = !game_input_active || ctx.text_edit_focused();
             let keyboard = ctx.input(|input| guest_keyboard_input(
                 input,
@@ -8939,6 +10354,7 @@ impl eframe::App for HorizonApp {
                 keyboard_blocked,
                 speed_key_held,
                 overlay_key_held,
+                recenter_key,
             ));
             let pointer = ctx.input(|input| {
                 if !game_input_active || !input.focused {
@@ -9017,7 +10433,18 @@ impl eframe::App for HorizonApp {
             };
             let touch = nexium_core::hid_state::TouchInput { pressed: false, ..hid.touch };
             hid.update_input(Default::default());
+            hid.publish_motion();
             hid.update_devices(mouse, keyboard, touch);
+        }
+
+        let rumble_live = self.game_input_active() && crate::boot::emu_alive();
+        let rumble_strength = if self.app_settings.vibration_enabled {
+            self.app_settings.vibration_strength
+        } else {
+            0
+        };
+        if let Some(ib) = self.input.as_mut() {
+            ib.set_guest_rumble(rumble_live, rumble_strength);
         }
 
         self.poll_frames(ctx);
@@ -9204,48 +10631,106 @@ impl eframe::App for HorizonApp {
                             },
                         );
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(12.0);
-                            let (fps_col, fps_str) = if fps >= 55.0 {
-                                (GREEN, format!("{:.0} fps", fps))
-                            } else if fps >= 28.0 {
-                                (AMBER, format!("{:.0} fps", fps))
-                            } else {
-                                (DANGER, format!("{:.0} fps", fps))
+                        let left_end = ui.min_rect().max.x;
+                        let paused = false;
+                        let (run_icon, status, status_col) = if paused {
+                            (StatusIcon::Pause, "Paused", AMBER)
+                        } else if running {
+                            (StatusIcon::Play, "Running", GREEN)
+                        } else {
+                            (StatusIcon::Stop, "Idle", MUTED)
+                        };
+                        let mode_txt = if nexium_core::hid_state::is_docked() {
+                            "Docked"
+                        } else {
+                            "Handheld"
+                        };
+                        let motion_enabled = self.app_settings.motion_enabled;
+                        let vibration_enabled = self.app_settings.vibration_enabled;
+                        let (label_saving, state_saving) = ui.fonts_mut(|f| {
+                            let mut width = |text: String, size: f32| {
+                                f.layout_no_wrap(text, egui::FontId::proportional(size), MUTED)
+                                    .size()
+                                    .x
                             };
-                            ui.label(
-                                egui::RichText::new(fps_str)
-                                    .size(12.0)
-                                    .color(fps_col)
-                                    .monospace(),
-                            );
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
-                            ui.add_space(6.0);
-                            let paused = false;
-                            let (run_icon, status, status_col) = if paused {
-                                (StatusIcon::Pause, "Paused", AMBER)
-                            } else if running {
-                                (StatusIcon::Play, "Running", GREEN)
-                            } else {
-                                (StatusIcon::Stop, "Idle", MUTED)
-                            };
-                            ui.label(egui::RichText::new(status).size(12.0).color(status_col));
-                            ui.add_space(2.0);
-                            status_icon(ui, run_icon, status_col);
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
-                            ui.add_space(6.0);
-                            self.draw_docked_toggle(ctx, ui);
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
-                            ui.add_space(6.0);
-                            if pill_button(ui, "⊞ Carousel", false).clicked() {
-                                self.app_settings.view_mode =
-                                    crate::app_settings::ViewMode::Carousel;
-                                let _ = self.app_settings.save();
-                            }
+                            let mut label_saving =
+                                width(status.to_string(), 12.0) + width(mode_txt.to_string(), 12.0) + 16.0;
+                            label_saving += width("⊞ Carousel".to_string(), 12.5) - width("⊞".to_string(), 12.5);
+                            let mut state_saving = width(bar_toggle_label("Motion", motion_enabled, false), 12.0)
+                                - width(bar_toggle_label("Motion", motion_enabled, true), 12.0);
+                            state_saving += width(bar_toggle_label("Vibration", vibration_enabled, false), 12.0)
+                                - width(bar_toggle_label("Vibration", vibration_enabled, true), 12.0);
+                            (label_saving, state_saving)
                         });
+                        let compact = self.top_bar_spare < if self.top_bar_compact { 24.0 } else { 0.0 };
+                        let terse = self.top_bar_terse_spare < if self.top_bar_terse { 24.0 } else { 0.0 };
+
+                        let right_start = ui
+                            .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(12.0);
+                                let (fps_col, fps_str) = if fps >= 55.0 {
+                                    (GREEN, format!("{:.0} fps", fps))
+                                } else if fps >= 28.0 {
+                                    (AMBER, format!("{:.0} fps", fps))
+                                } else {
+                                    (DANGER, format!("{:.0} fps", fps))
+                                };
+                                ui.label(
+                                    egui::RichText::new(fps_str)
+                                        .size(12.0)
+                                        .color(fps_col)
+                                        .monospace(),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                                ui.add_space(6.0);
+                                if compact {
+                                    status_icon(ui, run_icon, status_col).on_hover_text(status);
+                                } else {
+                                    ui.label(egui::RichText::new(status).size(12.0).color(status_col));
+                                    ui.add_space(2.0);
+                                    status_icon(ui, run_icon, status_col);
+                                }
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                                ui.add_space(6.0);
+                                self.draw_vibration_toggle(ctx, ui, terse);
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                                ui.add_space(6.0);
+                                self.draw_motion_toggle(ctx, ui, terse);
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                                ui.add_space(6.0);
+                                self.draw_docked_toggle(ctx, ui, compact);
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                                ui.add_space(6.0);
+                                let carousel = if compact {
+                                    pill_button(ui, "⊞", false).on_hover_text("Carousel view")
+                                } else {
+                                    pill_button(ui, "⊞ Carousel", false)
+                                };
+                                if carousel.clicked() {
+                                    self.app_settings.view_mode =
+                                        crate::app_settings::ViewMode::Carousel;
+                                    let _ = self.app_settings.save();
+                                }
+                                ui.min_rect().min.x
+                            })
+                            .inner;
+                        let spare = right_start - left_end - 12.0;
+                        self.top_bar_spare = spare
+                            - if terse {
+                                label_saving + state_saving
+                            } else if compact {
+                                label_saving
+                            } else {
+                                0.0
+                            };
+                        self.top_bar_terse_spare = self.top_bar_spare + label_saving;
+                        self.top_bar_compact = compact;
+                        self.top_bar_terse = terse;
                     });
                 });
         }
@@ -9875,6 +11360,7 @@ impl eframe::App for HorizonApp {
                         ctx.request_repaint();
                     }
                 }
+                self.draw_motion_toast(ctx);
                 self.update_carousel_settings(ctx, ui);
                 if self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel {
                     self.update_preferences(ctx, ui);
@@ -9899,11 +11385,36 @@ impl eframe::App for HorizonApp {
             let gp_name = self.input.as_ref().and_then(|ib| ib.name());
             let mut rebinding_pad = self.rebinding_pad;
             let mut input_device = self.input_device;
+            let mut motion_key_capture = self.motion_key_capture;
+            let mut motion_key_notice = self.motion_key_notice.clone();
+            let motion_button_missing = self.motion_button_missing();
+            let startup_motion_enabled = self.startup_motion_enabled;
+            let mut recenter_now = false;
+            let mut calibrate_now = false;
+            let motion_source = self.input.as_ref().and_then(|ib| ib.motion_source());
+            let (calibration, calibration_note) = motion_calibration_text(
+                self.app_settings.motion_enabled,
+                nexium_core::hid_motion::calibration_states(),
+                nexium_core::hid_motion::stale_sources(),
+                self.input.as_ref().and_then(|ib| ib.motion_hint_note()),
+            );
+            let motion_values = motion_row_values(
+                &self.app_settings,
+                motion_source.as_deref(),
+                self.motion_key_capture,
+                self.motion_recently_recentered(),
+                calibration,
+            );
+            let vibration_values = vibration_row_values(&self.app_settings, &self.vibration_status());
+            let mut vibration_test = false;
+            let pad_list = self.input.as_ref().map(|ib| ib.list_gamepads()).unwrap_or_default();
+            let active_pad = self.input.as_ref().and_then(|ib| ib.get_active_id());
+            let mut pad_pick = None;
 
             let screen = ctx.viewport_rect();
             let max_h = (screen.height() - 80.0).clamp(360.0, 760.0);
             let max_w = (screen.width() - 80.0).clamp(520.0, 980.0);
-            egui::Window::new("Preferences")
+            let body_shown = egui::Window::new("Preferences")
                 .open(&mut open)
                 .resizable(true)
                 .default_size([max_w.min(900.0), max_h.min(560.0)])
@@ -9996,6 +11507,21 @@ impl eframe::App for HorizonApp {
                                 &last_input,
                                 gp_name.as_deref(),
                                 &mut input_device,
+                                &mut app_cfg,
+                                &mut app_save_needed,
+                                &mut motion_key_capture,
+                                &mut motion_key_notice,
+                                &motion_values,
+                                motion_button_missing,
+                                &mut recenter_now,
+                                calibration_note,
+                                &mut calibrate_now,
+                                &vibration_values,
+                                &mut vibration_test,
+                                startup_motion_enabled,
+                                &pad_list,
+                                active_pad,
+                                &mut pad_pick,
                             );
                         }
                         SettingsTab::Graphics => {
@@ -10022,15 +11548,26 @@ impl eframe::App for HorizonApp {
                             logging_settings_content(ui, &mut app_cfg, &mut app_save_needed);
                         }
                     }
-                });
+                })
+                .is_some_and(|response| response.inner.is_some());
 
             self.show_settings = open;
             self.settings_tab = tab;
             self.controller_config = cfg;
-            self.rebinding = rebinding;
-            self.rebinding_pad = rebinding_pad;
+            self.rebinding = rebinding.filter(|_| body_shown);
+            self.rebinding_pad = rebinding_pad.filter(|_| body_shown);
             self.input_device = input_device;
             self.app_settings = app_cfg;
+            if let (Some(id), Some(ib)) = (pad_pick, self.input.as_mut()) {
+                self.app_settings.gamepad = ib.set_active_id(id);
+                app_save_needed = true;
+            }
+            self.motion_key_capture = motion_key_capture
+                && body_shown
+                && open
+                && tab == SettingsTab::Controller
+                && input_device == InputDevice::Motion;
+            self.motion_key_notice = motion_key_notice;
             if save_needed {
                 if let Err(e) = self.controller_config.save() {
                     log::warn!("Failed to save controller config: {}", e);
@@ -10040,6 +11577,15 @@ impl eframe::App for HorizonApp {
                 if let Err(e) = self.app_settings.save() {
                     log::warn!("Failed to save app settings: {}", e);
                 }
+            }
+            if recenter_now {
+                self.recenter_motion();
+            }
+            if calibrate_now {
+                self.calibrate_motion();
+            }
+            if vibration_test {
+                self.test_vibration();
             }
             if let Some(key) = test_key {
                 let state = std::sync::Arc::new(std::sync::Mutex::new(KeyTest::default()));
@@ -10153,6 +11699,9 @@ impl eframe::App for HorizonApp {
             if self.download_toast.is_some() {
                 let screen = ctx.viewport_rect();
                 holes.push(egui::Rect::from_min_size(egui::pos2(screen.center().x - 184.0, screen.min.y + 20.0), egui::vec2(368.0, 74.0)));
+            }
+            if self.motion_toast.is_some() {
+                holes.push(motion_toast_rect(ctx.viewport_rect(), self.download_toast.is_some()).expand(6.0));
             }
             window.update(self.last_game_rect.filter(|_| native_visible), &holes, ctx.pixels_per_point(),
                 nexium_common::speed_limit::enabled()
@@ -10286,6 +11835,21 @@ fn controller_settings_content(
     input: &InputSnapshot,
     gp_name: Option<&str>,
     input_device: &mut InputDevice,
+    app_cfg: &mut AppSettings,
+    app_save_needed: &mut bool,
+    motion_key_capture: &mut bool,
+    motion_key_notice: &mut Option<String>,
+    motion_values: &[String; 6],
+    motion_button_missing: bool,
+    recenter_now: &mut bool,
+    calibration_note: Option<&str>,
+    calibrate_now: &mut bool,
+    vibration_values: &[String; 4],
+    vibration_test: &mut bool,
+    startup_motion_enabled: bool,
+    pads: &[(sdl3::joystick::JoystickId, String)],
+    active_pad: Option<sdl3::joystick::JoystickId>,
+    pad_pick: &mut Option<Option<sdl3::joystick::JoystickId>>,
 ) {
     ui.horizontal(|ui| {
         ui.label(
@@ -10336,10 +11900,36 @@ fn controller_settings_content(
         ui.add_space(8.0);
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Controller").size(12.0).color(MUTED));
+                let saved = app_cfg.gamepad.as_deref();
+                let choice = pad_choice_row(saved, pads, active_pad);
+                let automatic = choice == 0;
+                egui::ComboBox::from_id_salt("controller_sel")
+                    .selected_text(pad_choice_text(saved, pads, active_pad))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(automatic, PAD_AUTOMATIC).clicked() && !automatic {
+                            *pad_pick = Some(None);
+                        }
+                        for (i, (id, name)) in pads.iter().enumerate() {
+                            let current = choice == i + 1;
+                            if ui.selectable_label(current, name.as_str()).clicked() && !current {
+                                *pad_pick = Some(Some(*id));
+                            }
+                        }
+                        if let Some(saved) = saved.filter(|_| choice > pads.len()) {
+                            let label = format!("{} (not connected)", saved);
+                            ui.add_enabled_ui(false, |ui| ui.selectable_label(true, label));
+                        }
+                    });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Input device").size(12.0).color(MUTED));
                 let sel = match *input_device {
                     InputDevice::Keyboard => "Keyboard".to_string(),
                     InputDevice::Gamepad => gp_name.unwrap_or("Gamepad").to_string(),
+                    InputDevice::Motion => "Motion".to_string(),
+                    InputDevice::Vibration => "Vibration".to_string(),
                 };
                 egui::ComboBox::from_id_salt("input_device_sel")
                     .selected_text(sel)
@@ -10350,9 +11940,42 @@ fn controller_settings_content(
                             InputDevice::Gamepad,
                             gp_name.unwrap_or("Gamepad"),
                         );
+                        ui.selectable_value(input_device, InputDevice::Motion, "Motion");
+                        ui.selectable_value(input_device, InputDevice::Vibration, "Vibration");
                     });
             });
             ui.add_space(6.0);
+            if *input_device == InputDevice::Motion {
+                *rebinding = None;
+                *rebinding_pad = None;
+                motion_settings_content(
+                    ui,
+                    app_cfg,
+                    app_save_needed,
+                    cfg,
+                    motion_key_capture,
+                    motion_key_notice,
+                    motion_values,
+                    motion_button_missing,
+                    recenter_now,
+                    calibration_note,
+                    calibrate_now,
+                    startup_motion_enabled,
+                );
+                return;
+            }
+            if *input_device == InputDevice::Vibration {
+                *rebinding = None;
+                *rebinding_pad = None;
+                vibration_settings_content(
+                    ui,
+                    app_cfg,
+                    app_save_needed,
+                    vibration_values,
+                    vibration_test,
+                );
+                return;
+            }
 
             if let Some(btn) = *rebinding {
                 ui.horizontal(|ui| {
@@ -10399,6 +12022,11 @@ fn controller_settings_content(
                         .color(MUTED),
                 );
             }
+            ui.label(
+                egui::RichText::new(motion_summary(app_cfg, cfg))
+                    .size(11.0)
+                    .color(MUTED),
+            );
             ui.add_space(4.0);
 
             let list_h = (ui.available_height() - 46.0).max(160.0);
@@ -10449,11 +12077,15 @@ fn controller_settings_content(
                                     ui.end_row();
                                 }
                             }
+                            InputDevice::Motion | InputDevice::Vibration => {}
                         });
                 });
         });
     });
 
+    if matches!(*input_device, InputDevice::Motion | InputDevice::Vibration) {
+        return;
+    }
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if pill_button(ui, "Reset to Defaults", false).clicked() {
@@ -10464,6 +12096,191 @@ fn controller_settings_content(
             *save_needed = true;
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn motion_settings_content(
+    ui: &mut egui::Ui,
+    app_cfg: &mut AppSettings,
+    app_save_needed: &mut bool,
+    config: &ControllerConfig,
+    key_capture: &mut bool,
+    key_notice: &mut Option<String>,
+    values: &[String; 6],
+    button_missing: bool,
+    recenter_now: &mut bool,
+    calibration_note: Option<&str>,
+    calibrate_now: &mut bool,
+    startup_motion_enabled: bool,
+) {
+    let mut key_handled = false;
+    if *key_capture {
+        match ui.input(|i| recenter_key_press(&i.events, config)) {
+            Some(MotionKeyCapture::Cancel) => {
+                *key_capture = false;
+                key_handled = true;
+            }
+            Some(MotionKeyCapture::Set(key)) => {
+                app_cfg.motion_recenter_key = key;
+                *key_capture = false;
+                *app_save_needed = true;
+                key_handled = true;
+            }
+            Some(MotionKeyCapture::Refuse(notice)) => {
+                *key_notice = Some(notice);
+                key_handled = true;
+            }
+            None => {}
+        }
+        if key_handled {
+            ui.ctx().request_repaint();
+        }
+    }
+    egui::Grid::new("motion")
+        .num_columns(3)
+        .spacing([10.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(MOTION_ROW_LABELS[0]).size(12.0).color(TEXT));
+            if ui.checkbox(&mut app_cfg.motion_enabled, "Enable motion controls").changed() {
+                *app_save_needed = true;
+            }
+            ui.end_row();
+            ui.label(egui::RichText::new(MOTION_ROW_LABELS[1]).size(12.0).color(TEXT));
+            ui.label(egui::RichText::new(values[1].as_str()).size(12.0).color(MUTED));
+            ui.end_row();
+            if !app_cfg.motion_enabled {
+                ui.multiply_opacity(0.45);
+            }
+            ui.label(egui::RichText::new(MOTION_ROW_LABELS[2]).size(12.0).color(TEXT));
+            ui.label(
+                egui::RichText::new(values[2].as_str())
+                    .size(12.0)
+                    .monospace()
+                    .color(if *key_capture { AMBER } else { MUTED }),
+            );
+            if ui
+                .small_button(if *key_capture { "Cancel" } else { "Rebind" })
+                .clicked()
+                && !key_handled
+            {
+                *key_capture = !*key_capture;
+                *key_notice = None;
+            }
+            ui.end_row();
+            ui.label(egui::RichText::new(MOTION_ROW_LABELS[3]).size(12.0).color(TEXT));
+            egui::ComboBox::from_id_salt("motion_recenter_button")
+                .selected_text(values[3].as_str())
+                .show_ui(ui, |ui| {
+                    for button in MotionRecenterButton::all() {
+                        if ui
+                            .selectable_value(
+                                &mut app_cfg.motion_recenter_button,
+                                *button,
+                                button.label(),
+                            )
+                            .changed()
+                        {
+                            *app_save_needed = true;
+                        }
+                    }
+                });
+            ui.end_row();
+            ui.label(egui::RichText::new(MOTION_ROW_LABELS[4]).size(12.0).color(TEXT));
+            ui.label(egui::RichText::new(values[4].as_str()).size(12.0).color(GREEN));
+            if ui.small_button(MOTION_RECENTER_ACTION).clicked() {
+                *recenter_now = true;
+            }
+            ui.end_row();
+            ui.label(egui::RichText::new(MOTION_ROW_LABELS[5]).size(12.0).color(TEXT));
+            ui.label(egui::RichText::new(values[5].as_str()).size(12.0).color(
+                match values[5].as_str() {
+                    "" => MUTED,
+                    "Calibrated" => GREEN,
+                    _ => AMBER,
+                },
+            ));
+            if ui.small_button(MOTION_CALIBRATE_ACTION).clicked() {
+                *calibrate_now = true;
+            }
+            ui.end_row();
+        });
+    if let Some(note) = motion_note(
+        app_cfg,
+        config,
+        key_notice.as_deref().filter(|_| *key_capture),
+        button_missing,
+    ) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(note).size(11.0).color(AMBER));
+    }
+    if app_cfg.motion_enabled != startup_motion_enabled {
+        ui.label(egui::RichText::new(MOTION_RESTART).size(11.0).color(AMBER));
+    }
+    if let Some(note) = calibration_note {
+        ui.label(egui::RichText::new(note).size(11.0).color(AMBER));
+    }
+    ui.add_space(6.0);
+    for line in MOTION_HELP {
+        ui.label(egui::RichText::new(line).size(11.0).color(MUTED));
+    }
+}
+
+fn vibration_settings_content(
+    ui: &mut egui::Ui,
+    app_cfg: &mut AppSettings,
+    app_save_needed: &mut bool,
+    values: &[String; 4],
+    test_now: &mut bool,
+) {
+    egui::Grid::new("vibration")
+        .num_columns(3)
+        .spacing([10.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(VIBRATION_ROW_LABELS[0]).size(12.0).color(TEXT));
+            if ui.checkbox(&mut app_cfg.vibration_enabled, "Enable vibration").changed() {
+                *app_save_needed = true;
+                *test_now |= app_cfg.vibration_enabled;
+            }
+            ui.end_row();
+            ui.label(egui::RichText::new(VIBRATION_ROW_LABELS[1]).size(12.0).color(TEXT));
+            ui.label(egui::RichText::new(values[1].as_str()).size(12.0).color(MUTED));
+            ui.end_row();
+            if !app_cfg.vibration_enabled {
+                ui.multiply_opacity(0.45);
+            }
+            ui.label(egui::RichText::new(VIBRATION_ROW_LABELS[2]).size(12.0).color(TEXT));
+            let strength = ui.add_enabled(
+                app_cfg.vibration_enabled,
+                egui::Slider::new(&mut app_cfg.vibration_strength, 10..=100)
+                    .step_by(10.0)
+                    .suffix("%"),
+            );
+            if strength.changed() {
+                *test_now = true;
+            }
+            if strength.drag_stopped() || (strength.changed() && !strength.dragged()) {
+                *app_save_needed = true;
+            }
+            ui.end_row();
+            ui.label(egui::RichText::new(VIBRATION_ROW_LABELS[3]).size(12.0).color(TEXT));
+            ui.label(egui::RichText::new(values[3].as_str()).size(12.0).color(GREEN));
+            if ui
+                .add_enabled(
+                    app_cfg.vibration_enabled,
+                    egui::Button::new(VIBRATION_TEST_ACTION).small(),
+                )
+                .clicked()
+            {
+                *test_now = true;
+            }
+            ui.end_row();
+        });
+    ui.add_space(6.0);
+    for line in VIBRATION_HELP {
+        ui.label(egui::RichText::new(line).size(11.0).color(MUTED));
+    }
 }
 
 fn draw_controller_diagram(ui: &mut egui::Ui, input: &InputSnapshot) {

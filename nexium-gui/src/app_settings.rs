@@ -571,18 +571,46 @@ pub struct AppSettings {
     pub left_deadzone: f32,
     #[serde(default = "default_right_deadzone")]
     pub right_deadzone: f32,
+    #[serde(default)]
+    pub gamepad: Option<String>,
     #[serde(default = "default_emulated_device")]
     pub emulate_mouse: bool,
     #[serde(default = "default_emulated_device")]
     pub emulate_keyboard: bool,
     #[serde(default = "default_emulated_device")]
     pub emulate_touch: bool,
+    #[serde(default = "default_motion_enabled")]
+    pub motion_enabled: bool,
+    #[serde(default = "default_motion_recenter_key")]
+    pub motion_recenter_key: String,
+    #[serde(default)]
+    pub motion_recenter_button: MotionRecenterButton,
+    #[serde(default = "default_vibration_enabled")]
+    pub vibration_enabled: bool,
+    #[serde(default = "default_vibration_strength")]
+    pub vibration_strength: u8,
     #[serde(default)]
     pub performance_debug: PerformanceDebugSettings,
 }
 
 fn default_emulated_device() -> bool {
     true
+}
+
+fn default_motion_enabled() -> bool {
+    true
+}
+
+fn default_motion_recenter_key() -> String {
+    "F8".to_string()
+}
+
+fn default_vibration_enabled() -> bool {
+    true
+}
+
+fn default_vibration_strength() -> u8 {
+    100
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +690,49 @@ impl OverlayCorner {
         all[(i + 1) % all.len()]
     }
     pub fn prev(&self) -> OverlayCorner {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MotionRecenterButton {
+    Paddles,
+    Capture,
+    Touchpad,
+    Unbound,
+}
+
+impl Default for MotionRecenterButton {
+    fn default() -> Self {
+        MotionRecenterButton::Paddles
+    }
+}
+
+impl MotionRecenterButton {
+    pub fn all() -> &'static [MotionRecenterButton] {
+        &[
+            MotionRecenterButton::Paddles,
+            MotionRecenterButton::Capture,
+            MotionRecenterButton::Touchpad,
+            MotionRecenterButton::Unbound,
+        ]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            MotionRecenterButton::Paddles => "SL / SR",
+            MotionRecenterButton::Capture => "Capture",
+            MotionRecenterButton::Touchpad => "Touchpad",
+            MotionRecenterButton::Unbound => "None",
+        }
+    }
+    pub fn next(&self) -> MotionRecenterButton {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+    pub fn prev(&self) -> MotionRecenterButton {
         let all = Self::all();
         let i = all.iter().position(|x| x == self).unwrap_or(0);
         all[(i + all.len() - 1) % all.len()]
@@ -773,9 +844,15 @@ impl Default for AppSettings {
             game_bar: default_game_bar(),
             left_deadzone: default_left_deadzone(),
             right_deadzone: default_right_deadzone(),
+            gamepad: None,
             emulate_mouse: default_emulated_device(),
             emulate_keyboard: default_emulated_device(),
             emulate_touch: default_emulated_device(),
+            motion_enabled: default_motion_enabled(),
+            motion_recenter_key: default_motion_recenter_key(),
+            motion_recenter_button: MotionRecenterButton::default(),
+            vibration_enabled: default_vibration_enabled(),
+            vibration_strength: default_vibration_strength(),
             performance_debug: PerformanceDebugSettings::default(),
         }
     }
@@ -822,6 +899,7 @@ impl AppSettings {
             Self::default()
         };
         cfg.fsr_sharpness = cfg.fsr_sharpness.min(100);
+        cfg.vibration_strength = cfg.vibration_strength.clamp(10, 100);
         if cfg.performance_debug.sanitize_unsafe_gpu_overrides() {
             let _ = cfg.save();
         }
@@ -974,5 +1052,72 @@ mod tests {
         let settings: AppSettings = serde_json::from_value(value).unwrap();
         assert!(settings.performance_debug.async_gpu);
         assert_eq!(settings.performance_debug.enabled_overrides().len(), 1);
+    }
+
+    #[test]
+    fn legacy_settings_json_defaults_motion() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in ["motion_enabled", "motion_recenter_key", "motion_recenter_button"] {
+            assert!(object.remove(key).is_some());
+        }
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(settings.motion_enabled);
+        assert_eq!(settings.motion_recenter_key, "F8");
+        assert_eq!(settings.motion_recenter_button, MotionRecenterButton::Paddles);
+    }
+
+    #[test]
+    fn motion_settings_round_trip_and_cycle() {
+        let settings = AppSettings {
+            motion_enabled: false,
+            motion_recenter_key: "Num5".to_string(),
+            motion_recenter_button: MotionRecenterButton::Capture,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(!restored.motion_enabled);
+        assert_eq!(restored.motion_recenter_key, "Num5");
+        assert_eq!(restored.motion_recenter_button, MotionRecenterButton::Capture);
+        assert_eq!(serde_json::to_value(MotionRecenterButton::Paddles).unwrap(), "Paddles");
+        assert_eq!(MotionRecenterButton::Unbound.next(), MotionRecenterButton::Paddles);
+        assert_eq!(MotionRecenterButton::Paddles.prev(), MotionRecenterButton::Unbound);
+    }
+
+    #[test]
+    fn chosen_gamepad_defaults_to_none_and_persists() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        assert!(value.as_object_mut().unwrap().remove("gamepad").is_some());
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.gamepad, None);
+        let settings = AppSettings {
+            gamepad: Some("Nintendo Switch Joy-Con (L/R)".to_string()),
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.gamepad.as_deref(), Some("Nintendo Switch Joy-Con (L/R)"));
+    }
+
+    #[test]
+    fn vibration_settings_default_and_persist() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in ["vibration_enabled", "vibration_strength"] {
+            assert!(object.remove(key).is_some());
+        }
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(settings.vibration_enabled);
+        assert_eq!(settings.vibration_strength, 100);
+        let settings = AppSettings {
+            vibration_enabled: false,
+            vibration_strength: 40,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(!restored.vibration_enabled);
+        assert_eq!(restored.vibration_strength, 40);
     }
 }
