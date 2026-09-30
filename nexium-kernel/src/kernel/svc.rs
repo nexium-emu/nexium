@@ -12152,9 +12152,7 @@ fn applet_buffer_response(port_name: &str, cmd_id: u32) -> Option<Vec<u8>> {
         ("IHOSBinderDriver", 0) | ("IHOSBinderDriver", 3) => Some(build_igbp_success_parcel()),
         ("ILaunchParamStorageAccessor", 11) => Some(build_launch_parameter()),
         ("IStorageAccessorOut", 11) => Some(crate::services::am::applet_out_data()),
-        ("acc:u0" | "acc:u1" | "acc:aa", 2) | ("acc:u0" | "acc:u1" | "acc:aa", 3) => {
-            Some(build_user_id_list())
-        }
+        ("acc:u0" | "acc:u1" | "acc:aa", 2 | 3 | 141) => Some(build_user_id_list()),
         ("IProfile", 0) => Some(vec![0u8; 0x80]),
         _ => None,
     }
