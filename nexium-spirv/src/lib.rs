@@ -861,6 +861,8 @@ pub struct Emitter {
     stage: Stage,
     geometry: GeometryOptions,
     geometry_inputs: HashMap<u32, Word>,
+    viewport_mask_var: Option<Word>,
+    passthrough_forward: Vec<(Word, Word)>,
     force_fp32_ftz: bool,
     force_signed_zero_preserve: bool,
     f32_t: Word,
@@ -1250,6 +1252,8 @@ impl Emitter {
             force_fp32_ftz: std::env::var("NEXIUM_SPIRV_FTZ").ok().as_deref() == Some("1"),
             geometry: GeometryOptions::default(),
             geometry_inputs: HashMap::new(),
+            viewport_mask_var: None,
+            passthrough_forward: Vec::new(),
             force_signed_zero_preserve: stage != Stage::Compute
                 && std::env::var("NEXIUM_SPIRV_SIGNED_ZERO_PRESERVE")
                     .ok()
@@ -1445,6 +1449,14 @@ impl Emitter {
     }
 
     fn setup_ssbos_at(&mut self, count: u32, binding_base: u32) {
+        self.setup_ssbo_range(0, count, binding_base);
+    }
+
+    fn setup_ssbo_slots(&mut self, first_slot: u32, count: u32) {
+        self.setup_ssbo_range(first_slot, count, SSBO_BINDING_BASE);
+    }
+
+    fn setup_ssbo_range(&mut self, first_slot: u32, count: u32, binding_base: u32) {
         if count == 0 {
             return;
         }
@@ -1486,17 +1498,18 @@ impl Emitter {
         } else {
             MAX_SSBO
         };
-        let n = count.min(max);
+        let n = count.min(max.saturating_sub(first_slot));
         for i in 0..n {
+            let slot = first_slot + i;
             let var = self.b.variable(ptr_struct, None, storage_class, None);
             self.b
                 .decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
             self.b.decorate(
                 var,
                 Decoration::Binding,
-                [Operand::LiteralBit32(binding_base + i)],
+                [Operand::LiteralBit32(binding_base + slot)],
             );
-            self.ssbo_vars[i as usize] = Some(var);
+            self.ssbo_vars[slot as usize] = Some(var);
         }
     }
 
@@ -2562,6 +2575,57 @@ impl Emitter {
             raw
         };
         Some(self.b.bitcast(self.f32_t, None, raw).unwrap())
+    }
+
+    fn viewport_mask_var(&mut self) -> Word {
+        if let Some(var) = self.viewport_mask_var {
+            return var;
+        }
+        let one = self.const_u32(1);
+        let var = self
+            .b
+            .variable(self.ptr_private_u32, None, StorageClass::Private, Some(one));
+        self.viewport_mask_var = Some(var);
+        var
+    }
+
+    fn emit_passthrough_primitive(&mut self) {
+        let mask_var = self.viewport_mask_var();
+        let mask = self.b.load(self.u32_t, None, mask_var, None, []).unwrap();
+        let zero = self.const_u32(0);
+        let visible = self.b.i_not_equal(self.bool_t, None, mask, zero).unwrap();
+        let body = self.b.id();
+        let merge = self.b.id();
+        self.b
+            .selection_merge(merge, rspirv::spirv::SelectionControl::NONE)
+            .unwrap();
+        self.b.branch_conditional(visible, body, merge, []).unwrap();
+        self.b.begin_block(Some(body)).unwrap();
+        let position_in = self.geometry_input(0x70);
+        let position_out = self.position_var();
+        let forward = self.passthrough_forward.clone();
+        for &vertex in passthrough_vertex_indices(self.geometry.input_mode) {
+            let index = self.const_u32(vertex);
+            for &(input, output) in &forward {
+                let ptr = self
+                    .b
+                    .access_chain(self.ptr_input_vec4, None, input, [index])
+                    .unwrap();
+                let value = self.b.load(self.vec4_t, None, ptr, None, []).unwrap();
+                self.b.store(output, value, None, []).unwrap();
+            }
+            let ptr = self
+                .b
+                .access_chain(self.ptr_input_vec4, None, position_in, [index])
+                .unwrap();
+            let value = self.b.load(self.vec4_t, None, ptr, None, []).unwrap();
+            self.b.store(position_out, value, None, []).unwrap();
+            self.transform_position();
+            self.b.emit_vertex().unwrap();
+        }
+        self.b.end_primitive().unwrap();
+        self.b.branch(merge).unwrap();
+        self.b.begin_block(Some(merge)).unwrap();
     }
 
     fn geometry_predicate_begin(&mut self, inst: &IrInst) -> Option<Word> {
@@ -4590,6 +4654,14 @@ impl Emitter {
                 val = self.select_guarded(val, guard, old);
             }
             self.b.store(ac, val, None, []).unwrap();
+        } else if slot == 0x3a0 && matches!(self.stage, Stage::Geometry) && self.geometry.passthrough {
+            let var = self.viewport_mask_var();
+            let mut bits = self.b.bitcast(self.u32_t, None, val).unwrap();
+            if let Some(cond) = guard {
+                let old = self.b.load(self.u32_t, None, var, None, []).unwrap();
+                bits = self.b.select(self.u32_t, None, cond, bits, old).unwrap();
+            }
+            self.b.store(var, bits, None, []).unwrap();
         } else if slot == 0x6C && matches!(self.stage, Stage::Vertex) {
             let v = self.point_size_var_id();
             if guard.is_some() {
@@ -9841,6 +9913,20 @@ impl Emitter {
             }
         }
 
+        if matches!(self.stage, Stage::Geometry) && self.geometry.passthrough {
+            self.viewport_mask_var();
+            self.position_var();
+            self.geometry_input(0x70);
+            for &loc in required_output_locations {
+                let slot = loc * 16 + 0x80;
+                let output = self.output_var(slot);
+                if output.var != 0 {
+                    let input = self.geometry_input(slot);
+                    self.passthrough_forward.push((input, output.var));
+                }
+            }
+        }
+
         let multi_exit = cfg
             .blocks
             .iter()
@@ -10063,6 +10149,7 @@ impl Emitter {
                     self.store_fragment_depth(exit_state);
                 }
             }
+            Stage::Geometry if self.geometry.passthrough => self.emit_passthrough_primitive(),
             Stage::Compute | Stage::Geometry => {}
         }
 
@@ -11666,6 +11753,17 @@ fn cbuf_vec4s(cfg: &Cfg, floor_vec4s: u32) -> u32 {
     ((vec4s + 15) & !15).min(UBO_VEC4S)
 }
 
+fn passthrough_vertex_indices(input_mode: rspirv::spirv::ExecutionMode) -> &'static [u32] {
+    use rspirv::spirv::ExecutionMode;
+    match input_mode {
+        ExecutionMode::InputPoints => &[0],
+        ExecutionMode::InputLines => &[0, 1],
+        ExecutionMode::InputLinesAdjacency => &[1, 2],
+        ExecutionMode::InputTrianglesAdjacency => &[0, 2, 4],
+        _ => &[0, 1, 2],
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct GeometryOptions {
     pub input_vertices: u32,
@@ -11673,6 +11771,7 @@ pub struct GeometryOptions {
     pub invocations: u32,
     pub input_mode: rspirv::spirv::ExecutionMode,
     pub output_mode: rspirv::spirv::ExecutionMode,
+    pub passthrough: bool,
 }
 
 impl GeometryOptions {
@@ -11687,30 +11786,57 @@ impl GeometryOptions {
             _ => return Err(format!("unsupported geometry input topology {topology}")),
         };
         let word = |i| u32::from_le_bytes(header[i..i + 4].try_into().unwrap());
-        let output_mode = match (word(12) >> 24) & 15 {
-            1 => ExecutionMode::OutputPoints,
-            6 => ExecutionMode::OutputLineStrip,
-            7 => ExecutionMode::OutputTriangleStrip,
-            mode => return Err(format!("unsupported geometry output topology {mode}")),
+        let passthrough = word(0) & (1 << 24) != 0;
+        let output_mode = if passthrough {
+            match input_mode {
+                ExecutionMode::InputPoints => ExecutionMode::OutputPoints,
+                ExecutionMode::InputLines | ExecutionMode::InputLinesAdjacency => {
+                    ExecutionMode::OutputLineStrip
+                }
+                _ => ExecutionMode::OutputTriangleStrip,
+            }
+        } else {
+            match (word(12) >> 24) & 15 {
+                1 => ExecutionMode::OutputPoints,
+                6 => ExecutionMode::OutputLineStrip,
+                7 => ExecutionMode::OutputTriangleStrip,
+                mode => return Err(format!("unsupported geometry output topology {mode}")),
+            }
         };
-        let output_vertices = word(16) & 0xfff;
+        let output_vertices = if passthrough {
+            passthrough_vertex_indices(input_mode).len() as u32
+        } else {
+            word(16) & 0xfff
+        };
         let invocations = (word(8) >> 24).max(1);
         if output_vertices == 0 { return Err("geometry shader has no output vertices".into()); }
-        Ok(Self { input_vertices, input_mode, output_mode, output_vertices, invocations })
+        Ok(Self { input_vertices, input_mode, output_mode, output_vertices, invocations, passthrough })
     }
 }
 
 impl Default for GeometryOptions {
     fn default() -> Self {
-        Self { input_vertices: 3, output_vertices: 3, invocations: 1,
+        Self { input_vertices: 3, output_vertices: 3, invocations: 1, passthrough: false,
             input_mode: rspirv::spirv::ExecutionMode::Triangles,
             output_mode: rspirv::spirv::ExecutionMode::OutputTriangleStrip }
     }
 }
 
 pub fn emit_geometry(cfg: &Cfg, outputs: &[u32], vertex: VertexOptions, geometry: GeometryOptions) -> (Vec<u32>, u64) {
+    emit_geometry_with_ssbos(cfg, outputs, vertex, geometry, 0, 0)
+}
+
+pub fn emit_geometry_with_ssbos(
+    cfg: &Cfg,
+    outputs: &[u32],
+    vertex: VertexOptions,
+    geometry: GeometryOptions,
+    ssbo_base: u32,
+    num_ssbo: u32,
+) -> (Vec<u32>, u64) {
     let mut emitter = Emitter::new_with_vertex_opts_sized(Stage::Geometry, vertex, UBO_VEC4S);
     emitter.geometry = geometry;
+    emitter.setup_ssbo_slots(ssbo_base, num_ssbo);
     emitter.finish_with_required_outputs_and_bindings(cfg, outputs)
 }
 
@@ -13185,6 +13311,86 @@ mod tests {
             instruction.class.opcode,
             rspirv::spirv::Op::UMulExtended | rspirv::spirv::Op::SMulExtended
         )));
+    }
+
+    #[test]
+    fn passthrough_geometry_forwards_input_primitive_when_viewport_mask_is_set() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit_void(IrOp::StoreAttr { slot: 0x3a0, src: IrValue::ImmU32(1) });
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let geometry = GeometryOptions { passthrough: true, ..Default::default() };
+        let (words, _) = emit_geometry(&cfg, &[0, 1], VertexOptions::default(), geometry);
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).unwrap();
+        let ops = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .map(|i| i.class.opcode)
+            .collect::<Vec<_>>();
+        assert_eq!(ops.iter().filter(|op| **op == rspirv::spirv::Op::EmitVertex).count(), 3);
+        assert_eq!(ops.iter().filter(|op| **op == rspirv::spirv::Op::EndPrimitive).count(), 1);
+        assert!(module.execution_modes.iter().any(|mode| mode.operands.as_slice()
+            == [
+                Operand::IdRef(module.entry_points[0].operands[1].unwrap_id_ref()),
+                Operand::ExecutionMode(rspirv::spirv::ExecutionMode::OutputVertices),
+                Operand::LiteralBit32(3),
+            ]));
+        let outputs = module
+            .types_global_values
+            .iter()
+            .filter(|inst| inst.class.opcode == rspirv::spirv::Op::Variable
+                && inst.operands.first() == Some(&Operand::StorageClass(StorageClass::Output)))
+            .count();
+        assert_eq!(outputs, 3, "position plus the two forwarded locations");
+    }
+
+    #[test]
+    fn geometry_storage_buffers_bind_after_the_vertex_and_fragment_slots() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit_void(IrOp::StoreStorage {
+            buffer_index: 2,
+            addr_lo: IrValue::ImmU32(0x40),
+            base_addr_lo: IrValue::ImmU32(0x40),
+            imm: 0,
+            value: IrValue::ImmU32(7),
+            cbuf_binding: 0,
+            cbuf_offset: 0x420,
+            align: 16,
+        });
+        program.emit_void(IrOp::StoreAttr { slot: 0x3a0, src: IrValue::ImmU32(1) });
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let geometry = GeometryOptions { passthrough: true, ..Default::default() };
+        let (words, cbuf_mask) =
+            emit_geometry_with_ssbos(&cfg, &[0], VertexOptions::default(), geometry, 2, 1);
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).unwrap();
+        let bindings = module
+            .annotations
+            .iter()
+            .filter(|inst| inst.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding)))
+            .map(|inst| inst.operands[2].unwrap_literal_bit32())
+            .collect::<Vec<_>>();
+        assert!(bindings.contains(&(GFX_BINDING_SSBO_BASE + 2)));
+        assert!(!bindings.contains(&GFX_BINDING_SSBO_BASE));
+        assert_ne!(cbuf_mask & (1u64 << (GFX_CBUF_STAGE_SLOTS * 2)), 0);
+        let stores = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .filter(|i| i.class.opcode == rspirv::spirv::Op::Store)
+            .count();
+        assert!(stores >= 1);
     }
 
     #[test]
