@@ -1,3 +1,4 @@
+use crate::hid_vibration::{self, VibrationValue};
 use crate::kernel::handles::HandleType;
 use crate::kernel::Kernel;
 use nexium_ipc::IpcCtx;
@@ -627,58 +628,84 @@ pub fn get_vibration_device_info(
     _k: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
 ) -> (u32, u32) {
-    (0, 0)
+    hid_vibration::device_info(handle)
 }
 pub fn send_vibration_value(
-    _k: &mut Kernel,
+    kernel: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
-    _v0: u32,
-    _v1: u32,
-    _v2: u32,
-    _v3: u32,
+    handle: u32,
+    v0: u32,
+    v1: u32,
+    v2: u32,
+    v3: u32,
     _aruid: u64,
 ) {
+    hid_vibration::submit(
+        handle,
+        VibrationValue::from_words([v0, v1, v2, v3]),
+        kernel.services.hid.vibration_allowed(),
+    );
 }
 pub fn get_actual_vibration_value(
     _k: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
-) {
+) -> Vec<u8> {
+    hid_vibration::actual(handle).to_le_bytes().to_vec()
 }
 pub fn create_active_vibration_device_list(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
 pub fn permit_vibration(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, permit: bool) {
     kernel.services.hid.vibration_permitted = permit;
+    if !permit && !kernel.services.hid.vibration_session {
+        hid_vibration::silence();
+    }
 }
 pub fn is_vibration_permitted(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> bool {
     kernel.services.hid.vibration_permitted
 }
-pub fn send_vibration_values(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
-pub fn send_vibration_gc_erm_command(
-    _k: &mut Kernel,
+pub fn send_vibration_values(
+    kernel: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
     _aruid: u64,
-    _cmd: u64,
+    handles: &[u8],
+    values: &[u8],
 ) {
+    hid_vibration::submit_batch(handles, values, kernel.services.hid.vibration_allowed());
+}
+pub fn send_vibration_gc_erm_command(
+    kernel: &mut Kernel,
+    _c: &mut IpcCtx,
+    _s: u32,
+    handle: u32,
+    _aruid: u64,
+    cmd: u64,
+) {
+    hid_vibration::submit_erm(handle, cmd, kernel.services.hid.vibration_allowed());
 }
 pub fn get_actual_vibration_gc_erm_command(
     _k: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _handle: u32,
+    handle: u32,
     _aruid: u64,
 ) -> u64 {
-    0
+    hid_vibration::erm_command(handle)
 }
-pub fn begin_permit_vibration_session(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
-pub fn end_permit_vibration_session(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn begin_permit_vibration_session(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {
+    kernel.services.hid.vibration_session = true;
+}
+pub fn end_permit_vibration_session(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32) {
+    kernel.services.hid.vibration_session = false;
+    if !kernel.services.hid.vibration_permitted {
+        hid_vibration::silence();
+    }
+}
 pub fn is_vibration_device_mounted(
     _k: &mut Kernel,
     _c: &mut IpcCtx,
@@ -689,13 +716,14 @@ pub fn is_vibration_device_mounted(
     true
 }
 pub fn send_vibration_value_in_bool(
-    _k: &mut Kernel,
+    kernel: &mut Kernel,
     _c: &mut IpcCtx,
     _s: u32,
-    _value: bool,
-    _handle: u32,
+    value: bool,
+    handle: u32,
     _aruid: u64,
 ) {
+    hid_vibration::submit_bool(handle, value, kernel.services.hid.vibration_allowed());
 }
 pub fn send_vibration_value_in_mode(
     _k: &mut Kernel,

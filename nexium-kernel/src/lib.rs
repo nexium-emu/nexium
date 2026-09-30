@@ -5,6 +5,7 @@ pub mod boot;
 pub mod fs_host;
 pub mod hid_motion;
 pub mod hid_state;
+pub mod hid_vibration;
 pub mod kernel;
 pub mod sdl_emu;
 pub mod services;

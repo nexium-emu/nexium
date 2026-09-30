@@ -33,6 +33,7 @@ pub struct HidService {
     pub npad_style_set: u32,
     pub p1_assignment_joy_dual: Option<bool>,
     pub vibration_permitted: bool,
+    pub vibration_session: bool,
     pub style_change_events: Vec<u32>,
     pub six_axis_passthrough: HashSet<u32>,
     pub six_axis_calibration: HashMap<u32, Vec<u8>>,
@@ -41,6 +42,10 @@ pub struct HidService {
 
 impl HidService {
     pub fn new() -> Self {
+        crate::hid_vibration::reset();
+        crate::hid_state::set_player1_joy_dual(false);
+        crate::hid_state::set_player1_joy_single(None);
+        crate::hid_state::set_npad_joy_hold_horizontal(false);
         Self {
             input_event_handle: 0x100,
             standard_port: 0x101,
@@ -50,11 +55,16 @@ impl HidService {
             npad_style_set: 0,
             p1_assignment_joy_dual: None,
             vibration_permitted: true,
+            vibration_session: false,
             style_change_events: Vec::new(),
             six_axis_passthrough: HashSet::new(),
             six_axis_calibration: HashMap::new(),
             six_axis_zero_drift: HashMap::new(),
         }
+    }
+
+    pub fn vibration_allowed(&self) -> bool {
+        self.vibration_permitted || self.vibration_session
     }
 
     pub fn dispatch(&self, cmd_id: u32) -> u32 {

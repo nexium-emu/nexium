@@ -13,6 +13,7 @@ pub use nexium_kernel::boot;
 pub use nexium_kernel::fs_host;
 pub use nexium_kernel::hid_motion;
 pub use nexium_kernel::hid_state;
+pub use nexium_kernel::hid_vibration;
 pub use nexium_kernel::kernel;
 pub use nexium_kernel::sdl_emu;
 pub use nexium_kernel::services;
