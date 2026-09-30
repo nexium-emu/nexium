@@ -927,6 +927,64 @@ impl Translator {
         }
     }
 
+    fn emit_subword_global_store(
+        &mut self,
+        addr_lo: Value,
+        offset: i32,
+        value: Value,
+        size: u32,
+        pred: Option<Predicate>,
+    ) {
+        let address = self.emit_iadd_value(addr_lo, Value::ImmU32(offset as u32), false, false);
+        let byte = self.emit_value(Op::ILop {
+            a: address,
+            b: Value::ImmU32(if size < 2 { 3 } else { 2 }),
+            op: LogicOp::And,
+            not_a: false,
+            not_b: false,
+        });
+        let position = self.emit_ishl_imm_value(byte, 3);
+        let width_mask = Value::ImmU32(if size < 2 { 0xff } else { 0xffff });
+        let mask = self.emit_value(Op::IShl { a: width_mask, b: position });
+        let keep = self.emit_value(Op::ILop {
+            a: mask,
+            b: Value::ImmU32(0xffff_ffff),
+            op: LogicOp::And,
+            not_a: true,
+            not_b: false,
+        });
+        let masked = self.emit_value(Op::ILop {
+            a: value,
+            b: width_mask,
+            op: LogicOp::And,
+            not_a: false,
+            not_b: false,
+        });
+        let shifted = self.emit_value(Op::IShl { a: masked, b: position });
+        self.write_side_effecting_reg(
+            RZ,
+            Op::GlobalAtomic {
+                addr_lo,
+                offset,
+                value: keep,
+                op: ImageAtomicOp::And,
+                is_signed: false,
+            },
+            pred,
+        );
+        self.write_side_effecting_reg(
+            RZ,
+            Op::GlobalAtomic {
+                addr_lo,
+                offset,
+                value: shifted,
+                op: ImageAtomicOp::Or,
+                is_signed: false,
+            },
+            pred,
+        );
+    }
+
     fn emit_f2f(&mut self, raw: u64, src: Value, pred: Option<Predicate>) -> bool {
         let dest = reg_dest(raw);
         let m = f2f_mods(raw);
@@ -4334,12 +4392,12 @@ impl Translator {
                 let offset = ldg_offset(raw);
                 let size = ldg_size(raw);
                 let count = match size {
-                    4 => 1u32,
+                    0..=4 => 1u32,
                     5 => 2,
                     6 | 7 => 4,
                     _ => {
                         log::warn!(
-                            "STG sub-word size not yet lifted raw={:#018x} size={}",
+                            "STG unsupported size raw={:#018x} size={}",
                             raw,
                             size,
                         );
@@ -4352,6 +4410,11 @@ impl Translator {
                     }
                 };
                 let addr_lo = self.read_reg(addr_reg);
+                if size < 4 {
+                    let value = self.read_reg(src);
+                    self.emit_subword_global_store(addr_lo, offset, value, size, pred);
+                    return true;
+                }
                 for w in 0..count {
                     let off = offset.wrapping_add((w * 4) as i32);
                     let value = self.read_reg(if src == RZ {

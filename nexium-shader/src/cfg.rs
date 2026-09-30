@@ -1267,6 +1267,108 @@ where
     );
     let preds = compute_predecessors(&topology);
 
+    let mut forced = LoopCarriedPhis::empty(topology.len());
+    let cfg = build_cfg_blocks(bytes, stage, &topology, &preds, &forced);
+    let gaps = loop_carried_phi_gaps(&cfg.blocks, &preds);
+    if gaps.is_empty() {
+        return cfg;
+    }
+    forced = gaps;
+    build_cfg_blocks(bytes, stage, &topology, &preds, &forced)
+}
+
+struct LoopCarriedPhis {
+    regs: Vec<BTreeSet<u8>>,
+    preds: Vec<BTreeSet<u8>>,
+}
+
+impl LoopCarriedPhis {
+    fn empty(blocks: usize) -> Self {
+        Self {
+            regs: vec![BTreeSet::new(); blocks],
+            preds: vec![BTreeSet::new(); blocks],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.regs.iter().all(BTreeSet::is_empty) && self.preds.iter().all(BTreeSet::is_empty)
+    }
+}
+
+fn natural_loop_body(header: usize, preds: &[Vec<BlockId>]) -> Option<HashSet<BlockId>> {
+    let mut body: HashSet<BlockId> = HashSet::new();
+    let mut stack: Vec<BlockId> = preds[header]
+        .iter()
+        .copied()
+        .filter(|&p| p as usize >= header)
+        .collect();
+    if stack.is_empty() {
+        return None;
+    }
+    body.insert(header as BlockId);
+    while let Some(block) = stack.pop() {
+        if !body.insert(block) {
+            continue;
+        }
+        stack.extend(preds[block as usize].iter().copied());
+    }
+    Some(body)
+}
+
+fn loop_carried_phi_gaps(blocks: &[BasicBlock], preds: &[Vec<BlockId>]) -> LoopCarriedPhis {
+    let mut gaps = LoopCarriedPhis::empty(blocks.len());
+    for header in 0..blocks.len() {
+        let Some(body) = natural_loop_body(header, preds) else {
+            continue;
+        };
+        let mut reg_defs: BTreeSet<u8> = BTreeSet::new();
+        let mut pred_defs: BTreeSet<u8> = BTreeSet::new();
+        for &block in &body {
+            let block = &blocks[block as usize];
+            let mut results: HashSet<u32> = HashSet::new();
+            for inst in &block.program.instructions {
+                if let Some(r) = inst.dest_reg.filter(|&r| r != RZ) {
+                    reg_defs.insert(r);
+                }
+                if let Some(id) = inst.result {
+                    results.insert(id.0);
+                }
+            }
+            for phi in &block.pred_phis {
+                results.insert(phi.result.0);
+            }
+            for (&pred, id) in &block.pred_exit {
+                if pred < 7 && results.contains(&id.0) {
+                    pred_defs.insert(pred);
+                }
+            }
+        }
+        let forward: Vec<&BasicBlock> = preds[header]
+            .iter()
+            .filter(|&&p| (p as usize) < header)
+            .map(|&p| &blocks[p as usize])
+            .collect();
+        for r in reg_defs {
+            if !forward.iter().any(|b| b.reg_exit.contains_key(&r)) {
+                gaps.regs[header].insert(r);
+            }
+        }
+        for p in pred_defs {
+            if !forward.iter().any(|b| b.pred_exit.contains_key(&p)) {
+                gaps.preds[header].insert(p);
+            }
+        }
+    }
+    gaps
+}
+
+fn build_cfg_blocks(
+    bytes: &[u8],
+    stage: ShaderStage,
+    topology: &[BlockInfo],
+    preds: &[Vec<BlockId>],
+    forced: &LoopCarriedPhis,
+) -> Cfg {
     let mut blocks: Vec<BasicBlock> = Vec::with_capacity(topology.len());
     let mut total_unimpl: u32 = 0;
     let mut next_value: u32 = 0;
@@ -1276,12 +1378,22 @@ where
     let mut pending_bindless_checks: Vec<(BlockId, PendingBindlessOriginCheck)> = Vec::new();
 
     for (bid, info) in topology.iter().enumerate() {
-        let (initial_state, phis, after_phis) =
-            compute_initial_reg_state(&blocks, &preds, bid as BlockId, next_value);
+        let (initial_state, phis, after_phis) = compute_initial_reg_state(
+            &blocks,
+            preds,
+            bid as BlockId,
+            next_value,
+            &forced.regs[bid],
+        );
         next_value = after_phis;
 
-        let (initial_pred_state, pred_phis, after_pred_phis) =
-            compute_initial_pred_state(&blocks, &preds, bid as BlockId, next_value);
+        let (initial_pred_state, pred_phis, after_pred_phis) = compute_initial_pred_state(
+            &blocks,
+            preds,
+            bid as BlockId,
+            next_value,
+            &forced.preds[bid],
+        );
         next_value = after_pred_phis;
 
         let mut t =
@@ -1550,6 +1662,7 @@ fn compute_initial_reg_state(
     preds: &[Vec<BlockId>],
     bid: BlockId,
     mut next_value: u32,
+    forced: &BTreeSet<u8>,
 ) -> (HashMap<u8, Value>, Vec<Inst>, u32) {
     let pred_ids = &preds[bid as usize];
     if pred_ids.is_empty() {
@@ -1574,6 +1687,7 @@ fn compute_initial_reg_state(
             }
         }
     }
+    all_regs.extend(forced.iter().copied());
 
     let mut initial = HashMap::new();
     let mut phis = Vec::new();
@@ -1617,6 +1731,7 @@ fn compute_initial_pred_state(
     preds: &[Vec<BlockId>],
     bid: BlockId,
     mut next_value: u32,
+    forced: &BTreeSet<u8>,
 ) -> (HashMap<u8, ValueId>, Vec<PredPhi>, u32) {
     let pred_ids = &preds[bid as usize];
     if pred_ids.is_empty() {
@@ -1641,6 +1756,7 @@ fn compute_initial_pred_state(
             }
         }
     }
+    all_preds.extend(forced.iter().copied());
 
     let mut initial = HashMap::new();
     let mut phis = Vec::new();
@@ -2917,6 +3033,43 @@ mod tests {
                 ))
             ));
         assert!(sample_tex_ids(&cfg).is_empty());
+    }
+
+    #[test]
+    fn register_first_written_inside_loop_gets_loop_carried_phi() {
+        let bytes = build_program(&[
+            0x5C98_0780_0FF7_0001,
+            0x366B_0380_0017_0107,
+            0x5C98_0780_0038_0002,
+            0x1C00_0000_0017_0101,
+            0x3663_0380_0037_0107,
+            enc_bra_p0(-0x30),
+            enc_exit(),
+        ]);
+        let cfg = build_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let header = cfg
+            .blocks
+            .iter()
+            .find(|block| block.start_offset == 0x10)
+            .expect("loop header block");
+        let phi = header
+            .program
+            .instructions
+            .iter()
+            .find(|inst| matches!(inst.op, Op::Phi { .. }) && inst.dest_reg == Some(2))
+            .expect("R2 loop-carried phi");
+        let Op::Phi { sources } = &phi.op else {
+            unreachable!()
+        };
+        assert!(sources
+            .iter()
+            .any(|(pred, value)| *pred >= header.id && matches!(value, Value::Inst(_))));
+        assert!(sources
+            .iter()
+            .any(|(pred, value)| *pred < header.id && matches!(value, Value::GprIn(2))));
+        let exit = cfg.blocks.last().expect("exit block");
+        assert!(matches!(exit.reg_exit.get(&2), Some(Value::Inst(_))));
     }
 
     #[test]
