@@ -687,23 +687,28 @@ impl Threads {
     pub fn pick_next(&mut self) -> Option<u32> {
         let core = current_core() as i32;
         let pos = self
-            .ready
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| {
-                self.threads
-                    .get(h)
-                    .map_or(false, |t| t.core == core || t.core < 0)
-            })
-            .min_by_key(|(idx, h)| (self.effective_priority(**h), *idx))
-            .map(|(idx, _)| idx)?;
+            .best_ready_position(|t| t.core == core || t.core < 0)
+            .or_else(|| {
+                self.best_ready_position(|t| {
+                    t.core != core && (0..NUM_CORES as i32).contains(&core) && t.affinity_mask & (1u64 << core) != 0
+                })
+            })?;
         let handle = self.ready.remove(pos)?;
         if let Some(t) = self.threads.get_mut(&handle) {
-            if t.core < 0 {
+            if t.core != core {
                 t.core = core;
             }
         }
         Some(handle)
+    }
+
+    fn best_ready_position(&self, eligible: impl Fn(&Thread) -> bool) -> Option<usize> {
+        self.ready
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| self.threads.get(h).is_some_and(&eligible))
+            .min_by_key(|(idx, h)| (self.effective_priority(**h), *idx))
+            .map(|(idx, _)| idx)
     }
 
     pub fn has_ready_for_core(&self, core: i32) -> bool {
@@ -1160,6 +1165,29 @@ mod tests {
             threads.ready.iter().copied().collect::<Vec<_>>(),
             vec![0x200]
         );
+    }
+
+    #[test]
+    fn idle_core_takes_ready_threads_its_affinity_allows() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_ready_thread(&mut threads, 0x200, 0x2c);
+        add_ready_thread(&mut threads, 0x201, 0x2b);
+        add_ready_thread(&mut threads, 0x202, 0x2a);
+        for (handle, mask) in [(0x200, 0b0110u64), (0x201, 0b0110), (0x202, 0b1000)] {
+            let thread = threads.threads.get_mut(&handle).unwrap();
+            thread.core = 1;
+            thread.affinity_mask = mask;
+        }
+        threads.threads.get_mut(&0x202).unwrap().core = 3;
+
+        assert_eq!(threads.pick_next(), None);
+        threads.threads.get_mut(&0x200).unwrap().affinity_mask = 0b0111;
+        threads.threads.get_mut(&0x201).unwrap().affinity_mask = 0b0111;
+        assert_eq!(threads.pick_next(), Some(0x201));
+        assert_eq!(threads.threads.get(&0x201).unwrap().core, 0);
+        assert_eq!(threads.pick_next(), Some(0x200));
+        assert_eq!(threads.pick_next(), None);
+        assert_eq!(threads.ready.iter().copied().collect::<Vec<_>>(), vec![0x202]);
     }
 
     #[test]
