@@ -94,11 +94,12 @@ const REG_UPLOAD_LINE_COUNT: u32 = 0x61;
 const REG_UPLOAD_DST_HI: u32 = 0x62;
 const REG_UPLOAD_DST_LO: u32 = 0x63;
 const REG_LAUNCH_DMA: u32 = 0x6C;
+const REG_UPLOAD_DATA: u32 = 0x6D;
 
 #[derive(Clone, Copy)]
 enum HleMacro {
-    DrawArrays { base_instance: bool },
-    DrawIndexed { base_instance: bool },
+    DrawArrays,
+    DrawIndexed { shader_parameters: bool },
     DrawInstancedWithVbMask { indexed: bool },
     ConstantBuffer { size: u32 },
     Upload,
@@ -106,17 +107,12 @@ enum HleMacro {
 
 fn hle_macro_kind(hash: u64) -> Option<HleMacro> {
     match hash {
-        0x0D61_FC9F_AAC9_FCAD => Some(HleMacro::DrawArrays {
-            base_instance: false,
-        }),
-        0x8A4D_173E_B99A_8603 => Some(HleMacro::DrawArrays {
-            base_instance: true,
-        }),
+        0x0D61_FC9F_AAC9_FCAD => Some(HleMacro::DrawArrays),
         0x771B_B18C_6244_4DA0 => Some(HleMacro::DrawIndexed {
-            base_instance: false,
+            shader_parameters: false,
         }),
         0x0217_9201_0048_8FF7 => Some(HleMacro::DrawIndexed {
-            base_instance: true,
+            shader_parameters: true,
         }),
         0x62AB_88C4_D2DF_58E3 => Some(HleMacro::DrawInstancedWithVbMask { indexed: false }),
         0xD00E_2028_0475_8F38 => Some(HleMacro::DrawInstancedWithVbMask { indexed: true }),
@@ -134,43 +130,57 @@ fn hle_macro(
     writes: Vec<(u32, u32)>,
 ) -> Option<MacroOutput> {
     let p = |i: usize| params.get(i).copied().unwrap_or(0);
-    let macro_instance_count = || (reg_reader(REG_DRAW_INSTANCE_COUNT) & p(2)).max(1);
     let mut out = MacroOutput {
         writes,
         ..MacroOutput::default()
     };
     match kind {
-        HleMacro::DrawArrays { base_instance } => {
-            let topology = p(0) & 0xFFFF;
-            let vertex_count = p(1);
-            let vertex_first = p(3);
-            out.draw_instance_count = Some(macro_instance_count());
-            if base_instance {
-                out.writes.push((REG_GLOBAL_BASE_INSTANCE, p(4)));
+        HleMacro::DrawArrays => {
+            let instance_count = reg_reader(REG_DRAW_INSTANCE_COUNT) & p(2);
+            if instance_count > 128 {
+                return None;
             }
-            out.writes.push((REG_DRAW_BEGIN, topology));
-            out.writes.push((REG_VERTEX_FIRST, vertex_first));
-            out.writes.push((REG_VERTEX_COUNT, vertex_count));
-            if base_instance {
-                out.writes.push((REG_GLOBAL_BASE_INSTANCE, 0));
+            out.writes.reserve(3 + instance_count as usize * 3);
+            out.writes.push((REG_VERTEX_FIRST, p(3)));
+            out.writes.push((REG_GLOBAL_BASE_INSTANCE, p(4)));
+            let mut topology = p(0);
+            for _ in 0..instance_count {
+                out.writes.push((REG_DRAW_BEGIN, topology));
+                out.writes.push((REG_VERTEX_COUNT, p(1)));
+                out.writes.push((REG_DRAW_END, 0));
+                topology = (topology & !(3 << 26)) | (1 << 26);
             }
+            out.writes.push((REG_GLOBAL_BASE_INSTANCE, 0));
         }
-        HleMacro::DrawIndexed { base_instance } => {
-            let topology = p(0) & 0xFFFF;
-            let index_count = p(1);
-            let index_first = p(3);
-            let base_vertex = p(4);
-            out.draw_instance_count = Some(macro_instance_count());
-            out.writes.push((REG_GLOBAL_BASE_VERTEX, base_vertex));
-            if base_instance {
-                out.writes.push((REG_GLOBAL_BASE_INSTANCE, p(5)));
+        HleMacro::DrawIndexed { shader_parameters } => {
+            let instance_count = reg_reader(REG_DRAW_INSTANCE_COUNT) & p(2);
+            if instance_count > 128 {
+                return None;
             }
-            out.writes.push((REG_DRAW_BEGIN, topology));
-            out.writes.push((REG_INDEX_FIRST, index_first));
-            out.writes.push((REG_INDEX_COUNT, index_count));
+            out.writes.reserve(13 + instance_count as usize * 3);
+            out.writes.push((REG_INDEX_FIRST, p(3)));
+            out.writes.push((REG_VERTEX_ID_BASE, p(4)));
+            out.writes.push((REG_GLOBAL_BASE_VERTEX, p(4)));
+            out.writes.push((REG_GLOBAL_BASE_INSTANCE, p(5)));
+            if shader_parameters {
+                out.writes.push((REG_CB_OFFSET, 0x640));
+                out.writes.push((REG_CB_DATA, p(4)));
+                out.writes.push((REG_CB_DATA + 1, p(5)));
+            }
+            let mut topology = p(0);
+            for _ in 0..instance_count {
+                out.writes.push((REG_DRAW_BEGIN, topology));
+                out.writes.push((REG_INDEX_COUNT, p(1)));
+                out.writes.push((REG_DRAW_END, 0));
+                topology = (topology & !(3 << 26)) | (1 << 26);
+            }
+            out.writes.push((REG_VERTEX_ID_BASE, 0));
             out.writes.push((REG_GLOBAL_BASE_VERTEX, 0));
-            if base_instance {
-                out.writes.push((REG_GLOBAL_BASE_INSTANCE, 0));
+            out.writes.push((REG_GLOBAL_BASE_INSTANCE, 0));
+            if shader_parameters {
+                out.writes.push((REG_CB_OFFSET, 0x640));
+                out.writes.push((REG_CB_DATA, 0));
+                out.writes.push((REG_CB_DATA + 1, 0));
             }
         }
         HleMacro::DrawInstancedWithVbMask { indexed } => {
@@ -248,17 +258,33 @@ fn hle_macro(
             }
         }
         HleMacro::ConstantBuffer { size } => {
+            let clear_blocks = p(2);
+            if clear_blocks > 1024 {
+                return None;
+            }
+            out.writes.reserve(4 + clear_blocks as usize * 4);
             out.writes.push((REG_CB_SIZE, size));
             out.writes.push((REG_CB_ADDR_HI, p(0)));
             out.writes.push((REG_CB_ADDR_LO, p(1)));
             out.writes.push((REG_CB_OFFSET, 0));
+            for _ in 0..clear_blocks * 4 {
+                out.writes.push((REG_CB_DATA, 0));
+            }
         }
         HleMacro::Upload => {
-            out.writes.push((REG_UPLOAD_LINE_LENGTH, p(2)));
+            let clear_bytes = p(2);
+            if clear_bytes > 16 * 1024 || clear_bytes % 16 != 0 {
+                return None;
+            }
+            out.writes.reserve(5 + clear_bytes as usize / 4);
+            out.writes.push((REG_UPLOAD_LINE_LENGTH, clear_bytes));
             out.writes.push((REG_UPLOAD_LINE_COUNT, 1));
             out.writes.push((REG_UPLOAD_DST_HI, p(0)));
             out.writes.push((REG_UPLOAD_DST_LO, p(1)));
             out.writes.push((REG_LAUNCH_DMA, 0x1011));
+            for _ in 0..clear_bytes / 4 {
+                out.writes.push((REG_UPLOAD_DATA, 0));
+            }
         }
     }
     Some(out)
@@ -1628,6 +1654,120 @@ mod tests {
         assert_eq!(fast.writes, legacy.writes);
         assert_eq!(fast.steps_remaining, legacy.steps_remaining);
         (fast.writes, fast.steps_remaining)
+    }
+
+    #[test]
+    fn draw_hle_preserves_captured_register_and_constant_buffer_writes() {
+        let fixtures = [
+            (
+                0x0d61fc9faac9fcad,
+                &[
+                    0x0346_c215, 0x0000_0401, 0x0000_0301, 0x0014_d310,
+                    0x00d7_4061, 0x0002_d807, 0x0143_8061, 0x0161_8021,
+                    0x0000_0841, 0x00d7_8021, 0x0000_2041, 0x0161_4071,
+                    0xffff_db11, 0x0000_4211, 0xfffe_5817, 0xd080_8912,
+                    0x0143_80f1, 0x0000_0011,
+                ][..],
+            ),
+            (
+                0x771bb18c62444da0,
+                &[
+                    0x0000_0501, 0x0346_c215, 0x0000_0401, 0x017d_c061,
+                    0x0111_8351, 0x0000_1841, 0x0543_4021, 0x0015_1410,
+                    0x0000_1a31, 0x0002_e007, 0x0000_1041, 0x0161_8021,
+                    0x0000_0841, 0x017e_0021, 0x0000_2841, 0x0161_4071,
+                    0xffff_e411, 0x0000_4211, 0xfffe_6017, 0xd080_8912,
+                    0x0111_8071, 0x0143_40f1, 0x0143_8071,
+                ][..],
+            ),
+            (
+                0x0217920100488ff7,
+                &[
+                    0x0000_0601, 0x0000_0501, 0x0346_c215, 0x017d_c061,
+                    0x0111_8451, 0x0000_2041, 0x0543_4021, 0x0000_2331,
+                    0x0000_1841, 0x0638_c021, 0x0190_0041, 0x0015_5510,
+                    0x0000_2041, 0x0002_e807, 0x0000_1841, 0x0161_8021,
+                    0x0000_0841, 0x017e_0021, 0x0000_3041, 0x0161_4071,
+                    0xffff_ed11, 0x0000_4211, 0xfffe_6817, 0xd080_8912,
+                    0x0111_8071, 0x0143_4071, 0x0143_8071, 0x0638_c021,
+                    0x0190_0041, 0x0000_00c1, 0x0000_0041,
+                ][..],
+            ),
+        ];
+        for (hash, code) in fixtures {
+            assert_eq!(macro_hash(code), hash);
+            let kind = hle_macro_kind(hash).unwrap();
+            for topology in [3, 5, 0x0400_0003, 0x0800_0005, 0xdead_beef] {
+                for count in [0, 1, 2, 31, 128] {
+                    for mask in [0, 1, 3, 0xffff_ffff] {
+                        for base in [0u32, 11, 0xffff_ffff] {
+                            let params = [topology, 12, mask, 5, base, base.wrapping_add(7)];
+                            let reg_reader = |reg| {
+                                if reg == REG_DRAW_INSTANCE_COUNT { count } else { 0 }
+                            };
+                            let (writes, _) = assert_fast_matches_legacy(code, &params, &reg_reader);
+                            let hle = hle_macro(kind, &params, &reg_reader, Vec::new()).unwrap();
+                            assert_eq!(
+                                hle.writes, writes,
+                                "hash={hash:x} params={params:x?} count={count}"
+                            );
+                            assert_eq!(hle.draw_instance_count, None);
+                        }
+                    }
+                }
+            }
+            assert!(hle_macro(kind, &[3, 12, u32::MAX, 5, 7, 11], &|_| 129, Vec::new()).is_none());
+        }
+        assert!(hle_macro_kind(0x8a4d_173e_b99a_8603).is_none());
+    }
+
+    #[test]
+    fn upload_hle_preserves_captured_zero_fill_writes() {
+        let code = [
+            0x0000_0301, 0x0418_0251, 0x0000_1041, 0x0000_4041,
+            0x0000_0841, 0x0000_1841, 0x041b_0021, 0x0404_4041,
+            0x0002_1007, 0x001b_4021, 0x0000_0041, 0x0000_0041,
+            0xfffc_1211, 0x0000_0041, 0xffff_1097, 0x0000_0041,
+            0x0000_0091, 0x0000_0011,
+        ];
+        assert_eq!(macro_hash(&code), 0xee4d_0004_bec8_ecf4);
+        let kind = hle_macro_kind(macro_hash(&code)).unwrap();
+        for clear_bytes in [0, 16, 32, 256, 16 * 1024] {
+            let params = [5, 0x1234_5670, clear_bytes];
+            let (writes, _) = assert_fast_matches_legacy(&code, &params, &|_| 0);
+            let hle = hle_macro(kind, &params, &|_| 0, Vec::new()).unwrap();
+            assert_eq!(hle.writes, writes, "clear_bytes={clear_bytes}");
+        }
+        for clear_bytes in [1, 4, 17, 16 * 1024 + 16, u32::MAX] {
+            assert!(hle_macro(kind, &[5, 0, clear_bytes], &|_| 0, Vec::new()).is_none());
+        }
+    }
+
+    #[test]
+    fn constant_buffer_hle_preserves_captured_clear_writes() {
+        let code = [
+            0x0638_0021, 0x1c00_0041, 0x0000_0931, 0x0000_0841,
+            0x0000_0131, 0x0002_0807, 0x0239_0021, 0x0000_0041,
+            0x0000_0041, 0xffff_c911, 0x0000_0041, 0xffff_0897,
+            0x0000_0041, 0x0000_0091, 0x0000_0011,
+        ];
+        for (size, hash) in [
+            (0x7000, 0xd246_fddf_3a61_73d7),
+            (0x5f00, 0x6c97_861d_891e_df7e),
+        ] {
+            let mut code = code;
+            code[1] = (size << 14) | 0x41;
+            assert_eq!(macro_hash(&code), hash);
+            let kind = hle_macro_kind(hash).unwrap();
+            for clear_blocks in [0, 1, 2, 16, 101, 102, 256, 1024] {
+                let params = [0x5, 0x0007_0000, clear_blocks];
+                let (writes, _) = assert_fast_matches_legacy(&code, &params, &|_| 0);
+                let hle = hle_macro(kind, &params, &|_| 0, Vec::new()).unwrap();
+                assert_eq!(hle.writes, writes, "size={size:x} clear_blocks={clear_blocks}");
+                assert_eq!(writes.len(), 4 + clear_blocks as usize * 4);
+            }
+            assert!(hle_macro(kind, &[5, 0x70000, 1025], &|_| 0, Vec::new()).is_none());
+        }
     }
 
     fn add_immediate(result: u32, dst: u32, src_a: u32, immediate: u32) -> u32 {

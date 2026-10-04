@@ -14208,6 +14208,8 @@ impl Renderer {
                                     key.height,
                                     key.layers,
                                     tic.gpu_va,
+                                    graphics_texture_image_format(&tic, numeric_type, native_bc_formats)
+                                        .unwrap_or(vk::Format::UNDEFINED),
                                 );
                             }
                         }
@@ -15526,6 +15528,7 @@ impl Renderer {
                 post_submit_texture_probe,
             );
         }
+
         if pprof_enabled() && rp_t0.elapsed() >= std::time::Duration::from_millis(10) {
             let rp_tex_known =
                 rp_tex_sync + rp_tex_view + rp_tex_gen + rp_tex_upload + rp_tex_finish;
@@ -16778,6 +16781,14 @@ fn rt_stats_keys(rt_cache: &RtCache, requested_key: RtKey, resolved_key: RtKey) 
     push_unique_rt_key(&mut keys, resolved_key);
     for (k, _) in rt_cache.present_candidates(requested_key) {
         push_unique_rt_key(&mut keys, k);
+    }
+    if std::env::var_os("NEXIUM_RT_STATS_VOLUMES").is_some() {
+        let mut volumes: Vec<_> = rt_cache.debug_all().into_iter()
+            .filter(|(key, _)| key.is_3d).map(|(key, _)| key).collect();
+        volumes.sort_by_key(|key| (key.gpu_va, key.width, key.height, key.depth));
+        for key in volumes {
+            push_unique_rt_key(&mut keys, key);
+        }
     }
     if let Ok(list) = std::env::var("NEXIUM_RT_STATS_KEYS") {
         for item in list.split(',') {
@@ -22681,6 +22692,7 @@ fn read_image_mip_stats(
     format: vk::Format,
     mip_level: u32,
 ) -> Option<RtImageStats> {
+    let depth = if key.is_3d { (key.depth >> mip_level).max(1) } else { 1 };
     let key = RtKey::new(
         key.nvmap_id,
         (key.width >> mip_level).max(1),
@@ -22689,6 +22701,7 @@ fn read_image_mip_stats(
     );
     let total = (key.width as u64)
         .checked_mul(key.height as u64)?
+        .checked_mul(depth as u64)?
         .checked_mul(readback_format_bpp(format) as u64)?;
     let stage = create_staging_owned(device, mem_props, total).ok()?;
     let cleanup = |device: &ash::Device,
@@ -22755,7 +22768,7 @@ fn read_image_mip_stats(
         image_extent: vk::Extent3D {
             width: key.width,
             height: key.height,
-            depth: 1,
+            depth,
         },
     };
     unsafe {
@@ -22846,11 +22859,15 @@ fn read_image_mip_stats(
         if let Some(directory) = std::env::var_os("NEXIUM_RT_STATS_RAW_DIR") {
             let directory = std::path::PathBuf::from(directory);
             if std::fs::create_dir_all(&directory).is_ok() {
+                let dimensions = if depth > 1 {
+                    format!("{}x{}x{}", key.width, key.height, depth)
+                } else {
+                    format!("{}x{}", key.width, key.height)
+                };
                 let path = directory.join(format!(
-                    "rt_{:x}_{}x{}_{}_m{}.bin",
+                    "rt_{:x}_{}_{}_m{}.bin",
                     key.gpu_va,
-                    key.width,
-                    key.height,
+                    dimensions,
                     format.as_raw(),
                     mip_level
                 ));
@@ -23810,6 +23827,7 @@ fn verify_volume_image(
     height: u32,
     layers: u32,
     va: u64,
+    format: vk::Format,
 ) {
     use ash::vk::Handle;
     use std::collections::HashMap;
@@ -23826,7 +23844,8 @@ fn verify_volume_image(
             return;
         }
     }
-    let size = (width as usize) * (height as usize) * (layers as usize) * 4;
+    let pixel_size = readback_format_bpp(format);
+    let size = (width as usize) * (height as usize) * (layers as usize) * pixel_size;
     let Ok(buf) = create_staging_owned(device, mem_props, size as u64) else {
         return;
     };
@@ -23892,12 +23911,24 @@ fn verify_volume_image(
     }
     match result {
         Ok(data) => {
-            let slice_bytes = (width as usize) * (height as usize) * 4;
+            if let Some(directory) = std::env::var_os("NEXIUM_DUMP_DIR") {
+                let directory = std::path::PathBuf::from(directory);
+                if std::fs::create_dir_all(&directory).is_ok() {
+                    let _ = std::fs::write(directory.join(format!(
+                        "sampled_volume_{va:x}_{width}x{height}x{layers}_{}.bin", format.as_raw()
+                    )), &data);
+                }
+            }
+            let slice_bytes = (width as usize) * (height as usize) * pixel_size;
             for z in 0..layers as usize {
                 let base = z * slice_bytes;
-                let w00 = u32::from_le_bytes(data[base..base + 4].try_into().unwrap_or_default());
-                let mid = base + ((height as usize / 2) * width as usize + width as usize / 2) * 4;
-                let wmid = u32::from_le_bytes(data[mid..mid + 4].try_into().unwrap_or_default());
+                let w00 = data.get(base..base + 4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap_or_default()))
+                    .unwrap_or_default();
+                let mid = base + ((height as usize / 2) * width as usize + width as usize / 2) * pixel_size;
+                let wmid = data.get(mid..mid + 4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap_or_default()))
+                    .unwrap_or_default();
                 log::warn!(
                     "[volume-verify] va={:#x} z={} w00={:08x} wmid={:08x}",
                     va,
@@ -23986,8 +24017,10 @@ fn dump_volume_texture_once(raw: &[u8], tic: &crate::texture::TicEntry, layers: 
     if !seen.insert(tic.gpu_va) {
         return;
     }
-    let base = std::env::var_os("HOME")
-        .map(|home| std::path::PathBuf::from(home).join(".config/NeXium/dump"))
+    let base = std::env::var_os("NEXIUM_DUMP_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join(".config/NeXium/dump")))
         .filter(|path| std::fs::create_dir_all(path).is_ok())
         .unwrap_or_else(std::env::temp_dir);
     let stem = format!("volume_{:x}_{}x{}x{}", tic.gpu_va, tic.width, tic.height, layers);
@@ -27689,6 +27722,21 @@ pub fn texel_buffer_format(
             if tic.component_types == [ComponentType::Float; 4] && tic.swizzle == rgba =>
         {
             Some((vk::Format::R32G32B32A32_SFLOAT, 16))
+        }
+        (nexium_spirv::TextureNumericType::Float, TicFormat::R16G16B16A16)
+            if tic.component_types == [ComponentType::Float; 4] && tic.swizzle == rgba =>
+        {
+            Some((vk::Format::R16G16B16A16_SFLOAT, 8))
+        }
+        (nexium_spirv::TextureNumericType::Float, TicFormat::R32)
+            if tic.component_types == [ComponentType::Float; 4] && tic.swizzle == r001 =>
+        {
+            Some((vk::Format::R32_SFLOAT, 4))
+        }
+        (nexium_spirv::TextureNumericType::Float, TicFormat::R16)
+            if tic.component_types == [ComponentType::Float; 4] && tic.swizzle == r001 =>
+        {
+            Some((vk::Format::R16_SFLOAT, 2))
         }
         (nexium_spirv::TextureNumericType::Float, TicFormat::R32G32)
             if tic.component_types == [ComponentType::Float; 4] && tic.swizzle == rg01 =>

@@ -237,6 +237,7 @@ fn mask_mrt_for_fs_texture(fs_addr: u64, texture_gpu_va: u64) -> bool {
 #[derive(Debug)]
 struct GraphicsSpirvEnvironmentConfig {
     debug_targets: Option<Vec<u64>>,
+    debug_rt: Option<(u32, u32)>,
     debug_fingerprint: u128,
     production_fingerprint: u128,
 }
@@ -251,20 +252,26 @@ fn graphics_spirv_environment_config() -> &'static GraphicsSpirvEnvironmentConfi
                 .filter_map(|part| parse_env_u64(part.trim()))
                 .collect()
         });
+        let debug_rt = std::env::var("NEXIUM_FS_DEBUG_RT").ok().and_then(|value| {
+            let (width, height) = value.trim().split_once('x')?;
+            Some((width.parse().ok()?, height.parse().ok()?))
+        });
         GraphicsSpirvEnvironmentConfig {
             debug_targets,
+            debug_rt,
             debug_fingerprint: nexium_spirv::graphics_spirv_environment_fingerprint(true),
             production_fingerprint: nexium_spirv::graphics_spirv_environment_fingerprint(false),
         }
     })
 }
 
-fn graphics_spirv_environment_for_fs(fs_addr: u64) -> (bool, u128) {
+fn graphics_spirv_environment_for_fs(fs_addr: u64, rt_key: RtKey) -> (bool, u128) {
     let config = graphics_spirv_environment_config();
     let debug_active = config
         .debug_targets
         .as_ref()
-        .map_or(true, |targets| targets.contains(&fs_addr));
+        .map_or(true, |targets| targets.contains(&fs_addr))
+        && config.debug_rt.map_or(true, |dimensions| dimensions == (rt_key.width, rt_key.height));
     let fingerprint = if debug_active {
         config.debug_fingerprint
     } else {
@@ -11630,24 +11637,63 @@ fn passthrough_float_layer_slot(sph: &[u8; SPH_SIZE], sass: &[u8]) -> Option<u32
         .then_some(slot)
 }
 
-fn recognized_layer_output_slot(
-    draw: &DrawCall,
-    rt: &RenderTarget,
-    vs_address_lo: u32,
-    gs_address_lo: u32,
-    gs_active: bool,
-) -> Option<u32> {
-    let volume_depth = render_target_volume_depth(rt);
-    if no_layered_lut_enabled()
-        || !gs_active
-        || vs_address_lo != 0x88c30
-        || gs_address_lo != 0x89f30
-        || volume_depth <= 1
-        || draw.instance_count.max(1) != volume_depth
+fn forwarded_geometry_layer_slot(sass: &[u8]) -> Option<u32> {
+    let word = |offset| {
+        sass.get(offset..offset + 8)
+            .and_then(|bytes| bytes.try_into().ok()).map(u64::from_le_bytes)
+    };
+    for (offset, expected) in [
+        (0x008, 0x010000000017f00cu64),
+        (0x010, 0xf0c8000001d70013u64),
+        (0x018, 0x010000000027f010u64),
+        (0x028, 0x5c9807800ff70000u64),
+        (0x030, 0x5f047f8021371308u64),
+        (0x038, 0x50f41ba06ff71307u64),
+        (0x048, 0xefd0000000070809u64),
+        (0x050, 0x5f0406002137130cu64),
+        (0x058, 0x5f04080021371310u64),
+        (0x068, 0xefd0000000070c11u64),
+        (0x070, 0xefd0000000071012u64),
+        (0x078, 0x010800000000f009u64),
+        (0x088, 0x50f01ba000171307u64),
+        (0x090, 0xefd984800707ff04u64),
+        (0x098, 0xefd884800807ff02u64),
+        (0x0b0, 0x010800000000f011u64),
+        (0x0b8, 0x50f01ba000271307u64),
+        (0x0c8, 0xefd988800707ff08u64),
+        (0x0d0, 0xefd888800807ff0eu64),
+        (0x0d8, 0xeff180000707ff04u64),
+        (0x0e8, 0xeff080000807ff02u64),
+        (0x0f0, 0x010800000000f012u64),
+        (0x0f8, 0xeff000000647ff01u64),
+        (0x108, 0xfbe000800ff70000u64),
+        (0x118, 0xefd989000707ff04u64),
+        (0x128, 0xefd889000807ff02u64),
+        (0x138, 0xeff180000707ff08u64),
+        (0x148, 0xeff080000807ff0eu64),
+        (0x150, 0xeff000000647ff0du64),
+        (0x158, 0xfbe000800ff70000u64),
+        (0x168, 0xeff180000707ff04u64),
+        (0x170, 0xeff080000807ff02u64),
+        (0x178, 0xeff000000647ff01u64),
+        (0x188, 0xfbe000800ff70000u64),
+        (0x190, 0xe30000000007000fu64),
+    ] {
+        if word(offset)? != expected { return None; }
+    }
+    let load = word(0xa8)?;
+    let slot = ((load >> 20) & 0x3ff) as u32;
+    let mask = !(0x3ffu64 << 20);
+    if load & mask != 0xefd804800007ff01
+        || word(0x110)? & mask != 0xefd808800007ff0d
+        || word(0x130)? & mask != 0xefd809000007ff01
+        || (word(0x110)? >> 20) & 0x3ff != u64::from(slot)
+        || (word(0x130)? >> 20) & 0x3ff != u64::from(slot)
+        || !(0x80..0x280).contains(&slot) || slot % 4 != 0
     {
         return None;
     }
-    Some(0x90)
+    Some(slot)
 }
 
 fn shader_numeric_key(uint_output_mask: u32, sint_output_mask: u32) -> u32 {
@@ -13926,18 +13972,28 @@ fn execute_one_inner(
             && vsa_prog.address_lo != vs_prog.address_lo
     };
     let vsa_key = if vsa_active { vsa_prog.address_lo } else { 0 };
-    let float_layer_slot = if gs_active && rt_key.render_layer_count() > 1 {
+    let layer_output = if gs_active && rt_key.render_layer_count() > 1 {
         let gs_addr = program_region.wrapping_add(gs_prog.address_lo as u64);
         fetch_sph(gs_addr, mappings, mem_read).and_then(|sph| {
-            let code = read_gpu_strict(mappings, mem_read, gs_addr + SPH_SIZE as u64, 0x70)?;
-            passthrough_float_layer_slot(&sph, &code)
+            let code = read_gpu_strict(mappings, mem_read, gs_addr + SPH_SIZE as u64, 0x200)?;
+            if let Some(slot) = passthrough_float_layer_slot(&sph, &code) {
+                return Some((slot, true));
+            }
+            let options = nexium_spirv::GeometryOptions::from_header(draw.topology, &sph).ok()?;
+            if no_layered_lut_enabled() || options.passthrough || options.input_vertices != 3
+                || options.output_vertices != 3 || options.invocations != 1
+                || options.output_mode != nexium_spirv::GeometryOptions::default().output_mode
+            {
+                return None;
+            }
+            forwarded_geometry_layer_slot(&code)
+                .map(|slot| (slot, false))
         })
     } else {
         None
     };
-    let layer_output_float = float_layer_slot.is_some();
-    let layer_output_slot = float_layer_slot.or_else(||
-        recognized_layer_output_slot(draw, rt, vs_prog.address_lo, gs_prog.address_lo, gs_active));
+    let layer_output_float = layer_output.is_some_and(|(_, float)| float);
+    let layer_output_slot = layer_output.map(|(slot, _)| slot);
     if let Some(slot) = layer_output_slot {
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -13989,7 +14045,7 @@ fn execute_one_inner(
         );
     }
     let (fs_debug_active_key, spirv_environment_fingerprint) =
-        graphics_spirv_environment_for_fs(fs_addr);
+        graphics_spirv_environment_for_fs(fs_addr, rt_key);
     let derived_state_write_serial = derived_state_cache
         .enabled
         .then(nexium_memory::fastmem::observed_write_serial);
@@ -14620,6 +14676,10 @@ fn execute_one_inner(
                         mem_read,
                     )
                 });
+            if env_dump_shader("NEXIUM_DUMP_FS", fs_addr) || rt_dims_dump {
+                let path = shader_dump_path(&format!("target_fs_{:x}.cfg.txt", fs_addr));
+                let _ = std::fs::write(&path, shader_cfg_dump(&fs_cfg));
+            }
             let vs_tables = collect_indirect_tables(&vs_cfg);
             let fs_tables = collect_indirect_tables(&fs_cfg);
             {
@@ -16505,6 +16565,35 @@ fn execute_one_inner(
                 bytes.is_some(),
             );
         }
+        {
+            static LIMIT: OnceLock<u64> = OnceLock::new();
+            static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let limit = *LIMIT.get_or_init(|| {
+                std::env::var("NEXIUM_SSBO_READ_WATCH")
+                    .ok()
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0)
+            });
+            if limit != 0
+                && logical_size <= 64
+                && COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < limit
+            {
+                let words = bytes.as_ref().map_or_else(String::new, |data| {
+                    data.chunks_exact(4)
+                        .take(4)
+                        .map(|chunk| {
+                            let bits = u32::from_le_bytes(chunk.try_into().unwrap());
+                            format!("{bits:#010x}({:e})", f32::from_bits(bits))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+                log::info!(
+                    "[ssbo-read-watch] vs={vs_addr:#x} fs={fs_addr:#x} ssbo[{idx}] guest={guest_addr:#x} size={logical_size} readonly_noalias={readonly_noalias} resident={} words=[{words}]",
+                    resident.is_some(),
+                );
+            }
+        }
         ssbo_data.push(StorageBufferSnapshot {
             binding: idx as u32,
             guest_addr,
@@ -16929,9 +17018,13 @@ fn finish_render_target_key(mut key: RtKey, rt: &RenderTarget, format: vk::Forma
         .unwrap_or(u64::MAX);
         (tight_size, layout_size)
     };
-    let stride_size = u64::from(rt.layer_stride)
-        .saturating_mul(4)
-        .saturating_mul(u64::from(key.render_layer_count()));
+    let stride_size = if key.is_3d {
+        0
+    } else {
+        u64::from(rt.layer_stride)
+            .saturating_mul(4)
+            .saturating_mul(u64::from(key.render_layer_count()))
+    };
     key.with_guest_size_bytes(tight_size.max(layout_size).max(stride_size))
 }
 
@@ -18721,8 +18814,10 @@ fn dynamic_skip_draw_vs(vs_addr: u64, address_lo: u64) -> bool {
 }
 
 fn shader_dump_path(filename: &str) -> std::path::PathBuf {
-    let base = std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".config/NeXium/dump"))
+    let base = std::env::var_os("NEXIUM_DUMP_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".config/NeXium/dump")))
         .filter(|p| std::fs::create_dir_all(p).is_ok())
         .unwrap_or_else(std::env::temp_dir);
     base.join(filename)
@@ -20363,6 +20458,7 @@ fn fragment_texture_numeric_metadata(
                 }
                 nexium_shader::IrOp::TexelFetchHandle {
                     handle,
+                    dimension,
                     y,
                     z,
                     component,
@@ -20383,12 +20479,15 @@ fn fragment_texture_numeric_metadata(
                         ),
                     };
                     *texel_fetches.entry(shader_id).or_insert(0u8) |= 1u8 << (*component).min(3);
-                    if constant_facts
+                    let array = *dimension == nexium_shader::ImageDimension::D2Array;
+                    if !array && constant_facts
                         .texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref())
                     {
                         buffer_candidates.insert(shader_id);
                     }
-                    let image_kind = if z.is_some() {
+                    let image_kind = if array {
+                        GraphicsTextureImageKind::D2Array
+                    } else if z.is_some() {
                         GraphicsTextureImageKind::D3
                     } else if sampler_arrayed {
                         GraphicsTextureImageKind::D2Array
@@ -20515,7 +20614,16 @@ fn inferred_texture_image_kind(
         .image_kinds
         .binary_search_by_key(&shader_id, |(id, _)| *id)
         .ok()
-        .map(|index| metadata.image_kinds[index].1)
+        .map(|index| {
+            let kind = metadata.image_kinds[index].1;
+            if kind == GraphicsTextureImageKind::D2Array
+                && resolved_tic.is_some_and(|tic| tic.texture_type == 2)
+            {
+                GraphicsTextureImageKind::D3
+            } else {
+                kind
+            }
+        })
         .or_else(|| resolved_tic.map(tic_texture_image_kind))
         .unwrap_or(GraphicsTextureImageKind::D2)
 }
@@ -23807,6 +23915,32 @@ mod tests {
     }
 
     #[test]
+    fn volume_render_target_footprint_does_not_multiply_array_pitch_by_depth() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x20000, 0x1000000, 0x20000000, 10);
+        let rt = crate::gpu::engines::RenderTarget {
+            address_lo: 0x20000,
+            width: 32,
+            height: 32,
+            format: crate::gpu::formats::FMT_A2B10G10R10_UNORM,
+            tile_mode: (1 << 16) | (4 << 8),
+            depth: 32,
+            layer_stride: 0x8000,
+            ..Default::default()
+        };
+        let key = super::rt_key_for_target(&rt, &mappings, (1, 1)).unwrap();
+        assert!(key.is_3d);
+        assert_eq!(key.render_layer_count(), 32);
+        assert_eq!(key.array_stride_bytes, 0);
+        assert_eq!(key.guest_size_bytes, 0x20000);
+        let array = crate::gpu::engines::RenderTarget { tile_mode: 0, ..rt };
+        let key = super::rt_key_for_target(&array, &mappings, (1, 1)).unwrap();
+        assert!(!key.is_3d);
+        assert_eq!(key.array_stride_bytes, 0x20000);
+        assert_eq!(key.guest_size_bytes, 0x400000);
+    }
+
+    #[test]
     fn array_render_target_preserves_cube_layers_and_mip_stride() {
         let mut mappings = crate::gpu::GpuMappings::new();
         mappings.add(0x20000, 0x100000, 0x20000000, 10);
@@ -23839,6 +23973,41 @@ mod tests {
         }
         raw.pop();
         assert!(super::small_rt_layer_writebacks(mip_key, 0, 2, 2, 4, &mut raw).is_none());
+    }
+
+    #[test]
+    fn integer_layer_forwarding_checks_routing_and_all_layer_loads() {
+        let words = [
+            0x001fc400e22007f0u64, 0x010000000017f00cu64, 0xf0c8000001d70013u64, 0x010000000027f010u64,
+            0x081fc0c1fe8007ffu64, 0x5c9807800ff70000u64, 0x5f047f8021371308u64, 0x50f41ba06ff71307u64,
+            0x001fc0c0fe800711u64, 0xefd0000000070809u64, 0x5f0406002137130cu64, 0x5f04080021371310u64,
+            0x003f9000ffa00738u64, 0xefd0000000070c11u64, 0xefd0000000071012u64, 0x010800000000f009u64,
+            0x001d4400e22207f0u64, 0x50f01ba000171307u64, 0xefd984800707ff04u64, 0xefd884800807ff02u64,
+            0x001fc002fe80077bu64, 0xefd804800907ff01u64, 0x010800000000f011u64, 0x50f01ba000271307u64,
+            0x003fc400fe2007f1u64, 0xefd988800707ff08u64, 0xefd888800807ff0eu64, 0xeff180000707ff04u64,
+            0x011fc800fe0027fau64, 0xeff080000807ff02u64, 0x010800000000f012u64, 0xeff000000647ff01u64,
+            0x001fc400e6200711u64, 0xfbe000800ff70000u64, 0xefd808800907ff0du64, 0xefd989000707ff04u64,
+            0x003fc400ffa007f1u64, 0xefd889000807ff02u64, 0xefd809000907ff01u64, 0xeff180000707ff08u64,
+            0x001c7c02fe4007f1u64, 0xeff080000807ff0eu64, 0xeff000000647ff0du64, 0xfbe000800ff70000u64,
+            0x001fc800fe200ff1u64, 0xeff180000707ff04u64, 0xeff080000807ff02u64, 0xeff000000647ff01u64,
+            0x001ffc00ffe007f1u64, 0xfbe000800ff70000u64, 0xe30000000007000fu64,
+        ];
+        let mut code = words.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>();
+        assert_eq!(super::forwarded_geometry_layer_slot(&code), Some(0x90));
+        code[0x30] ^= 1;
+        assert_eq!(super::forwarded_geometry_layer_slot(&code), None);
+        code[0x30] ^= 1;
+        code[0x112] ^= 1;
+        assert_eq!(super::forwarded_geometry_layer_slot(&code), None);
+        code[0x112] ^= 1;
+        for offset in [0xa8, 0x110, 0x130] {
+            let mut word = u64::from_le_bytes(code[offset..offset + 8].try_into().unwrap());
+            word = (word & !(0x3ff << 20)) | (0xa4 << 20);
+            code[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(super::forwarded_geometry_layer_slot(&code), Some(0xa4));
+        code.truncate(0x190);
+        assert_eq!(super::forwarded_geometry_layer_slot(&code), None);
     }
 
     #[test]
@@ -30593,6 +30762,49 @@ mod tests {
         assert_eq!(metadata.texture_ids, vec![10]);
         assert!(metadata.sampled_ids.is_empty());
         assert_eq!(metadata.texel_fetches, Some(vec![(10, 1)]));
+    }
+
+    #[test]
+    fn array_fetch_metadata_uses_array_or_resolved_volume() {
+        use nexium_shader::{ImageDimension, IrOp, IrValue, TextureHandleOrigin};
+        use nexium_gpu::texture::{ComponentType, SwizzleSource, TicFormat};
+        use nexium_gpu::texture_manifest::GraphicsTextureImageKind;
+
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(IrOp::TexelFetchHandle {
+            handle: TextureHandleOrigin::Bound { cbuf_word_offset: 10 },
+            dimension: ImageDimension::D2Array,
+            x: IrValue::Zero,
+            y: Some(IrValue::Zero),
+            z: Some(IrValue::Zero),
+            component: 0,
+        }, Some(0));
+        let cfg = nexium_shader::Cfg {
+            blocks: vec![nexium_shader::BasicBlock {
+                id: 0,
+                start_offset: 0,
+                end_offset: 8,
+                branch: nexium_shader::BranchKind::Exit,
+                program,
+                reg_exit: Default::default(),
+                pred_phis: Vec::new(),
+                pred_exit: Default::default(),
+            }],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let metadata = fragment_texture_numeric_metadata(&cfg).unwrap();
+        assert_eq!(metadata.image_kinds, vec![(10, GraphicsTextureImageKind::D2Array)]);
+        assert!(metadata.buffer_candidates.is_empty());
+        assert!(!metadata.sampler_arrayed);
+        let mut tic = numeric_tic(TicFormat::R32, [ComponentType::Uint; 4], [SwizzleSource::R; 4]);
+        for texture_type in [4, 5] {
+            tic.texture_type = texture_type;
+            assert_eq!(inferred_texture_image_kind(&metadata, 10, Some(&tic)), GraphicsTextureImageKind::D2Array);
+        }
+        tic.texture_type = 2;
+        assert_eq!(inferred_texture_image_kind(&metadata, 10, Some(&tic)), GraphicsTextureImageKind::D3);
+        assert_eq!(inferred_texture_image_kind(&metadata, 10, None), GraphicsTextureImageKind::D2Array);
     }
 
     #[test]

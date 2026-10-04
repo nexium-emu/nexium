@@ -28,6 +28,8 @@ pub enum ComputeStorageFormat {
     R16Float,
     B10G11R11Float,
     Rgba16Float,
+    Rgba32Float,
+    Rg32Float,
     Abgr8Unorm,
     Abgr8Uint,
     Rgba8Uint,
@@ -54,6 +56,8 @@ impl ComputeStorageFormat {
             (TicFormat::R16, ComponentType::Float) => Some(Self::R16Float),
             (TicFormat::B10G11R11, ComponentType::Float) => Some(Self::B10G11R11Float),
             (TicFormat::R16G16B16A16, ComponentType::Float) => Some(Self::Rgba16Float),
+            (TicFormat::R32G32B32A32, ComponentType::Float) => Some(Self::Rgba32Float),
+            (TicFormat::R32G32, ComponentType::Float) => Some(Self::Rg32Float),
             (TicFormat::A8B8G8R8, ComponentType::Unorm | ComponentType::UnormForceFp16) => {
                 Some(Self::Abgr8Unorm)
             }
@@ -71,6 +75,8 @@ impl ComputeStorageFormat {
             Self::R16Float => vk::Format::R16_SFLOAT,
             Self::B10G11R11Float => vk::Format::B10G11R11_UFLOAT_PACK32,
             Self::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+            Self::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
+            Self::Rg32Float => vk::Format::R32G32_SFLOAT,
             Self::Abgr8Unorm => vk::Format::A8B8G8R8_UNORM_PACK32,
             Self::Abgr8Uint => vk::Format::A8B8G8R8_UINT_PACK32,
             Self::Rgba8Uint => vk::Format::R8G8B8A8_UINT,
@@ -89,7 +95,8 @@ impl ComputeStorageFormat {
             | Self::Rgba8Uint
             | Self::R32Uint
             | Self::R32Float => 4,
-            Self::Rgba16Float => 8,
+            Self::Rgba16Float | Self::Rg32Float => 8,
+            Self::Rgba32Float => 16,
         }
     }
 }

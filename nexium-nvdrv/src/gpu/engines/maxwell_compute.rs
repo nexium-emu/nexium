@@ -51,6 +51,7 @@ pub(crate) enum MaxwellComputeOutcome {
 enum ResourceAccess {
     Sampled,
     FilteredSample,
+    StorageRead,
     Storage,
     Atomic,
 }
@@ -1401,9 +1402,10 @@ fn prepare_and_execute(
                 let (tic_index, tsc_index) = split_sample_handle(qmd, handle);
                 (tic_index, Some(tsc_index))
             }
-            ResourceAccess::Sampled | ResourceAccess::Storage | ResourceAccess::Atomic => {
-                (split_tic_handle(qmd, handle), None)
-            }
+            ResourceAccess::Sampled
+            | ResourceAccess::StorageRead
+            | ResourceAccess::Storage
+            | ResourceAccess::Atomic => (split_tic_handle(qmd, handle), None),
         };
         if let Some(renderer) = renderer {
             if has_pending_writebacks() {
@@ -1476,14 +1478,30 @@ fn prepare_and_execute(
                     format!("filtered Maxwell compute sample has unsupported {other} TIC").into(),
                 );
             }
-            (ResourceAccess::Storage, ImageDimension::Buffer) => {
+            (ResourceAccess::Storage | ResourceAccess::StorageRead, ImageDimension::Buffer) => {
                 storage_texel_format(&tic, numeric_type)?;
                 ComputeResourceKind::StorageTexelBuffer
             }
             (ResourceAccess::Storage, _) => ComputeResourceKind::StorageImage,
+            (ResourceAccess::StorageRead, other) => {
+                return Err(format!(
+                    "Maxwell surface load has unsupported {other} TIC; only buffer views are implemented"
+                )
+                .into());
+            }
             (ResourceAccess::Atomic, ImageDimension::Buffer) => {
                 validate_storage_texel_buffer(&tic)?;
                 ComputeResourceKind::StorageTexelBuffer
+            }
+            (ResourceAccess::Atomic, ImageDimension::D2) => {
+                if storage_format(&tic)? != ComputeStorageFormat::R32Uint {
+                    return Err(
+                        "Maxwell surface atomics require an R32_UINT storage image view"
+                            .to_string()
+                            .into(),
+                    );
+                }
+                ComputeResourceKind::StorageImage
             }
             (ResourceAccess::Atomic, other) => {
                 return Err(format!(
@@ -1497,9 +1515,10 @@ fn prepare_and_execute(
             ComputeResourceKind::StorageTexelBuffer => {
                 Some(storage_texel_format(&tic, numeric_type)?)
             }
-            ComputeResourceKind::CombinedSampledImage
-            | ComputeResourceKind::SampledImage
-            | ComputeResourceKind::StorageImage => None,
+            ComputeResourceKind::StorageImage => {
+                (need.access == ResourceAccess::Atomic).then_some(ComputeTexelFormat::R32Uint)
+            }
+            ComputeResourceKind::CombinedSampledImage | ComputeResourceKind::SampledImage => None,
         };
         resolved.push(ResolvedResource {
             metadata: ComputeImageResource {
@@ -1788,6 +1807,7 @@ fn prepare_and_execute(
             }
             ComputeDescriptorKind::StorageTexelBuffer => {
                 let requires_atomics = resource.access == ResourceAccess::Atomic;
+                let writable = resource.access != ResourceAccess::StorageRead;
                 if requires_atomics {
                     validate_storage_texel_buffer(&resource.tic)?;
                 }
@@ -1877,19 +1897,21 @@ fn prepare_and_execute(
                         format,
                         raw: false,
                         raw_storage_key: None,
-                        writable: true,
+                        writable,
                         requires_atomics,
                         graphics_storage: None,
                     });
-                    texel_targets.push(TexelTarget {
-                        resource_index,
-                        binding: descriptor.binding,
-                        gpu_va: resource.tic.gpu_va,
-                        cpu_addr,
-                        guest_size,
-                        raw: false,
-                        raw_storage_key: None,
-                    });
+                    if writable {
+                        texel_targets.push(TexelTarget {
+                            resource_index,
+                            binding: descriptor.binding,
+                            gpu_va: resource.tic.gpu_va,
+                            cpu_addr,
+                            guest_size,
+                            raw: false,
+                            raw_storage_key: None,
+                        });
+                    }
                 }
             }
             ComputeDescriptorKind::UniformTexelBuffer => {
@@ -2205,6 +2227,10 @@ fn prepare_and_execute(
         }
     }
 
+    if outputs.is_empty() && !texel_buffers.iter().any(|buffer| buffer.writable) {
+        return Ok(());
+    }
+
     let program_key = renderer_program_key(code_sha256, module.spirv_hash);
     let serial = if code_override.is_none()
         && lazy_compute_enabled()
@@ -2318,6 +2344,7 @@ fn prepare_and_execute(
         if let Some(rt) = crate::render_thread::maybe_render_thread() {
             let (id_tx, id_rx) = crossbeam::channel::bounded(1);
             let job_renderer = std::sync::Arc::clone(renderer_arc);
+            let program = qmd[0x08];
             rt.submit_named(
                 "compute-dispatch",
                 Box::new(move || {
@@ -2330,7 +2357,11 @@ fn prepare_and_execute(
                         ComputeDispatchOutcome::Unsupported(reason)
                         | ComputeDispatchOutcome::FailedBeforeSubmit(reason)
                         | ComputeDispatchOutcome::SubmittedFailure(reason) => {
-                            log::warn!("[compute-offload] dispatch failed: {}", reason);
+                            log::warn!(
+                                "[compute-offload] dispatch failed: program={:#x} {}",
+                                program,
+                                reason
+                            );
                             None
                         }
                     };
@@ -2795,7 +2826,7 @@ fn collect_resource_needs(cfg: &nexium_shader::Cfg) -> Result<Vec<ResourceNeed>,
                 }
                 IrOp::GatherTex { tex_id, array, gather_component, .. } => merge_need(
                     &mut needs,
-                    TextureHandleOrigin::Bound { cbuf_word_offset: *tex_id },
+                    nexium_shader::texture_handle_for_id(*tex_id),
                     ResourceAccess::FilteredSample,
                     Some(if array.is_some() { ImageDimension::D2Array } else { ImageDimension::D2 }),
                     1u8 << *gather_component,
@@ -2811,6 +2842,18 @@ fn collect_resource_needs(cfg: &nexium_shader::Cfg) -> Result<Vec<ResourceNeed>,
                     ResourceAccess::Storage,
                     Some(*dimension),
                     0xf,
+                )?,
+                IrOp::ImageRead {
+                    handle,
+                    dimension,
+                    component,
+                    ..
+                } => merge_need(
+                    &mut needs,
+                    *handle,
+                    ResourceAccess::StorageRead,
+                    Some(*dimension),
+                    1u8 << *component,
                 )?,
                 IrOp::ImageAtomic {
                     handle, dimension, ..
@@ -2835,10 +2878,14 @@ fn merge_need(
     dimension: Option<ImageDimension>,
     referenced_components: u8,
 ) -> Result<(), String> {
-    let shares_storage_descriptor = |a: ResourceAccess, b: ResourceAccess| {
-        matches!(a, ResourceAccess::Storage | ResourceAccess::Atomic)
-            && matches!(b, ResourceAccess::Storage | ResourceAccess::Atomic)
+    let is_storage = |access: ResourceAccess| {
+        matches!(
+            access,
+            ResourceAccess::StorageRead | ResourceAccess::Storage | ResourceAccess::Atomic
+        )
     };
+    let shares_storage_descriptor =
+        |a: ResourceAccess, b: ResourceAccess| is_storage(a) && is_storage(b);
     if let Some(existing) = needs.iter_mut().find(|need| {
         need.handle == handle
             && (need.access == access || shares_storage_descriptor(need.access, access))
@@ -2852,10 +2899,12 @@ fn merge_need(
             (None, Some(dimension)) => existing.instruction_dimension = Some(dimension),
             _ => {}
         }
-        if shares_storage_descriptor(existing.access, access)
-            && (existing.access == ResourceAccess::Atomic || access == ResourceAccess::Atomic)
-        {
-            existing.access = ResourceAccess::Atomic;
+        if shares_storage_descriptor(existing.access, access) {
+            if existing.access == ResourceAccess::Atomic || access == ResourceAccess::Atomic {
+                existing.access = ResourceAccess::Atomic;
+            } else if access == ResourceAccess::Storage {
+                existing.access = ResourceAccess::Storage;
+            }
         }
         existing.referenced_components |= referenced_components;
     } else {
@@ -3746,13 +3795,6 @@ fn validate_sampled_writable_aliases(
         .iter()
         .filter(|descriptor| is_image_resource_descriptor(descriptor))
     {
-        let writable = match descriptor.kind {
-            ComputeDescriptorKind::StorageTexelBuffer | ComputeDescriptorKind::StorageImage => true,
-            ComputeDescriptorKind::CombinedSampledImage
-            | ComputeDescriptorKind::UniformTexelBuffer
-            | ComputeDescriptorKind::SampledImage => false,
-            ComputeDescriptorKind::UniformBuffer | ComputeDescriptorKind::StorageBuffer => continue,
-        };
         let resource = resolved
             .iter()
             .find(|resource| resource.metadata.binding == descriptor.binding)
@@ -3762,6 +3804,15 @@ fn validate_sampled_writable_aliases(
                     descriptor.binding
                 )
             })?;
+        let writable = match descriptor.kind {
+            ComputeDescriptorKind::StorageTexelBuffer | ComputeDescriptorKind::StorageImage => {
+                resource.access != ResourceAccess::StorageRead
+            }
+            ComputeDescriptorKind::CombinedSampledImage
+            | ComputeDescriptorKind::UniformTexelBuffer
+            | ComputeDescriptorKind::SampledImage => false,
+            ComputeDescriptorKind::UniformBuffer | ComputeDescriptorKind::StorageBuffer => continue,
+        };
         if resource.null {
             continue;
         }
@@ -4188,6 +4239,48 @@ fn trace_compute_storage_watch(program_gpu_va: u64, write: &PreparedTexelWrite, 
     log::info!("[compute-ssbo-watch] output={output} program_code_gpu={program_gpu_va:#x} binding={} resource={} raw={} gpu={:#x} cpu={:#x} bytes={} published={published} watch={offset:#x}..{end:#x} words=[{}]", write.target.binding, write.target.resource_index, write.target.raw, write.target.gpu_va, write.target.cpu_addr, write.bytes.len(), words.join(" "));
 }
 
+fn trace_compute_image_watch(
+    program_gpu_va: u64,
+    readback: &nexium_gpu::compute::ComputeImageReadback,
+) {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_COMPUTE_IMAGE_WATCH")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    if limit == 0 || readback.bytes.len() > 0x10000 {
+        return;
+    }
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= limit {
+        return;
+    }
+    let words: Vec<u32> = readback
+        .bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let nonzero = words.iter().filter(|word| **word != 0).count();
+    let sum: u64 = words.iter().map(|word| u64::from(*word)).sum();
+    let head = words
+        .iter()
+        .take(16)
+        .map(|word| format!("{word:#010x}({:e})", f32::from_bits(*word)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    log::info!(
+        "[compute-image-watch] program={program_gpu_va:#x} binding={} {}x{}x{} format={:?} words={} nonzero={nonzero} sum={sum} head=[{head}]",
+        readback.binding,
+        readback.width,
+        readback.height,
+        readback.depth,
+        readback.format,
+        words.len(),
+    );
+}
+
 fn write_back_outputs(
     result: ComputeDispatchResult,
     program_gpu_va: u64,
@@ -4254,6 +4347,7 @@ fn write_back_outputs(
                 tight_size
             ));
         }
+        trace_compute_image_watch(program_gpu_va, &readback);
         let bytes = if target.tic.pitch_bytes != 0 {
             readback.bytes
         } else {
@@ -5473,6 +5567,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(needs.len(), 4);
+    }
+
+    #[test]
+    fn suld_marks_the_buffer_as_a_storage_need() {
+        let handle = TextureHandleOrigin::Bound {
+            cbuf_word_offset: 0x48,
+        };
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::ImageRead {
+                handle,
+                dimension: ImageDimension::Buffer,
+                x: nexium_shader::IrValue::GprIn(3),
+                y: None,
+                z: None,
+                component: 2,
+            },
+            Some(5),
+        );
+        let cfg = nexium_shader::Cfg {
+            blocks: vec![nexium_shader::BasicBlock {
+                id: 0,
+                start_offset: 0,
+                end_offset: 8,
+                branch: nexium_shader::BranchKind::Exit,
+                program,
+                reg_exit: HashMap::new(),
+                pred_phis: Vec::new(),
+                pred_exit: HashMap::new(),
+            }],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let needs = collect_resource_needs(&cfg).unwrap();
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].access, ResourceAccess::StorageRead);
+        assert_eq!(needs[0].instruction_dimension, Some(ImageDimension::Buffer));
+        assert_eq!(needs[0].referenced_components, 4);
+    }
+
+    #[test]
+    fn suld_and_sust_on_the_same_buffer_share_a_writable_descriptor() {
+        let handle = TextureHandleOrigin::Bound {
+            cbuf_word_offset: 0x48,
+        };
+        for (first, second, expected) in [
+            (ResourceAccess::StorageRead, ResourceAccess::Storage, ResourceAccess::Storage),
+            (ResourceAccess::Storage, ResourceAccess::StorageRead, ResourceAccess::Storage),
+            (ResourceAccess::StorageRead, ResourceAccess::Atomic, ResourceAccess::Atomic),
+            (ResourceAccess::StorageRead, ResourceAccess::StorageRead, ResourceAccess::StorageRead),
+        ] {
+            let mut needs = Vec::new();
+            merge_need(&mut needs, handle, first, Some(ImageDimension::Buffer), 1).unwrap();
+            merge_need(&mut needs, handle, second, Some(ImageDimension::Buffer), 2).unwrap();
+            assert_eq!(needs.len(), 1);
+            assert_eq!(needs[0].access, expected);
+            assert_eq!(needs[0].referenced_components, 3);
+        }
     }
 
     #[test]
