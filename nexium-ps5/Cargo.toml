@@ -1,0 +1,40 @@
+[package]
+name = "nexium-ps5"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "nexium_ps5"
+crate-type = ["staticlib"]
+
+[features]
+default = []
+title = []
+
+[target.'cfg(all(target_os = "freebsd", target_vendor = "sony"))'.dependencies]
+log = "0.4"
+libc = "0.2"
+nexium-memory.workspace = true
+nexium-cpu = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
+nexium-common.workspace = true
+nexium-core = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
+nexium-kernel = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
+nexium-gpu.workspace = true
+nexium-nvdrv.workspace = true
+nexium-runner = { path = "../nexium-runner", default-features = false, features = ["backend-dynarmic"] }
+ash = "0.38"
+memmap2.workspace = true
+
+[dependencies]
+ab_glyph = "0.2"
+epaint_default_fonts = "0.36"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nexium-loader.workspace = true
+
+[build-dependencies]
+naga = { version = "30.0", features = ["wgsl-in", "spv-out"] }
