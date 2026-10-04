@@ -31,6 +31,17 @@ pub struct Slot {
     pub state: SlotState,
     pub queued: bool,
     pub last_swap_interval: u32,
+    pub frame_number: u64,
+}
+
+pub const BUFFER_HISTORY_LEN: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferHistoryEntry {
+    pub frame_number: u64,
+    pub queued_at: std::time::Instant,
+    pub presented_at: Option<std::time::Instant>,
+    pub state: SlotState,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +66,9 @@ pub struct BufferQueue {
     pub connected_api: i32,
     next_swap_deadline: Option<std::time::Instant>,
     availability_generation: Arc<AtomicU64>,
+    frame_counter: u64,
+    history: VecDeque<BufferHistoryEntry>,
+    pending_wake: bool,
 }
 
 impl BufferQueue {
@@ -76,6 +90,9 @@ impl BufferQueue {
             connected_api: 0,
             next_swap_deadline: None,
             availability_generation,
+            frame_counter: 0,
+            history: VecDeque::with_capacity(BUFFER_HISTORY_LEN),
+            pending_wake: false,
         }
     }
 
@@ -127,6 +144,30 @@ impl BufferQueue {
             self.free.push_back(slot);
             self.notify_availability_changed();
         }
+    }
+
+    pub fn clear_preallocated(&mut self, slot: u32) {
+        let Some(entry) = self.slots.get_mut(slot as usize) else {
+            return;
+        };
+        *entry = Slot::default();
+        self.free.retain(|&candidate| candidate != slot);
+        self.dequeued.retain(|&candidate| candidate != slot);
+        self.queued.retain(|&candidate| candidate != slot);
+        self.acquired.retain(|&candidate| candidate != slot);
+        if self.last_queued == Some(slot) {
+            self.last_queued = None;
+        }
+        self.pending_wake = true;
+        self.notify_availability_changed();
+    }
+
+    pub fn wake_pending(&self) -> bool {
+        self.pending_wake
+    }
+
+    pub fn take_wake(&mut self) -> bool {
+        std::mem::take(&mut self.pending_wake)
     }
 
     pub fn request_buffer(&self, slot: u32) -> Option<&GraphicBuffer> {
@@ -181,6 +222,7 @@ impl BufferQueue {
         if !self.queued.contains(&slot) {
             self.queued.push_back(slot);
         }
+        self.record_queued_frame(slot, SlotState::Queued);
         true
     }
 
@@ -192,6 +234,7 @@ impl BufferQueue {
 
             self.set_state(slot, SlotState::Acquired);
             self.acquired.push(slot);
+            self.update_history(slot, |entry| entry.state = SlotState::Acquired);
             return Some(slot);
         }
 
@@ -209,6 +252,7 @@ impl BufferQueue {
         if !self.acquired.contains(&slot) {
             self.acquired.push(slot);
         }
+        self.record_queued_frame(slot, SlotState::Acquired);
         true
     }
 
@@ -222,8 +266,42 @@ impl BufferQueue {
         if !self.free.contains(&slot) {
             self.free.push_back(slot);
         }
+        let now = std::time::Instant::now();
+        self.update_history(slot, |entry| {
+            entry.presented_at.get_or_insert(now);
+        });
         self.notify_availability_changed();
         true
+    }
+
+    pub fn history(&self, count: usize) -> Vec<BufferHistoryEntry> {
+        self.history.iter().rev().take(count).copied().collect()
+    }
+
+    fn record_queued_frame(&mut self, slot: u32, state: SlotState) {
+        self.frame_counter += 1;
+        let frame_number = self.frame_counter;
+        if let Some(entry) = self.slots.get_mut(slot as usize) {
+            entry.frame_number = frame_number;
+        }
+        if self.history.len() == BUFFER_HISTORY_LEN {
+            self.history.pop_front();
+        }
+        self.history.push_back(BufferHistoryEntry {
+            frame_number,
+            queued_at: std::time::Instant::now(),
+            presented_at: None,
+            state,
+        });
+    }
+
+    fn update_history(&mut self, slot: u32, update: impl FnOnce(&mut BufferHistoryEntry)) {
+        let Some(frame_number) = self.slots.get(slot as usize).map(|entry| entry.frame_number) else {
+            return;
+        };
+        if let Some(entry) = self.history.iter_mut().find(|entry| entry.frame_number == frame_number) {
+            update(entry);
+        }
     }
 
     pub fn cancel(&mut self, slot: u32) -> bool {
@@ -287,6 +365,53 @@ mod tests {
 
         assert!(queue.release(0));
         assert_eq!(queue.try_dequeue(), Some(0));
+    }
+
+    #[test]
+    fn clearing_a_preallocated_slot_frees_it_and_wakes_waiters() {
+        let mut queue = BufferQueue::new(1);
+        queue.set_preallocated(0, buffer());
+        queue.set_preallocated(1, buffer());
+        assert_eq!(queue.try_dequeue(), Some(0));
+        assert!(queue.queue_and_acquire(0));
+        assert_eq!(queue.try_dequeue(), Some(1));
+        assert!(!queue.has_free_slot());
+
+        queue.clear_preallocated(0);
+        queue.clear_preallocated(1);
+        assert_eq!(queue.slot_state(0), Some(SlotState::Free));
+        assert_eq!(queue.slot_state(1), Some(SlotState::Free));
+        assert!(queue.request_buffer(0).is_none());
+        assert!(queue.acquired.is_empty() && queue.dequeued.is_empty());
+        assert!(!queue.has_free_slot());
+        assert!(queue.wake_pending());
+        assert!(queue.take_wake());
+        assert!(!queue.wake_pending());
+        assert!(!queue.release(0));
+
+        queue.set_preallocated(0, buffer());
+        assert!(queue.has_free_slot());
+        assert_eq!(queue.try_dequeue(), Some(0));
+    }
+
+    #[test]
+    fn buffer_history_lists_recent_frames_newest_first() {
+        let mut queue = BufferQueue::new(1);
+        queue.set_preallocated(0, buffer());
+        queue.set_preallocated(1, buffer());
+        assert!(queue.history(4).is_empty());
+
+        for _ in 0..10 {
+            let slot = queue.try_dequeue().unwrap();
+            assert!(queue.queue_and_acquire(slot));
+            assert!(queue.history(1)[0].presented_at.is_none());
+            assert!(queue.release(slot));
+        }
+        let history = queue.history(32);
+        assert_eq!(history.len(), super::BUFFER_HISTORY_LEN);
+        assert_eq!(history.iter().map(|entry| entry.frame_number).collect::<Vec<_>>(), (3..=10).rev().collect::<Vec<_>>());
+        assert!(history.iter().all(|entry| entry.presented_at.is_some() && entry.state == SlotState::Acquired));
+        assert_eq!(queue.history(2).len(), 2);
     }
 
     #[test]

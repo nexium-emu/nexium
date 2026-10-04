@@ -15,6 +15,74 @@ pub mod msg {
 
 pub const FOCUS_STATE_IN_FOCUS: u8 = 1;
 
+#[cfg(test)]
+mod save_data_size_tests {
+    use super::SaveDataSizes;
+
+    fn input(kind: u32, uid: u8) -> Vec<u8> {
+        let mut bytes = vec![0; 24];
+        bytes[..4].copy_from_slice(&kind.to_le_bytes());
+        bytes[8] = uid;
+        bytes
+    }
+
+    fn sizes(data: &[u8]) -> (u64, u64) {
+        (u64::from_le_bytes(data[..8].try_into().unwrap()),
+            u64::from_le_bytes(data[8..16].try_into().unwrap()))
+    }
+
+    fn control() -> Vec<u8> {
+        let mut bytes = vec![0; 0x4000];
+        for (offset, value) in [(0x3080, 0x800000u64), (0x3088, 0x100000),
+            (0x3090, 0x200000), (0x3098, 0x40000)] {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn reports_declared_account_and_device_sizes() {
+        let mut state = SaveDataSizes::default();
+        state.set_control(Some(&control()));
+        let (rc, data) = state.command(26, &input(1, 1));
+        assert_eq!(rc, 0);
+        assert_eq!(sizes(&data), (0x800000, 0x100000));
+        assert_eq!(sizes(&state.command(26, &input(3, 0)).1), (0x200000, 0x40000));
+    }
+
+    #[test]
+    fn extension_is_user_scoped_and_does_not_shrink() {
+        let mut state = SaveDataSizes::default();
+        state.set_control(Some(&control()));
+        let mut request = input(1, 1);
+        request.extend_from_slice(&0x1000000u64.to_le_bytes());
+        request.extend_from_slice(&0x200000u64.to_le_bytes());
+        assert_eq!(state.command(25, &request), (0, vec![0; 8]));
+        assert_eq!(sizes(&state.command(26, &input(1, 1)).1), (0x1000000, 0x200000));
+        assert_eq!(sizes(&state.command(26, &input(1, 2)).1), (0x800000, 0x100000));
+        request[24..].fill(0);
+        assert_eq!(state.command(25, &request).0, 0);
+        assert_eq!(sizes(&state.command(26, &input(1, 1)).1), (0x1000000, 0x200000));
+        state.set_control(Some(&control()));
+        assert_eq!(sizes(&state.command(26, &input(1, 1)).1), (0x800000, 0x100000));
+    }
+
+    #[test]
+    fn truncated_control_and_requests_are_bounded() {
+        let mut state = SaveDataSizes::default();
+        state.set_control(Some(&[0; 7]));
+        assert_eq!(sizes(&state.command(26, &input(1, 1)).1), (0, 0));
+        for (cmd, len) in [(25, 39), (26, 23)] {
+            assert_ne!(state.command(cmd, &vec![0; len]).0, 0);
+        }
+        let mut request = input(1, 1);
+        request.extend_from_slice(&u64::MAX.to_le_bytes());
+        request.extend_from_slice(&0u64.to_le_bytes());
+        assert_ne!(state.command(25, &request).0, 0);
+        assert_eq!(sizes(&state.command(26, &input(1, 1)).1), (0, 0));
+    }
+}
+
 pub(crate) fn mode_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_MODE_TRACE").is_some())
@@ -30,6 +98,56 @@ pub(crate) fn default_display_resolution() -> (u32, u32) {
 
 pub const APPLET_MESSAGE_AVAILABLE_RC: u32 = 0;
 pub const APPLET_NO_MESSAGES_RC: u32 = 0x680;
+
+#[derive(Default)]
+pub(crate) struct SaveDataSizes {
+    user: (u64, u64),
+    device: (u64, u64),
+    extended: std::collections::HashMap<(u32, [u8; 16]), (u64, u64)>,
+}
+
+impl SaveDataSizes {
+    pub(crate) fn set_control(&mut self, control: Option<&[u8]>) {
+        let read = |offset| control.and_then(|bytes| bytes.get(offset..offset + 8))
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap())).unwrap_or(0);
+        self.user = (read(0x3080), read(0x3088));
+        self.device = (read(0x3090), read(0x3098));
+        self.extended.clear();
+    }
+
+    fn get(&self, kind: u32, uid: [u8; 16]) -> (u64, u64) {
+        self.extended.get(&(kind, uid)).copied().unwrap_or(match kind {
+            1 => self.user,
+            3 => self.device,
+            _ => (0, 0),
+        })
+    }
+
+    pub(crate) fn command(&mut self, cmd: u32, input: &[u8]) -> (u32, Vec<u8>) {
+        let required = if cmd == 25 { 40 } else { 24 };
+        if input.len() < required {
+            return (nexium_common::result::KERNEL_INVALID_SIZE, Vec::new());
+        }
+        let kind = u32::from_le_bytes(input[..4].try_into().unwrap());
+        let uid = input[8..24].try_into().unwrap();
+        let current = self.get(kind, uid);
+        if cmd == 25 {
+            let size = u64::from_le_bytes(input[24..32].try_into().unwrap());
+            let journal = u64::from_le_bytes(input[32..40].try_into().unwrap());
+            if size > i64::MAX as u64 || journal > i64::MAX as u64 {
+                return (nexium_common::result::KERNEL_INVALID_SIZE, Vec::new());
+            }
+            self.extended.insert((kind, uid), (current.0.max(size), current.1.max(journal)));
+            (SUCCESS, 0u64.to_le_bytes().to_vec())
+        } else {
+            log::debug!("am: GetSaveDataSize type={} uid={:02x?} data={} journal={}",
+                kind, uid, current.0, current.1);
+            let mut data = current.0.to_le_bytes().to_vec();
+            data.extend_from_slice(&current.1.to_le_bytes());
+            (SUCCESS, data)
+        }
+    }
+}
 
 pub struct AppletService;
 
@@ -101,7 +219,7 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("IOverlayAppletProxy", 11) => Some("ILibraryAppletCreator"),
         ("IOverlayAppletProxy", 20) => Some("IOverlayFunctions"),
         ("IOverlayAppletProxy", 1000) => Some("IDebugFunctions"),
-        ("ILibraryAppletCreator", 0) => Some("ILibraryAppletAccessor"),
+        ("ILibraryAppletCreator", 0 | 3) => Some("ILibraryAppletAccessor"),
         ("ILibraryAppletCreator", 10) => Some("IStorage"),
         ("ILibraryAppletCreator", 11) => Some("IStorage"),
         ("IApplicationCreator", 0) => Some("IApplicationAccessor"),
@@ -566,8 +684,7 @@ fn application_functions(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>,
         22 => ok_empty(),
         23 => ok(vec![0u8; 16]),
         24 => ok(vec![0u8; 16]),
-        25 => ok(0u64.to_le_bytes().to_vec()),
-        26 => ok(vec![0u8; 16]),
+        25 | 26 => err(nexium_common::result::KERNEL_INVALID_SIZE),
         27 => ok(vec![0u8; 16]),
         28 => ok(vec![0u8; 16]),
         30 | 31 | 32 | 33 => ok_empty(),
@@ -891,8 +1008,21 @@ fn async_context(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32
     }
 }
 
+static TITLE_NIFM_OFFLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_title_nifm_offline(offline: bool) {
+    TITLE_NIFM_OFFLINE.store(offline, Ordering::Relaxed);
+    if offline {
+        log::info!("nifm: reporting the network as unavailable for this title (NEXIUM_NIFM_ONLINE=1 overrides)");
+    }
+}
+
 fn nifm_online() -> bool {
-    std::env::var("NEXIUM_NIFM_ONLINE").ok().as_deref() != Some("0")
+    match std::env::var("NEXIUM_NIFM_ONLINE").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => !TITLE_NIFM_OFFLINE.load(Ordering::Relaxed),
+    }
 }
 
 fn host_ip_address() -> [u8; 4] {

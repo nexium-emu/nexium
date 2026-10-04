@@ -13,6 +13,7 @@ pub static EMU_ALIVE: AtomicBool = AtomicBool::new(false);
 
 const METROID_DREAD_TITLE_ID: u64 = 0x0100_9380_1237_C000;
 const SWITCH_SPORTS_TITLE_ID: u64 = 0x0100_D2F0_0D5C_0000;
+const MINECRAFT_DUNGEONS_2_TITLE_ID: u64 = 0x0100_A7C0_1B79_2000;
 
 pub fn emu_alive() -> bool {
     EMU_ALIVE.load(Ordering::Acquire)
@@ -821,7 +822,7 @@ impl EmulationHandle {
                 config.loader_path = Some(initial_loader_argv.clone());
                 config.argv_override = chained_argv.take();
                 config.cpu_backend = cpu_backend;
-                let mut boot_ctx = BootContext::new(config)?;
+                let mut boot_ctx = BootContext::new(config).inspect_err(|error| log::error!("Boot failed: {error}"))?;
                 boot_ctx.kernel.lock().nvdrv.presentation_target = thread_target.clone();
                 let (frame_queue, frame_stats) = {
                     let kernel = boot_ctx.kernel.lock();
@@ -839,6 +840,9 @@ impl EmulationHandle {
                 )?;
                 let title_id = boot_ctx.kernel.lock().title_id;
                 nexium_nvdrv::gpu::set_title_fast_gpu_time(title_id == SWITCH_SPORTS_TITLE_ID);
+                nexium_core::services::am::set_title_nifm_offline(
+                    title_id == MINECRAFT_DUNGEONS_2_TITLE_ID,
+                );
 
                 let mut cpu = boot_ctx
                     .cpu

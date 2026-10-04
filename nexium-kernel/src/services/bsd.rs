@@ -89,6 +89,9 @@ const SHUT_RDWR: i32 = 2;
 const FCNTL_GETFL: i32 = 3;
 const FCNTL_SETFL: i32 = 4;
 
+const EFD_SEMAPHORE: u32 = 1;
+const EFD_NONBLOCK: u32 = 4;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BsdAddress {
     ip: [u8; 4],
@@ -174,6 +177,53 @@ impl HostSocket {
 
 type SharedSocket = Arc<Mutex<HostSocket>>;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EventFd {
+    counter: u64,
+    semaphore: bool,
+    nonblocking: bool,
+}
+
+impl EventFd {
+    fn new(initial: u64, flags: u32) -> Self {
+        Self {
+            counter: initial,
+            semaphore: flags & EFD_SEMAPHORE != 0,
+            nonblocking: flags & EFD_NONBLOCK != 0,
+        }
+    }
+
+    fn write(&mut self, value: u64) -> Result<(), u32> {
+        if value == u64::MAX {
+            return Err(EINVAL);
+        }
+        match self.counter.checked_add(value) {
+            Some(counter) if counter != u64::MAX => {
+                self.counter = counter;
+                Ok(())
+            }
+            _ => Err(EAGAIN),
+        }
+    }
+
+    fn read(&mut self) -> Option<u64> {
+        if self.counter == 0 {
+            return None;
+        }
+        if self.semaphore {
+            self.counter -= 1;
+            Some(1)
+        } else {
+            Some(std::mem::take(&mut self.counter))
+        }
+    }
+
+    fn poll_events(&self, events: u16) -> u16 {
+        let readable = if self.counter > 0 { POLLIN | POLLRDNORM } else { 0 };
+        events & (readable | POLLOUT)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PendingWait {
     cmd_id: u32,
@@ -210,6 +260,7 @@ enum ConnectStatus {
 
 pub struct BsdService {
     sockets: Vec<Option<SharedSocket>>,
+    event_fds: Vec<Option<EventFd>>,
     waits: HashMap<u32, PendingWait>,
     active_wait: Option<PendingWait>,
 }
@@ -218,6 +269,7 @@ impl BsdService {
     pub fn new() -> Self {
         Self {
             sockets: (0..MAX_SOCKETS).map(|_| None).collect(),
+            event_fds: vec![None; MAX_SOCKETS],
             waits: HashMap::new(),
             active_wait: None,
         }
@@ -260,7 +312,7 @@ impl BsdService {
             25 => self.recv_command(memory, ctx, false),
             26 => self.close_command(ctx),
             27 => self.duplicate_command(ctx),
-            31 => done(0, 0),
+            31 => self.event_fd_command(ctx),
             _ => {
                 log::warn!("bsd:u cmd_{} unsupported", cmd_id);
                 done(-1, EINVAL)
@@ -544,6 +596,15 @@ impl BsdService {
         } else {
             None
         };
+        if let Some(event) = self.event_fd_mut(fd) {
+            let Some(value) = message.get(..8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap())) else {
+                return done(-1, EINVAL);
+            };
+            return match event.write(value) {
+                Ok(()) => done(8, 0),
+                Err(errno) => done(-1, errno),
+            };
+        }
         let Some(shared) = self.socket(fd) else {
             return done(-1, EBADF);
         };
@@ -607,6 +668,24 @@ impl BsdService {
         let Some(message_buffer) = recv_buffer(ctx, 0) else {
             return fail(-1, EINVAL);
         };
+        if let Some(event) = self.event_fd_mut(fd) {
+            if message_buffer.size < 8 {
+                return fail(-1, EINVAL);
+            }
+            return match event.read() {
+                Some(value) => {
+                    if memory.write(message_buffer.addr, &value.to_le_bytes()).is_err() {
+                        return fail(-1, EFAULT);
+                    }
+                    if with_addr { done_with_len(8, 0, 0) } else { done(8, 0) }
+                }
+                None if event.nonblocking || flags & MSG_DONTWAIT != 0 => fail(-1, EAGAIN),
+                None => Outcome::Wait {
+                    timeout: None,
+                    fallback: bsd_result(-1, EAGAIN),
+                },
+            };
+        }
         let Some(shared) = self.socket(fd) else {
             return fail(-1, EBADF);
         };
@@ -733,6 +812,13 @@ impl BsdService {
             if fd < 0 {
                 continue;
             }
+            if let Some(event) = self.event_fd(fd) {
+                revents[index] = event.poll_events(events);
+                if revents[index] != 0 {
+                    ready += 1;
+                }
+                continue;
+            }
             match self.socket(fd) {
                 Some(shared) => {
                     host_entries.push(HostPollFd {
@@ -807,6 +893,7 @@ impl BsdService {
         let interest = [POLLIN, POLLOUT, POLLPRI];
         let mut host_entries = Vec::new();
         let mut host_index = Vec::new();
+        let mut event_entries = Vec::new();
         for fd in 0..nfds {
             let mut events = 0u16;
             for (set, mask) in sets.iter().zip(interest.iter()) {
@@ -815,6 +902,10 @@ impl BsdService {
                 }
             }
             if events == 0 {
+                continue;
+            }
+            if let Some(event) = self.event_fd(fd as i32) {
+                event_entries.push((fd, events, event.poll_events(events)));
                 continue;
             }
             let Some(shared) = self.socket(fd as i32) else {
@@ -832,6 +923,14 @@ impl BsdService {
             .map(|set| vec![0u8; set.1.map_or(0, |buffer| buffer.size as usize).min(4096)])
             .collect();
         let mut ready = 0i32;
+        for &(fd, events, revents) in &event_entries {
+            for (index, mask) in interest.iter().enumerate() {
+                if events & mask != 0 && revents & mask != 0 {
+                    fd_set_insert(&mut outputs[index], fd);
+                    ready += 1;
+                }
+            }
+        }
         if !host_entries.is_empty() {
             if let Err(error) = host_poll(&mut host_entries) {
                 log::debug!("bsd.Select host failure: {}", error);
@@ -1071,6 +1170,16 @@ impl BsdService {
             return done(-1, EINVAL);
         };
         let arg = input_i32(ctx, 2).unwrap_or(0);
+        if let Some(event) = self.event_fd_mut(fd) {
+            return match cmd {
+                FCNTL_GETFL => done(if event.nonblocking { O_NONBLOCK } else { 0 }, 0),
+                FCNTL_SETFL => {
+                    event.nonblocking = arg & O_NONBLOCK != 0;
+                    done(0, 0)
+                }
+                _ => done(-1, EINVAL),
+            };
+        }
         let Some(shared) = self.socket(fd) else {
             return done(-1, EBADF);
         };
@@ -1117,7 +1226,9 @@ impl BsdService {
         let Some(slot) = self.sockets.get_mut(index) else {
             return done(-1, EBADF);
         };
-        if slot.take().is_none() {
+        let closed_socket = slot.take().is_some();
+        let closed_event = self.event_fds[index].take().is_some();
+        if !closed_socket && !closed_event {
             return done(-1, EBADF);
         }
         log::debug!("bsd.Close fd={}", fd);
@@ -1146,8 +1257,30 @@ impl BsdService {
             .and_then(|slot| slot.clone())
     }
 
+    fn event_fd(&self, fd: i32) -> Option<EventFd> {
+        usize::try_from(fd).ok().and_then(|fd| self.event_fds.get(fd).copied().flatten())
+    }
+
+    fn event_fd_mut(&mut self, fd: i32) -> Option<&mut EventFd> {
+        usize::try_from(fd).ok().and_then(|fd| self.event_fds.get_mut(fd)).and_then(Option::as_mut)
+    }
+
+    fn event_fd_command(&mut self, ctx: &IpcCtx) -> Outcome {
+        let flags = input_u32(ctx, 0).unwrap_or(0);
+        let initial = match (input_u32(ctx, 2), input_u32(ctx, 3)) {
+            (Some(low), Some(high)) => u64::from(low) | (u64::from(high) << 32),
+            _ => 0,
+        };
+        let Some(fd) = self.free_slot() else {
+            return done(-1, EMFILE);
+        };
+        self.event_fds[fd] = Some(EventFd::new(initial, flags));
+        log::debug!("bsd.EventFd flags={:#x} initial={} -> fd={}", flags, initial, fd);
+        done(fd as i32, 0)
+    }
+
     fn free_slot(&self) -> Option<usize> {
-        self.sockets.iter().position(Option::is_none)
+        (0..MAX_SOCKETS).find(|&fd| self.sockets[fd].is_none() && self.event_fds[fd].is_none())
     }
 }
 
@@ -1563,6 +1696,38 @@ mod tests {
         let timeout = Some(Duration::from_millis(1_500));
         assert_eq!(decode_timeval(&encode_timeval(timeout)), timeout);
         assert_eq!(decode_timeval(&encode_timeval(None)), None);
+    }
+
+    #[test]
+    fn event_fd_counts_writes_and_drains_reads() {
+        let mut event = EventFd::new(0, EFD_NONBLOCK);
+        assert!(event.nonblocking);
+        assert_eq!(event.poll_events(POLLIN | POLLOUT), POLLOUT);
+        assert_eq!(event.read(), None);
+        event.write(2).unwrap();
+        event.write(3).unwrap();
+        assert_eq!(event.poll_events(POLLIN), POLLIN);
+        assert_eq!(event.read(), Some(5));
+        assert_eq!(event.read(), None);
+        assert_eq!(event.write(u64::MAX), Err(EINVAL));
+    }
+
+    #[test]
+    fn event_fd_semaphore_reads_one_at_a_time() {
+        let mut event = EventFd::new(2, EFD_SEMAPHORE);
+        assert!(!event.nonblocking);
+        assert_eq!(event.read(), Some(1));
+        assert_eq!(event.read(), Some(1));
+        assert_eq!(event.read(), None);
+    }
+
+    #[test]
+    fn event_fds_share_the_descriptor_space() {
+        let mut service = BsdService::new();
+        service.event_fds[0] = Some(EventFd::new(0, 0));
+        assert_eq!(service.free_slot(), Some(1));
+        assert!(service.socket(0).is_none());
+        assert!(service.event_fd(0).is_some());
     }
 
     #[test]

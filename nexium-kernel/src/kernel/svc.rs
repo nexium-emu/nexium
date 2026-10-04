@@ -533,6 +533,91 @@ fn audio_source_step(sample_rate: u32, pitch: f32) -> Option<i32> {
     Some((ratio * 32768.0) as i32)
 }
 
+const VOICE_IN_PARAMETER_SIZE: usize = 0x170;
+const VOICE_IN_PARAMETER_V2_SIZE: usize = 0x188;
+
+fn voice_in_parameter_v2_to_v1(src: &[u8; VOICE_IN_PARAMETER_V2_SIZE]) -> [u8; VOICE_IN_PARAMETER_SIZE] {
+    let mut out = [0u8; VOICE_IN_PARAMETER_SIZE];
+    out[..0x24].copy_from_slice(&src[..0x24]);
+    for filter in 0..2 {
+        let from = 0x24 + filter * 0x18;
+        let to = 0x24 + filter * 0xC;
+        out[to] = src[from];
+        for coefficient in 0..5 {
+            let at = from + 4 + coefficient * 4;
+            let value = f32::from_le_bytes(src[at..at + 4].try_into().unwrap());
+            let fixed = (value * 16384.0).clamp(-32768.0, 32767.0) as i16;
+            out[to + 2 + coefficient * 2..to + 4 + coefficient * 2].copy_from_slice(&fixed.to_le_bytes());
+        }
+    }
+    out[0x3C..0x40].copy_from_slice(&src[0x54..0x58]);
+    out[0x40..0x42].copy_from_slice(&src[0x58..0x5A]);
+    out[0x48..0x60].copy_from_slice(&src[0x60..0x78]);
+    out[0x60..0x158].copy_from_slice(&src[0x78..0x170]);
+    out[0x158..0x15A].copy_from_slice(&src[0x170..0x172]);
+    out[0x15C] = src[0x174];
+    out[0x15E] = src[0x176];
+    out
+}
+
+fn read_voice_in_parameter(
+    space: &nexium_memory::AddressSpace,
+    address: u64,
+    v2: bool,
+) -> Option<[u8; VOICE_IN_PARAMETER_SIZE]> {
+    if v2 {
+        let mut raw = [0u8; VOICE_IN_PARAMETER_V2_SIZE];
+        space.read(address, &mut raw).ok()?;
+        Some(voice_in_parameter_v2_to_v1(&raw))
+    } else {
+        let mut raw = [0u8; VOICE_IN_PARAMETER_SIZE];
+        space.read(address, &mut raw).ok()?;
+        Some(raw)
+    }
+}
+
+#[cfg(test)]
+mod voice_in_parameter_v2_tests {
+    use super::{voice_in_parameter_v2_to_v1, VOICE_IN_PARAMETER_V2_SIZE};
+
+    #[test]
+    fn v2_voice_fields_move_to_the_v1_layout() {
+        let mut v2 = [0u8; VOICE_IN_PARAMETER_V2_SIZE];
+        v2[0x00..0x04].copy_from_slice(&7u32.to_le_bytes());
+        v2[0x09] = 1;
+        v2[0x0B] = 2;
+        v2[0x0C..0x10].copy_from_slice(&48_000u32.to_le_bytes());
+        v2[0x18..0x1C].copy_from_slice(&2u32.to_le_bytes());
+        v2[0x24] = 1;
+        v2[0x28..0x2C].copy_from_slice(&0.5f32.to_le_bytes());
+        v2[0x38..0x3C].copy_from_slice(&(-3.0f32).to_le_bytes());
+        v2[0x54..0x58].copy_from_slice(&3u32.to_le_bytes());
+        v2[0x58..0x5C].copy_from_slice(&1u32.to_le_bytes());
+        v2[0x60..0x68].copy_from_slice(&0x1234_5000u64.to_le_bytes());
+        v2[0x70..0x74].copy_from_slice(&5u32.to_le_bytes());
+        v2[0x78..0x80].copy_from_slice(&0xdead_0000u64.to_le_bytes());
+        v2[0x150..0x158].copy_from_slice(&0xbeef_0000u64.to_le_bytes());
+        v2[0x158..0x15C].copy_from_slice(&9u32.to_le_bytes());
+        v2[0x171] = 2;
+        v2[0x174] = 1;
+        v2[0x176] = 3;
+
+        let v1 = voice_in_parameter_v2_to_v1(&v2);
+        assert_eq!(&v1[..0x24], &v2[..0x24]);
+        assert_eq!(v1[0x24], 1);
+        assert_eq!(i16::from_le_bytes([v1[0x26], v1[0x27]]), 8192);
+        assert_eq!(i16::from_le_bytes([v1[0x2E], v1[0x2F]]), -32768);
+        assert_eq!(u32::from_le_bytes(v1[0x3C..0x40].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes([v1[0x40], v1[0x41]]), 1);
+        assert_eq!(u64::from_le_bytes(v1[0x48..0x50].try_into().unwrap()), 0x1234_5000);
+        assert_eq!(u32::from_le_bytes(v1[0x58..0x5C].try_into().unwrap()), 5);
+        assert_eq!(u64::from_le_bytes(v1[0x60..0x68].try_into().unwrap()), 0xdead_0000);
+        assert_eq!(u64::from_le_bytes(v1[0x138..0x140].try_into().unwrap()), 0xbeef_0000);
+        assert_eq!(u32::from_le_bytes(v1[0x140..0x144].try_into().unwrap()), 9);
+        assert_eq!((v1[0x159], v1[0x15C], v1[0x15E]), (2, 1, 3));
+    }
+}
+
 fn audio_blocks_to_produce(queued_frames: usize) -> usize {
     if queued_frames >= AUDIO_RING_HIGH_WATER_FRAMES {
         return 0;
@@ -4972,11 +5057,25 @@ mod system_tick_tests {
     }
 }
 
+fn guest_tick_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+fn current_guest_ticks() -> u64 {
+    cpu_ref()
+        .and_then(|cpu| cpu.guest_cntpct())
+        .unwrap_or_else(|| system_ticks_from_elapsed(guest_tick_epoch().elapsed()))
+}
+
+fn guest_clock_ns_at(at: std::time::Instant) -> u64 {
+    let now_ns = current_guest_ticks() as u128 * 1_000_000_000 / 19_200_000;
+    let age = std::time::Instant::now().saturating_duration_since(at).as_nanos();
+    now_ns.saturating_sub(age) as u64
+}
+
 fn svc_get_system_tick(_kernel: &mut Kernel) -> u32 {
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    let elapsed = EPOCH.get_or_init(std::time::Instant::now).elapsed();
-    let ticks = system_ticks_from_elapsed(elapsed);
+    let ticks = current_guest_ticks();
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, ticks);
     }
@@ -5705,6 +5804,14 @@ fn dump_throw_context(kernel: &Kernel) {
 const SVC_SEND_SYNC_REQUEST_INSN: u32 = 0xD400_0421;
 const IPC_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
+fn first_ipc_buffer(buffers: &[ipc::IpcBuffer], statics: &[ipc::IpcBuffer]) -> Option<ipc::IpcBuffer> {
+    buffers
+        .iter()
+        .chain(statics.iter())
+        .find(|buffer| buffer.addr != 0 && buffer.size > 0)
+        .copied()
+}
+
 fn rewind_svc_for_retry(kernel: &mut Kernel) -> bool {
     if kernel.threads.current_handle().is_none() {
         return false;
@@ -6011,7 +6118,7 @@ fn dispatch_service_v2(
         }
     }
 
-    if port_name == "ILibraryAppletCreator" && cmd_id == 0 {
+    if port_name == "ILibraryAppletCreator" && matches!(cmd_id, 0 | 3) {
         let off = ctx.cmif_in_data_off;
         if off + 4 <= ctx.buf.len() {
             let applet_id = u32::from_le_bytes([
@@ -6046,6 +6153,13 @@ fn dispatch_service_v2(
                 log::info!("swkbd: applet created (gen={})", generation);
             }
         }
+    }
+
+    if port_name == "IApplicationFunctions" && matches!(cmd_id, 25 | 26) {
+        let start = ctx.cmif_in_data_off.min(ctx.buf.len());
+        let end = start.saturating_add(ctx.cmif_in_data_len).min(ctx.buf.len());
+        let (rc, data) = kernel.save_data_sizes.command(cmd_id, &ctx.buf[start..end]);
+        return build_ipc_response(ctx, rc, &data, &[]);
     }
 
     if port_name == "IApplicationFunctions" && cmd_id == 1 {
@@ -6101,6 +6215,40 @@ fn dispatch_service_v2(
 
     if let Some(sub_service) = subsession_service(port_name, cmd_id) {
         return return_subsession(kernel, ctx, session_handle, sub_service);
+    }
+
+    if port_name == "sfdnsres" {
+        if let Some(data) = crate::services::resolver::sfdnsres_lookup_reply(cmd_id) {
+            let host = first_ipc_buffer(&ctx.send_buffers, &ctx.send_statics)
+                .and_then(|buffer| {
+                    let mut bytes = vec![0u8; (buffer.size as usize).min(0x100)];
+                    kernel.address_space.read(buffer.addr, &mut bytes).ok()?;
+                    Some(crate::services::resolver::c_string(&bytes))
+                })
+                .unwrap_or_default();
+            log::info!("sfdnsres cmd {} lookup of '{}' reported as host not found", cmd_id, host);
+            return build_ipc_response(ctx, 0, &data, &[]);
+        }
+    }
+
+    if matches!(port_name, "nsd:a" | "nsd:u") && matches!(cmd_id, 20 | 21) {
+        let fqdn = first_ipc_buffer(&ctx.send_buffers, &ctx.send_statics)
+            .and_then(|buffer| {
+                let mut bytes = vec![0u8; (buffer.size as usize).min(0x100)];
+                kernel.address_space.read(buffer.addr, &mut bytes).ok()?;
+                Some(crate::services::resolver::c_string(&bytes))
+            })
+            .unwrap_or_default();
+        let resolved = crate::services::resolver::nsd_resolve(&fqdn);
+        if let Some(buffer) = first_ipc_buffer(&ctx.recv_buffers, &ctx.recv_statics) {
+            let mut out = vec![0u8; (buffer.size as usize).min(0x100)];
+            let len = resolved.len().min(out.len().saturating_sub(1));
+            out[..len].copy_from_slice(&resolved.as_bytes()[..len]);
+            let _ = kernel.address_space.write(buffer.addr, &out);
+        }
+        log::debug!("nsd cmd {} resolved '{}' -> '{}'", cmd_id, fqdn, resolved);
+        let data = if cmd_id == 21 { 0u32.to_le_bytes().to_vec() } else { Vec::new() };
+        return build_ipc_response(ctx, 0, &data, &[]);
     }
 
     if matches!(port_name, "bsd:u" | "bsd:s") {
@@ -7243,6 +7391,15 @@ fn dispatch_service_v2(
                     audren_behavior::SupportTags::WaveBufferVer2,
                     revision_num,
                 );
+                let voice_in_v2 = audren_behavior::check_feature_supported(
+                    audren_behavior::SupportTags::VoiceInParameterV2,
+                    revision_num,
+                );
+                let voice_info_stride: u64 = if voice_in_v2 {
+                    VOICE_IN_PARAMETER_V2_SIZE as u64
+                } else {
+                    VOICE_IN_PARAMETER_SIZE as u64
+                };
                 let frame = kernel.audio_renderer_frame_counter;
 
                 let mut in_behavior_sz: u64 = 0;
@@ -7305,7 +7462,7 @@ fn dispatch_service_v2(
                     }
                 }
                 let mempool_count = mempool_in_states.len();
-                let voice_count_seen = (in_voices_sz / 0x170) as usize;
+                let voice_count_seen = (in_voices_sz / voice_info_stride) as usize;
                 let effect_count_seen = (in_effects_sz / 0xC0) as usize;
                 if audio_debug_enabled() {
                     use std::sync::atomic::{AtomicBool, Ordering};
@@ -7427,22 +7584,20 @@ fn dispatch_service_v2(
                     if let Some(ib) = in_buf {
                         let voices_off: u64 =
                             0x40 + in_behavior_sz + in_mempools_sz + in_channels_sz;
-                        let voice_info_stride: u64 = 0x170;
                         for vid in 0..voice_count_seen {
                             let vinfo_off = voices_off + (vid as u64) * voice_info_stride;
-                            if vinfo_off + 0x42 > ib.size as u64 {
+                            if vinfo_off + voice_info_stride > ib.size as u64 {
                                 st.voice_adpcm_states[vid..].fill(AudioAdpcmDecodeState::default());
                                 break;
                             }
-                            let mut metadata = [0u8; 0x42];
-                            if kernel
-                                .address_space
-                                .read(ib.addr.wrapping_add(vinfo_off), &mut metadata)
-                                .is_err()
-                            {
+                            let Some(metadata) = read_voice_in_parameter(
+                                &kernel.address_space,
+                                ib.addr.wrapping_add(vinfo_off),
+                                voice_in_v2,
+                            ) else {
                                 st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
                                 continue;
-                            }
+                            };
                             let is_new = metadata[0x008] != 0;
                             let is_in_use = metadata[0x009] != 0;
                             let play_state = metadata[0x00A];
@@ -7493,7 +7648,6 @@ fn dispatch_service_v2(
                         }
                         let voices_off: u64 =
                             0x40 + in_behavior_sz + in_mempools_sz + in_channels_sz;
-                        let voice_info_stride: u64 = 0x170;
 
                         for vid in 0..voice_count_seen {
                             let vinfo_off = voices_off + (vid as u64) * voice_info_stride;
@@ -7501,10 +7655,11 @@ fn dispatch_service_v2(
                                 break;
                             }
                             let v0_addr = ib.addr.wrapping_add(vinfo_off);
-                            let mut v = [0u8; 0x170];
-                            if kernel.address_space.read(v0_addr, &mut v).is_err() {
+                            let Some(v) =
+                                read_voice_in_parameter(&kernel.address_space, v0_addr, voice_in_v2)
+                            else {
                                 continue;
-                            }
+                            };
 
                             let is_new = v[0x008] != 0;
                             let is_in_use = v[0x009] != 0;
@@ -8806,6 +8961,7 @@ const IGBP_CONNECT: u32 = 10;
 const IGBP_DISCONNECT: u32 = 11;
 const IGBP_ALLOCATE_BUFFERS: u32 = 13;
 const IGBP_SET_PREALLOCATED_BUFFER: u32 = 14;
+const IGBP_GET_BUFFER_HISTORY: u32 = 17;
 
 fn handle_binder_transact(
     kernel: &mut Kernel,
@@ -8944,10 +9100,11 @@ fn igbp_handle_transact(
             let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
             let has = reader.read_i32().unwrap_or(0);
             if has == 0 {
-                log::warn!(
-                    "IGBP::SetPreallocatedBuffer slot={} has=0 â€” no buffer",
-                    slot
-                );
+                log::info!("IGBP::SetPreallocatedBuffer binder={} slot={} cleared", binder_id, slot);
+                kernel
+                    .nvdrv
+                    .with_bufferqueue(binder_id, |bq| bq.clear_preallocated(slot));
+                kernel.refresh_bufferqueue_events();
                 return ParcelBuilder::new().finish();
             }
             let mut gb = parse_flattened_graphic_buffer(&mut reader);
@@ -10610,6 +10767,35 @@ fn igbp_handle_transact(
             );
             let mut p = ParcelBuilder::new();
             p.write_u32(0);
+            p.finish()
+        }
+        IGBP_GET_BUFFER_HISTORY => {
+            let requested = reader.read_i32().unwrap_or(0);
+            let mut p = ParcelBuilder::new();
+            if requested <= 0 {
+                p.write_u32((-22i32) as u32);
+                p.write_u32(0);
+            } else {
+                let entries = kernel
+                    .nvdrv
+                    .with_bufferqueue(binder_id, |bq| bq.history(requested as usize));
+                let guest_ns = guest_clock_ns_at;
+                p.write_u32(0);
+                p.write_u32(entries.len() as u32);
+                for entry in &entries {
+                    let presented = entry.presented_at.map_or(0, guest_ns);
+                    for value in [entry.frame_number, guest_ns(entry.queued_at), presented] {
+                        p.write_u32(value as u32);
+                        p.write_u32((value >> 32) as u32);
+                    }
+                    p.write_u32(match entry.state {
+                        nexium_nvdrv::bufferqueue::SlotState::Free => 0,
+                        nexium_nvdrv::bufferqueue::SlotState::Dequeued => 1,
+                        nexium_nvdrv::bufferqueue::SlotState::Queued => 2,
+                        nexium_nvdrv::bufferqueue::SlotState::Acquired => 3,
+                    });
+                }
+            }
             p.finish()
         }
         other => {
@@ -12588,7 +12774,7 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
     match (port_name, cmd_id) {
         ("hid", 0) => Some("IAppletResource"),
         ("IApplicationCreator", 0) => Some("IApplicationAccessor"),
-        ("ILibraryAppletCreator", 0) => Some("ILibraryAppletAccessor"),
+        ("ILibraryAppletCreator", 0 | 3) => Some("ILibraryAppletAccessor"),
         ("time:s" | "time:u" | "time:a" | "time:r", 0) => Some("ISystemClock"),
         ("time:s" | "time:u" | "time:a" | "time:r", 1) => Some("ISystemClock"),
         ("time:s" | "time:u" | "time:a" | "time:r", 2) => Some("ISteadyClock"),
@@ -15118,8 +15304,9 @@ fn ipc_trace_request(
     };
 
     log::warn!(
-        "[ipc-trace] n={} thread={:?} sess={:#x} port={} target={} cmd={} domain={} is_domain={} in_len={} pc={:#x} lr={:#x} x20={:#x} x21={:#x} x20mem={} x21mem={} send={} recv={} sstat={} rstat={} in={}",
+        "[ipc-trace] n={} caller={:#x} thread={:?} sess={:#x} port={} target={} cmd={} domain={} is_domain={} in_len={} pc={:#x} lr={:#x} x20={:#x} x21={:#x} x20mem={} x21mem={} send={} recv={} sstat={} rstat={} in={}",
         n,
+        kernel.threads.current_handle().unwrap_or(0),
         kernel.threads.current,
         session_handle,
         port_name,

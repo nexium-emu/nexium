@@ -270,6 +270,23 @@ impl Cpu {
         }
     }
 
+    pub fn guest_cntpct(&self) -> Option<u64> {
+        match self {
+            #[cfg(feature = "backend-dynarmic")]
+            Cpu::Dynarmic(_) => Some(dynarmic_sys::host_cntpct()),
+            #[cfg(nce_runtime)]
+            Cpu::Nce(_) => {
+                let counter: u64;
+                unsafe {
+                    std::arch::asm!("mrs {0}, cntvct_el0", out(reg) counter, options(nomem, nostack, preserves_flags));
+                }
+                Some(nce_patch::scale_counter(counter, nce_patch::cntpct_factor(nce_host_counter_hz())))
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     #[cfg(feature = "backend-rustarmic")]
     pub fn new_rustarmic() -> Result<Self, String> {
         RustarmicCpu::new().map(Cpu::Rustarmic)

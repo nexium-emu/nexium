@@ -65,6 +65,7 @@ pub mod prepo;
 pub mod process_winding_controller;
 pub mod psc;
 pub mod psm;
+pub mod resolver;
 pub mod rtc;
 pub mod self_controller;
 pub mod set;

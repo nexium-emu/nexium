@@ -78,6 +78,7 @@ pub struct Kernel {
     pub alias_size: u64,
     pub is_application: bool,
     pub title_id: u64,
+    pub(crate) save_data_sizes: crate::services::am::SaveDataSizes,
     pub guest_isa: nexium_cpu::GuestIsa,
     pub total_memory: u64,
     pub heap_committed: u64,
@@ -343,6 +344,7 @@ impl Kernel {
             alias_size: 0x4_0000_0000,
             is_application: false,
             title_id: 0,
+            save_data_sizes: Default::default(),
             guest_isa: nexium_cpu::GuestIsa::AArch64,
             total_memory: 0x8000_0000,
             heap_committed: 0,
@@ -928,9 +930,10 @@ impl Kernel {
         let Some(&binder_id) = self.bufferqueue_events.get(&handle) else {
             return;
         };
-        let signaled = self
-            .nvdrv
-            .with_bufferqueue(binder_id, |queue| queue.has_free_slot());
+        let signaled = self.nvdrv.with_bufferqueue(binder_id, |queue| {
+            queue.take_wake();
+            queue.has_free_slot()
+        });
         self.set_bufferqueue_event_level(handle, signaled);
     }
 
@@ -948,7 +951,7 @@ impl Kernel {
         for (handle, binder_id) in events {
             let signaled = self
                 .nvdrv
-                .with_bufferqueue(binder_id, |queue| queue.has_free_slot());
+                .with_bufferqueue(binder_id, |queue| queue.has_free_slot() || queue.wake_pending());
             self.set_bufferqueue_event_level(handle, signaled);
         }
 
