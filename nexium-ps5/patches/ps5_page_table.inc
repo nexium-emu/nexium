@@ -85,22 +85,13 @@ bool ps5_pt_back_locked(Ps5PageTable& t, size_t chunk) {
 
 void ps5_pt_sigaction(int sig, siginfo_t* info, void* context);
 
-struct Ps5VirtualQueryInfo {
-    uintptr_t start;
-    uintptr_t end;
-    int64_t offset;
-    int protection;
-    int memory_type;
-    uint8_t bits;
-    char name[32];
-};
-
-extern "C" int sceKernelVirtualQuery(const void* addr, int flags, Ps5VirtualQueryInfo* info, size_t size);
-
 bool ps5_pt_usable(uintptr_t at) {
-    Ps5VirtualQueryInfo info{};
-    return sceKernelVirtualQuery(reinterpret_cast<const void*>(at), 0, &info, sizeof(info)) == 0 && info.start <= at &&
-           at < info.end;
+    void* address = reinterpret_cast<void*>(at);
+    void* view = nullptr;
+    if (ps5_shm_map(&g_ps5_zero, 0, kPs5PtChunk, address, PS5_SHM_READ, PS5_SHM_FIXED | PS5_SHM_KEEP_RESERVED, &view) != 0) {
+        return false;
+    }
+    return ps5_shm_unmap(address, kPs5PtChunk, PS5_SHM_KEEP_RESERVED) == 0;
 }
 
 bool ps5_pt_reserve(size_t bytes, void** out) {

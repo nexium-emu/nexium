@@ -199,27 +199,26 @@ unsafe fn load_chunk(r: &Region, chunk: usize) -> bool {
     }
 }
 
-#[repr(C)]
-struct VirtualQueryInfo {
-    start: usize,
-    end: usize,
-    offset: i64,
-    protection: c_int,
-    memory_type: c_int,
-    bits: u8,
-    name: [u8; 32],
-}
-
-unsafe extern "C" {
-    fn sceKernelVirtualQuery(addr: *const c_void, flags: c_int, info: *mut VirtualQueryInfo, size: usize) -> c_int;
-}
+static PROBE_DIRECT: AtomicI64 = AtomicI64::new(-1);
 
 unsafe fn usable(at: usize) -> bool {
     unsafe {
-        let mut info: VirtualQueryInfo = std::mem::zeroed();
-        sceKernelVirtualQuery(at as *const c_void, 0, &mut info, std::mem::size_of::<VirtualQueryInfo>()) == 0
-            && info.start <= at
-            && at < info.end
+        let mut direct = PROBE_DIRECT.load(Ordering::Acquire);
+        if direct < 0 {
+            let mut shm = Shm::default();
+            if sys::ps5_shm_create(CHUNK, &mut shm) != 0 {
+                return false;
+            }
+            direct = shm.direct_start;
+            PROBE_DIRECT.store(direct, Ordering::Release);
+        }
+        let shm = Shm { direct_start: direct, bytes: CHUNK };
+        let mut view = ptr::null_mut();
+        let flags = sys::SHM_FIXED | sys::SHM_KEEP_RESERVED;
+        if sys::ps5_shm_map(&shm, 0, CHUNK, at as *mut c_void, sys::SHM_READ, flags, &mut view) != 0 {
+            return false;
+        }
+        sys::ps5_shm_unmap(at as *mut c_void, CHUNK, sys::SHM_KEEP_RESERVED) == 0
     }
 }
 
