@@ -373,14 +373,20 @@ jobs:
           done
           git -c safe.directory="$vulkan" -C "$vulkan" rev-parse --short HEAD | sed 's/^/PS5_Vulkan at /'
 
-      - name: Install pinned Rust toolchain
+      - name: Read pinned Rust toolchain
+        id: pin
         shell: bash
         run: |
           set -euo pipefail
-          source "$HOME/.cargo/env"
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' nexium-ps5/rust-toolchain.toml)
-          rustup toolchain install "$channel" --profile minimal -c rust-src
-          rustc "+$channel" --version
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: rust-src
 
       - name: Build and package PS5 title
         shell: bash
