@@ -5325,8 +5325,8 @@ impl Renderer {
             log::info!("[vulkan-present] depth export selected; using GUI frame delivery");
             presentation_target = None;
         }
-        let entry = unsafe { ash::Entry::load() }
-            .map_err(|e| format!("Vulkan entry load failed: {:?}", e))?;
+        let entry = crate::adapter::vulkan_entry()
+            .map_err(|e| format!("Vulkan entry load failed: {e}"))?;
 
         let want_validation = std::env::var("NEXIUM_VK_VALIDATION").ok().as_deref() == Some("1");
         let validation_layer = c"VK_LAYER_KHRONOS_validation";

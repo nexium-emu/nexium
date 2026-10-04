@@ -386,7 +386,72 @@ pub fn commit_generation() -> u64 {
 }
 
 pub fn write_watch_available() -> bool {
-    ARENA_WRITE_WATCH.load(Ordering::Acquire)
+    ARENA_WRITE_WATCH.load(Ordering::Acquire) || soft_write_watch_available()
+}
+
+#[cfg(target_vendor = "sony")]
+fn soft_write_watch_available() -> bool {
+    crate::soft_watch::enabled()
+}
+
+#[cfg(not(target_vendor = "sony"))]
+fn soft_write_watch_available() -> bool {
+    false
+}
+
+#[cfg(target_vendor = "sony")]
+fn record_observed_write_vas(pages: &[u64]) {
+    if pages.is_empty() {
+        return;
+    }
+    let mut chunks = observed_write_chunks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let serial = OBSERVED_WRITE_SERIAL
+        .load(Ordering::Relaxed)
+        .wrapping_add(1);
+    for &guest_va in pages {
+        let chunk = chunks.entry(guest_va & OBSERVED_WRITE_PAGE_MASK).or_default();
+        chunk.generation = chunk.generation.max(serial);
+        let page = &mut chunk.pages[((guest_va >> 12) & 15) as usize];
+        *page = (*page).max(serial);
+    }
+    OBSERVED_WRITE_SERIAL.store(serial, Ordering::Release);
+}
+
+#[cfg(target_vendor = "sony")]
+fn soft_take_write_watch(
+    va: u64,
+    len: usize,
+    spans: Option<&mut Vec<(u64, usize)>>,
+) -> WriteWatchResult {
+    thread_local! {
+        static SOFT_PAGES: std::cell::RefCell<Vec<u64>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+    SOFT_PAGES.with(|pages| {
+        let mut pages = pages.borrow_mut();
+        pages.clear();
+        match crate::soft_watch::take(va, len, &mut pages) {
+            None => WriteWatchResult::Unavailable,
+            Some(false) => WriteWatchResult::Clean,
+            Some(true) => {
+                record_observed_write_vas(&pages);
+                if let Some(spans) = spans {
+                    for &page_va in pages.iter() {
+                        match spans.last_mut() {
+                            Some((last_va, last_len)) if *last_va + *last_len as u64 == page_va => {
+                                *last_len += 4096;
+                            }
+                            _ => spans.push((page_va, 4096)),
+                        }
+                    }
+                }
+                WriteWatchResult::Dirty
+            }
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -564,7 +629,12 @@ pub fn write_watch_query_range(va: u64, len: usize) -> Option<(u64, usize)> {
 }
 
 pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
-    #[cfg(not(windows))]
+    #[cfg(target_vendor = "sony")]
+    {
+        return soft_take_write_watch(va, len, None);
+    }
+
+    #[cfg(not(any(windows, target_vendor = "sony")))]
     {
         let _ = (va, len);
         return WriteWatchResult::Unavailable;
@@ -621,7 +691,12 @@ pub fn take_write_watch_spans(
     len: usize,
     spans: &mut Vec<(u64, usize)>,
 ) -> WriteWatchResult {
-    #[cfg(not(windows))]
+    #[cfg(target_vendor = "sony")]
+    {
+        return soft_take_write_watch(va, len, Some(spans));
+    }
+
+    #[cfg(not(any(windows, target_vendor = "sony")))]
     {
         let _ = (va, len, spans);
         return WriteWatchResult::Unavailable;
@@ -689,7 +764,25 @@ pub fn take_write_watch_spans_observed(
     len: usize,
     spans: &mut Vec<(u64, usize)>,
 ) -> WriteWatchObservation {
-    #[cfg(not(windows))]
+    #[cfg(target_vendor = "sony")]
+    {
+        if len == 0 {
+            return WriteWatchObservation::unavailable();
+        }
+        let lo = va & !0xfffu64;
+        let query_len = (va + len as u64 - lo) as usize;
+        let (_, generation_before) = observed_write_snapshot_range(lo, query_len);
+        let result = soft_take_write_watch(va, len, Some(spans));
+        let (serial_after, generation_after) = observed_write_snapshot_range(lo, query_len);
+        return WriteWatchObservation {
+            result,
+            serial_after,
+            generation_before,
+            generation_after,
+        };
+    }
+
+    #[cfg(not(any(windows, target_vendor = "sony")))]
     {
         let _ = (va, len, spans);
         return WriteWatchObservation::unavailable();

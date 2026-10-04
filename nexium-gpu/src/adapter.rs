@@ -45,8 +45,24 @@ pub fn available_devices() -> &'static [AdapterInfo] {
     })
 }
 
+#[cfg(target_vendor = "sony")]
+unsafe extern "system" {
+    fn vk_icdGetInstanceProcAddr(instance: vk::Instance, name: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction;
+}
+
+pub fn vulkan_entry() -> Result<ash::Entry, String> {
+    #[cfg(target_vendor = "sony")]
+    {
+        Ok(unsafe { ash::Entry::from_static_fn(ash::StaticFn { get_instance_proc_addr: vk_icdGetInstanceProcAddr }) })
+    }
+    #[cfg(not(target_vendor = "sony"))]
+    {
+        unsafe { ash::Entry::load() }.map_err(|error| error.to_string())
+    }
+}
+
 fn enumerate_devices() -> Result<Vec<AdapterInfo>, String> {
-    let entry = unsafe { ash::Entry::load() }.map_err(|error| error.to_string())?;
+    let entry = vulkan_entry()?;
     let app = vk::ApplicationInfo::default()
         .application_name(c"NeXium GPU discovery")
         .api_version(vk::API_VERSION_1_3);

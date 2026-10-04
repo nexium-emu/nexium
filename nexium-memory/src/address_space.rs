@@ -77,6 +77,8 @@ impl Region {
         let boxed: Box<[u8]> = vec![0u8; len].into_boxed_slice();
         let raw = Box::into_raw(boxed);
         let buf = unsafe { NonNull::new_unchecked(raw as *mut u8) };
+        #[cfg(target_vendor = "sony")]
+        crate::soft_watch::register(base, buf.as_ptr(), len, true);
         Self {
             base,
             buf,
@@ -115,6 +117,8 @@ impl Region {
         let boxed: Box<[u8]> = vec![0u8; len].into_boxed_slice();
         let raw = Box::into_raw(boxed);
         let buf = unsafe { NonNull::new_unchecked(raw as *mut u8) };
+        #[cfg(target_vendor = "sony")]
+        crate::soft_watch::register(base, buf.as_ptr(), len, true);
         Self {
             base,
             buf,
@@ -134,6 +138,8 @@ impl Region {
             None => (Arc::clone(source), offset),
         };
         source.alias_users.fetch_add(1, Ordering::AcqRel);
+        #[cfg(target_vendor = "sony")]
+        crate::soft_watch::register(base, unsafe { source.buf.as_ptr().add(offset) }, len, false);
         Self {
             base,
             buf: unsafe { NonNull::new_unchecked(source.buf.as_ptr().add(offset)) },
@@ -180,6 +186,10 @@ impl Region {
 
 impl Drop for Region {
     fn drop(&mut self) {
+        #[cfg(target_vendor = "sony")]
+        if !self.arena {
+            crate::soft_watch::unregister(self.base, self.buf.as_ptr(), self.len);
+        }
         if let Some(backing) = &self.alias_backing {
             backing.source.alias_users.fetch_sub(1, Ordering::AcqRel);
             return;
