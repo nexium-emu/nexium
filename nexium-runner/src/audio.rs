@@ -1,4 +1,6 @@
+#[cfg(not(target_vendor = "sony"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(not(target_vendor = "sony"))]
 use cpal::{Device, SampleFormat, StreamConfig};
 use nexium_kernel::audio_sink::{set_host_audio_sink, HostPcmSink};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
@@ -164,6 +166,7 @@ pub fn current_stream_info() -> Option<AudioStreamInfo> {
     STREAM_INFO.get().cloned()
 }
 
+#[cfg(not(target_vendor = "sony"))]
 pub fn list_output_devices() -> Vec<String> {
     let host = cpal::default_host();
     match host.output_devices() {
@@ -199,6 +202,7 @@ pub fn push_test_tone(freq_hz: f32, seconds: f32) -> usize {
     sink.push_stereo_f32(&buf)
 }
 
+#[cfg(not(target_vendor = "sony"))]
 pub fn resolve_output_device(preferred: Option<&str>) -> Option<Device> {
     let host = cpal::default_host();
     if let Some(name) = preferred {
@@ -324,9 +328,10 @@ impl HostPcmSink for HostAudioSink {
 
 #[cfg(target_os = "android")]
 const DESIRED_BUFFER_FRAMES: Option<u32> = Some(1024);
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_vendor = "sony")))]
 const DESIRED_BUFFER_FRAMES: Option<u32> = None;
 
+#[cfg(not(target_vendor = "sony"))]
 fn apply_buffer_size(config: &mut StreamConfig, supported: Option<&cpal::SupportedBufferSize>) {
     let Some(want) = DESIRED_BUFFER_FRAMES else {
         return;
@@ -339,6 +344,7 @@ fn apply_buffer_size(config: &mut StreamConfig, supported: Option<&cpal::Support
     log::info!("audio: requesting fixed buffer of {} frames", frames);
 }
 
+#[cfg(not(target_vendor = "sony"))]
 fn pick_config(device: &cpal::Device) -> Result<(StreamConfig, SampleFormat), String> {
     let supported: Vec<_> = device
         .supported_output_configs()
@@ -375,6 +381,7 @@ fn pick_config(device: &cpal::Device) -> Result<(StreamConfig, SampleFormat), St
     Ok((config, format))
 }
 
+#[cfg(not(target_vendor = "sony"))]
 fn output_config_preference(
     channels: u16,
     format: SampleFormat,
@@ -396,6 +403,7 @@ fn output_config_preference(
     Some((u8::from(channels != 2), format_rank, channels.abs_diff(2)))
 }
 
+#[cfg(not(target_vendor = "sony"))]
 pub fn init_host_audio(preferred_device: Option<&str>, initial_volume: f32) {
     let preferred = preferred_device.map(|s| s.to_string());
     let _ = std::thread::Builder::new()
@@ -408,6 +416,7 @@ pub fn init_host_audio(preferred_device: Option<&str>, initial_volume: f32) {
         });
 }
 
+#[cfg(not(target_vendor = "sony"))]
 fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32) {
     let Some(device) = resolve_output_device(preferred_device) else {
         log::warn!("Audio output disabled: no output device available");
@@ -558,6 +567,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
     AUDIO_STREAM.with(|s| *s.borrow_mut() = Some(stream));
 }
 
+#[cfg(not(target_vendor = "sony"))]
 fn drain_stereo_to(
     consumer: &mut <HeapRb<f32> as Split>::Cons,
     out: &mut [f32],
@@ -621,6 +631,78 @@ fn drain_stereo_to(
     let render_frames = ((frames_written as f32) * ratio).round() as u64;
     let new_consumed = consumed.fetch_add(render_frames, Ordering::Relaxed) + render_frames;
     post_audio_events(new_consumed);
+}
+
+pub struct PullStream {
+    consumer: <HeapRb<f32> as Split>::Cons,
+    consumed: Arc<AtomicU64>,
+    volume: Arc<AtomicU32>,
+    audio_out: Arc<Mutex<AudioOutMixer>>,
+    underrun_frames: Arc<AtomicU64>,
+    prebuf: PrebufState,
+    channels: usize,
+    ratio: f32,
+}
+
+impl PullStream {
+    pub fn fill_i16(&mut self, out: &mut [i16]) {
+        drain_stereo_to_i16(
+            &mut self.consumer,
+            out,
+            self.channels,
+            self.ratio,
+            &self.consumed,
+            &self.volume,
+            &self.audio_out,
+            &self.underrun_frames,
+            &mut self.prebuf,
+        );
+    }
+}
+
+pub fn init_host_audio_pull(device_name: &str, sample_rate: u32, channels: u16, initial_volume: f32) -> PullStream {
+    let rb = HeapRb::<f32>::new(RB_CAP_SAMPLES);
+    let (producer, consumer) = rb.split();
+    let consumed = Arc::new(AtomicU64::new(0));
+    let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
+    let audio_out = Arc::new(Mutex::new(AudioOutMixer::default()));
+    let underrun_frames = Arc::new(AtomicU64::new(0));
+    let ratio = RENDER_SR as f32 / sample_rate as f32;
+    log::info!(
+        "HostAudioSink: pull device '{}' @ {} Hz {}ch I16 (ring cap {} samples, vol {:.2})",
+        device_name,
+        sample_rate,
+        channels,
+        RB_CAP_SAMPLES,
+        initial_volume,
+    );
+    let _ = STREAM_INFO.set(AudioStreamInfo {
+        device_name: device_name.to_string(),
+        sample_rate,
+        channels,
+        sample_format: "I16",
+    });
+    let sink = Arc::new(HostAudioSink {
+        producer: Mutex::new(producer),
+        consumed: consumed.clone(),
+        volume: volume.clone(),
+        audio_out: audio_out.clone(),
+        underrun_frames: underrun_frames.clone(),
+        dropped_frames: AtomicU64::new(0),
+    });
+    let _ = SINK_HANDLE.set(sink.clone());
+    let sink_dyn: Arc<dyn HostPcmSink> = sink;
+    set_host_audio_sink(sink_dyn);
+    PullStream {
+        consumer,
+        consumed,
+        volume,
+        audio_out,
+        underrun_frames,
+        prebuf: PrebufState::new(ratio),
+        channels: channels as usize,
+        ratio,
+    }
 }
 
 fn drain_stereo_to_i16(

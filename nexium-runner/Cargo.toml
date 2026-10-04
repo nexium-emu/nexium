@@ -16,8 +16,10 @@ nexium-gpu.workspace = true
 
 parking_lot = "0.12"
 log = "0.4"
-cpal = "0.18"
 ringbuf = { workspace = true }
+
+[target.'cfg(not(target_vendor = "sony"))'.dependencies]
+cpal = "0.18"
 
 [features]
 default = ["backend-dynarmic", "backend-rustarmic"]
