@@ -269,6 +269,7 @@ mod tests {
             system_romfs: Default::default(),
             content_version: 0,
             display_version: String::new(),
+            application_control: None,
             patch_romfs: None,
             add_on_content: Default::default(),
             title_id: 0x0100_0000_0000_00ab,

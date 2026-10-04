@@ -8,7 +8,18 @@ use crate::nca::{Nca, NcaContentType, NcaFsType};
 use crate::nro::{parse_nacp, NroMetadata};
 use crate::romfs::{romfs_dir_files, romfs_file, romfs_header};
 
+pub fn read_container_control(path: &std::path::Path) -> Option<Vec<u8>> {
+    let (mmap, range) = read_control_romfs(path)?;
+    romfs_file(mmap.get(range)?, "/control.nacp").map(<[u8]>::to_vec)
+}
+
 pub fn read_container_metadata(path: &std::path::Path) -> Option<NroMetadata> {
+    let (mmap, range) = read_control_romfs(path)?;
+    let romfs = mmap.get(range)?;
+    metadata_from_romfs(romfs)
+}
+
+fn read_control_romfs(path: &std::path::Path) -> Option<(Arc<Mmap>, std::ops::Range<usize>)> {
     let file = std::fs::File::open(path).ok()?;
     let mmap = Arc::new(unsafe { Mmap::map(&file) }.ok()?);
     let path_str = path.to_string_lossy();
@@ -26,8 +37,10 @@ pub fn read_container_metadata(path: &std::path::Path) -> Option<NroMetadata> {
     };
 
     let section = control.section(NcaFsType::RomFs)?;
-    let romfs = mmap.get(section.fs_data_range.clone())?;
+    Some((mmap, section.fs_data_range.clone()))
+}
 
+fn metadata_from_romfs(romfs: &[u8]) -> Option<NroMetadata> {
     let (title, author, version) = romfs_file(romfs, "/control.nacp")
         .filter(|n| n.len() >= 0x300)
         .map(parse_nacp)

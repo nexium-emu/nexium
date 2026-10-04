@@ -351,6 +351,7 @@ pub struct Application {
     pub title_id: u64,
     pub content_version: u32,
     pub display_version: String,
+    pub application_control: Option<Vec<u8>>,
     pub patch_romfs: Option<LazyRomfs>,
     pub add_on_content: std::collections::BTreeMap<u64, Option<LazyRomfs>>,
 }
@@ -363,7 +364,7 @@ pub(crate) const MODULE_ORDER: &[&str] = &[
 impl Application {
     pub fn load_with_content(path: &str, content_root: &std::path::Path) -> Result<Self, String> {
         use crate::content::{ContentKind, Package};
-        let mut application = Self::load(path)?;
+        let mut application = Self::load_impl(path, true)?;
         let base_title_id = application.title_id;
         let installed = crate::content::list_game_content(content_root, base_title_id)?;
         if let Some(entry) = installed.entries.iter().find(|entry| entry.enabled && entry.kind == ContentKind::Update) {
@@ -384,7 +385,7 @@ impl Application {
                 },
                 None => application.romfs.clone(),
             };
-            let mut updated = Self::from_program_nca_with_romfs(package.mmap.clone(), &updated_program, romfs)?;
+            let mut updated = Self::from_program_nca_with_romfs(package.mmap.clone(), &updated_program, romfs, false)?;
             if updated.npdm.title_id != 0 && updated.npdm.title_id != base_title_id {
                 return Err(format!("Update program belongs to {:016X}, not {base_title_id:016X}", updated.npdm.title_id));
             }
@@ -395,10 +396,15 @@ impl Application {
             } else {
                 entry.display_version.clone()
             };
+            updated.application_control = crate::control::read_container_control(&entry.path)
+                .or(application.application_control);
             updated.patch_romfs = updated.romfs.clone();
             updated.system_romfs = application.system_romfs;
             application = updated;
             log::info!("Applied update {:016X} version {} from {}", metadata.title_id, metadata.version, entry.path.display());
+        }
+        if application.modules.is_empty() {
+            return Err("This base game has no usable program code and needs its update. Install the update from Updates & DLC.".into());
         }
         for entry in installed.entries.iter().filter(|entry| entry.enabled && entry.kind == ContentKind::Dlc) {
             let package = Package::open(&entry.path)?;
@@ -438,6 +444,10 @@ impl Application {
     }
 
     pub fn load(path: &str) -> Result<Self, String> {
+        Self::load_impl(path, false)
+    }
+
+    fn load_impl(path: &str, allow_missing_code: bool) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
         let mmap =
             Arc::new(unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {}: {}", path, e))?);
@@ -451,33 +461,34 @@ impl Application {
                     system_romfs.extend(Self::collect_system_romfs(&mmap, update));
                 }
                 log::info!("indexed {} bundled system archive(s)", system_romfs.len());
-                let mut application = Self::from_partition(mmap, xci.ncas())?;
+                let mut application = Self::from_partition(mmap, xci.ncas(), allow_missing_code)?;
                 application.system_romfs = system_romfs;
                 Ok(application)
             }
             ContainerKind::Dnsp => {
                 let nsp = Nsp::parse(mmap.clone())?;
                 let system_romfs = Self::collect_system_romfs(&mmap, nsp.ncas());
-                let mut application = Self::from_partition(mmap, nsp.ncas())?;
+                let mut application = Self::from_partition(mmap, nsp.ncas(), allow_missing_code)?;
                 application.system_romfs = system_romfs;
                 Ok(application)
             }
             ContainerKind::Nca => {
                 let nca = Nca::parse(mmap.clone(), 0)?;
-                Self::from_program_nca(mmap, &nca)
+                Self::from_program_nca(mmap, &nca, allow_missing_code)
             }
             ContainerKind::Nro => Err("NRO is not an application container".to_string()),
             ContainerKind::Unknown => Err(format!("unrecognized container format: {}", path)),
         }?;
         application.display_version = crate::read_container_metadata(std::path::Path::new(path))
             .map(|metadata| metadata.version).unwrap_or_default();
+        application.application_control = crate::control::read_container_control(std::path::Path::new(path));
         Ok(application)
     }
 
-    fn from_partition(mmap: Arc<Mmap>, ncas: &PartitionFs) -> Result<Self, String> {
+    fn from_partition(mmap: Arc<Mmap>, ncas: &PartitionFs, allow_missing_code: bool) -> Result<Self, String> {
         let program = Self::program_from_partition(mmap.clone(), ncas)?;
         let metadata = Self::metadata_from_partition(&mmap, ncas)?;
-        let mut application = Self::from_program_nca(mmap, &program)?;
+        let mut application = Self::from_program_nca(mmap, &program, allow_missing_code)?;
         if let Some(metadata) = metadata.iter().find(|metadata| {
             metadata.meta_type == crate::cnmt::ContentMetaType::Application
                 && metadata.title_id == application.title_id
@@ -610,14 +621,68 @@ impl Application {
             .unwrap_or_else(|| Err("no Program NCA found".to_string()))
     }
 
-    fn from_program_nca(mmap: Arc<Mmap>, program: &Nca) -> Result<Self, String> {
+    fn from_program_nca(mmap: Arc<Mmap>, program: &Nca, allow_missing_code: bool) -> Result<Self, String> {
         let romfs = program.section(NcaFsType::RomFs)
             .map(|section| LazyRomfs::from_section(mmap.clone(), section)).transpose()?;
-        Self::from_program_nca_with_romfs(mmap, program, romfs)
+        Self::from_program_nca_with_romfs(mmap, program, romfs, allow_missing_code)
     }
 
-    fn from_program_nca_with_romfs(mmap: Arc<Mmap>, program: &Nca, romfs: Option<LazyRomfs>) -> Result<Self, String> {
+    fn from_program_nca_with_romfs(
+        mmap: Arc<Mmap>,
+        program: &Nca,
+        romfs: Option<LazyRomfs>,
+        allow_missing_code: bool,
+    ) -> Result<Self, String> {
         log::info!("selected program NCA base={:#x}", program.nca_base);
+        let (npdm, modules, total_code_size) = match Self::load_code(&mmap, program) {
+            Ok(code) => code,
+            Err(error) if allow_missing_code => {
+                log::warn!("program NCA at {:#x} has no usable ExeFS ({error}); an update must provide the code", program.nca_base);
+                (Npdm::default_for_homebrew(), Vec::new(), 0)
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Some(r) = &romfs {
+            log::info!(
+                "romfs image {:#x}..{:#x} ({} bytes)",
+                r.range.start,
+                r.range.end,
+                r.len()
+            );
+        }
+
+        let title_id = if npdm.title_id != 0 {
+            npdm.title_id
+        } else {
+            program.program_id
+        };
+        log::info!(
+            "application title_id={:#018x} addr_space={:?} stack={:#x} code_size={:#x} modules={}",
+            title_id,
+            npdm.address_space,
+            npdm.main_stack_size,
+            total_code_size,
+            modules.len()
+        );
+
+        Ok(Self {
+            mmap,
+            modules,
+            total_code_size,
+            npdm,
+            romfs,
+            system_romfs: HashMap::new(),
+            title_id,
+            content_version: 0,
+            display_version: String::new(),
+            application_control: None,
+            patch_romfs: None,
+            add_on_content: Default::default(),
+        })
+    }
+
+    fn load_code(mmap: &Arc<Mmap>, program: &Nca) -> Result<(Npdm, Vec<LoadedModule>, u64), String> {
         let exefs_section = program
             .section(NcaFsType::PartitionFs)
             .ok_or("program NCA has no exefs (PartitionFs) section")?;
@@ -675,44 +740,7 @@ impl Application {
         if modules.is_empty() {
             return Err("exefs has no loadable NSO modules".to_string());
         }
-        let total_code_size = load_offset;
-
-        if let Some(r) = &romfs {
-            log::info!(
-                "romfs image {:#x}..{:#x} ({} bytes)",
-                r.range.start,
-                r.range.end,
-                r.len()
-            );
-        }
-
-        let title_id = if npdm.title_id != 0 {
-            npdm.title_id
-        } else {
-            program.program_id
-        };
-        log::info!(
-            "application title_id={:#018x} addr_space={:?} stack={:#x} code_size={:#x} modules={}",
-            title_id,
-            npdm.address_space,
-            npdm.main_stack_size,
-            total_code_size,
-            modules.len()
-        );
-
-        Ok(Self {
-            mmap,
-            modules,
-            total_code_size,
-            npdm,
-            romfs,
-            system_romfs: HashMap::new(),
-            title_id,
-            content_version: 0,
-            display_version: String::new(),
-            patch_romfs: None,
-            add_on_content: Default::default(),
-        })
+        Ok((npdm, modules, load_offset))
     }
 }
 
@@ -736,10 +764,11 @@ pub fn read_application_title_id(path: &std::path::Path) -> Result<Option<u64>, 
     };
     let mut title_id = program.program_id;
     if let Some(section) = program.section(NcaFsType::PartitionFs) {
-        let exefs = PartitionFs::parse(mmap.clone(), section.fs_data_range.start)?;
-        if let Some(entry) = exefs.find("main.npdm") {
-            if let Ok(npdm) = Npdm::parse(&mmap[exefs.entry_range(entry)?]) {
-                if npdm.title_id != 0 { title_id = npdm.title_id; }
+        if let Ok(exefs) = PartitionFs::parse(mmap.clone(), section.fs_data_range.start) {
+            if let Some(entry) = exefs.find("main.npdm") {
+                if let Ok(npdm) = Npdm::parse(&mmap[exefs.entry_range(entry)?]) {
+                    if npdm.title_id != 0 { title_id = npdm.title_id; }
+                }
             }
         }
     }
