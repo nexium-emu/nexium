@@ -756,7 +756,7 @@ impl HidState {
     fn write_mouse_lifo(buf: &mut [u8], mouse: &MouseInput, previous: &MouseInput, sampling: u64) {
         let tail = Self::write_device_lifo_header(buf, MOUSE_OFFSET, sampling);
         let storage = MOUSE_OFFSET + LIFO_HEADER_SIZE + tail * MOUSE_ELEM_SIZE;
-        write_u64(buf, storage, sampling);
+        write_u64(buf, storage, sampling << 1);
         let state = storage + 8;
         write_u64(buf, state + 0x00, sampling);
         write_i32(buf, state + 0x08, mouse.x);
@@ -783,7 +783,7 @@ impl HidState {
     fn write_touch_lifo(buf: &mut [u8], touch: &TouchInput, previous: &TouchInput, sampling: u64) {
         let tail = Self::write_device_lifo_header(buf, TOUCH_OFFSET, sampling);
         let storage = TOUCH_OFFSET + LIFO_HEADER_SIZE + tail * TOUCH_ELEM_SIZE;
-        write_u64(buf, storage, sampling);
+        write_u64(buf, storage, sampling << 1);
         let state = storage + 8;
         write_u64(buf, state + 0x00, sampling);
         let ending = !touch.pressed && previous.pressed;
@@ -821,7 +821,7 @@ impl HidState {
     fn write_keyboard_lifo(buf: &mut [u8], keyboard: &KeyboardInput, sampling: u64) {
         let tail = Self::write_device_lifo_header(buf, KEYBOARD_OFFSET, sampling);
         let storage = KEYBOARD_OFFSET + LIFO_HEADER_SIZE + tail * KEYBOARD_ELEM_SIZE;
-        write_u64(buf, storage, sampling);
+        write_u64(buf, storage, sampling << 1);
         let state = storage + 8;
         write_u64(buf, state + 0x00, sampling);
         write_u64(buf, state + 0x08, u64::from(keyboard.modifiers));
@@ -1153,7 +1153,7 @@ impl HidState {
         attr: u32,
     ) {
         let storage = lifo + LIFO_HEADER_SIZE + index * LIFO_STORAGE_ELEM_SIZE;
-        write_u64(buf, storage, sampling);
+        write_u64(buf, storage, sampling << 1);
         let state = storage + 8;
         write_u64(buf, state + 0x00, sampling);
         write_u64(buf, state + 0x08, input.buttons);
@@ -1233,7 +1233,7 @@ fn append_sixaxis_entry(buf: &mut [u8], lifo: usize, frame: &crate::hid_motion::
     let mut state = frame.sanitized();
     state.delta_time_ns = state.delta_time_ns.max(SIXAXIS_MIN_DELTA_NS);
     let storage = lifo + LIFO_HEADER_SIZE + slot * SIXAXIS_ELEM_SIZE;
-    write_u64(buf, storage, sampling);
+    write_u64(buf, storage, sampling << 1);
     let at = storage + 8;
     write_u64(buf, at + 0x00, state.delta_time_ns);
     write_u64(buf, at + 0x08, sampling);
@@ -2046,7 +2046,7 @@ mod tests {
             assert_eq!(tail, (i as usize + 1) % LIFO_STORAGE_COUNT);
             assert_eq!(read_u64(&buf, 0x18), (i + 1).min(16));
             let storage = LIFO_HEADER_SIZE + tail * SIXAXIS_ELEM_SIZE;
-            assert_eq!(read_u64(&buf, storage), i + 1);
+            assert_eq!(read_u64(&buf, storage), (i + 1) << 1);
             assert_eq!(read_u64(&buf, storage + 8), 5_000_000 + i);
             assert_eq!(read_u64(&buf, storage + 0x10), i + 1);
             assert_eq!(read_u32_at(&buf, storage + 8 + 0x58), SIXAXIS_ATTR_IS_CONNECTED);
