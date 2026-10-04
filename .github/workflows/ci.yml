@@ -486,7 +486,7 @@ jobs:
             embeds: [ {
               title: ("NeXium nightly " + $ver),
               url: $url,
-              description: "A new early-access build is up. Windows and Linux (x86_64) downloads plus an Android arm64 APK are on the release page.\n\nExperimental — expect bugs.",
+              description: "A new early-access build is up. Windows and Linux (x86_64) downloads, an Android arm64 APK and a PS5 homebrew build are on the release page.\n\nExperimental — expect bugs.",
               color: 5814783
             } ]
           }')"
