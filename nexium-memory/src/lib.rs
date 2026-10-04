@@ -2,6 +2,8 @@ pub mod address_space;
 pub mod fastmem;
 pub mod perm;
 pub mod region;
+#[cfg(target_vendor = "sony")]
+pub mod soft_watch;
 
 pub use address_space::{
     align_request, AddressSpace, AddressSpaceError, HostRegion, HostRegionChange,
