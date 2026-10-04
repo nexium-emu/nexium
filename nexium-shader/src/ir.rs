@@ -644,6 +644,15 @@ pub enum Op {
         values: [Value; 4],
     },
 
+    ImageRead {
+        handle: TextureHandleOrigin,
+        dimension: ImageDimension,
+        x: Value,
+        y: Option<Value>,
+        z: Option<Value>,
+        component: u8,
+    },
+
     ImageAtomic {
         handle: TextureHandleOrigin,
         dimension: ImageDimension,
@@ -1412,6 +1421,29 @@ impl Inst {
                     f,
                     "ImageWrite {handle}, {coords}{dimension}, ({}, {}, {}, {})",
                     values[0], values[1], values[2], values[3]
+                )
+            }
+            Op::ImageRead {
+                handle,
+                dimension,
+                x,
+                y,
+                z,
+                component,
+            } => {
+                let coords = match (y, z) {
+                    (None, None) => format!("({x})"),
+                    (Some(y), None) => format!("({x}, {y})"),
+                    (Some(y), Some(z)) => format!("({x}, {y}, {z})"),
+                    (None, Some(z)) => format!("({x}, ?, {z})"),
+                };
+                write!(
+                    f,
+                    "ImageRead {handle}, {coords}{dimension}.{}",
+                    ["r", "g", "b", "a"]
+                        .get(*component as usize)
+                        .copied()
+                        .unwrap_or("?")
                 )
             }
             Op::ImageAtomic {

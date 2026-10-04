@@ -42,7 +42,7 @@ struct ValueDef {
 }
 
 #[derive(Default)]
-pub(crate) struct ValueDefs(HashMap<ValueId, ValueDef>);
+pub(crate) struct ValueDefs(HashMap<ValueId, ValueDef>, HashMap<ValueId, ValueId>);
 
 impl ValueDefs {
     pub(crate) fn new() -> Self {
@@ -64,6 +64,10 @@ impl ValueDefs {
                 },
             );
         }
+    }
+
+    pub(crate) fn insert_select_pred_defs(&mut self, defs: &HashMap<ValueId, ValueId>) {
+        self.1.extend(defs.iter().map(|(id, def)| (*id, *def)));
     }
 
     fn get(&self, id: &ValueId) -> Option<&ValueDef> {
@@ -122,6 +126,7 @@ enum CbufHandleTrace {
         deferred: bool,
     },
     Cycle,
+    Uninitialized(u8),
 }
 
 pub(crate) struct PendingBindlessOriginCheck {
@@ -136,15 +141,36 @@ struct CbufOriginTracer<'a> {
     local: Option<&'a Program>,
     defs: Option<&'a ValueDefs>,
     consumer_pred: Option<Predicate>,
+    consumer_pred_def: Option<ValueId>,
+    select_pred_defs: Option<&'a HashMap<ValueId, ValueId>>,
     allow_back_edge_placeholder: bool,
     visiting: HashSet<ValueId>,
+    predicate_assumptions: HashMap<(ValueId, u8), bool>,
+}
+
+fn pred_def_polarity(op: &Op, idx: u8) -> Option<bool> {
+    let (dest_p, dest_np) = match op {
+        Op::ISetPred { dest_p, dest_np, .. }
+        | Op::FSetPred { dest_p, dest_np, .. }
+        | Op::HSetPred { dest_p, dest_np, .. }
+        | Op::PSetPred { dest_p, dest_np, .. }
+        | Op::CSetPred { dest_p, dest_np, .. } => (*dest_p, *dest_np),
+        _ => return None,
+    };
+    if dest_p == idx {
+        Some(true)
+    } else if dest_np == idx {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 impl CbufOriginTracer<'_> {
     fn trace_root(&mut self, value: &Value) -> Option<(CbufHandleOrigin, bool)> {
         match self.trace_inner(value)? {
             CbufHandleTrace::Origin { origin, deferred } => Some((origin, deferred)),
-            CbufHandleTrace::Cycle => None,
+            CbufHandleTrace::Cycle | CbufHandleTrace::Uninitialized(_) => None,
         }
     }
 
@@ -164,6 +190,9 @@ impl CbufOriginTracer<'_> {
     }
 
     fn trace_inner(&mut self, value: &Value) -> Option<CbufHandleTrace> {
+        if let Value::GprIn(reg) = *value {
+            return Some(CbufHandleTrace::Uninitialized(reg));
+        }
         let Value::Inst(id) = *value else {
             return None;
         };
@@ -173,6 +202,158 @@ impl CbufOriginTracer<'_> {
 
         let result = self.find_def(id).and_then(|def| self.trace_def(id, def));
         self.visiting.remove(&id);
+        result
+    }
+
+    fn local_inst(&self, id: ValueId) -> Option<&Inst> {
+        self.local?
+            .instructions
+            .iter()
+            .find(|inst| inst.result == Some(id))
+    }
+
+    fn values_equivalent(&self, a: &Value, b: &Value) -> bool {
+        if a == b {
+            return true;
+        }
+        let (Value::Inst(a_id), Value::Inst(b_id)) = (a, b) else {
+            return false;
+        };
+        match (
+            self.local_inst(*a_id).map(|inst| &inst.op),
+            self.local_inst(*b_id).map(|inst| &inst.op),
+        ) {
+            (
+                Some(Op::LoadCbuf {
+                    binding,
+                    byte_offset,
+                }),
+                Some(Op::LoadCbuf {
+                    binding: other_binding,
+                    byte_offset: other_byte_offset,
+                }),
+            ) => binding == other_binding && byte_offset == other_byte_offset,
+            (Some(Op::Mov(inner)), _) => self.values_equivalent(inner, b),
+            (_, Some(Op::Mov(inner))) => self.values_equivalent(a, inner),
+            _ => false,
+        }
+    }
+
+    fn pred_compares_equivalent(&self, a: &Op, b: &Op) -> bool {
+        match (a, b) {
+            (
+                Op::ISetPred {
+                    cmp,
+                    signed,
+                    bop,
+                    src_a,
+                    src_b,
+                    src_pred,
+                    src_pred_inv,
+                    ..
+                },
+                Op::ISetPred {
+                    cmp: other_cmp,
+                    signed: other_signed,
+                    bop: other_bop,
+                    src_a: other_src_a,
+                    src_b: other_src_b,
+                    src_pred: other_src_pred,
+                    src_pred_inv: other_src_pred_inv,
+                    ..
+                },
+            ) => {
+                cmp == other_cmp
+                    && signed == other_signed
+                    && bop == other_bop
+                    && *src_pred == PT
+                    && *other_src_pred == PT
+                    && src_pred_inv == other_src_pred_inv
+                    && self.values_equivalent(src_a, other_src_a)
+                    && self.values_equivalent(src_b, other_src_b)
+            }
+            (
+                Op::FSetPred {
+                    cmp,
+                    bop,
+                    src_a,
+                    src_b,
+                    neg_a,
+                    abs_a,
+                    neg_b,
+                    abs_b,
+                    src_pred,
+                    src_pred_inv,
+                    ..
+                },
+                Op::FSetPred {
+                    cmp: other_cmp,
+                    bop: other_bop,
+                    src_a: other_src_a,
+                    src_b: other_src_b,
+                    neg_a: other_neg_a,
+                    abs_a: other_abs_a,
+                    neg_b: other_neg_b,
+                    abs_b: other_abs_b,
+                    src_pred: other_src_pred,
+                    src_pred_inv: other_src_pred_inv,
+                    ..
+                },
+            ) => {
+                cmp == other_cmp
+                    && bop == other_bop
+                    && neg_a == other_neg_a
+                    && abs_a == other_abs_a
+                    && neg_b == other_neg_b
+                    && abs_b == other_abs_b
+                    && *src_pred == PT
+                    && *other_src_pred == PT
+                    && src_pred_inv == other_src_pred_inv
+                    && self.values_equivalent(src_a, other_src_a)
+                    && self.values_equivalent(src_b, other_src_b)
+            }
+            _ => false,
+        }
+    }
+
+    fn select_pred_relation(
+        &self,
+        select: ValueId,
+        select_idx: u8,
+        consumer_idx: u8,
+    ) -> Option<bool> {
+        let select_def = self.select_pred_def(select)?;
+        let consumer_def = self.consumer_pred_def?;
+        let select_inst = self.local_inst(select_def)?;
+        let consumer_inst = self.local_inst(consumer_def)?;
+        let select_polarity = pred_def_polarity(&select_inst.op, select_idx)?;
+        let consumer_polarity = pred_def_polarity(&consumer_inst.op, consumer_idx)?;
+        let equivalent = select_def == consumer_def
+            || (select_inst.pred.is_none()
+                && consumer_inst.pred.is_none()
+                && self.pred_compares_equivalent(&select_inst.op, &consumer_inst.op));
+        equivalent.then_some(select_polarity == consumer_polarity)
+    }
+
+    fn select_pred_def(&self, select: ValueId) -> Option<ValueId> {
+        self.select_pred_defs.and_then(|defs| defs.get(&select).copied())
+            .or_else(|| self.defs.and_then(|defs| defs.1.get(&select).copied()))
+    }
+
+    fn trace_select_branch(
+        &mut self,
+        value: &Value,
+        predicate: Option<(ValueId, u8)>,
+        truth: bool,
+    ) -> Option<CbufHandleTrace> {
+        let previous = predicate.and_then(|key| self.predicate_assumptions.insert(key, truth));
+        let result = self.trace_inner(value);
+        if let Some(key) = predicate {
+            match previous {
+                Some(value) => { self.predicate_assumptions.insert(key, value); }
+                None => { self.predicate_assumptions.remove(&key); }
+            }
+        }
         result
     }
 
@@ -191,20 +372,45 @@ impl CbufOriginTracer<'_> {
                 deferred: false,
             }),
             Op::Mov(inner) => self.trace_inner(&inner),
+            Op::IAdd { a, b, neg_a, neg_b } => match (a, b) {
+                (zero, value) if is_zero_value(&zero) && !neg_b => self.trace_inner(&value),
+                (value, zero) if is_zero_value(&zero) && !neg_a => self.trace_inner(&value),
+                _ => None,
+            },
+            Op::ILop {
+                a,
+                b,
+                op: LogicOp::Or | LogicOp::Xor,
+                not_a: false,
+                not_b: false,
+            } if is_zero_value(&a) || is_zero_value(&b) => {
+                self.trace_inner(if is_zero_value(&a) { &b } else { &a })
+            }
             Op::SelectPred {
                 pred,
                 if_true,
                 if_false,
             } => {
-                if self.consumer_pred == Some(pred) {
+                let predicate = self.select_pred_def(id).map(|def| (def, pred.idx));
+                let assumed = predicate.and_then(|key| self.predicate_assumptions.get(&key).copied());
+                let relation = assumed.map(|truth| truth != pred.negate).or_else(|| {
+                    match self.consumer_pred {
+                        Some(consumer) if consumer.idx == pred.idx => {
+                            Some(consumer.negate == pred.negate)
+                        }
+                        Some(consumer) => self
+                            .select_pred_relation(id, pred.idx, consumer.idx)
+                            .map(|same_polarity| same_polarity == (consumer.negate == pred.negate)),
+                        None => None,
+                    }
+                });
+                if relation == Some(true) {
                     self.trace_inner(&if_true)
-                } else if self.consumer_pred.is_some_and(|consumer| {
-                    consumer.idx == pred.idx && consumer.negate != pred.negate
-                }) {
+                } else if relation == Some(false) {
                     self.trace_inner(&if_false)
                 } else {
-                    let if_true = self.trace_inner(&if_true)?;
-                    let if_false = self.trace_inner(&if_false)?;
+                    let if_true = self.trace_select_branch(&if_true, predicate, !pred.negate)?;
+                    let if_false = self.trace_select_branch(&if_false, predicate, pred.negate)?;
                     match (if_true, if_false) {
                         (
                             CbufHandleTrace::Origin {
@@ -219,6 +425,15 @@ impl CbufOriginTracer<'_> {
                             origin: true_origin,
                             deferred: true_deferred || false_deferred,
                         }),
+                        (CbufHandleTrace::Origin { origin, .. }, CbufHandleTrace::Uninitialized(reg))
+                        | (CbufHandleTrace::Uninitialized(reg), CbufHandleTrace::Origin { origin, .. })
+                            if def.dest_reg == Some(reg) && self.consumer_pred.is_none() =>
+                        {
+                            Some(CbufHandleTrace::Origin { origin, deferred: true })
+                        }
+                        (CbufHandleTrace::Uninitialized(a), CbufHandleTrace::Uninitialized(b)) if a == b => {
+                            Some(CbufHandleTrace::Uninitialized(a))
+                        }
                         (CbufHandleTrace::Cycle, CbufHandleTrace::Cycle) => {
                             Some(CbufHandleTrace::Cycle)
                         }
@@ -258,6 +473,7 @@ impl CbufOriginTracer<'_> {
                             deferred = true;
                             saw_cycle = true;
                         }
+                        CbufHandleTrace::Uninitialized(_) => return None,
                     }
                 }
                 origin.map_or_else(
@@ -334,6 +550,10 @@ impl CbufOriginTracer<'_> {
     }
 }
 
+fn is_zero_value(value: &Value) -> bool {
+    matches!(value, Value::Zero | Value::ImmU32(0))
+}
+
 pub(crate) fn resolve_cbuf_handle_origin(
     value: &Value,
     consumer_pred: Option<Predicate>,
@@ -343,8 +563,11 @@ pub(crate) fn resolve_cbuf_handle_origin(
         local: None,
         defs: Some(defs),
         consumer_pred,
+        consumer_pred_def: None,
+        select_pred_defs: None,
         allow_back_edge_placeholder: false,
         visiting: HashSet::new(),
+        predicate_assumptions: HashMap::new(),
     }
     .trace_root(value)
     .map(|(origin, _)| origin)
@@ -432,6 +655,7 @@ pub struct Translator {
     carry_source: Option<Value>,
     carry_guard: Option<(Predicate, Option<ValueId>)>,
     pending_bindless_origin_checks: Vec<PendingBindlessOriginCheck>,
+    select_pred_defs: HashMap<ValueId, ValueId>,
     pub finished: bool,
     pub unimplemented_count: u32,
     pub bindless_or_partners: HashMap<u32, u32>,
@@ -490,6 +714,7 @@ impl Translator {
             carry_source: None,
             carry_guard: None,
             pending_bindless_origin_checks: Vec::new(),
+            select_pred_defs: HashMap::new(),
             finished: false,
             unimplemented_count: 0,
             bindless_or_partners: HashMap::new(),
@@ -651,8 +876,12 @@ impl Translator {
             local: Some(&self.program),
             defs,
             consumer_pred,
+            consumer_pred_def: consumer_pred
+                .and_then(|consumer| self.pred_state.get(&consumer.idx).copied()),
+            select_pred_defs: Some(&self.select_pred_defs),
             allow_back_edge_placeholder: true,
             visiting: HashSet::new(),
+            predicate_assumptions: HashMap::new(),
         }
         .trace_root(value)
     }
@@ -694,6 +923,10 @@ impl Translator {
         std::mem::take(&mut self.pending_bindless_origin_checks)
     }
 
+    pub(crate) fn select_predicate_defs(&self) -> &HashMap<ValueId, ValueId> {
+        &self.select_pred_defs
+    }
+
     pub fn snapshot_reg_state(&self) -> HashMap<u8, Value> {
         self.reg_state.clone()
     }
@@ -716,6 +949,9 @@ impl Translator {
                 Some(r),
             );
             self.reg_state.insert(r, Value::Inst(id));
+            if let Some(def) = self.pred_state.get(&pred.idx).copied() {
+                self.select_pred_defs.insert(id, def);
+            }
             id
         } else {
             let id = self.program.emit_pred(op, Some(r), pred);
@@ -748,6 +984,9 @@ impl Translator {
                 Some(r),
             );
             self.reg_state.insert(r, Value::Inst(selected));
+            if let Some(def) = self.pred_state.get(&pred.idx).copied() {
+                self.select_pred_defs.insert(selected, def);
+            }
             (selected, instruction_index)
         } else {
             if r != RZ {
@@ -845,6 +1084,7 @@ impl Translator {
                         ImageDimension::D3 => Some(
                             volume.expect("3D compute texture sample must have a W coordinate"),
                         ),
+                        ImageDimension::Cube => cube,
                         _ => None,
                     },
                     implicit_lod: form.implicit_lod,
@@ -1556,6 +1796,33 @@ impl Translator {
         })
     }
 
+    fn emit_lea_hi_offset(&mut self, lo_reg: u8, hi_reg: u8, scale: u32) -> Value {
+        if scale == 0 {
+            return self.read_reg(hi_reg);
+        }
+        let lo = self.read_reg(lo_reg);
+        let lo_part = self.emit_value(Op::IShr {
+            a: lo,
+            b: Value::ImmU32(32 - scale),
+            signed: false,
+        });
+        if hi_reg == RZ {
+            return lo_part;
+        }
+        let hi = self.read_reg(hi_reg);
+        let hi_part = self.emit_value(Op::IShl {
+            a: hi,
+            b: Value::ImmU32(scale),
+        });
+        self.emit_value(Op::ILop {
+            a: lo_part,
+            b: hi_part,
+            op: LogicOp::Or,
+            not_a: false,
+            not_b: false,
+        })
+    }
+
     fn emit_iadd_value(&mut self, a: Value, b: Value, neg_a: bool, neg_b: bool) -> Value {
         self.emit_value(Op::IAdd { a, b, neg_a, neg_b })
     }
@@ -1587,8 +1854,17 @@ impl Translator {
         ((raw >> 37) & 3) == 0 && ((raw >> 47) & 1) == 0 && ((raw >> 48) & 3) == 0
     }
 
+    fn shf_imm_shift(raw: u64) -> u32 {
+        let shift = imm20(raw) as u32;
+        if ((raw >> 50) & 1) != 0 {
+            shift & 31
+        } else {
+            shift.min(32)
+        }
+    }
+
     fn emit_shf_l_imm(&mut self, raw: u64, pred: Option<Predicate>) -> bool {
-        if !Self::shf_common_supported(raw) || ((raw >> 50) & 1) != 0 {
+        if !Self::shf_common_supported(raw) {
             return false;
         }
 
@@ -1597,7 +1873,7 @@ impl Translator {
         let high_reg = reg_c(raw);
         let low = self.read_reg(low_reg);
         let high = self.read_reg(high_reg);
-        let shift = (imm20(raw) as u32).min(32);
+        let shift = Self::shf_imm_shift(raw);
 
         let op = match shift {
             0 => Op::Mov(high),
@@ -1647,12 +1923,12 @@ impl Translator {
     }
 
     fn emit_shf_r_imm(&mut self, raw: u64, pred: Option<Predicate>) -> bool {
-        if !Self::shf_common_supported(raw) || ((raw >> 50) & 1) != 0 || reg_c(raw) != RZ {
+        if !Self::shf_common_supported(raw) || reg_c(raw) != RZ {
             return false;
         }
 
         let low = self.read_reg(reg_a(raw));
-        let shift = (imm20(raw) as u32).min(32);
+        let shift = Self::shf_imm_shift(raw);
         let op = match shift {
             0 => Op::Mov(low),
             32 => Op::Mov(Value::Zero),
@@ -2214,8 +2490,6 @@ impl Translator {
     }
 
     fn emit_i2i(&mut self, raw: u64, src: Value, pred: Option<Predicate>) -> bool {
-        const WORD: u8 = 2;
-
         let writes_cc = i2i_cc(raw);
         if writes_cc {
             self.cc_source = None;
@@ -2224,16 +2498,27 @@ impl Translator {
         let dst_signed = i2i_dst_signed(raw);
         let abs = i2i_abs(raw);
         let neg = i2i_neg(raw);
-        if i2i_src_format(raw) != WORD
-            || i2i_dst_format(raw) != WORD
-            || i2i_selector(raw) != 0
-            || src_signed != dst_signed
-            || i2i_sat(raw)
-            || ((abs || neg) && !src_signed)
-        {
+        let sat = i2i_sat(raw);
+        let format_bits = |format: u8| match format {
+            0 => Some(8u32),
+            1 => Some(16),
+            2 => Some(32),
+            _ => None,
+        };
+        let (Some(src_bits), Some(dst_bits)) =
+            (format_bits(i2i_src_format(raw)), format_bits(i2i_dst_format(raw)))
+        else {
+            return false;
+        };
+        let offset = u32::from(i2i_selector(raw)) * 8;
+        if offset + src_bits > 32 || ((abs || neg) && !src_signed) {
             return false;
         }
-        let mut value = src;
+        let mut value = if src_bits < 32 {
+            self.emit_bfe_value(src, offset, src_bits, src_signed)
+        } else {
+            src
+        };
         if abs {
             let sign = self.emit_value(Op::IShr {
                 a: value.clone(),
@@ -2252,8 +2537,38 @@ impl Translator {
         if neg {
             value = self.emit_ineg_value(value);
         }
+        if sat {
+            let dst_max = if dst_signed {
+                (1u64 << (dst_bits - 1)) - 1
+            } else {
+                (1u64 << dst_bits) - 1
+            } as u32;
+            let dst_min = if dst_signed { (1u32 << (dst_bits - 1)).wrapping_neg() } else { 0 };
+            let upper_needed = !(src_signed && dst_signed && dst_bits == 32)
+                && !(!src_signed && !dst_signed && dst_bits == 32);
+            if upper_needed {
+                value = self.emit_value(Op::IMinMaxPred {
+                    a: value,
+                    b: Value::ImmU32(dst_max),
+                    signed: src_signed,
+                    pred: PT,
+                    neg_pred: false,
+                });
+            }
+            if src_signed && !(dst_signed && dst_bits == 32) {
+                value = self.emit_value(Op::IMinMaxPred {
+                    a: value,
+                    b: Value::ImmU32(dst_min),
+                    signed: true,
+                    pred: PT,
+                    neg_pred: true,
+                });
+            }
+        } else if dst_bits < 32 {
+            value = self.emit_bfe_value(value, 0, dst_bits, dst_signed);
+        }
 
-        if writes_cc && pred.is_none() && !abs && !neg {
+        if writes_cc && pred.is_none() && !abs && !neg && !sat {
             self.cc_source = Some(value);
         }
 
@@ -3286,6 +3601,7 @@ impl Translator {
                         2 => ImageDimension::D2,
                         3 if form.bias_reg.is_none() => ImageDimension::D2Array,
                         4 => ImageDimension::D3,
+                        6 if form.dref_reg.is_none() => ImageDimension::Cube,
                         _ => {
                             self.program.emit_void(Op::Unimplemented {
                                 opcode: Opcode::TEX_b,
@@ -3412,10 +3728,9 @@ impl Translator {
                 let mask = ((raw >> 31) & 0xF) as u8;
                 if lod
                     || multisample
-                    || aoffi
                     || clamp
                     || sparse_pred != PT
-                    || !matches!(tex_type, 0 | 2 | 4)
+                    || !matches!(tex_type, 0 | 2 | 3 | 4)
                     || mask == 0
                 {
                     log::debug!(
@@ -3480,20 +3795,59 @@ impl Translator {
                 };
 
                 let coord = reg_a(raw);
-                let x = self.read_reg(coord);
-                let (dimension, y, z) = match tex_type {
-                    0 => (ImageDimension::D1, None, None),
+                let (dimension, x, y, z) = match tex_type {
+                    0 => (ImageDimension::D1, self.read_reg(coord), None, None),
                     2 => (
                         ImageDimension::D2,
+                        self.read_reg(coord),
                         Some(self.read_reg(coord.wrapping_add(1))),
                         None,
                     ),
+                    3 => (
+                        ImageDimension::D2Array,
+                        self.read_reg(coord.wrapping_add(1)),
+                        Some(self.read_reg(coord.wrapping_add(2))),
+                        Some(self.read_reg(coord)),
+                    ),
                     4 => (
                         ImageDimension::D3,
+                        self.read_reg(coord),
                         Some(self.read_reg(coord.wrapping_add(1))),
                         Some(self.read_reg(coord.wrapping_add(2))),
                     ),
                     _ => unreachable!(),
+                };
+                let (x, y, z) = if aoffi {
+                    let offset = self.read_reg(reg_b(raw).wrapping_add(u8::from(bindless)));
+                    let mut shifted = |value: Value, position: u32| {
+                        let delta = self.program.emit(
+                            Op::Bfe {
+                                a: offset,
+                                b: Value::ImmU32(position | (4 << 8)),
+                                signed: true,
+                            },
+                            None,
+                        );
+                        Value::Inst(self.program.emit(
+                            Op::IAdd {
+                                a: value,
+                                b: Value::Inst(delta),
+                                neg_a: false,
+                                neg_b: false,
+                            },
+                            None,
+                        ))
+                    };
+                    let x = shifted(x, 0);
+                    let y = y.map(|y| shifted(y, 4));
+                    let z = if dimension == ImageDimension::D3 {
+                        z.map(|z| shifted(z, 8))
+                    } else {
+                        z
+                    };
+                    (x, y, z)
+                } else {
+                    (x, y, z)
                 };
                 let mut dst = reg_dest(raw);
                 let mut fetches = Vec::new();
@@ -3505,7 +3859,10 @@ impl Translator {
                     let instruction_index = self.program.instructions.len();
                     self.write_reg(
                         dst,
-                        if self.stage == ShaderStage::Compute || !bindless {
+                        if self.stage == ShaderStage::Compute
+                            || !bindless
+                            || dimension == ImageDimension::D2Array
+                        {
                             Op::TexelFetchHandle {
                                 handle: handle_origin,
                                 dimension,
@@ -4089,12 +4446,11 @@ impl Translator {
                 } else {
                     (((raw >> 54) & 0x3) as u8, ((raw >> 56) & 0x3) as u8)
                 };
-                if (self.stage == ShaderStage::Compute && bindless)
-                    || mask == 0
+                if mask == 0
                     || !matches!(tex_type, 2 | 3)
                     || dc
                     || sparse_pred != PT
-                    || offset_type != 0
+                    || offset_type > 1
                 {
                     log::debug!(
                         "TLD4 unsupported form raw={:#018x} bindless={} stage={:?} type={} mask={:#x} dc={} sparse_pred={} offset={}",
@@ -4141,6 +4497,18 @@ impl Translator {
                         return false;
                     }
                     if let Some(partner) = origin.cross_binding_partner_id() {
+                        if self.stage == ShaderStage::Compute {
+                            log::debug!(
+                                "TLD4_b cross-buffer handle is unsupported raw={:#018x}",
+                                raw,
+                            );
+                            self.program.emit_void(Op::Unimplemented {
+                                opcode: Opcode::TLD4_b,
+                                raw,
+                            });
+                            self.unimplemented_count += 1;
+                            return false;
+                        }
                         self.bindless_or_partners
                             .insert(origin.texture_id(), partner);
                     }
@@ -4154,6 +4522,77 @@ impl Translator {
                 let array = arrayed.then(|| self.read_reg(coord));
                 let u = self.read_reg(coord.wrapping_add(u8::from(arrayed)));
                 let v = self.read_reg(coord.wrapping_add(1 + u8::from(arrayed)));
+                let (u, v) = if offset_type == 1 {
+                    let offset = self.read_reg(reg_b(raw).wrapping_add(u8::from(bindless)));
+                    let handle = crate::texture_handle_for_id(tex_id);
+                    let mut shifted = |value: Value, position: u32, component: u8| {
+                        let delta = self.program.emit(
+                            Op::Bfe {
+                                a: offset,
+                                b: Value::ImmU32(position | (6 << 8)),
+                                signed: true,
+                            },
+                            None,
+                        );
+                        let delta = self.program.emit(
+                            Op::I2F {
+                                src: Value::Inst(delta),
+                                signed: true,
+                                neg: false,
+                                abs: false,
+                                int_format: 2,
+                                selector: 0,
+                            },
+                            None,
+                        );
+                        let size = self.program.emit(
+                            Op::TextureQueryDimension {
+                                handle,
+                                lod: Value::Zero,
+                                component,
+                            },
+                            None,
+                        );
+                        let size = self.program.emit(
+                            Op::I2F {
+                                src: Value::Inst(size),
+                                signed: false,
+                                neg: false,
+                                abs: false,
+                                int_format: 2,
+                                selector: 0,
+                            },
+                            None,
+                        );
+                        let texel = self.program.emit(
+                            Op::MultiFunc {
+                                src: Value::Inst(size),
+                                func: MufuFunc::Rcp,
+                                mods: FMods::default(),
+                            },
+                            None,
+                        );
+                        let step = self.program.emit(
+                            Op::FMul {
+                                a: Value::Inst(delta),
+                                b: Value::Inst(texel),
+                                mods: FMods::default(),
+                            },
+                            None,
+                        );
+                        Value::Inst(self.program.emit(
+                            Op::FAdd {
+                                a: value,
+                                b: Value::Inst(step),
+                                mods: FMods::default(),
+                            },
+                            None,
+                        ))
+                    };
+                    (shifted(u, 0, 0), shifted(v, 8, 1))
+                } else {
+                    (u, v)
+                };
                 let mut dst = reg_dest(raw);
                 for lane in 0..4u8 {
                     if (mask >> lane) & 1 == 0 {
@@ -4661,7 +5100,17 @@ impl Translator {
             Opcode::ATOMS if self.stage == ShaderStage::Compute => {
                 let size = ((raw >> 28) & 0x3) as u8;
                 let atomic_op = ((raw >> 52) & 0xf) as u8;
-                if size != 0 || atomic_op != 6 {
+                let op = match (size, atomic_op) {
+                    (0 | 1, 0) => Some(ImageAtomicOp::Add),
+                    (0, 1) => Some(ImageAtomicOp::Min),
+                    (0, 2) => Some(ImageAtomicOp::Max),
+                    (0 | 1, 5) => Some(ImageAtomicOp::And),
+                    (0 | 1, 6) => Some(ImageAtomicOp::Or),
+                    (0 | 1, 7) => Some(ImageAtomicOp::Xor),
+                    (0 | 1, 8) => Some(ImageAtomicOp::Exchange),
+                    _ => None,
+                };
+                let Some(op) = op else {
                     log::debug!(
                         "ATOMS unsupported form raw={:#018x} size={} op={}",
                         raw,
@@ -4674,20 +5123,12 @@ impl Translator {
                     });
                     self.unimplemented_count += 1;
                     return false;
-                }
+                };
 
                 let dest = reg_dest(raw);
                 let addr = self.shared_atomic_addr(raw);
                 let value = self.read_reg(reg_b(raw));
-                self.write_side_effecting_reg(
-                    dest,
-                    Op::SharedAtomic {
-                        addr,
-                        value,
-                        op: ImageAtomicOp::Or,
-                    },
-                    pred,
-                );
+                self.write_side_effecting_reg(dest, Op::SharedAtomic { addr, value, op }, pred);
             }
 
             Opcode::BAR if self.stage == ShaderStage::Compute => {
@@ -4744,7 +5185,11 @@ impl Translator {
                     6 => Some(ImageAtomicType::Sd32),
                     _ => None,
                 };
-                if surface_type != 1 || data_type.is_none() || clamp != 0 || op.is_none() {
+                if !matches!(surface_type, 1 | 3)
+                    || data_type.is_none()
+                    || clamp != 0
+                    || op.is_none()
+                {
                     log::debug!(
                         "SUATOM unsupported form raw={:#018x} type={} size={} clamp={} op={}",
                         raw,
@@ -4792,9 +5237,13 @@ impl Translator {
                     dest,
                     Op::ImageAtomic {
                         handle,
-                        dimension: ImageDimension::Buffer,
+                        dimension: if surface_type == 3 {
+                            ImageDimension::D2
+                        } else {
+                            ImageDimension::Buffer
+                        },
                         x: self.read_reg(coord),
-                        y: None,
+                        y: (surface_type == 3).then(|| self.read_reg(coord.wrapping_add(1))),
                         z: None,
                         value: self.read_reg(operand),
                         op: op.unwrap(),
@@ -4814,6 +5263,171 @@ impl Translator {
                 }
             }
 
+            Opcode::SULD if self.stage == ShaderStage::Compute => {
+                let is_bound = ((raw >> 51) & 1) != 0;
+                let typed = ((raw >> 52) & 1) != 0;
+                let surface_type = ((raw >> 33) & 0x7) as u8;
+                let cache = ((raw >> 24) & 0x3) as u8;
+                let size_or_swizzle = ((raw >> 20) & 0xf) as u8;
+                let clamp = ((raw >> 49) & 0x3) as u8;
+                let Some(dimension) = (match surface_type {
+                    0 => Some(ImageDimension::D1),
+                    1 => Some(ImageDimension::Buffer),
+                    3 => Some(ImageDimension::D2),
+                    4 => Some(ImageDimension::D2Array),
+                    5 => Some(ImageDimension::D3),
+                    _ => None,
+                }) else {
+                    log::debug!(
+                        "SULD unsupported surface type raw={:#018x} type={}",
+                        raw,
+                        surface_type,
+                    );
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::SULD,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                };
+                let components: Vec<u8> = if typed {
+                    if size_or_swizzle & 0x7 == 4 { vec![0] } else { Vec::new() }
+                } else {
+                    (0..4u8).filter(|component| (size_or_swizzle >> component) & 1 != 0).collect()
+                };
+                if components.is_empty() || clamp != 0 || !matches!(cache, 0 | 1) {
+                    log::debug!(
+                        "SULD unsupported form raw={:#018x} typed={} size_or_swizzle={:#x} clamp={} cache={}",
+                        raw,
+                        typed,
+                        size_or_swizzle,
+                        clamp,
+                        cache,
+                    );
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::SULD,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+
+                let (handle, pending_handle) = if is_bound {
+                    (TextureHandleOrigin::Bound {
+                        cbuf_word_offset: ((raw >> 36) & 0x1fff) as u32,
+                    }, None)
+                } else {
+                    let handle_reg = ((raw >> 39) & 0xff) as u8;
+                    let handle_value = self.read_reg(handle_reg);
+                    let Some((origin, deferred)) =
+                        self.trace_cbuf_handle_origin(&handle_value, pred, defs)
+                    else {
+                        log::debug!("SULD handle not traceable to LDC raw={:#018x}", raw);
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::SULD,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    };
+                    (origin.as_texture_handle(), deferred.then_some(handle_value))
+                };
+
+                let coord = reg_a(raw);
+                let x = self.read_reg(coord);
+                let (y, z) = match dimension {
+                    ImageDimension::D1 | ImageDimension::Buffer => (None, None),
+                    ImageDimension::D2 => (Some(self.read_reg(coord.wrapping_add(1))), None),
+                    ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube => (
+                        Some(self.read_reg(coord.wrapping_add(1))),
+                        Some(self.read_reg(coord.wrapping_add(2))),
+                    ),
+                };
+                let mut dst = reg_dest(raw);
+                let mut samples = Vec::new();
+                for component in components {
+                    let old_value = self.read_reg(dst);
+                    let instruction_index = self.program.instructions.len();
+                    self.write_reg(
+                        dst,
+                        Op::ImageRead {
+                            handle,
+                            dimension,
+                            x,
+                            y,
+                            z,
+                            component,
+                        },
+                        pred,
+                    );
+                    samples.push((instruction_index, old_value));
+                    dst = dst.wrapping_add(1);
+                }
+                if let Some(handle) = pending_handle {
+                    self.pending_bindless_origin_checks.push(PendingBindlessOriginCheck {
+                        opcode: Opcode::SULD, raw, handle, consumer_pred: pred, samples,
+                    });
+                }
+            }
+
+            Opcode::SURED if self.stage == ShaderStage::Compute => {
+                let is_bound = ((raw >> 51) & 1) != 0;
+                let surface_type = ((raw >> 33) & 0x7) as u8;
+                let op_and_size = ((raw >> 20) & 0xf) as u8;
+                let clamp = ((raw >> 49) & 0x3) as u8;
+                if is_bound || !matches!(surface_type, 1 | 3) || op_and_size != 0 || clamp != 0 {
+                    log::debug!("SURED unsupported form raw={:#018x}", raw);
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::SURED,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let handle_value = self.read_reg(((raw >> 39) & 0xff) as u8);
+                let Some((origin, deferred)) =
+                    self.trace_cbuf_handle_origin(&handle_value, pred, defs)
+                else {
+                    log::debug!("SURED handle not traceable to LDC raw={:#018x}", raw);
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::SURED,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                };
+                let coord = ((raw >> 8) & 0xff) as u8;
+                let operand = (raw & 0xff) as u8;
+                let (_, instruction_index) = self.write_side_effecting_reg(
+                    RZ,
+                    Op::ImageAtomic {
+                        handle: origin.as_texture_handle(),
+                        dimension: if surface_type == 3 {
+                            ImageDimension::D2
+                        } else {
+                            ImageDimension::Buffer
+                        },
+                        x: self.read_reg(coord),
+                        y: (surface_type == 3).then(|| self.read_reg(coord.wrapping_add(1))),
+                        z: None,
+                        value: self.read_reg(operand),
+                        op: ImageAtomicOp::Add,
+                        data_type: ImageAtomicType::U32,
+                    },
+                    pred,
+                );
+                if deferred {
+                    self.pending_bindless_origin_checks
+                        .push(PendingBindlessOriginCheck {
+                            opcode: Opcode::SUATOM,
+                            raw,
+                            handle: handle_value,
+                            consumer_pred: pred,
+                            samples: vec![(instruction_index, Value::Zero)],
+                        });
+                }
+            }
+
             Opcode::SUST if self.stage == ShaderStage::Compute => {
                 let is_bound = ((raw >> 51) & 1) != 0;
                 let typed = ((raw >> 52) & 1) != 0;
@@ -4825,6 +5439,7 @@ impl Translator {
                     0 => Some(ImageDimension::D1),
                     1 => Some(ImageDimension::Buffer),
                     3 => Some(ImageDimension::D2),
+                    4 => Some(ImageDimension::D2Array),
                     5 => Some(ImageDimension::D3),
                     _ => None,
                 }) else {
@@ -5304,9 +5919,9 @@ impl Translator {
             Opcode::FLO_reg => {
                 let tilde = ((raw >> 40) & 0x1) != 0;
                 let shift = ((raw >> 41) & 0x1) != 0;
+                let signed = ((raw >> 48) & 0x1) != 0;
                 let unsupported_modifiers = ((raw >> 47) & 0x1) != 0
-                    || ((raw >> 48) & 0x1) != 0
-                    || ((tilde || shift) && new_fs_ops_disabled());
+                    || ((tilde || shift || signed) && new_fs_ops_disabled());
                 if unsupported_modifiers {
                     self.program.emit_void(Op::Unimplemented {
                         opcode: Opcode::FLO_reg,
@@ -5323,6 +5938,20 @@ impl Translator {
                         op: LogicOp::PassB,
                         not_a: false,
                         not_b: true,
+                    });
+                }
+                if signed {
+                    let sign = self.emit_value(Op::IShr {
+                        a: source.clone(),
+                        b: Value::ImmU32(31),
+                        signed: true,
+                    });
+                    source = self.emit_value(Op::ILop {
+                        a: source,
+                        b: sign,
+                        op: LogicOp::Xor,
+                        not_a: false,
+                        not_b: false,
                     });
                 }
                 if shift {
@@ -5413,32 +6042,36 @@ impl Translator {
                 let scale = ((raw >> 28) & 0x1F) as u32;
                 let rc = ((raw >> 39) & 0xFF) as u8;
                 let base = self.read_reg(reg_b(raw));
-                let shifted = if scale == 0 {
-                    self.read_reg(rc)
-                } else {
-                    let lo = self.read_reg(reg_a(raw));
-                    let lo_part = self.emit_value(Op::IShr {
-                        a: lo,
-                        b: Value::ImmU32(32 - scale),
-                        signed: false,
+                let shifted = self.emit_lea_hi_offset(reg_a(raw), rc, scale);
+                self.write_reg(
+                    reg_dest(raw),
+                    Op::IAdd {
+                        a: base,
+                        b: shifted,
+                        neg_a: false,
+                        neg_b: false,
+                    },
+                    pred,
+                );
+            }
+            Opcode::LEA_hi_cbuf => {
+                let neg = ((raw >> 56) & 1) != 0;
+                let x = ((raw >> 57) & 1) != 0;
+                let cc = ((raw >> 47) & 1) != 0;
+                let src_pred = ((raw >> 48) & 0x7) as u8;
+                if neg || x || cc || src_pred != PT || new_fs_ops_disabled() {
+                    log::debug!("LEA_hi_cbuf unsupported form raw={:#018x}", raw);
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::LEA_hi_cbuf,
+                        raw,
                     });
-                    if rc == RZ {
-                        lo_part
-                    } else {
-                        let hi = self.read_reg(rc);
-                        let hi_part = self.emit_value(Op::IShl {
-                            a: hi,
-                            b: Value::ImmU32(scale),
-                        });
-                        self.emit_value(Op::ILop {
-                            a: lo_part,
-                            b: hi_part,
-                            op: LogicOp::Or,
-                            not_a: false,
-                            not_b: false,
-                        })
-                    }
-                };
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let scale = ((raw >> 51) & 0x1F) as u32;
+                let rc = ((raw >> 39) & 0xFF) as u8;
+                let base = Value::Inst(self.load_cbuf(raw));
+                let shifted = self.emit_lea_hi_offset(reg_a(raw), rc, scale);
                 self.write_reg(
                     reg_dest(raw),
                     Op::IAdd {
@@ -7516,10 +8149,8 @@ mod tests {
             left_imm | (1 << 47),
             left_imm | (1 << 48),
             left_imm | (2 << 37),
-            left_imm | (1 << 50),
             left_reg & !(1 << 50),
             (left_reg & !(0xff << 8)) | (1 << 8),
-            right_imm | (1 << 50),
             (right_imm & !(0xff << 39)) | (1 << 39),
         ] {
             let mut t = Translator::new();
@@ -7866,12 +8497,11 @@ mod tests {
         let mut unsupported = vec![
             base | (1 << 55),
             base | (1 << 50),
-            base | (1 << 35),
             base | (1 << 54),
             base & !(0x7 << 51),
             base & !(0xF << 31),
         ];
-        for tex_type in [1u64, 3, 5, 6, 7] {
+        for tex_type in [1u64, 5, 6, 7] {
             unsupported.push((base & !(0x7 << 28)) | (tex_type << 28));
         }
         for raw in unsupported {
@@ -7963,6 +8593,103 @@ mod tests {
                 } if actual == component as u8
             ));
         }
+    }
+
+    #[test]
+    fn shf_right_immediate_accepts_wrap_flag() {
+        let mut t = Translator::new_compute();
+        assert!(t.translate(0x38fc_7f80_0047_1011));
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::IShr { b: Value::ImmU32(4), signed: false, .. }
+        )));
+    }
+
+    #[test]
+    fn i2i_saturates_word_to_unsigned_halfword() {
+        let mut t = Translator::new_compute();
+        assert!(t.translate(0x5ce4_0000_0037_0900));
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::IMinMaxPred { b: Value::ImmU32(0xffff), signed: false, neg_pred: false, .. }
+        )));
+        assert_eq!(t.unimplemented_count, 0);
+    }
+
+    #[test]
+    fn lea_hi_cbuf_adds_shifted_low_register_to_constant() {
+        let mut t = Translator::new_compute();
+        assert!(t.translate(0x1887_7f84_0120_0e10));
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::IShr { b: Value::ImmU32(16), signed: false, .. }
+        )));
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::IAdd { a: Value::Inst(_), b: Value::Inst(_), neg_a: false, neg_b: false }
+        )));
+        assert_eq!(t.program.instructions.last().and_then(|inst| inst.dest_reg), Some(16));
+    }
+
+    #[test]
+    fn bindless_tld_on_2d_array_reads_layer_from_first_coordinate() {
+        let mut t = Translator::new_fragment();
+        for raw in [
+            0x4c98_0788_05e7_002f,
+            0x4c47_0208_15e7_2f2f,
+            0xdd38_0000_b2f7_1010,
+        ] {
+            assert!(t.translate(raw), "raw={raw:#018x}");
+        }
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::TexelFetchHandle {
+                handle: TextureHandleOrigin::Bindless {
+                    cbuf_binding: 2,
+                    cbuf_word_offset: 0x5e,
+                    cbuf_secondary_word_offset: Some(0x15e),
+                },
+                dimension: ImageDimension::D2Array,
+                x: Value::GprIn(17),
+                y: Some(Value::GprIn(18)),
+                z: Some(Value::GprIn(16)),
+                component: 0,
+            }
+        )));
+    }
+
+    #[test]
+    fn bindless_handle_traces_through_zero_register_add() {
+        let mut t = Translator::new_compute();
+        for raw in [
+            0x4c98_0788_05c1_0003,
+            0x4c47_0208_15c1_0303,
+            0x5c10_0000_0031_ff03,
+            0xdd38_0001_0031_0202,
+        ] {
+            assert!(t.translate(raw), "raw={raw:#018x}");
+        }
+        let fetch = t
+            .program
+            .instructions
+            .iter()
+            .find(|inst| matches!(inst.op, Op::TexelFetchHandle { .. } | Op::TexelFetch { .. }))
+            .expect("bindless fetch");
+        assert!(
+            matches!(
+                fetch.op,
+                Op::TexelFetchHandle {
+                    handle: TextureHandleOrigin::Bindless {
+                        cbuf_binding: 2,
+                        cbuf_word_offset: 0x5c,
+                        cbuf_secondary_word_offset: Some(0x15c),
+                    },
+                    ..
+                }
+            ),
+            "{:?}",
+            fetch.op
+        );
     }
 
     #[test]
@@ -8355,7 +9082,7 @@ mod tests {
     fn tld4_unsupported_forms_fail_closed_without_zero_results() {
         let direct_base = tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, PT);
         let unsupported = [
-            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 1, false, PT),
+            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 2, false, PT),
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, true, PT),
             tld4_raw(false, 8, 4, 0x24, 4, 0xf, 0, 0, false, PT),
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, 6),
@@ -8474,6 +9201,183 @@ mod tests {
                     ..
                 }) if *failed_raw == raw
             ));
+        }
+    }
+
+    #[test]
+    fn bindless_tld_handle_guarded_by_an_equivalent_compare_resolves() {
+        let mut t = Translator::new_compute();
+        assert!(t.translate(0x4b62_038c_0037_0227));
+        assert!(t.translate(0x4c98_0788_05a4_0003));
+        assert!(t.translate(0x4c47_0208_15a4_0305));
+        assert!(t.translate(0x4b62_038c_0037_0237));
+        assert!(t.translate(0xdd38_0000_8056_0b0b));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::TexelFetchHandle {
+                handle: TextureHandleOrigin::Bindless {
+                    cbuf_binding: 2,
+                    cbuf_word_offset: 0x5a,
+                    cbuf_secondary_word_offset: Some(0x15a),
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn bindless_tld_handle_guarded_by_a_different_compare_stays_unresolved() {
+        for second_compare in [0x4b62_038c_0047_0237u64, 0x4b62_038c_0037_0337] {
+            let mut t = Translator::new_compute();
+            assert!(t.translate(0x4b62_038c_0037_0227));
+            assert!(t.translate(0x4c98_0788_05a4_0003));
+            assert!(t.translate(0x4c47_0208_15a4_0305));
+            assert!(t.translate(second_compare));
+            assert!(!t.translate(0xdd38_0000_8056_0b0b), "{second_compare:#x}");
+            assert_eq!(t.unimplemented_count, 1, "{second_compare:#x}");
+        }
+    }
+
+    #[test]
+    fn bindless_tld_with_texel_offset_adds_signed_nibbles_to_coordinates() {
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(0x4c98_0788_05a7_000a));
+        assert!(t.translate(0xdd38_0008_a0a7_0800));
+        assert_eq!(t.unimplemented_count, 0);
+        let offsets: Vec<u32> = t
+            .program
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::Bfe {
+                    a: Value::GprIn(11),
+                    b: Value::ImmU32(field),
+                    signed: true,
+                } => Some(field),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offsets, vec![4 << 8, 4 | (4 << 8)]);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::TexelFetch {
+                x: Value::Inst(_),
+                y: Some(Value::Inst(_)),
+                z: None,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn compute_suatom_and_sured_accept_2d_surfaces() {
+        for (raw, expected_op, expected_type, value_reg) in [
+            (
+                0xea70_0386_0027_0001u64,
+                ImageAtomicOp::Add,
+                ImageAtomicType::Sd32,
+                2,
+            ),
+            (
+                0xeb50_0386_0007_0002,
+                ImageAtomicOp::Add,
+                ImageAtomicType::U32,
+                2,
+            ),
+        ] {
+            let mut t = Translator::new_compute();
+            assert!(t.translate(0x4c98_0788_0487_0007));
+            assert!(t.translate(raw), "raw={raw:#018x}");
+            assert_eq!(t.unimplemented_count, 0, "raw={raw:#018x}");
+            assert!(
+                t.program.instructions.iter().any(|inst| matches!(
+                    inst.op,
+                    Op::ImageAtomic {
+                        handle: TextureHandleOrigin::Bindless {
+                            cbuf_binding: 2,
+                            cbuf_word_offset: 0x48,
+                            cbuf_secondary_word_offset: None,
+                        },
+                        dimension: ImageDimension::D2,
+                        x: Value::GprIn(0),
+                        y: Some(Value::GprIn(1)),
+                        z: None,
+                        value: Value::GprIn(reg),
+                        op,
+                        data_type,
+                    } if reg == value_reg && op == expected_op && data_type == expected_type
+                )),
+                "raw={raw:#018x}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_typed_bindless_suld_buffer_emits_image_read() {
+        let raw = (0xeb10_0482_0048_0305u64 & !(0xff << 39) & !(0xf << 16))
+            | (11 << 39)
+            | (u64::from(PT) << 16);
+        let mut t = Translator::new_compute();
+        assert!(t.translate(0x4c98_0788_0487_000b));
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(matches!(
+            t.program.instructions.last(),
+            Some(Inst {
+                op: Op::ImageRead {
+                    handle: TextureHandleOrigin::Bindless {
+                        cbuf_binding: 2,
+                        cbuf_word_offset: 0x48,
+                        cbuf_secondary_word_offset: None,
+                    },
+                    dimension: ImageDimension::Buffer,
+                    x: Value::GprIn(3),
+                    y: None,
+                    z: None,
+                    component: 0,
+                },
+                result: Some(_),
+                dest_reg: Some(5),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compute_untyped_suld_swizzle_reads_consecutive_components() {
+        let raw = (0xeb00_0482_0057_0305u64 & !(0xff << 39)) | (11 << 39);
+        let mut t = Translator::new_compute();
+        assert!(t.translate(0x4c98_0788_0487_000b));
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        let reads: Vec<(u8, Option<u8>)> = t
+            .program
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::ImageRead {
+                    dimension: ImageDimension::Buffer,
+                    x: Value::GprIn(3),
+                    y: None,
+                    z: None,
+                    component,
+                    ..
+                } => Some((component, inst.dest_reg)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![(0, Some(5)), (2, Some(6))]);
+    }
+
+    #[test]
+    fn compute_suld_rejects_typed_sizes_other_than_b32() {
+        for size in [0u64, 1, 2, 3, 5, 6] {
+            let raw = (0xeb10_0482_0048_0305u64 & !(0x7 << 20)) | (size << 20);
+            let mut t = Translator::new_compute();
+            assert!(t.translate(0x4c98_0788_0487_0009));
+            assert!(!t.translate(raw), "size={size}");
+            assert_eq!(t.unimplemented_count, 1, "size={size}");
         }
     }
 
@@ -8932,9 +9836,20 @@ mod tests {
     }
 
     #[test]
+    fn flo_reg_signed_search_flips_negative_inputs() {
+        let mut t = Translator::new_compute();
+        assert!(t.translate(0x5c31_0000_0017_0003));
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::IShr { b: Value::ImmU32(31), signed: true, .. }
+        )));
+        assert!(t.program.instructions.iter().any(|inst| matches!(inst.op, Op::FindUMsb { .. })));
+    }
+
+    #[test]
     fn flo_reg_unsupported_modifiers_fail_closed() {
         let base = 0x5c30_0000_0017_0003u64;
-        for bit in [47, 48] {
+        for bit in [47] {
             let raw = base | (1u64 << bit);
             assert_eq!(
                 decode_one(raw).map(|decoded| decoded.opcode),
@@ -10448,11 +11363,13 @@ mod tests {
     }
 
     #[test]
-    fn atoms_non_or_or_non_u32_forms_fail_closed() {
+    fn atoms_signed_min_wide_and_increment_forms_fail_closed() {
         const CAPTURED: u64 = 0xec60_0000_0081_ffff;
+        let with_op = |op: u64| (CAPTURED & !(0xfu64 << 52)) | (op << 52);
         for raw in [
-            (CAPTURED & !(0xfu64 << 52)) | (5u64 << 52),
-            CAPTURED | (1u64 << 28),
+            with_op(1) | (1u64 << 28),
+            CAPTURED | (2u64 << 28),
+            with_op(3),
         ] {
             let mut t = Translator::new_compute();
             assert!(!t.translate(raw));
@@ -10464,6 +11381,24 @@ mod tests {
                     ..
                 })
             ));
+        }
+    }
+
+    #[test]
+    fn atoms_add_and_logic_ops_lower_to_shared_atomics() {
+        const CAPTURED: u64 = 0xec60_0000_0081_ffff;
+        for (op_bits, expected) in [
+            (0u64, ImageAtomicOp::Add),
+            (5, ImageAtomicOp::And),
+            (7, ImageAtomicOp::Xor),
+        ] {
+            let raw = (CAPTURED & !(0xfu64 << 52)) | (op_bits << 52);
+            let mut t = Translator::new_compute();
+            assert!(t.translate(raw), "raw={raw:#018x}");
+            assert!(t.program.instructions.iter().any(|inst| matches!(
+                inst.op,
+                Op::SharedAtomic { op, .. } if op == expected
+            )));
         }
     }
 
@@ -10762,13 +11697,10 @@ mod tests {
     }
 
     #[test]
-    fn i2i_unproven_formats_selector_sat_and_unsigned_modifiers_fail_closed() {
+    fn i2i_word_selector_and_unsigned_modifiers_fail_closed() {
         const CAPTURED: u64 = 0x5ce2_0000_0057_3a04;
         for raw in [
             CAPTURED | (1u64 << 41),
-            (CAPTURED & !(3u64 << 10)) | (1u64 << 10),
-            CAPTURED & !(3u64 << 8),
-            CAPTURED | (1u64 << 50),
             CAPTURED & !((1u64 << 12) | (1u64 << 13)),
         ] {
             let mut t = Translator::new();
@@ -10781,6 +11713,20 @@ mod tests {
                     raw: actual,
                 }) if *actual == raw
             ));
+        }
+    }
+
+    #[test]
+    fn i2i_narrow_formats_and_saturation_translate() {
+        const CAPTURED: u64 = 0x5ce2_0000_0057_3a04;
+        for raw in [
+            (CAPTURED & !(3u64 << 10)) | (1u64 << 10),
+            CAPTURED & !(3u64 << 8),
+            CAPTURED | (1u64 << 50),
+        ] {
+            let mut t = Translator::new();
+            assert!(t.translate(raw), "raw={raw:#018x}");
+            assert_eq!(t.unimplemented_count, 0, "raw={raw:#018x}");
         }
     }
 

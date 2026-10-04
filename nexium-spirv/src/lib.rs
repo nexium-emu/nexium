@@ -1476,10 +1476,7 @@ impl Emitter {
                 StorageClass::StorageBuffer,
             )
         } else {
-            let words_id = self.b.id();
-            let words = self.b.type_runtime_array_id(Some(words_id), self.u32_t);
-            self.b
-                .decorate(words, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+            let words = self.b.type_runtime_array(self.u32_t);
             let structure_id = self.b.id();
             let structure = self.b.type_struct_id(Some(structure_id), [words]);
             self.b.decorate(structure, Decoration::BufferBlock, []);
@@ -1983,12 +1980,23 @@ impl Emitter {
         if let Some(v) = self.layer_var {
             return v;
         }
-        self.b.capability(Capability::ShaderLayer);
-        let v = self
-            .b
-            .variable(self.ptr_output_u32, None, StorageClass::Output, None);
+        let (pointer, storage) = if self.stage == Stage::Fragment {
+            self.b.capability(Capability::Geometry);
+            (self.ptr_input_u32, StorageClass::Input)
+        } else {
+            self.b.capability(if self.stage == Stage::Geometry {
+                Capability::Geometry
+            } else {
+                Capability::ShaderLayer
+            });
+            (self.ptr_output_u32, StorageClass::Output)
+        };
+        let v = self.b.variable(pointer, None, storage, None);
         self.b
             .decorate(v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Layer)]);
+        if self.stage == Stage::Fragment {
+            self.b.decorate(v, Decoration::Flat, []);
+        }
         self.interface.push(v);
         self.layer_var = Some(v);
         v
@@ -2551,6 +2559,9 @@ impl Emitter {
     }
 
     fn system_attr_var_id(&mut self, slot: u32) -> Option<Word> {
+        if self.stage == Stage::Fragment && slot == 0x64 {
+            return Some(self.layer_var_id());
+        }
         if !matches!(self.stage, Stage::Vertex) {
             return None;
         }
@@ -3271,10 +3282,19 @@ impl Emitter {
                         });
                     }
                 }
-                ComputeResourceKind::StorageImage => {
-                    self.b
-                        .capability(Capability::StorageImageWriteWithoutFormat);
-                }
+                ComputeResourceKind::StorageImage => match resource.texel_format {
+                    Some(format) => {
+                        if format.supports_storage_atomics() {
+                            self.ptr_image_u32.get_or_insert_with(|| {
+                                self.b.type_pointer(None, StorageClass::Image, self.u32_t)
+                            });
+                        }
+                    }
+                    None => {
+                        self.b
+                            .capability(Capability::StorageImageWriteWithoutFormat);
+                    }
+                },
                 ComputeResourceKind::CombinedSampledImage | ComputeResourceKind::SampledImage => {}
             }
             let sampled = if matches!(
@@ -3290,6 +3310,9 @@ impl Emitter {
                     .texel_format
                     .expect("validated storage texel resource format")
                     .storage_image_format(),
+                ComputeResourceKind::StorageImage => resource
+                    .texel_format
+                    .map_or(ImageFormat::Unknown, |format| format.storage_image_format()),
                 _ => ImageFormat::Unknown,
             };
             let image_t =
@@ -3364,6 +3387,19 @@ impl Emitter {
             .find(|resource| {
                 resource.resource.handle == handle
                     && resource.resource.kind == ComputeResourceKind::StorageTexelBuffer
+            })
+            .expect("compute resource metadata was validated before emission")
+    }
+
+    fn compute_atomic_resource(&self, handle: TextureHandleOrigin) -> ComputeResourceVar {
+        self.compute_resource_vars
+            .iter()
+            .copied()
+            .find(|resource| {
+                resource.resource.handle == handle
+                    && (resource.resource.kind == ComputeResourceKind::StorageTexelBuffer
+                        || (resource.resource.kind == ComputeResourceKind::StorageImage
+                            && resource.resource.texel_format.is_some()))
             })
             .expect("compute resource metadata was validated before emission")
     }
@@ -3459,6 +3495,38 @@ impl Emitter {
                 None,
                 fetched,
                 [(component.min(3)) as u32],
+            )
+            .unwrap();
+        match resource.resource.numeric_type {
+            TextureNumericType::Float => component,
+            TextureNumericType::Uint | TextureNumericType::Sint => {
+                self.b.bitcast(self.f32_t, None, component).unwrap()
+            }
+        }
+    }
+
+    fn lower_compute_image_read(
+        &mut self,
+        handle: TextureHandleOrigin,
+        x: &IrValue,
+        y: Option<&IrValue>,
+        z: Option<&IrValue>,
+        component: u8,
+    ) -> Word {
+        let resource = self.compute_storage_texel_resource(handle);
+        let image = self.load_compute_image(resource);
+        let coords = self.compute_image_coords(resource.resource.dimension, x, y, z);
+        let texel = self
+            .b
+            .image_read(resource.vec4_t, None, image, coords, None, [])
+            .unwrap();
+        let component = self
+            .b
+            .composite_extract(
+                resource.scalar_t,
+                None,
+                texel,
+                [u32::from(component.min(3))],
             )
             .unwrap();
         match resource.resource.numeric_type {
@@ -3599,7 +3667,7 @@ impl Emitter {
         &mut self, tex_id: u32, u: &IrValue, v: &IrValue,
         array: Option<&IrValue>, component: u8, lane: u8,
     ) -> Word {
-        let handle = TextureHandleOrigin::Bound { cbuf_word_offset: tex_id };
+        let handle = nexium_shader::texture_handle_for_id(tex_id);
         let resource = self.compute_filtered_resource(handle);
         let image = self.load_compute_sampled_image(resource);
         let u = self.lower_value(u);
@@ -4239,12 +4307,13 @@ impl Emitter {
         inst: &IrInst,
         handle: TextureHandleOrigin,
         x: &IrValue,
+        y: Option<&IrValue>,
         value: &IrValue,
         op: ImageAtomicOp,
         data_type: ImageAtomicType,
     ) -> Word {
-        let resource = self.compute_storage_texel_resource(handle);
-        let coords = self.compute_image_coords(ImageDimension::Buffer, x, None, None);
+        let resource = self.compute_atomic_resource(handle);
+        let coords = self.compute_image_coords(resource.resource.dimension, x, y, None);
         let pointer = self
             .b
             .image_texel_pointer(
@@ -4662,6 +4731,14 @@ impl Emitter {
                 bits = self.b.select(self.u32_t, None, cond, bits, old).unwrap();
             }
             self.b.store(var, bits, None, []).unwrap();
+        } else if slot == 0x64 && matches!(self.stage, Stage::Vertex | Stage::Geometry) {
+            let layer = self.layer_var.expect("layer output must be preallocated");
+            let mut bits = self.b.bitcast(self.u32_t, None, val).unwrap();
+            if let Some(condition) = guard {
+                let old = self.b.load(self.u32_t, None, layer, None, []).unwrap();
+                bits = self.b.select(self.u32_t, None, condition, bits, old).unwrap();
+            }
+            self.b.store(layer, bits, None, []).unwrap();
         } else if slot == 0x6C && matches!(self.stage, Stage::Vertex) {
             let v = self.point_size_var_id();
             if guard.is_some() {
@@ -5275,6 +5352,8 @@ impl Emitter {
             );
         let mut val = if self.stage == Stage::Fragment && *slot == 0x3fc {
             self.load_front_facing_bits()
+        } else if let Some(value) = self.load_system_attr_bits(*slot) {
+            value
         } else if aligned_slot == 0x70 {
             let fc = self.frag_coord_var();
             let idx = self.const_u32(component);
@@ -5317,12 +5396,50 @@ impl Emitter {
         y: &Option<IrValue>,
         z: &Option<IrValue>,
         component: &u8,
+        array: bool,
     ) -> Option<Word> {
         self.texs_ids_used.insert(tex_id);
         let x_value = self.lower_value(x);
         let x_coord = self.as_i32(x_value);
         let numeric_type = self.texture_numeric_type_at(tex_id);
         let vec4_t = self.graphics_numeric_vec4_type(numeric_type);
+        if array {
+            let y = y.as_ref().expect("2D array texel fetch requires Y coordinate");
+            let layer = z.as_ref().expect("2D array texel fetch requires a layer");
+            let y_value = self.lower_value(y);
+            let y_coord = self.as_i32(y_value);
+            let layer_value = self.lower_value(layer);
+            let layer_coord = self.as_i32(layer_value);
+            let coords = self
+                .b
+                .composite_construct(self.ivec3_t, None, [x_coord, y_coord, layer_coord])
+                .unwrap();
+            let kind = if self
+                .manifested_texture_for_shader_id(tex_id)
+                .is_some_and(|resource| resource.image_kind == GraphicsImageKind::D3)
+            {
+                GraphicsImageKind::D3
+            } else {
+                GraphicsImageKind::D2Array
+            };
+            let (decl, image_var) = self.typed_fetch_image_at(tex_id, numeric_type, kind);
+            let image = self
+                .b
+                .load(decl.image_t, None, image_var, None, [])
+                .unwrap();
+            let fetched = self
+                .b
+                .image_fetch(
+                    vec4_t,
+                    None,
+                    image,
+                    coords,
+                    Some(rspirv::spirv::ImageOperands::LOD),
+                    [Operand::IdRef(self.i32_zero)],
+                )
+                .unwrap();
+            return Some(self.graphics_fetch_component_as_f32(fetched, numeric_type, *component));
+        }
         if self
             .ir_constant_facts
             .texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref())
@@ -6255,11 +6372,11 @@ impl Emitter {
                     *cbuf_word_offset,
                     *cbuf_secondary_word_offset,
                 );
-                self.lower_graphics_texel_fetch(tex_id, x, y, z, component)
+                self.lower_graphics_texel_fetch(tex_id, x, y, z, component, false)
             }
             IrOp::TexelFetchHandle {
                 handle,
-                dimension: _,
+                dimension,
                 x,
                 y,
                 z,
@@ -6268,7 +6385,14 @@ impl Emitter {
                 if self.stage == Stage::Compute {
                     Some(self.lower_compute_texel_fetch(*handle, x, y.as_ref(), z.as_ref(), *component))
                 } else {
-                    self.lower_graphics_texel_fetch(graphics_texture_id(*handle), x, y, z, component)
+                    self.lower_graphics_texel_fetch(
+                        graphics_texture_id(*handle),
+                        x,
+                        y,
+                        z,
+                        component,
+                        *dimension == ImageDimension::D2Array,
+                    )
                 }
             }
             IrOp::SampleTexHandle {
@@ -6351,15 +6475,38 @@ impl Emitter {
                 );
                 None
             }
+            IrOp::ImageRead {
+                handle,
+                x,
+                y,
+                z,
+                component,
+                ..
+            } => Some(self.lower_compute_image_read(
+                *handle,
+                x,
+                y.as_ref(),
+                z.as_ref(),
+                *component,
+            )),
             IrOp::ImageAtomic {
                 handle,
                 dimension: _,
                 x,
+                y,
                 value,
                 op,
                 data_type,
                 ..
-            } => Some(self.lower_compute_image_atomic(inst, *handle, x, value, *op, *data_type)),
+            } => Some(self.lower_compute_image_atomic(
+                inst,
+                *handle,
+                x,
+                y.as_ref(),
+                value,
+                *op,
+                *data_type,
+            )),
             IrOp::TextureGradients {
                 sample_site,
                 dpdx,
@@ -9586,6 +9733,9 @@ impl Emitter {
                         self.input_var(aligned);
                     }
                     IrOp::InterpAttr { slot, .. } => {
+                        if self.system_attr_var_id(*slot).is_some() {
+                            continue;
+                        }
                         if self.stage == Stage::Fragment && *slot == 0x3fc {
                             self.front_facing_var_id();
                             continue;
@@ -9605,6 +9755,8 @@ impl Emitter {
                         let aligned = slot & !0xF;
                         if slot_is_gl_position(aligned) {
                             self.position_var();
+                        } else if *slot == 0x64 && matches!(self.stage, Stage::Vertex | Stage::Geometry) {
+                            self.layer_var_id();
                         } else if *slot == 0x6C && matches!(self.stage, Stage::Vertex) {
                             self.point_size_var_id();
                         } else if *slot >= 0x80 {
@@ -9660,16 +9812,32 @@ impl Emitter {
                             tex_id,
                             self.ir_constant_facts
                                 .texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref()),
-                            z.is_some(),
+                            z.is_some().then_some(GraphicsImageKind::D3),
                         ));
                     }
-                    IrOp::TexelFetchHandle { handle, y, z, .. } if self.stage != Stage::Compute => {
+                    IrOp::TexelFetchHandle { handle, dimension, y, z, .. } if self.stage != Stage::Compute => {
                         needs_image = true;
                         let tex_id = graphics_texture_id(*handle);
                         tex_ids.insert(tex_id);
+                        let array = *dimension == ImageDimension::D2Array;
                         texel_fetches.push((tex_id,
-                            self.ir_constant_facts.texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref()),
-                            z.is_some()));
+                            !array && self.ir_constant_facts.texel_fetch_buffer_coordinates_compatible(y.as_ref(), z.as_ref()),
+                            if array {
+                                Some(
+                                    if self
+                                        .manifested_texture_for_shader_id(tex_id)
+                                        .is_some_and(|resource| {
+                                            resource.image_kind == GraphicsImageKind::D3
+                                        })
+                                    {
+                                        GraphicsImageKind::D3
+                                    } else {
+                                        GraphicsImageKind::D2Array
+                                    },
+                                )
+                            } else {
+                                z.is_some().then_some(GraphicsImageKind::D3)
+                            }));
                     }
                     IrOp::GatherTex { tex_id, array, .. } => {
                         needs_image = true;
@@ -9762,11 +9930,11 @@ impl Emitter {
                     self.b.capability(Capability::ImageQuery);
                 }
             }
-            for (tex_id, buffer_candidate, is_3d) in texel_fetches {
+            for (tex_id, buffer_candidate, explicit_kind) in texel_fetches {
                 let kind = if buffer_candidate && self.texel_buffer_slot_enabled(tex_id) {
                     GraphicsImageKind::Buffer
-                } else if is_3d {
-                    GraphicsImageKind::D3
+                } else if let Some(kind) = explicit_kind {
+                    kind
                 } else if self.sampler_arrayed {
                     GraphicsImageKind::D2Array
                 } else {
@@ -11285,6 +11453,11 @@ fn validate_compute_options(
                     resource.handle
                 )));
             }
+            (false, Some(format))
+                if resource.kind == ComputeResourceKind::StorageImage
+                    && resource.dimension == ImageDimension::D2
+                    && format.supports_storage_atomics()
+                    && format.numeric_type() == resource.numeric_type => {}
             (false, Some(format)) => {
                 return Err(ComputeEmitError::UnsupportedOperation(format!(
                     "non-texel resource {:?} unexpectedly declares {format:?}",
@@ -11336,7 +11509,10 @@ fn validate_compute_options(
     };
     let atomic_resource = |handle: TextureHandleOrigin| {
         options.resources.iter().find(|resource| {
-            resource.handle == handle && resource.kind == ComputeResourceKind::StorageTexelBuffer
+            resource.handle == handle
+                && (resource.kind == ComputeResourceKind::StorageTexelBuffer
+                    || (resource.kind == ComputeResourceKind::StorageImage
+                        && resource.texel_format.is_some()))
         })
     };
 
@@ -11457,7 +11633,9 @@ fn validate_compute_options(
                         "predicated LoadShared".to_owned(),
                     ));
                 }
-                IrOp::SharedAtomic { op, .. } if *op != ImageAtomicOp::Or => {
+                IrOp::SharedAtomic { op, .. }
+                    if matches!(op, ImageAtomicOp::Increment | ImageAtomicOp::Decrement) =>
+                {
                     return Err(ComputeEmitError::UnsupportedOperation(format!(
                         "unsupported shared atomic operation {op:?}"
                     )));
@@ -11490,6 +11668,49 @@ fn validate_compute_options(
                         return Err(ComputeEmitError::MissingResource {
                             handle: *handle,
                             kind: expected_kind,
+                        });
+                    }
+                    if *dimension != resource.dimension {
+                        return Err(ComputeEmitError::DimensionMismatch {
+                            handle: *handle,
+                            instruction: *dimension,
+                            actual: resource.dimension,
+                        });
+                    }
+                    validate_compute_coordinates(
+                        *handle,
+                        resource.dimension,
+                        y.as_ref(),
+                        z.as_ref(),
+                    )?;
+                }
+                IrOp::ImageRead {
+                    handle,
+                    dimension,
+                    y,
+                    z,
+                    component,
+                    ..
+                } => {
+                    if *component > 3 {
+                        return Err(ComputeEmitError::UnsupportedOperation(format!(
+                            "ImageRead component {component}"
+                        )));
+                    }
+                    if *dimension != ImageDimension::Buffer {
+                        return Err(ComputeEmitError::UnsupportedOperation(format!(
+                            "{dimension:?} storage image read"
+                        )));
+                    }
+                    let resource =
+                        storage_resource(*handle).ok_or(ComputeEmitError::MissingResource {
+                            handle: *handle,
+                            kind: ComputeResourceKind::StorageTexelBuffer,
+                        })?;
+                    if resource.kind != ComputeResourceKind::StorageTexelBuffer {
+                        return Err(ComputeEmitError::MissingResource {
+                            handle: *handle,
+                            kind: ComputeResourceKind::StorageTexelBuffer,
                         });
                     }
                     if *dimension != resource.dimension {
@@ -11540,17 +11761,18 @@ fn validate_compute_options(
                             actual: resource.dimension,
                         });
                     }
-                    if y.is_some() || z.is_some() {
-                        return Err(ComputeEmitError::UnsupportedOperation(
-                            "buffer ImageAtomic with non-X coordinates".to_owned(),
-                        ));
-                    }
+                    validate_compute_coordinates(
+                        *handle,
+                        resource.dimension,
+                        y.as_ref(),
+                        z.as_ref(),
+                    )?;
                 }
                 IrOp::Unimplemented { .. } => {
                     return Err(ComputeEmitError::UnimplementedIr(1));
                 }
                 IrOp::GatherTex { tex_id, array, gather_component, lane, .. } => {
-                    let handle = TextureHandleOrigin::Bound { cbuf_word_offset: *tex_id };
+                    let handle = nexium_shader::texture_handle_for_id(*tex_id);
                     let resource = filtered_resource(handle).ok_or(ComputeEmitError::MissingResource {
                         handle, kind: ComputeResourceKind::CombinedSampledImage,
                     })?;
@@ -13654,6 +13876,56 @@ mod tests {
             assert_eq!(scan_input_locations(&fragment), expected);
             validates_with_spirv_val_if_available(&vertex);
             validates_with_spirv_val_if_available(&fragment);
+        }
+    }
+
+    #[test]
+    fn native_layer_attribute_routes_geometry_and_fragment() {
+        let layer_id = |module: &rspirv::dr::Module| {
+            module.annotations.iter().find_map(|instruction| match instruction.operands.as_slice() {
+                [Operand::IdRef(var), Operand::Decoration(Decoration::BuiltIn), Operand::BuiltIn(BuiltIn::Layer)] => Some(*var),
+                _ => None,
+            }).expect("Layer built-in")
+        };
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit_void(IrOp::StoreAttr { slot: 0x64, src: IrValue::ImmU32(7) });
+        program.emit_void(IrOp::StoreAttr { slot: 0x70, src: IrValue::Zero });
+        program.emit_void(IrOp::EmitVertex);
+        let mut cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (geometry, _) = emit_geometry(&cfg, &[], VertexOptions::default(), GeometryOptions::default());
+        cfg.blocks[0].program.instructions.pop();
+        let vertex = emit_vertex(&cfg);
+        for words in [&geometry, &vertex] {
+            validates_with_spirv_val_if_available(words);
+            let module = rspirv::dr::load_words(words).unwrap();
+            let layer = layer_id(&module);
+            assert!(module.all_inst_iter().any(|instruction|
+                instruction.class.opcode == rspirv::spirv::Op::Store
+                && instruction.operands.first() == Some(&Operand::IdRef(layer))));
+        }
+        for op in [IrOp::LoadAttr { slot: 0x64 }, IrOp::InterpAttr {
+            slot: 0x64, perspective: IrValue::Zero, mode: 2, sat: false,
+        }] {
+            let mut program = nexium_shader::IrProgram::new();
+            program.emit(op, Some(0));
+            let cfg = Cfg {
+                blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+                unimplemented: 0,
+                bindless_or_partners: Default::default(),
+            };
+            let words = emit_fragment(&cfg);
+            validates_with_spirv_val_if_available(&words);
+            let module = rspirv::dr::load_words(&words).unwrap();
+            let layer = layer_id(&module);
+            assert!(module.all_inst_iter().any(|instruction|
+                instruction.class.opcode == rspirv::spirv::Op::Load
+                && instruction.operands.first() == Some(&Operand::IdRef(layer))));
+            assert!(module.annotations.iter().any(|instruction|
+                instruction.operands == [Operand::IdRef(layer), Operand::Decoration(Decoration::Flat)]));
         }
     }
 
@@ -19550,6 +19822,164 @@ mod tests {
     }
 
     #[test]
+    fn compute_2d_storage_image_atomics_emit_valid_vulkan_spirv() {
+        let handle = TextureHandleOrigin::Bindless {
+            cbuf_binding: 2,
+            cbuf_word_offset: 0x120 / 4,
+            cbuf_secondary_word_offset: None,
+        };
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::ImageAtomic {
+                handle,
+                dimension: ImageDimension::D2,
+                x: IrValue::GprIn(0),
+                y: Some(IrValue::GprIn(1)),
+                z: None,
+                value: IrValue::GprIn(2),
+                op: ImageAtomicOp::Add,
+                data_type: ImageAtomicType::Sd32,
+            },
+            Some(1),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let resource = |texel_format| ComputeImageResource {
+            handle,
+            binding: 1,
+            kind: ComputeResourceKind::StorageImage,
+            dimension: ImageDimension::D2,
+            numeric_type: TextureNumericType::Uint,
+            texel_format,
+        };
+        let options = ComputeOptions {
+            local_size: [8, 8, 1],
+            texture_bound_cbuf: 2,
+            resources: vec![resource(Some(ComputeTexelFormat::R32Uint))],
+            ..ComputeOptions::default()
+        };
+        let emitted = emit_compute(&cfg, &options).expect("2D storage image atomic module");
+        validates_with_spirv_val_if_available(&emitted.words);
+        let module = rspirv::dr::load_words(&emitted.words).expect("valid SPIR-V");
+        assert!(module.types_global_values.iter().any(|instruction| {
+            instruction.class.opcode == rspirv::spirv::Op::TypeImage
+                && instruction.operands.get(1) == Some(&Operand::Dim(rspirv::spirv::Dim::Dim2D))
+                && instruction.operands.get(6) == Some(&Operand::ImageFormat(ImageFormat::R32ui))
+        }));
+        let atomic_adds = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| instruction.class.opcode == rspirv::spirv::Op::AtomicIAdd)
+            .count();
+        assert_eq!(atomic_adds, 1);
+
+        let untyped = ComputeOptions {
+            local_size: [8, 8, 1],
+            texture_bound_cbuf: 2,
+            resources: vec![resource(None)],
+            ..ComputeOptions::default()
+        };
+        assert!(emit_compute(&cfg, &untyped).is_err());
+    }
+
+    #[test]
+    fn compute_suld_buffer_reads_the_storage_texel_buffer() {
+        let handle = TextureHandleOrigin::Bound {
+            cbuf_word_offset: 0x20,
+        };
+        let read = |program: &mut nexium_shader::IrProgram| {
+            program.emit(
+                IrOp::ImageRead {
+                    handle,
+                    dimension: ImageDimension::Buffer,
+                    x: IrValue::ImmU32(3),
+                    y: None,
+                    z: None,
+                    component: 0,
+                },
+                Some(5),
+            )
+        };
+        let mut program = nexium_shader::IrProgram::new();
+        let value = read(&mut program);
+        program.emit_void(IrOp::ImageWrite {
+            handle,
+            dimension: ImageDimension::Buffer,
+            x: IrValue::ImmU32(4),
+            y: None,
+            z: None,
+            values: [
+                IrValue::Inst(value),
+                IrValue::Zero,
+                IrValue::Zero,
+                IrValue::Zero,
+            ],
+        });
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let resource = |kind| ComputeImageResource {
+            handle,
+            binding: 1,
+            kind,
+            dimension: ImageDimension::Buffer,
+            numeric_type: TextureNumericType::Uint,
+            texel_format: Some(ComputeTexelFormat::R32Uint),
+        };
+        let options = ComputeOptions {
+            local_size: [8, 1, 1],
+            resources: vec![resource(ComputeResourceKind::StorageTexelBuffer)],
+            ..ComputeOptions::default()
+        };
+        let emitted = emit_compute(&cfg, &options).expect("typed SULD buffer module");
+        assert_eq!(
+            emitted
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor.kind)
+                .collect::<Vec<_>>(),
+            vec![ComputeDescriptorKind::StorageTexelBuffer]
+        );
+        validates_with_spirv_val_if_available(&emitted.words);
+        let module = rspirv::dr::load_words(&emitted.words).expect("valid SPIR-V");
+        let image_reads = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| instruction.class.opcode == rspirv::spirv::Op::ImageRead)
+            .count();
+        assert_eq!(image_reads, 1);
+
+        let mut sampled_program = nexium_shader::IrProgram::new();
+        read(&mut sampled_program);
+        let sampled_cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, sampled_program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let sampled_options = ComputeOptions {
+            local_size: [8, 1, 1],
+            resources: vec![resource(ComputeResourceKind::UniformTexelBuffer)],
+            ..ComputeOptions::default()
+        };
+        assert!(matches!(
+            emit_compute(&sampled_cfg, &sampled_options),
+            Err(ComputeEmitError::MissingResource {
+                kind: ComputeResourceKind::StorageTexelBuffer,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn compute_sust_buffer_emits_exact_storage_texel_formats() {
         let resources = [
             (
@@ -20827,7 +21257,7 @@ mod tests {
             IrOp::SharedAtomic {
                 addr: IrValue::Zero,
                 value: IrValue::ImmU32(1),
-                op: ImageAtomicOp::Add,
+                op: ImageAtomicOp::Increment,
             },
             Some(0),
         );

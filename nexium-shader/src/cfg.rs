@@ -1441,6 +1441,7 @@ fn build_cfg_blocks(
         for inst in &t.program.instructions {
             value_defs.insert_inst(inst);
         }
+        value_defs.insert_select_pred_defs(t.select_predicate_defs());
         pending_bindless_checks.extend(
             t.take_pending_bindless_origin_checks()
                 .into_iter()
@@ -1471,7 +1472,7 @@ fn build_cfg_blocks(
 
     patch_back_edge_phi_sources(&mut blocks);
     patch_back_edge_pred_phi_sources(&mut blocks);
-    total_unimpl += finalize_bindless_origin_checks(&mut blocks, pending_bindless_checks);
+    total_unimpl += finalize_bindless_origin_checks(&mut blocks, pending_bindless_checks, value_defs);
 
     Cfg {
         blocks,
@@ -1840,12 +1841,12 @@ fn patch_back_edge_pred_phi_sources(blocks: &mut [BasicBlock]) {
 fn finalize_bindless_origin_checks(
     blocks: &mut [BasicBlock],
     checks: Vec<(BlockId, PendingBindlessOriginCheck)>,
+    mut defs: ValueDefs,
 ) -> u32 {
     if checks.is_empty() {
         return 0;
     }
 
-    let mut defs = ValueDefs::new();
     for block in blocks.iter() {
         for inst in &block.program.instructions {
             defs.insert_inst(inst);
@@ -1873,6 +1874,7 @@ fn finalize_bindless_origin_checks(
                     }
                     Opcode::SUATOM => matches!(inst.op, Op::ImageAtomic { .. }),
                     Opcode::SUST => matches!(inst.op, Op::ImageWrite { .. }),
+                    Opcode::SULD => matches!(inst.op, Op::ImageRead { .. }),
                     _ => false,
                 })
         });
@@ -1914,6 +1916,9 @@ fn finalize_bindless_origin_checks(
                         *handle = origin.as_texture_handle();
                     }
                     Op::ImageWrite { handle, .. } if check.opcode == Opcode::SUST => {
+                        *handle = origin.as_texture_handle();
+                    }
+                    Op::ImageRead { handle, .. } if check.opcode == Opcode::SULD => {
                         *handle = origin.as_texture_handle();
                     }
                     _ => unreachable!(),
@@ -2976,6 +2981,51 @@ mod tests {
                 )
             })
         }));
+    }
+
+    #[test]
+    fn nested_predicated_handle_is_resolved_across_predicate_redefinition_and_blocks() {
+        let mut bytes = vec![0u8; 0x60];
+        write_word(&mut bytes, 0x08, 0x5090_0380_2007_0017);
+        write_word(&mut bytes, 0x10, 0x4c98_0788_05a2_000c);
+        write_word(&mut bytes, 0x18, 0x4c47_0208_15a2_0c0c);
+        write_word(&mut bytes, 0x28, 0x5c10_0000_00c2_ff0c);
+        write_word(&mut bytes, 0x30, 0x4c42_3004_0007_15ff);
+        write_word(&mut bytes, 0x38, 0xe240_0000_0087_0000);
+        write_word(&mut bytes, 0x48, 0xdd38_0000_80c7_0101);
+        write_word(&mut bytes, 0x50, enc_exit());
+        let cfg = build_cfg(&bytes);
+        assert_eq!(cfg.blocks.len(), 2);
+        assert_eq!(cfg.unimplemented, 0);
+        assert!(cfg.blocks[1].program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::TexelFetch {
+                cbuf_binding: 2,
+                cbuf_word_offset: 0x5a,
+                cbuf_secondary_word_offset: Some(0x15a),
+                ..
+            }
+        )));
+
+        write_word(&mut bytes, 0x18, 0x4c42_3004_0007_15ff);
+        write_word(&mut bytes, 0x28, 0x4c47_0208_15a2_0c0c);
+        write_word(&mut bytes, 0x30, 0x5c10_0000_00c2_ff0c);
+        let changed_predicate = build_cfg(&bytes);
+        assert_eq!(changed_predicate.unimplemented, 1);
+    }
+
+    #[test]
+    fn initialized_different_handle_paths_remain_unresolved() {
+        let mut bytes = vec![0u8; 0x60];
+        write_word(&mut bytes, 0x08, 0x4c98_0788_0587_000c);
+        write_word(&mut bytes, 0x10, 0x5090_0380_2007_0017);
+        write_word(&mut bytes, 0x18, 0x4c98_0788_05a2_000c);
+        write_word(&mut bytes, 0x28, 0x4c47_0208_15a2_0c0c);
+        write_word(&mut bytes, 0x30, 0x5c10_0000_00c2_ff0c);
+        write_word(&mut bytes, 0x38, 0xe240_0000_0087_0000);
+        write_word(&mut bytes, 0x48, 0xdd38_0000_80c7_0101);
+        write_word(&mut bytes, 0x50, enc_exit());
+        assert_eq!(build_cfg(&bytes).unimplemented, 1);
     }
 
     #[test]

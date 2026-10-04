@@ -76,6 +76,21 @@ pub fn decode_bindless_texture_id(texture_id: u32) -> Option<(u8, u32, Option<u3
     ))
 }
 
+pub fn texture_handle_for_id(texture_id: u32) -> TextureHandleOrigin {
+    match decode_bindless_texture_id(texture_id) {
+        Some((cbuf_binding, cbuf_word_offset, cbuf_secondary_word_offset)) => {
+            TextureHandleOrigin::Bindless {
+                cbuf_binding,
+                cbuf_word_offset,
+                cbuf_secondary_word_offset,
+            }
+        }
+        None => TextureHandleOrigin::Bound {
+            cbuf_word_offset: texture_id,
+        },
+    }
+}
+
 pub fn texel_fetch_buffer_coordinates_compatible(y: Option<&IrValue>, z: Option<&IrValue>) -> bool {
     if z.is_some() {
         return false;
@@ -197,6 +212,7 @@ pub fn texture_ids(cfg: &Cfg) -> Vec<u32> {
                 | IrOp::TextureQueryDimension { handle, .. }
                 | IrOp::TextureQueryLod { handle, .. }
                 | IrOp::ImageWrite { handle, .. }
+                | IrOp::ImageRead { handle, .. }
                 | IrOp::ImageAtomic { handle, .. } => match handle {
                     TextureHandleOrigin::Bound { cbuf_word_offset } => {
                         ids.insert(*cbuf_word_offset);

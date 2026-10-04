@@ -43,6 +43,18 @@ fn escaping_edge(function: &Function) -> Option<(usize, usize)> {
         }
     }
     let dominators = super::structured_dominators(&reachable, &predecessors);
+    let loops: Vec<_> = function
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(header, block)| {
+            let inst = block.instructions.iter().find(|inst| inst.class.opcode == Op::LoopMerge)?;
+            let (Operand::IdRef(merge), Operand::IdRef(cont)) = (&inst.operands[0], &inst.operands[1]) else {
+                return None;
+            };
+            Some((header, labels[merge], labels[cont]))
+        })
+        .collect();
     for (header, block) in function.blocks.iter().enumerate() {
         if !reachable[header] {
             continue;
@@ -59,13 +71,27 @@ fn escaping_edge(function: &Function) -> Option<(usize, usize)> {
         let Some(merge) = merge else {
             continue;
         };
-        for (source, targets) in successors.iter().enumerate() {
-            if !reachable[source] || !dominators[source][header] || dominators[source][merge] {
-                continue;
-            }
-            for &target in targets {
-                if target != merge && !dominators[target][header] {
-                    return Some((source, target));
+        let cases = if block.instructions.last().is_some_and(|term| term.class.opcode == Op::Switch) {
+            successors[header].clone()
+        } else {
+            Vec::new()
+        };
+        for owner in std::iter::once(header).chain(cases.iter().copied()) {
+            for (source, targets) in successors.iter().enumerate() {
+                if !reachable[source] || !dominators[source][owner] || dominators[source][merge] {
+                    continue;
+                }
+                for &target in targets {
+                    let loop_exit = loops.iter().any(|&(loop_header, loop_merge, cont)| {
+                        dominators[source][loop_header]
+                            && !dominators[source][loop_merge]
+                            && (target == loop_merge || target == cont
+                                || (target == loop_header && dominators[source][cont]))
+                    });
+                    let case_entry = owner != header && cases.contains(&target);
+                    if target != merge && !dominators[target][owner] && !loop_exit && !case_entry {
+                        return Some((source, target));
+                    }
                 }
             }
         }
@@ -202,13 +228,7 @@ pub(super) fn repair(module: &mut Module) -> Result<(), String> {
     let mut bound = module.header.as_ref().ok_or("missing SPIR-V header")?.bound;
     let mut mappings = Vec::new();
     for function in &mut module.functions {
-        if function.blocks.is_empty()
-            || function
-                .blocks
-                .iter()
-                .flat_map(|b| &b.instructions)
-                .any(|inst| inst.class.opcode == Op::LoopMerge)
-        {
+        if function.blocks.is_empty() {
             continue;
         }
         let limit = function.blocks.len().saturating_mul(16).max(128);
@@ -313,6 +333,15 @@ mod tests {
                 }
             }
         }
+        for inst in &module.types_global_values {
+            if let Some(id) = inst.result_id {
+                match inst.class.opcode {
+                    Op::ConstantFalse => { values.insert(id, 0); }
+                    Op::ConstantTrue => { values.insert(id, 1); }
+                    _ => {}
+                }
+            }
+        }
         for (i, id) in conditions.into_iter().enumerate() {
             values.insert(id, (mask >> i) & 1);
         }
@@ -353,8 +382,18 @@ mod tests {
                     Op::BranchConditional => {
                         next = Some(id(if values[&id(0)] != 0 { 1 } else { 2 }))
                     }
+                    Op::Switch => {
+                        let selector = values[&id(0)];
+                        next = Some(inst.operands[2..].chunks_exact(2)
+                            .find_map(|case| match (&case[0], &case[1]) {
+                                (Operand::LiteralBit32(value), Operand::IdRef(target))
+                                    if *value == selector => Some(*target),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| id(1)));
+                    }
                     Op::Return => return result,
-                    Op::SelectionMerge => (),
+                    Op::SelectionMerge | Op::LoopMerge => (),
                     op => panic!("unexpected {op:?}"),
                 }
             }
@@ -362,6 +401,133 @@ mod tests {
             current = next.unwrap();
         }
         panic!("shader did not terminate")
+    }
+
+    fn shared_switch_tail_shader(selector_value: u32) -> Module {
+        let mut b = Builder::new();
+        b.set_version(1, 0);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void = b.type_void();
+        let float = b.type_float(32, None);
+        let uint = b.type_int(32, 0);
+        let selector = b.constant_bit32(uint, selector_value);
+        let values: [Word; 3] =
+            std::array::from_fn(|i| b.constant_bit32(float, ((i + 1) as f32).to_bits()));
+        let ptr = b.type_pointer(None, StorageClass::Output, float);
+        let output = b.variable(ptr, None, StorageClass::Output, None);
+        b.decorate(output, Decoration::Location, [Operand::LiteralBit32(0)]);
+        let ty = b.type_function(void, vec![]);
+        let main = b.begin_function(void, None, FunctionControl::NONE, ty).unwrap();
+        let [header, a, c, default, tail, merge] = std::array::from_fn(|_| b.id());
+        b.begin_block(Some(header)).unwrap();
+        b.selection_merge(merge, SelectionControl::NONE).unwrap();
+        b.switch(selector, default, [(Operand::LiteralBit32(0), a), (Operand::LiteralBit32(1), c)]).unwrap();
+        for label in [a, c] {
+            b.begin_block(Some(label)).unwrap();
+            b.branch(tail).unwrap();
+        }
+        b.begin_block(Some(default)).unwrap();
+        b.branch(merge).unwrap();
+        b.begin_block(Some(tail)).unwrap();
+        let value = b.phi(float, None, [(values[0], a), (values[1], c)]).unwrap();
+        b.branch(merge).unwrap();
+        b.begin_block(Some(merge)).unwrap();
+        let result = b.phi(float, None, [(value, tail), (values[2], default)]).unwrap();
+        b.store(output, result, None, []).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::Fragment, main, "main", [output]);
+        b.execution_mode(main, ExecutionMode::OriginUpperLeft, []);
+        b.module()
+    }
+
+    #[test]
+    fn switch_case_tails_preserve_all_case_and_default_values() {
+        for selector in [0, 1, 2, u32::MAX] {
+            let original = shared_switch_tail_shader(selector);
+            let mut repaired = original.clone();
+            assert!(escaping_edge(&original.functions[0]).is_some());
+            repair(&mut repaired).unwrap();
+            assert!(escaping_edge(&repaired.functions[0]).is_none());
+            let expected = ((selector.min(2) + 1) as f32).to_bits();
+            assert_eq!(evaluate(&original, [0; 4], 0), expected);
+            assert_eq!(evaluate(&repaired, [0; 4], 0), expected);
+            let words = repaired.assemble();
+            assert!(crate::phi_preds_consistent(&words));
+            assert!(crate::validate_structured_cfg(&words).is_ok());
+            crate::tests::validates_with_spirv_val_if_available(&words);
+        }
+    }
+
+    fn shared_tail_shader_with_loop() -> (Module, [Word; 4]) {
+        let (mut module, conditions) = shared_tail_shader();
+        let start = module.header.as_ref().unwrap().bound;
+        let [never, header, body, cont, merge, body_merge, always, first_pass] =
+            std::array::from_fn(|i| start + i as u32);
+        let boolean = module.types_global_values.iter()
+            .find(|inst| inst.result_id == Some(conditions[0]))
+            .unwrap().result_type;
+        module.types_global_values.push(Instruction::new(
+            Op::ConstantFalse, boolean, Some(never), Vec::new(),
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::ConstantTrue, boolean, Some(always), Vec::new(),
+        ));
+        let function = &mut module.functions[0];
+        let join = function.blocks.last_mut().unwrap();
+        let join_label = join.label.as_ref().unwrap().result_id.unwrap();
+        *join.instructions.last_mut().unwrap() = Instruction::new(
+            Op::Branch, None, None, vec![Operand::IdRef(header)],
+        );
+        for (label, instructions) in [
+            (header, vec![
+                Instruction::new(Op::Phi, boolean, Some(first_pass), vec![
+                    Operand::IdRef(always), Operand::IdRef(join_label),
+                    Operand::IdRef(never), Operand::IdRef(cont),
+                ]),
+                Instruction::new(Op::LoopMerge, None, None, vec![
+                    Operand::IdRef(merge), Operand::IdRef(cont), Operand::LoopControl(LoopControl::NONE),
+                ]),
+                Instruction::new(Op::BranchConditional, None, None, vec![
+                    Operand::IdRef(first_pass), Operand::IdRef(body), Operand::IdRef(merge),
+                ]),
+            ]),
+            (body, vec![
+                Instruction::new(Op::SelectionMerge, None, None, vec![
+                    Operand::IdRef(body_merge), Operand::SelectionControl(SelectionControl::NONE),
+                ]),
+                Instruction::new(Op::BranchConditional, None, None, vec![
+                    Operand::IdRef(conditions[0]), Operand::IdRef(merge), Operand::IdRef(body_merge),
+                ]),
+            ]),
+            (body_merge, vec![Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(cont)])]),
+            (cont, vec![Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(header)])]),
+            (merge, vec![Instruction::new(Op::Return, None, None, Vec::new())]),
+        ] {
+            function.blocks.push(rspirv::dr::Block {
+                label: Some(Instruction::new(Op::Label, None, Some(label), Vec::new())),
+                instructions,
+            });
+        }
+        module.header.as_mut().unwrap().bound = start + 8;
+        (module, conditions)
+    }
+
+    #[test]
+    fn loop_tails_preserve_phi_values_and_allow_structured_loop_exits() {
+        let (original, conditions) = shared_tail_shader_with_loop();
+        let mut repaired = original.clone();
+        assert!(escaping_edge(&original.functions[0]).is_some());
+        repair(&mut repaired).unwrap();
+        assert!(escaping_edge(&repaired.functions[0]).is_none());
+        for mask in 0..16 {
+            assert_eq!(evaluate(&original, conditions, mask), evaluate(&repaired, conditions, mask));
+        }
+        let words = repaired.assemble();
+        assert!(crate::phi_preds_consistent(&words));
+        assert!(crate::validate_structured_cfg(&words).is_ok());
+        crate::tests::validates_with_spirv_val_if_available(&words);
     }
 
     #[test]
