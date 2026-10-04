@@ -1,1 +1,2 @@
 .github/scripts/*.sh text eol=lf
+nexium-ps5/** text=auto eol=lf
