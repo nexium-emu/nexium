@@ -4727,7 +4727,6 @@ impl SsboSnapshotCache {
         arena: Option<&mut ResidentCbufArenaBuilder>,
     ) -> Option<nexium_gpu::draw::ResidentCbufDraw> {
         if requests.is_empty()
-            || nexium_memory::fastmem::base().is_none()
             || !nexium_memory::fastmem::write_watch_available()
         {
             return None;
@@ -4999,7 +4998,6 @@ impl SsboSnapshotCache {
     ) -> Option<nexium_gpu::draw::ResidentVertexRange> {
         const MAX_RESIDENT_CHUNKS: u64 = 512;
         if len == 0
-            || nexium_memory::fastmem::base().is_none()
             || !nexium_memory::fastmem::write_watch_available()
         {
             return None;
@@ -5115,7 +5113,6 @@ impl SsboSnapshotCache {
     ) -> Option<u64> {
         const MAX_KEY_CHUNKS: u64 = 512;
         if len == 0
-            || nexium_memory::fastmem::base().is_none()
             || !nexium_memory::fastmem::write_watch_available()
         {
             return None;
@@ -12543,7 +12540,7 @@ fn trace_zeta_key(
 #[derive(Debug, Default)]
 struct SmallRtRegistry {
     epoch: u64,
-    entries: std::collections::HashMap<RtKey, u32>,
+    entries: FastMap<RtKey, u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -13240,10 +13237,11 @@ fn writeback_cube_sample_dependencies(
                 .chain(call.color_rt_keys.iter().copied())
                 .chain(call.depth_key)
         })
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<FastSet<_>>();
     let has_external_target = {
         let registry = small_rt_registry().lock().unwrap();
-        if std::env::var_os("NEXIUM_CUBE_SCAN_TRACE").is_some() {
+        static SCAN_TRACE: OnceLock<bool> = OnceLock::new();
+        if *SCAN_TRACE.get_or_init(|| std::env::var_os("NEXIUM_CUBE_SCAN_TRACE").is_some()) {
             use std::sync::atomic::{AtomicU64, Ordering};
             static CALLS: AtomicU64 = AtomicU64::new(0);
             if CALLS.fetch_add(1, Ordering::Relaxed) % 2048 == 0 {
@@ -13287,8 +13285,8 @@ fn writeback_cube_sample_dependencies(
         let mut registry = small_rt_registry().lock().unwrap();
         registry.drain_matching(|key, tile_mode| {
             tile_mode & (1 << 12) == 0
-                && !current_targets.contains(key)
                 && small_rt_starts_in_ranges(*key, &dependencies.ranges)
+                && !current_targets.contains(key)
         })
     };
     if pending.entries.is_empty() {
