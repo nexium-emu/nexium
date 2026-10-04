@@ -371,7 +371,7 @@ jobs:
             /usr/include/boost/version.hpp; do
             test -e "$file" || { echo "::error::missing $file (run nexium-ps5/tools/setup-stack.sh once on the runner)"; exit 1; }
           done
-          git -C "$vulkan" rev-parse --short HEAD | sed 's/^/PS5_Vulkan at /'
+          git -c safe.directory="$vulkan" -C "$vulkan" rev-parse --short HEAD | sed 's/^/PS5_Vulkan at /'
 
       - name: Install pinned Rust toolchain
         shell: bash
