@@ -109,16 +109,18 @@ mod sys {
     }
 
     pub fn reserve(size: usize) -> (*mut u8, bool) {
-        let watched = unsafe {
-            VirtualAlloc(
-                std::ptr::null_mut(),
-                size,
-                MEM_RESERVE | MEM_WRITE_WATCH,
-                PAGE_NOACCESS,
-            )
-        };
-        if !watched.is_null() {
-            return (watched, true);
+        if !crate::soft_watch::enabled() {
+            let watched = unsafe {
+                VirtualAlloc(
+                    std::ptr::null_mut(),
+                    size,
+                    MEM_RESERVE | MEM_WRITE_WATCH,
+                    PAGE_NOACCESS,
+                )
+            };
+            if !watched.is_null() {
+                return (watched, true);
+            }
         }
         let plain = unsafe { VirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS) };
         (plain, false)
@@ -389,17 +391,17 @@ pub fn write_watch_available() -> bool {
     ARENA_WRITE_WATCH.load(Ordering::Acquire) || soft_write_watch_available()
 }
 
-#[cfg(target_vendor = "sony")]
+#[cfg(any(target_vendor = "sony", windows))]
 fn soft_write_watch_available() -> bool {
     crate::soft_watch::enabled()
 }
 
-#[cfg(not(target_vendor = "sony"))]
+#[cfg(not(any(target_vendor = "sony", windows)))]
 fn soft_write_watch_available() -> bool {
     false
 }
 
-#[cfg(target_vendor = "sony")]
+#[cfg(any(target_vendor = "sony", windows))]
 fn record_observed_write_vas(pages: &[u64]) {
     if pages.is_empty() {
         return;
@@ -419,7 +421,7 @@ fn record_observed_write_vas(pages: &[u64]) {
     OBSERVED_WRITE_SERIAL.store(serial, Ordering::Release);
 }
 
-#[cfg(target_vendor = "sony")]
+#[cfg(any(target_vendor = "sony", windows))]
 fn soft_take_write_watch(
     va: u64,
     len: usize,
@@ -452,6 +454,28 @@ fn soft_take_write_watch(
             }
         }
     })
+}
+
+#[cfg(any(target_vendor = "sony", windows))]
+fn soft_take_write_watch_observed(
+    va: u64,
+    len: usize,
+    spans: &mut Vec<(u64, usize)>,
+) -> WriteWatchObservation {
+    if len == 0 {
+        return WriteWatchObservation::unavailable();
+    }
+    let lo = va & !0xfffu64;
+    let query_len = (va + len as u64 - lo) as usize;
+    let (_, generation_before) = observed_write_snapshot_range(lo, query_len);
+    let result = soft_take_write_watch(va, len, Some(spans));
+    let (serial_after, generation_after) = observed_write_snapshot_range(lo, query_len);
+    WriteWatchObservation {
+        result,
+        serial_after,
+        generation_before,
+        generation_after,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -554,6 +578,8 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
         );
         return None;
     }
+    #[cfg(windows)]
+    crate::soft_watch::mark_dirty_host(ptr, len);
     let fresh = !is_committed(&ranges, va, end);
     update_commit_refs(&mut ranges, va, end, true);
     if fresh {
@@ -585,6 +611,8 @@ pub fn decommit(ptr: *mut u8, len: usize) {
     for (released_lo, released_hi) in released {
         let released_ptr = unsafe { base.add(released_lo as usize) };
         sys::decommit(released_ptr, (released_hi - released_lo) as usize);
+        #[cfg(windows)]
+        crate::soft_watch::mark_dirty_host(released_ptr, (released_hi - released_lo) as usize);
     }
 }
 
@@ -642,6 +670,9 @@ pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
 
     #[cfg(windows)]
     {
+        if crate::soft_watch::enabled() {
+            return soft_take_write_watch(va, len, None);
+        }
         if !ARENA_WRITE_WATCH.load(Ordering::Acquire) {
             return WriteWatchResult::Unavailable;
         }
@@ -704,6 +735,9 @@ pub fn take_write_watch_spans(
 
     #[cfg(windows)]
     {
+        if crate::soft_watch::enabled() {
+            return soft_take_write_watch(va, len, Some(spans));
+        }
         if !ARENA_WRITE_WATCH.load(Ordering::Acquire) {
             return WriteWatchResult::Unavailable;
         }
@@ -766,20 +800,7 @@ pub fn take_write_watch_spans_observed(
 ) -> WriteWatchObservation {
     #[cfg(target_vendor = "sony")]
     {
-        if len == 0 {
-            return WriteWatchObservation::unavailable();
-        }
-        let lo = va & !0xfffu64;
-        let query_len = (va + len as u64 - lo) as usize;
-        let (_, generation_before) = observed_write_snapshot_range(lo, query_len);
-        let result = soft_take_write_watch(va, len, Some(spans));
-        let (serial_after, generation_after) = observed_write_snapshot_range(lo, query_len);
-        return WriteWatchObservation {
-            result,
-            serial_after,
-            generation_before,
-            generation_after,
-        };
+        return soft_take_write_watch_observed(va, len, spans);
     }
 
     #[cfg(not(any(windows, target_vendor = "sony")))]
@@ -790,6 +811,9 @@ pub fn take_write_watch_spans_observed(
 
     #[cfg(windows)]
     {
+        if crate::soft_watch::enabled() {
+            return soft_take_write_watch_observed(va, len, spans);
+        }
         if !ARENA_WRITE_WATCH.load(Ordering::Acquire) {
             return WriteWatchObservation::unavailable();
         }
