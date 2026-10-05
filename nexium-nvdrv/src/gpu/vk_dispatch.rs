@@ -3497,6 +3497,9 @@ impl SsboSnapshotCache {
                 self.recent_cbuf_request_index.remove(&request.key());
             }
         }
+        for states in &mut self.cbuf_slot_states {
+            states.retain(|state| !Arc::ptr_eq(&state.snapshot.data, &entry.data));
+        }
         Some(entry)
     }
 
@@ -3576,9 +3579,12 @@ impl SsboSnapshotCache {
         map_generation: u64,
         cpu_addr: u64,
         snapshot: InputSnapshot,
-    ) {
+    ) -> bool {
+        if self.last_input_identity_for(&snapshot.data).is_none() {
+            return false;
+        }
         let Some(states) = self.cbuf_slot_states.get_mut(logical_slot) else {
-            return;
+            return false;
         };
         states.retain(|state| {
             state.gpu_addr != gpu_addr || state.bound_size != bound_size || state.len != len
@@ -3597,6 +3603,7 @@ impl SsboSnapshotCache {
                 snapshot,
             },
         );
+        true
     }
 
     fn sph_memo_lookup(
@@ -3903,7 +3910,7 @@ impl SsboSnapshotCache {
     }
 
     fn last_input_for_range(
-        &self,
+        &mut self,
         gpu_addr: u64,
         len: usize,
         allow_covering: bool,
@@ -3921,9 +3928,12 @@ impl SsboSnapshotCache {
         {
             return None;
         }
-        let entry = self.input_entries.get(&range)?;
-        (entry.serial == identity.serial && Arc::as_ptr(&entry.data) as usize == identity.data_ptr)
-            .then(|| entry.data.clone())
+        let entry = self.input_entries.get_mut(&range)?;
+        if entry.serial != identity.serial || Arc::as_ptr(&entry.data) as usize != identity.data_ptr {
+            return None;
+        }
+        entry.last_used_kick = self.input_sweep_kick;
+        Some(entry.data.clone())
     }
 
     fn insert_input_entry(
@@ -23078,6 +23088,7 @@ fn pack_cbuf_data_with_requirements(
     let mut bound_sizes = [0u32; PACKED_CBUF_SLOTS];
     let mut read_lens = [0usize; PACKED_CBUF_SLOTS];
     let mut slot_data: [Option<InputSnapshot>; PACKED_CBUF_SLOTS] = std::array::from_fn(|_| None);
+    let mut watched_slot_mask = 0u64;
     let mut cacheable = !recheck && !fresh_read;
     let kp_slots = super::pusher::kickprof::start();
     for logical_slot in 0..PACKED_CBUF_SLOTS {
@@ -23125,7 +23136,7 @@ fn pack_cbuf_data_with_requirements(
                 let data = snapshot_cache.read_cbuf_input_or_insert(mappings, addr, len, mem_read);
                 if let Some(data) = &data {
                     let cpu_addr = mappings.cpu_address_for(addr).unwrap_or(0);
-                    snapshot_cache.store_cbuf_slot(
+                    if !snapshot_cache.store_cbuf_slot(
                         logical_slot,
                         addr,
                         size,
@@ -23133,11 +23144,14 @@ fn pack_cbuf_data_with_requirements(
                         map_generation,
                         cpu_addr,
                         data.clone(),
-                    );
+                    ) {
+                        cacheable = false;
+                    }
                 }
                 data
             });
         if let Some(data) = data {
+            watched_slot_mask |= 1u64 << logical_slot;
             slot_data[logical_slot] = Some(data);
         } else {
             cacheable = false;
@@ -23146,6 +23160,20 @@ fn pack_cbuf_data_with_requirements(
     super::pusher::kickprof::add(super::pusher::kickprof::CBUF_SLOTS, kp_slots);
     let kp_pack = super::pusher::kickprof::start();
 
+    if cacheable {
+        while watched_slot_mask != 0 {
+            let logical_slot = watched_slot_mask.trailing_zeros() as usize;
+            watched_slot_mask &= watched_slot_mask - 1;
+            let snapshot = slot_data[logical_slot].as_ref().unwrap();
+            if !snapshot_cache.cbuf_slot_states[logical_slot].iter().any(|state| {
+                state.snapshot.source_offset == snapshot.source_offset
+                    && Arc::ptr_eq(&state.snapshot.data, &snapshot.data)
+            }) {
+                cacheable = false;
+                break;
+            }
+        }
+    }
     if cacheable {
         let mut packed_size = nexium_spirv::GFX_CBUF_MIN_SIZE as usize;
         let mut slots = Vec::new();
@@ -27308,6 +27336,49 @@ mod tests {
     }
 
     #[test]
+    fn last_input_shortcut_hits_keep_active_snapshots_resident() {
+        let active = InputRangeKey {
+            gpu_addr: 0x1000,
+            cpu_addr: 0x8000,
+            len: 8,
+            mapping_epoch: 1,
+        };
+        let unused = InputRangeKey {
+            gpu_addr: 0x2000,
+            cpu_addr: 0x9000,
+            ..active
+        };
+        for (len, allow_covering) in [(active.len, false), (active.len / 2, true)] {
+            let mut cache = SsboSnapshotCache::default();
+            for key in [active, unused] {
+                cache.insert_input_entry(
+                    key,
+                    HostWatchRange { cpu_addr: key.cpu_addr, len: key.len },
+                    Arc::new(vec![0x5a; key.len]),
+                );
+            }
+            let entry = cache.input_entries.get(&active).unwrap();
+            let retained = entry.data.clone();
+            cache.last_input = Some(InputSnapshotIdentity {
+                range: active,
+                serial: entry.serial,
+                data_ptr: Arc::as_ptr(&entry.data) as usize,
+            });
+            for kick in 1..=96 {
+                cache.input_sweep_kick = kick;
+                let hit = cache
+                    .last_input_for_range(active.gpu_addr, len, allow_covering, active.mapping_epoch)
+                    .expect("active shortcut remains cached");
+                assert!(Arc::ptr_eq(&retained, &hit));
+                cache.evict_idle_input_entries(kick + 1, 2);
+                assert!(cache.input_entries.contains_key(&active));
+            }
+            assert!(!cache.input_entries.contains_key(&unused));
+            assert_input_index_coherent(&cache);
+        }
+    }
+
+    #[test]
     fn input_snapshot_capacity_evicts_oldest_entries() {
         let key = |index: u64, len: usize| InputRangeKey {
             gpu_addr: 0x1000 + index * 0x100,
@@ -28617,6 +28688,117 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(&first, &fresh));
         assert!(std::sync::Arc::ptr_eq(&newer, &retained));
         cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_input_eviction_refetches_cbuf_slots_after_cpu_writes() {
+        const GPU_VA: u64 = 0x416c_0000;
+        const CPU_VA: u64 = 0xeb_2c00_0000;
+        const ARENA_LEN: usize = 0x1000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).unwrap();
+        unsafe { std::ptr::write_bytes(ptr, 0x13, ARENA_LEN) };
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut cache = SsboSnapshotCache::default();
+        let first = cache.read_cbuf_input_or_insert(&mappings, GPU_VA, 16, &read).unwrap();
+        cache.store_cbuf_slot(0, GPU_VA, 16, 16, mappings.generation(), CPU_VA, first.clone());
+        assert!(cache.cbuf_slot_cached(0, GPU_VA, 16, 16, mappings.generation()).is_some());
+
+        cache.input_sweep_kick = 65;
+        assert_eq!(cache.evict_idle_input_entries(65, 64), 1);
+        unsafe { ptr.add(3).write_volatile(0x7c) };
+        let fresh = cache
+            .cbuf_slot_cached(0, GPU_VA, 16, 16, mappings.generation())
+            .or_else(|| cache.read_cbuf_input_or_insert(&mappings, GPU_VA, 16, &read))
+            .unwrap();
+        assert_eq!(fresh.data[fresh.source_offset + 3], 0x7c);
+        assert_eq!(first.data[first.source_offset + 3], 0x13);
+        assert!(!Arc::ptr_eq(&first.data, &fresh.data));
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unwatched_cbuf_retry_snapshot_does_not_enter_slot_or_pack_memos() {
+        const GPU_VA: u64 = 0x4170_0000;
+        const CPU_VA: u64 = 0xeb_3000_0000;
+        const ARENA_LEN: usize = 0x1000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).unwrap();
+        unsafe { std::ptr::write_bytes(ptr, 0x13, ARENA_LEN) };
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let races_left = std::cell::Cell::new(3usize);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            let remaining = races_left.get();
+            if remaining != 0 {
+                unsafe { ptr.add(3).write_volatile(ptr.add(3).read_volatile() + 1) };
+                races_left.set(remaining - 1);
+            }
+            true
+        };
+        let mut binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
+        binds[0][0] = (GPU_VA, 16);
+        let mut cache = SsboSnapshotCache::default();
+        let first = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+        assert_eq!(races_left.get(), 0);
+        assert!(cache.input_entries.is_empty());
+        assert!(cache.cbuf_slot_states[0].is_empty());
+        assert!(cache.last_packed_cbuf.is_none());
+        unsafe { ptr.add(3).write_volatile(0x7c) };
+        cache.refresh_input_guest_writes();
+        let fresh = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+        let first_bytes = first.materialize();
+        let fresh_bytes = fresh.materialize();
+        assert_ne!(packed_cbuf_slot(&first_bytes, 0).unwrap()[3], 0x7c);
+        assert_eq!(packed_cbuf_slot(&fresh_bytes, 0).unwrap()[3], 0x7c);
+        assert!(cache.last_packed_cbuf.is_some());
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cbuf_pack_does_not_cache_snapshots_without_live_watch_owners() {
+        const GPU_VA: u64 = 0x4174_0000;
+        const CPU_VA: u64 = 0xeb_3400_0000;
+        const ARENA_LEN: usize = 0x2000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).unwrap();
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
+        binds[0][0] = (GPU_VA, 16);
+        binds[0][1] = (GPU_VA + 0x1000, 16);
+        for capacity in [0, 0x1000] {
+            unsafe { std::ptr::write_bytes(ptr, 0x13, ARENA_LEN) };
+            let mut cache = SsboSnapshotCache::with_input_capacity(capacity, 8);
+            let first = pack_cbuf_data(&binds, 3, 0, 0, 4, &[], &mut cache, &mappings, &read);
+            assert!(cache.last_packed_cbuf.is_none());
+            assert!(cache.cbuf_slot_states[0].is_empty());
+            unsafe { ptr.add(3).write_volatile(0x7c) };
+            cache.refresh_input_guest_writes();
+            let fresh = pack_cbuf_data(&binds, 3, 0, 0, 4, &[], &mut cache, &mappings, &read);
+            let first_bytes = first.materialize();
+            let fresh_bytes = fresh.materialize();
+            assert_eq!(packed_cbuf_slot(&first_bytes, 0).unwrap()[3], 0x13);
+            assert_eq!(packed_cbuf_slot(&fresh_bytes, 0).unwrap()[3], 0x7c);
+            assert!(cache.last_packed_cbuf.is_none());
+            cache.clear();
+        }
         nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
     }
 
