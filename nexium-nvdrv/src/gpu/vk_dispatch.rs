@@ -10088,7 +10088,7 @@ pub(crate) struct PreparedDrawBatch {
     hard_after: Arc<std::sync::atomic::AtomicBool>,
     fermi_exact_snapshot_leases: Vec<u64>,
     fermi_exact_snapshot_leases_transferred: bool,
-    retained_bytes: std::cell::OnceCell<usize>,
+    retained_allocations: std::cell::OnceCell<Vec<(usize, usize)>>,
 }
 
 impl PreparedDrawBatch {
@@ -10100,83 +10100,91 @@ impl PreparedDrawBatch {
         self.ring_upper_bytes
     }
 
-    pub(crate) fn snapshot_retained_bytes_upper_bound(&self) -> usize {
-        *self
-            .retained_bytes
-            .get_or_init(|| self.compute_snapshot_retained_bytes_upper_bound())
+    pub(crate) fn snapshot_allocations(&self) -> &[(usize, usize)] {
+        self.retained_allocations
+            .get_or_init(|| self.compute_snapshot_allocations())
     }
 
-    fn compute_snapshot_retained_bytes_upper_bound(&self) -> usize {
-        let mut seen = FastSet::<*const Vec<u8>>::default();
-        let mut seen_arenas = FastSet::<*const nexium_gpu::draw::ResidentCbufArena>::default();
-        let mut bytes = 0usize;
-        let mut arena_bytes = 0usize;
-        let mut charge = |data: &Arc<Vec<u8>>| {
-            if seen.insert(Arc::as_ptr(data)) {
-                bytes = bytes.saturating_add(data.capacity());
+    fn compute_snapshot_allocations(&self) -> Vec<(usize, usize)> {
+        struct Allocations {
+            seen: FastSet<usize>,
+            list: Vec<(usize, usize)>,
+        }
+        impl Allocations {
+            fn charge(&mut self, id: usize, bytes: usize) -> bool {
+                let fresh = self.seen.insert(id);
+                if fresh {
+                    self.list.push((id, bytes));
+                }
+                fresh
             }
+
+            fn data(&mut self, data: &Arc<Vec<u8>>) {
+                self.charge(Arc::as_ptr(data) as usize, data.capacity());
+            }
+        }
+        let capacity = self.snapshot.len() + self.calls.len() * 4;
+        let mut allocations = Allocations {
+            seen: FastSet::with_capacity_and_hasher(capacity, Default::default()),
+            list: Vec::with_capacity(capacity),
         };
         for data in self.snapshot.values() {
-            charge(data);
+            allocations.data(data);
         }
         for call in &self.calls {
             if let Some(payload) = &call.cbuf_data {
                 match payload {
                     GraphicsCbufPayload::Owned(data) => {
-                        charge(data);
+                        allocations.data(data);
                     }
                     GraphicsCbufPayload::Slots { slots, .. } => {
                         for slot in slots {
-                            charge(slot.data());
+                            allocations.data(slot.data());
                         }
                     }
                 }
             }
             if let Some(resident) = &call.resident_cbuf {
                 if let Some(arena) = &resident.arena {
-                    if seen_arenas.insert(Arc::as_ptr(arena)) {
-                        arena_bytes = arena_bytes
-                            .saturating_add(
-                                arena.sources.len()
-                                    * std::mem::size_of::<nexium_gpu::draw::ResidentCbufSource>(),
-                            )
-                            .saturating_add(
-                                arena.segments.len()
-                                    * std::mem::size_of::<nexium_gpu::draw::ResidentCbufSegment>(),
-                            )
-                            .saturating_add(
-                                arena.slots.len()
-                                    * std::mem::size_of::<nexium_gpu::draw::ResidentCbufArenaSlot>(
-                                    ),
-                            );
-                    }
-                    for source in &arena.sources {
-                        charge(&source.data);
+                    let metadata_bytes = (arena.sources.len()
+                        * std::mem::size_of::<nexium_gpu::draw::ResidentCbufSource>())
+                    .saturating_add(
+                        arena.segments.len()
+                            * std::mem::size_of::<nexium_gpu::draw::ResidentCbufSegment>(),
+                    )
+                    .saturating_add(
+                        arena.slots.len()
+                            * std::mem::size_of::<nexium_gpu::draw::ResidentCbufArenaSlot>(),
+                    );
+                    if allocations.charge(Arc::as_ptr(arena) as usize, metadata_bytes) {
+                        for source in &arena.sources {
+                            allocations.data(&source.data);
+                        }
                     }
                 } else {
                     for chunk in &resident.chunks {
-                        charge(&chunk.data);
+                        allocations.data(&chunk.data);
                     }
                 }
             }
             for range in &call.resident_vertex {
                 for chunk in &range.chunks {
-                    charge(&chunk.data);
+                    allocations.data(&chunk.data);
                 }
             }
             if let Some(range) = &call.resident_index {
                 for chunk in &range.chunks {
-                    charge(&chunk.data);
+                    allocations.data(&chunk.data);
                 }
             }
             if let Some(data) = &call.index_data {
-                charge(data);
+                allocations.data(data);
             }
             for snapshot in &call.ssbo_data {
-                charge(&snapshot.data);
+                allocations.data(&snapshot.data);
             }
         }
-        bytes.saturating_add(arena_bytes)
+        allocations.list
     }
 
     pub(crate) fn compatibility(&self) -> &DrawBatchCompatibility {
@@ -11155,7 +11163,7 @@ fn prepare_draw_batch_async(
         hard_after: Arc::new(std::sync::atomic::AtomicBool::new(hard_after)),
         fermi_exact_snapshot_leases,
         fermi_exact_snapshot_leases_transferred: false,
-        retained_bytes: std::cell::OnceCell::new(),
+        retained_allocations: std::cell::OnceCell::new(),
     }
 }
 
@@ -11242,7 +11250,7 @@ fn prepare_clear_batch(
         hard_after: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fermi_exact_snapshot_leases: Vec::new(),
         fermi_exact_snapshot_leases_transferred: false,
-        retained_bytes: std::cell::OnceCell::new(),
+        retained_allocations: std::cell::OnceCell::new(),
     }
 }
 

@@ -153,15 +153,6 @@ struct DrawWorkCost {
 }
 
 impl DrawWorkCost {
-    fn for_draws(draws: &[PreparedDrawBatch]) -> Self {
-        Self {
-            groups: draws.len(),
-            snapshot_bytes: draws.iter().fold(0usize, |total, draw| {
-                total.saturating_add(draw.snapshot_retained_bytes_upper_bound())
-            }),
-        }
-    }
-
     fn saturating_add(self, other: Self) -> Self {
         Self {
             groups: self.groups.saturating_add(other.groups),
@@ -170,11 +161,101 @@ impl DrawWorkCost {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct DrawWorkClaim {
+    groups: usize,
+    owned_bytes: usize,
+    shared: Vec<(usize, usize, usize)>,
+}
+
+impl DrawWorkClaim {
+    fn for_draws(draws: &[PreparedDrawBatch]) -> Self {
+        Self {
+            groups: draws.len(),
+            owned_bytes: 0,
+            shared: count_shared_allocations(
+                draws
+                    .iter()
+                    .flat_map(|draw| draw.snapshot_allocations().iter().copied())
+                    .collect(),
+            ),
+        }
+    }
+
+    fn snapshot_bytes(&self) -> usize {
+        self.shared
+            .iter()
+            .fold(self.owned_bytes, |total, &(_, bytes, _)| total.saturating_add(bytes))
+    }
+}
+
+fn count_shared_allocations(mut allocations: Vec<(usize, usize)>) -> Vec<(usize, usize, usize)> {
+    allocations.sort_unstable_by_key(|&(id, _)| id);
+    let mut shared: Vec<(usize, usize, usize)> = Vec::with_capacity(allocations.len());
+    for (id, bytes) in allocations {
+        match shared.last_mut() {
+            Some(last) if last.0 == id => last.2 += 1,
+            _ => shared.push((id, bytes, 1)),
+        }
+    }
+    shared
+}
+
+impl From<DrawWorkCost> for DrawWorkClaim {
+    fn from(cost: DrawWorkCost) -> Self {
+        Self {
+            groups: cost.groups,
+            owned_bytes: cost.snapshot_bytes,
+            shared: Vec::new(),
+        }
+    }
+}
+
 struct DrawWorkBudgetState {
     outstanding: DrawWorkCost,
     peak: DrawWorkCost,
+    shared: nexium_common::fast_hash::FastMap<usize, (usize, usize)>,
     closed: bool,
     next_telemetry: Instant,
+}
+
+impl DrawWorkBudgetState {
+    fn incoming(&self, claim: &DrawWorkClaim) -> DrawWorkCost {
+        let fresh = claim
+            .shared
+            .iter()
+            .filter(|(id, _, _)| !self.shared.contains_key(id))
+            .fold(0usize, |total, &(_, bytes, _)| total.saturating_add(bytes));
+        DrawWorkCost {
+            groups: claim.groups,
+            snapshot_bytes: claim.owned_bytes.saturating_add(fresh),
+        }
+    }
+
+    fn charge(&mut self, claim: &DrawWorkClaim, incoming: DrawWorkCost) {
+        self.outstanding = self.outstanding.saturating_add(incoming);
+        for &(id, bytes, refs) in &claim.shared {
+            self.shared.entry(id).or_insert((bytes, 0)).1 += refs;
+        }
+    }
+
+    fn release_shared(&mut self, claim: &DrawWorkClaim) -> usize {
+        let mut freed = claim.owned_bytes;
+        for &(id, _, refs) in &claim.shared {
+            let dropped = match self.shared.get_mut(&id) {
+                Some((bytes, held)) => {
+                    *held = held.saturating_sub(refs);
+                    (*held == 0).then_some(*bytes)
+                }
+                None => None,
+            };
+            if let Some(bytes) = dropped {
+                self.shared.remove(&id);
+                freed = freed.saturating_add(bytes);
+            }
+        }
+        freed
+    }
 }
 
 struct DrawWorkBudget {
@@ -192,6 +273,7 @@ impl DrawWorkBudget {
             state: Mutex::new(DrawWorkBudgetState {
                 outstanding: DrawWorkCost::default(),
                 peak: DrawWorkCost::default(),
+                shared: Default::default(),
                 closed: false,
                 next_telemetry: Instant::now() + DRAW_QUEUE_TELEMETRY_INTERVAL,
             }),
@@ -228,21 +310,26 @@ impl DrawWorkBudget {
     fn reserve(&self, incoming: DrawWorkCost, label: &'static str, timeout: Duration) -> bool {
         let started = Instant::now();
         let deadline = Some(started.checked_add(timeout).unwrap_or(started));
-        self.reserve_until(incoming, label, started, deadline)
+        self.reserve_until(&incoming.into(), label, started, deadline)
     }
 
+    #[cfg(test)]
     fn reserve_blocking(&self, incoming: DrawWorkCost, label: &'static str) -> bool {
-        self.reserve_until(incoming, label, Instant::now(), None)
+        self.reserve_claim_blocking(&incoming.into(), label)
+    }
+
+    fn reserve_claim_blocking(&self, claim: &DrawWorkClaim, label: &'static str) -> bool {
+        self.reserve_until(claim, label, Instant::now(), None)
     }
 
     fn reserve_until(
         &self,
-        incoming: DrawWorkCost,
+        claim: &DrawWorkClaim,
         label: &'static str,
         started: Instant,
         deadline: Option<Instant>,
     ) -> bool {
-        if !self.enabled() || incoming.groups == 0 {
+        if !self.enabled() || claim.groups == 0 {
             return true;
         }
         let mut next_report = started + DRAW_BACKPRESSURE_LOG_INTERVAL;
@@ -251,8 +338,9 @@ impl DrawWorkBudget {
             if state.closed {
                 return false;
             }
+            let incoming = state.incoming(claim);
             if self.fits(state.outstanding, incoming) {
-                state.outstanding = state.outstanding.saturating_add(incoming);
+                state.charge(claim, incoming);
                 state.peak.groups = state.peak.groups.max(state.outstanding.groups);
                 state.peak.snapshot_bytes = state
                     .peak
@@ -328,7 +416,12 @@ impl DrawWorkBudget {
         }
     }
 
+    #[cfg(test)]
     fn release(&self, completed: DrawWorkCost) {
+        self.release_claim(&completed.into());
+    }
+
+    fn release_claim(&self, completed: &DrawWorkClaim) {
         if !self.enabled() || completed.groups == 0 {
             return;
         }
@@ -341,22 +434,21 @@ impl DrawWorkBudget {
                 self.group_limit,
             );
             state.outstanding = DrawWorkCost::default();
+            state.shared.clear();
             drop(state);
             self.available.notify_all();
             return;
         };
-        let Some(snapshot_bytes) = state
-            .outstanding
-            .snapshot_bytes
-            .checked_sub(completed.snapshot_bytes)
-        else {
+        let freed = state.release_shared(completed);
+        let Some(snapshot_bytes) = state.outstanding.snapshot_bytes.checked_sub(freed) else {
             log::error!(
                 "[render-backpressure] release snapshot underflow completed={} outstanding={} budget={}",
-                completed.snapshot_bytes,
+                freed,
                 state.outstanding.snapshot_bytes,
                 self.snapshot_byte_limit,
             );
             state.outstanding = DrawWorkCost::default();
+            state.shared.clear();
             drop(state);
             self.available.notify_all();
             return;
@@ -391,13 +483,13 @@ impl DrawWorkBudget {
 struct DrawWorkCompletion<'a> {
     pending: &'a AtomicUsize,
     budget: &'a DrawWorkBudget,
-    cost: DrawWorkCost,
+    claim: DrawWorkClaim,
 }
 
 impl Drop for DrawWorkCompletion<'_> {
     fn drop(&mut self) {
-        self.pending.fetch_sub(self.cost.groups, Ordering::Release);
-        self.budget.release(self.cost);
+        self.pending.fetch_sub(self.claim.groups, Ordering::Release);
+        self.budget.release_claim(&self.claim);
     }
 }
 
@@ -734,12 +826,12 @@ fn execute_draw_groups(
     worker_pending: &AtomicUsize,
     draw_work_budget: &DrawWorkBudget,
 ) {
-    let cost = DrawWorkCost::for_draws(&draws);
-    let group_count = cost.groups;
+    let claim = DrawWorkClaim::for_draws(&draws);
+    let group_count = claim.groups;
     let _completion = DrawWorkCompletion {
         pending: worker_pending,
         budget: draw_work_budget,
-        cost,
+        claim,
     };
     let profile = render_profile_enabled();
     let started = profile.then(std::time::Instant::now);
@@ -1119,18 +1211,18 @@ impl RenderThread {
         let hard_after_handle = draws
             .last()
             .and_then(|draw| (!hard_after).then(|| draw.hard_after_handle()));
-        let cost = DrawWorkCost::for_draws(&draws);
+        let claim = DrawWorkClaim::for_draws(&draws);
         let blocked_started = crate::gpu::pusher::kickprof::rate_start();
-        crate::gpu::watchdog::phase(crate::gpu::watchdog::Phase::RenderWait, cost.groups as u64);
+        crate::gpu::watchdog::phase(crate::gpu::watchdog::Phase::RenderWait, claim.groups as u64);
         let phase_started = crate::gpu::pusher::kickprof::start();
         let mut draw_tail = self.draw_tail.lock().unwrap();
         crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_LOCK, phase_started);
-        self.pending.fetch_add(cost.groups, Ordering::AcqRel);
+        self.pending.fetch_add(claim.groups, Ordering::AcqRel);
         let phase_started = crate::gpu::pusher::kickprof::start();
-        let reserved = self.draw_work_budget.reserve_blocking(cost, label);
+        let reserved = self.draw_work_budget.reserve_claim_blocking(&claim, label);
         crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_RESERVE, phase_started);
         let submitted = if !reserved {
-            self.pending.fetch_sub(cost.groups, Ordering::Release);
+            self.pending.fetch_sub(claim.groups, Ordering::Release);
             if hard_after {
                 seal_draw_tail_locked(&mut draw_tail);
             }
@@ -1148,8 +1240,8 @@ impl RenderThread {
                 }
                 true
             } else {
-                self.draw_work_budget.release(cost);
-                self.pending.fetch_sub(cost.groups, Ordering::Release);
+                self.draw_work_budget.release_claim(&claim);
+                self.pending.fetch_sub(claim.groups, Ordering::Release);
                 if hard_after {
                     seal_draw_tail_locked(&mut draw_tail);
                 }
@@ -1164,8 +1256,8 @@ impl RenderThread {
                 log::warn!(
                     "[render-submit] label={} groups={} snapshot_mib={:.1} blocked_ms={:.3}",
                     label,
-                    cost.groups,
-                    cost.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                    claim.groups,
+                    claim.snapshot_bytes() as f64 / (1024.0 * 1024.0),
                     elapsed.as_secs_f64() * 1000.0,
                 );
             }
@@ -1186,23 +1278,23 @@ impl RenderThread {
         let hard_after_handle = draws
             .last()
             .and_then(|draw| (!hard_after).then(|| draw.hard_after_handle()));
-        let cost = DrawWorkCost::for_draws(&draws);
+        let claim = DrawWorkClaim::for_draws(&draws);
         let blocked_started = crate::gpu::pusher::kickprof::rate_start();
         let phase_started = crate::gpu::pusher::kickprof::start();
         let mut draw_tail = self.draw_tail.lock().unwrap();
         crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_LOCK, phase_started);
         self.pending.fetch_add(1, Ordering::AcqRel);
 
-        if cost.groups != 0 {
-            self.pending.fetch_add(cost.groups, Ordering::AcqRel);
+        if claim.groups != 0 {
+            self.pending.fetch_add(claim.groups, Ordering::AcqRel);
             let phase_started = crate::gpu::pusher::kickprof::start();
-            let reserved = self.draw_work_budget.reserve_blocking(cost, label);
+            let reserved = self.draw_work_budget.reserve_claim_blocking(&claim, label);
             crate::gpu::pusher::kickprof::add(
                 crate::gpu::pusher::kickprof::BLK_RESERVE,
                 phase_started,
             );
             if !reserved {
-                self.pending.fetch_sub(cost.groups, Ordering::Release);
+                self.pending.fetch_sub(claim.groups, Ordering::Release);
                 self.pending.fetch_sub(1, Ordering::Release);
                 if hard_after {
                     seal_draw_tail_locked(&mut draw_tail);
@@ -1213,8 +1305,8 @@ impl RenderThread {
             let sent = self.tx.send(RenderWork::DrawGroup(draws));
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::BLK_SEND, phase_started);
             if sent.is_err() {
-                self.draw_work_budget.release(cost);
-                self.pending.fetch_sub(cost.groups, Ordering::Release);
+                self.draw_work_budget.release_claim(&claim);
+                self.pending.fetch_sub(claim.groups, Ordering::Release);
                 self.pending.fetch_sub(1, Ordering::Release);
                 if hard_after {
                     seal_draw_tail_locked(&mut draw_tail);
@@ -1245,8 +1337,8 @@ impl RenderThread {
                     "[render-submit] label={} job_label={} groups={} snapshot_mib={:.1} blocked_ms={:.3}",
                     label,
                     job_label,
-                    cost.groups,
-                    cost.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                    claim.groups,
+                    claim.snapshot_bytes() as f64 / (1024.0 * 1024.0),
                     elapsed.as_secs_f64() * 1000.0,
                 );
             }
@@ -1466,7 +1558,7 @@ mod tests {
         recv_group_candidate, recv_group_candidate_precise, rejected_draw_end_reason,
         retain_received_if_unsealed, seal_draw_tail_locked, sealed_candidate_end_reason,
         DrawGatherEndReason, DrawWorkBudget,
-        DrawWorkCompletion, DrawWorkCost, PresentThread, RenderThread, RenderWork,
+        DrawWorkClaim, DrawWorkCompletion, DrawWorkCost, PresentThread, RenderThread, RenderWork,
         DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION, DEFAULT_PENDING_DRAW_GROUP_BUDGET,
         DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES, DRAW_GATHER_GRACE,
         MAX_DRAW_GROUPS_PER_SUBMISSION_ENV,
@@ -1609,7 +1701,7 @@ mod tests {
                 let _completion = DrawWorkCompletion {
                     pending: &pending,
                     budget: &budget,
-                    cost: chunk_cost,
+                    claim: chunk_cost.into(),
                 };
             }
             chunks.push(chunk);
@@ -1664,6 +1756,55 @@ mod tests {
     }
 
     #[test]
+    fn pending_draw_budget_charges_shared_snapshots_once() {
+        let budget = DrawWorkBudget::new(64, 100);
+        let claim = |shared: &[(usize, usize)]| DrawWorkClaim {
+            groups: 1,
+            owned_bytes: 0,
+            shared: shared.iter().map(|&(id, bytes)| (id, bytes, 1)).collect(),
+        };
+        let reserve = |claim: &DrawWorkClaim| {
+            let now = Instant::now();
+            budget.reserve_until(claim, "shared", now, Some(now + Duration::from_millis(20)))
+        };
+        let first = claim(&[(1, 80)]);
+        let second = claim(&[(1, 80), (2, 10)]);
+        let third = claim(&[(3, 30)]);
+        assert!(reserve(&first));
+        assert!(reserve(&second));
+        assert_eq!(budget.outstanding(), cost(2, 90));
+        assert!(!reserve(&third));
+        budget.release_claim(&first);
+        assert_eq!(budget.outstanding(), cost(1, 90));
+        budget.release_claim(&second);
+        assert_eq!(budget.outstanding(), DrawWorkCost::default());
+        assert!(reserve(&third));
+        budget.release_claim(&third);
+
+        let both = DrawWorkClaim {
+            groups: 2,
+            owned_bytes: 0,
+            shared: vec![(4, 50, 2)],
+        };
+        assert_eq!(both.snapshot_bytes(), 50);
+        assert!(reserve(&both));
+        assert_eq!(budget.outstanding(), cost(2, 50));
+        budget.release_claim(&claim(&[(4, 50)]));
+        assert_eq!(budget.outstanding(), cost(1, 50));
+        budget.release_claim(&claim(&[(4, 50)]));
+        assert_eq!(budget.outstanding(), DrawWorkCost::default());
+    }
+
+    #[test]
+    fn shared_snapshot_allocations_count_batch_references() {
+        assert_eq!(
+            super::count_shared_allocations(vec![(7, 30), (2, 10), (7, 30), (5, 20), (7, 30), (2, 10)]),
+            vec![(2, 10, 2), (5, 20, 1), (7, 30, 3)]
+        );
+        assert!(super::count_shared_allocations(Vec::new()).is_empty());
+    }
+
+    #[test]
     fn pending_draw_budget_admits_oversized_packet_only_when_empty() {
         let budget = DrawWorkBudget::new(64, 64);
         assert!(budget.fits(DrawWorkCost::default(), cost(96, 96)));
@@ -1707,7 +1848,7 @@ mod tests {
             let _completion = DrawWorkCompletion {
                 pending: &pending,
                 budget: &budget,
-                cost: work,
+                claim: work.into(),
             };
             panic!("test unwind");
         }));
