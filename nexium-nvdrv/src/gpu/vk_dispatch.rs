@@ -1934,6 +1934,8 @@ pub(crate) struct SsboSnapshotCache {
     prepared_tic_plans: PreparedTicPlanCache,
     input_profile: bool,
     watch_query_ranges: Vec<HostWatchRange>,
+    input_observed_query_ranges: Vec<(u64, HostWatchRange)>,
+    input_observed_range_last: FastMap<u64, usize>,
     input_sweep_kick: u64,
     idle_input_scratch: Vec<InputRangeKey>,
     input_gpu_bounds: (u64, u64),
@@ -2379,6 +2381,10 @@ const HOST_WATCH_COALESCE_GAP: u64 = 64 * 1024;
 
 fn coalesce_host_watch_ranges(ranges: &mut Vec<HostWatchRange>) {
     ranges.sort_unstable();
+    coalesce_sorted_host_watch_ranges(ranges);
+}
+
+fn coalesce_sorted_host_watch_ranges(ranges: &mut Vec<HostWatchRange>) {
     let mut merged_len = 0usize;
     for index in 0..ranges.len() {
         let range = ranges[index];
@@ -2393,6 +2399,35 @@ fn coalesce_host_watch_ranges(ranges: &mut Vec<HostWatchRange>) {
             }
         }
         ranges[merged_len] = range;
+        merged_len += 1;
+    }
+    ranges.truncate(merged_len);
+}
+
+fn coalesce_observed_watch_ranges(
+    ranges: &mut Vec<(u64, HostWatchRange)>,
+    observed_serial: u64,
+    last_by_serial: &mut FastMap<u64, usize>,
+) {
+    last_by_serial.clear();
+    let mut merged_len = 0usize;
+    for index in 0..ranges.len() {
+        let (serial, range) = ranges[index];
+        if serial == observed_serial {
+            continue;
+        }
+        if let Some(&previous_index) = last_by_serial.get(&serial) {
+            let (_, previous) = &mut ranges[previous_index];
+            let previous_end = previous.cpu_addr.saturating_add(previous.len as u64);
+            if range.cpu_addr <= previous_end {
+                let merged_end = previous_end.max(range.cpu_addr.saturating_add(range.len as u64));
+                previous.len =
+                    usize::try_from(merged_end - previous.cpu_addr).unwrap_or(usize::MAX);
+                continue;
+            }
+        }
+        ranges[merged_len] = (serial, range);
+        last_by_serial.insert(serial, merged_len);
         merged_len += 1;
     }
     ranges.truncate(merged_len);
@@ -2566,6 +2601,8 @@ impl SsboSnapshotCache {
             prepared_tic_plans: PreparedTicPlanCache::default(),
             input_profile: input_cache_profile_enabled(),
             watch_query_ranges: Vec::new(),
+            input_observed_query_ranges: Vec::new(),
+            input_observed_range_last: FastMap::default(),
             input_sweep_kick: 0,
             idle_input_scratch: Vec::new(),
             input_gpu_bounds: (u64::MAX, 0),
@@ -4115,10 +4152,16 @@ impl SsboSnapshotCache {
             }
             _ => 0,
         };
+        let mut observed_ranges = std::mem::take(&mut self.input_observed_query_ranges);
+        observed_ranges.clear();
+        observed_ranges.extend(
+            self.input_entries.values().map(|entry| (entry.observed_write_serial, entry.watch_range)),
+        );
+        observed_ranges.sort_unstable_by_key(|&(_, range)| range);
         let mut ranges = std::mem::take(&mut self.watch_query_ranges);
         ranges.clear();
-        ranges.extend(self.input_entries.values().map(|entry| entry.watch_range));
-        coalesce_host_watch_ranges(&mut ranges);
+        ranges.extend(observed_ranges.iter().map(|&(_, range)| range));
+        coalesce_sorted_host_watch_ranges(&mut ranges);
         if super::pusher::kickprof::rate_enabled() && kick % 1024 == 0 {
             let pages: usize = ranges
                 .iter()
@@ -4149,18 +4192,23 @@ impl SsboSnapshotCache {
         }
         let observed_serial = nexium_memory::fastmem::observed_write_serial();
         for entry in self.input_entries.values_mut() {
-            if entry.observed_write_serial == observed_serial {
-                continue;
-            }
-            let range = entry.watch_range;
+            entry.observed_write_serial = observed_serial;
+        }
+        coalesce_observed_watch_ranges(
+            &mut observed_ranges,
+            observed_serial,
+            &mut self.input_observed_range_last,
+        );
+        for &(serial, range) in &observed_ranges {
             nexium_memory::fastmem::observed_write_spans_since(
                 range.cpu_addr,
                 range.len,
-                entry.observed_write_serial,
+                serial,
                 &mut dirty_spans,
             );
-            entry.observed_write_serial = observed_serial;
         }
+        observed_ranges.clear();
+        self.input_observed_query_ranges = observed_ranges;
         if !dirty_spans.is_empty() {
             self.invalidate_cpu_spans(&dirty_spans);
         }
@@ -26917,6 +26965,80 @@ mod tests {
     }
 
     #[test]
+    fn observed_watch_ranges_merge_equal_serials_without_bridging_gaps() {
+        let mut ranges = vec![
+            (7, HostWatchRange { cpu_addr: 0x3000, len: 0x1000 }),
+            (3, HostWatchRange { cpu_addr: 0x2000, len: 0x1000 }),
+            (3, HostWatchRange { cpu_addr: 0x1000, len: 0x2000 }),
+            (3, HostWatchRange { cpu_addr: 0x4000, len: 0x1000 }),
+            (7, HostWatchRange { cpu_addr: 0x3000, len: 0x1000 }),
+        ];
+        ranges.sort_unstable_by_key(|&(_, range)| range);
+        let mut last_by_serial = super::FastMap::default();
+        super::coalesce_observed_watch_ranges(&mut ranges, 11, &mut last_by_serial);
+        assert_eq!(
+            ranges,
+            vec![
+                (3, HostWatchRange { cpu_addr: 0x1000, len: 0x2000 }),
+                (7, HostWatchRange { cpu_addr: 0x3000, len: 0x1000 }),
+                (3, HostWatchRange { cpu_addr: 0x4000, len: 0x1000 }),
+            ],
+        );
+    }
+
+    #[test]
+    fn observed_watch_range_replay_matches_entry_scan_for_interleaved_serials() {
+        let mut seed = 0x51c3_7a29_4f0b_6d83u64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut original = vec![
+            (3, HostWatchRange { cpu_addr: 0x1000, len: 0x3000 }),
+            (7, HostWatchRange { cpu_addr: 0x2000, len: 0x1000 }),
+            (3, HostWatchRange { cpu_addr: 0x3000, len: 0x3000 }),
+            (7, HostWatchRange { cpu_addr: 0x6000, len: 0x1000 }),
+            (3, HostWatchRange { cpu_addr: 0x8000, len: 0x1000 }),
+            (13, HostWatchRange { cpu_addr: 0x7000, len: 0x2000 }),
+        ];
+        for _ in 0..192 {
+            original.push((
+                random() % 14,
+                HostWatchRange {
+                    cpu_addr: (random() % 256) * 4096,
+                    len: (1 + random() % 16) as usize * 4096,
+                },
+            ));
+        }
+        let mut merged = original.clone();
+        merged.sort_unstable_by_key(|&(_, range)| range);
+        let mut last_by_serial = super::FastMap::default();
+        super::coalesce_observed_watch_ranges(&mut merged, 13, &mut last_by_serial);
+        assert!(merged.len() < original.len());
+        for page in 0..=272 {
+            let address = page * 4096;
+            for generation in 0..=14 {
+                let changed = |&(serial, range): &(u64, HostWatchRange)| {
+                    serial != 13
+                        && generation > serial
+                        && address >= range.cpu_addr
+                        && address < range.cpu_addr + range.len as u64
+                };
+                assert_eq!(
+                    merged.iter().any(changed),
+                    original.iter().any(changed),
+                    "page={page} generation={generation}",
+                );
+            }
+        }
+        let mut next = vec![(3, HostWatchRange { cpu_addr: 0x4000, len: 0x1000 })];
+        super::coalesce_observed_watch_ranges(&mut next, 13, &mut last_by_serial);
+        assert_eq!(next, vec![(3, HostWatchRange { cpu_addr: 0x4000, len: 0x1000 })]);
+    }
+
+    #[test]
     fn input_snapshot_capacity_evicts_oldest_entries() {
         let key = |index: u64, len: usize| InputRangeKey {
             gpu_addr: 0x1000 + index * 0x100,
@@ -28186,6 +28308,47 @@ mod tests {
         assert_eq!(refreshed[3], 0x7c);
         assert!(!std::sync::Arc::ptr_eq(&first, &refreshed));
         assert!(std::sync::Arc::ptr_eq(&disjoint, &retained));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_refresh_replay_preserves_a_newer_adjacent_snapshot() {
+        const GPU_VA: u64 = 0x4168_0000;
+        const CPU_VA: u64 = 0xeb_2800_0000;
+        const ARENA_LEN: usize = 0x2000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).unwrap();
+        unsafe { std::ptr::write_bytes(ptr, 0x13, ARENA_LEN) };
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut cache = SsboSnapshotCache::default();
+        let first = cache.read_input_or_insert(&mappings, GPU_VA + 0x100, 16, &read).unwrap();
+        unsafe {
+            ptr.add(0x103).write_volatile(0x44);
+            ptr.add(0x1103).write_volatile(0x55);
+        }
+        assert_eq!(
+            nexium_memory::fastmem::take_write_watch(CPU_VA, ARENA_LEN),
+            nexium_memory::fastmem::WriteWatchResult::Dirty,
+        );
+        let newer = cache
+            .read_input_or_insert(&mappings, GPU_VA + 0x1100, 16, &read)
+            .unwrap();
+        cache.refresh_input_guest_writes();
+        let fresh = cache.read_input_or_insert(&mappings, GPU_VA + 0x100, 16, &read).unwrap();
+        let retained = cache
+            .read_input_or_insert(&mappings, GPU_VA + 0x1100, 16, &read)
+            .unwrap();
+        assert_eq!(fresh[3], 0x44);
+        assert_eq!(retained[3], 0x55);
+        assert!(!std::sync::Arc::ptr_eq(&first, &fresh));
+        assert!(std::sync::Arc::ptr_eq(&newer, &retained));
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
     }
 
     #[cfg(windows)]
