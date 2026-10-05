@@ -34,6 +34,10 @@ pub fn content_dir() -> PathBuf {
     ensure(data_root().join("content"))
 }
 
+pub fn firmware_dir() -> PathBuf {
+    ensure(data_root().join("firmware"))
+}
+
 pub fn mods_dir() -> PathBuf {
     ensure(data_root().join("mods"))
 }

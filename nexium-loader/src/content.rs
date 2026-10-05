@@ -126,7 +126,7 @@ impl Package {
     }
 }
 
-fn validate_nca(nca: &Nca, range: &std::ops::Range<usize>) -> Result<(), String> {
+pub(crate) fn validate_nca(nca: &Nca, range: &std::ops::Range<usize>) -> Result<(), String> {
     if nca.content_size > range.len() as u64 || nca.sections.iter().any(|section| {
         section.section_range.start < range.start || section.section_range.end > range.end
     }) {
@@ -145,8 +145,9 @@ fn kind_for(kind: ContentMetaType) -> Option<ContentKind> {
 
 pub fn is_content_only_package(path: &Path) -> bool {
     let Ok(package) = Package::open(path) else { return false };
-    package.metadata.iter().any(|metadata| kind_for(metadata.meta_type).is_some())
-        && !package.metadata.iter().any(|metadata| metadata.meta_type == ContentMetaType::Application)
+    package.metadata.iter().any(|metadata| {
+        kind_for(metadata.meta_type).is_some() || metadata.meta_type == ContentMetaType::SystemUpdate
+    }) && !package.metadata.iter().any(|metadata| metadata.meta_type == ContentMetaType::Application)
 }
 
 pub fn inspect_package(path: &Path) -> Result<ContentPackage, String> {
@@ -265,7 +266,7 @@ pub fn list_game_content(root: &Path, application_id: u64) -> Result<GameContent
     Ok(content)
 }
 
-fn unique_name(prefix: &str, extension: &str) -> String {
+pub(crate) fn unique_name(prefix: &str, extension: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     format!("{prefix}-{nanos:x}-{:x}.{extension}", NEXT.fetch_add(1, Ordering::Relaxed))
@@ -426,15 +427,15 @@ fn remove_unreferenced(previous: &GameContent, current: &GameContent) {
 
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const TITLE: u64 = 0x0100_1234_5678_0000;
 
-    struct TestDirectory(PathBuf);
+    pub(crate) struct TestDirectory(pub(crate) PathBuf);
 
     impl TestDirectory {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let path = std::env::temp_dir().join(unique_name("nexium-content", "test"));
             fs::create_dir_all(&path).unwrap();
             Self(path)
@@ -451,7 +452,7 @@ mod tests {
         fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
     }
 
-    fn pfs(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    pub(crate) fn pfs(files: &[(String, Vec<u8>)]) -> Vec<u8> {
         let mut names = Vec::new();
         let mut offsets = Vec::new();
         for (name, _) in files {
@@ -477,7 +478,7 @@ mod tests {
         result
     }
 
-    fn nca(kind: u8, fs_kind: u8, title_id: u64, body: &[u8]) -> Vec<u8> {
+    pub(crate) fn nca(kind: u8, fs_kind: u8, title_id: u64, body: &[u8]) -> Vec<u8> {
         let size = (0xC00 + body.len() + 0x1FF) & !0x1FF;
         let mut bytes = vec![0; size];
         bytes[0x200..0x204].copy_from_slice(b"DNCA");

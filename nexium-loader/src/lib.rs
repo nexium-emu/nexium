@@ -6,6 +6,7 @@ pub mod container;
 pub mod control;
 pub mod content;
 pub mod env;
+pub mod firmware;
 pub mod layered;
 pub mod mods;
 pub mod patch;

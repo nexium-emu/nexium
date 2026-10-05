@@ -10,6 +10,7 @@ pub const HEAD_MAGIC: u32 = 0x44414548;
 pub struct Xci {
     secure: PartitionFs,
     update: Option<PartitionFs>,
+    update_error: Option<String>,
 }
 
 impl Xci {
@@ -41,12 +42,14 @@ impl Xci {
         let secure_range = main.entry_range(&secure_entry)?;
         let secure = PartitionFs::parse(mmap.clone(), secure_range.start)?;
 
+        let mut update_error = None;
         let update = if let Some(update_entry) = main.find("update") {
             let update_range = main.entry_range(update_entry)?;
             match PartitionFs::parse(mmap.clone(), update_range.start) {
                 Ok(update) => Some(update),
                 Err(error) => {
                     log::warn!("skipping unreadable gamecard update partition: {}", error);
+                    update_error = Some(error);
                     None
                 }
             }
@@ -54,7 +57,7 @@ impl Xci {
             None
         };
 
-        Ok(Self { secure, update })
+        Ok(Self { secure, update, update_error })
     }
 
     pub fn ncas(&self) -> &PartitionFs {
@@ -63,5 +66,9 @@ impl Xci {
 
     pub fn update_ncas(&self) -> Option<&PartitionFs> {
         self.update.as_ref()
+    }
+
+    pub fn update_error(&self) -> Option<&str> {
+        self.update_error.as_deref()
     }
 }
