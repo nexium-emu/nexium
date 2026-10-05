@@ -736,7 +736,11 @@ impl PrepState {
             } => {
                 super::watchdog::phase(super::watchdog::Phase::Semaphore, gpu_va);
                 self.publish_pending_storage_readbacks(true, mappings, mem_read, mem_write);
-                self.resolve_pending_compute(mappings, mem_write);
+                if super::accuracy::normal_accuracy() {
+                    self.land_or_resolve_pending_compute(mappings, mem_write);
+                } else {
+                    self.resolve_pending_compute(mappings, mem_write);
+                }
                 self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
                 self.ssbo_snapshot_cache.invalidate_gpu_write(
                     mappings,
