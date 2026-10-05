@@ -561,6 +561,8 @@ pub struct RtCache {
     last_use: std::sync::Mutex<HashMap<RtKey, (u64, u64)>>,
     use_counter: AtomicU64,
     use_frame: u64,
+    budget_check_ns: AtomicU64,
+    budget_check_interval_ns: AtomicU64,
     full_clear_stamp: HashMap<RtKey, u64>,
     depth_full_clear_generation: HashMap<RtKey, u64>,
     color_region_sources: HashMap<RtKey, (RtKey, vk::Image, u64)>,
@@ -594,9 +596,17 @@ pub struct RtCache {
     guest_range_epoch: u64,
     guest_range_lookup: GuestRangeLookup,
     guest_hit_memo: Vec<GuestHitMemoEntry>,
+    evict_trace: Option<std::sync::Mutex<EvictTrace>>,
 }
 
 const GUEST_HIT_MEMO_SIZE: usize = 64;
+
+#[derive(Default)]
+struct EvictTrace {
+    evicted: std::collections::VecDeque<(RtKey, u64, u64, u64)>,
+    reported: HashSet<(RtKey, u64)>,
+    logged: u64,
+}
 
 struct GuestHitMemoEntry {
     epoch: u64,
@@ -858,6 +868,8 @@ impl RtCache {
             last_use: std::sync::Mutex::new(HashMap::default()),
             use_counter: AtomicU64::new(0),
             use_frame: 0,
+            budget_check_ns: AtomicU64::new(0),
+            budget_check_interval_ns: AtomicU64::new(RT_CACHE_BUDGET_CHECK_INTERVAL_NS),
             depth_formats: crate::depth::DepthFormats::default(),
             depth_pack_pipeline: None,
             snapshots: HashMap::default(),
@@ -899,6 +911,8 @@ impl RtCache {
             guest_range_epoch: 0,
             guest_range_lookup: GuestRangeLookup::default(),
             guest_hit_memo: Vec::new(),
+            evict_trace: std::env::var_os("NEXIUM_RT_EVICT_TRACE")
+                .map(|_| std::sync::Mutex::new(EvictTrace::default())),
         }
     }
 
@@ -2302,6 +2316,70 @@ impl RtCache {
         (count, bytes)
     }
 
+    fn trace_eviction(&self, depth: bool, key: RtKey, last_frame: u64) {
+        let Some(trace) = self.evict_trace.as_ref() else {
+            return;
+        };
+        let (ranges, index) = if depth {
+            (&self.depth_guest_ranges, &self.depth_guest_range_index)
+        } else {
+            (&self.color_guest_ranges, &self.color_guest_range_index)
+        };
+        let (lo, hi) = index
+            .get(&key)
+            .and_then(|&position| ranges.get(position))
+            .map(|entry| (entry.gpu_lo, entry.gpu_hi))
+            .unwrap_or((key.gpu_va, key.gpu_va));
+        let stamp = if depth { self.depth_generation(key) } else { self.writeback_stamp(key) };
+        let stale = if depth {
+            self.guest_stale_depth.contains(&key)
+        } else {
+            self.guest_stale_color.contains(&key)
+        };
+        let Ok(mut trace) = trace.lock() else {
+            return;
+        };
+        trace.logged += 1;
+        if trace.logged <= 20_000 {
+            log::warn!(
+                "[rt-evict] {} {} range={lo:#x}..{hi:#x} idle={} stamp={stamp:?} stale={stale}",
+                if depth { "depth" } else { "color" },
+                key.label(),
+                self.use_frame.saturating_sub(last_frame),
+            );
+        }
+        if trace.evicted.len() >= 16_384 {
+            trace.evicted.pop_front();
+        }
+        trace.evicted.push_back((key, self.use_frame, lo, hi));
+    }
+
+    pub(crate) fn trace_evicted_sample(&self, gpu_va: u64, size: u64, context: &dyn Fn() -> String) {
+        let Some(trace) = self.evict_trace.as_ref() else {
+            return;
+        };
+        let Ok(mut trace) = trace.lock() else {
+            return;
+        };
+        let end = gpu_va.saturating_add(size);
+        let hits: Vec<_> = trace
+            .evicted
+            .iter()
+            .filter(|(_, _, lo, hi)| *lo < end && gpu_va < *hi)
+            .map(|(key, frame, _, _)| (*key, *frame))
+            .collect();
+        for (key, frame) in hits {
+            if trace.reported.len() < 4096 && trace.reported.insert((key, gpu_va)) {
+                log::warn!(
+                    "[rt-evict-hit] texture va={gpu_va:#x}+{size:#x} reads evicted {} (evicted frame {frame}, now {}) {}",
+                    key.label(),
+                    self.use_frame,
+                    context()
+                );
+            }
+        }
+    }
+
     pub fn touch_use(&self, key: RtKey) {
         let stamp = self.use_counter.fetch_add(1, Ordering::Relaxed) + 1;
         if let Ok(mut uses) = self.last_use.lock() {
@@ -2310,7 +2388,66 @@ impl RtCache {
     }
 
     pub(crate) fn over_budget(&self) -> bool {
-        self.cached_bytes() > rt_cache_budget_bytes()
+        let now = crate::renderer::monotonic_nanos().max(1);
+        let last = self.budget_check_ns.load(Ordering::Relaxed);
+        let interval = self.budget_check_interval_ns.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < interval {
+            return false;
+        }
+        self.budget_check_ns.store(now, Ordering::Relaxed);
+        let over = self.cached_bytes() > rt_cache_budget_bytes();
+        if !over {
+            self.budget_check_interval_ns
+                .store(RT_CACHE_BUDGET_CHECK_INTERVAL_NS, Ordering::Relaxed);
+        }
+        over
+    }
+
+    fn contents_reclaimable(&self, depth: bool, key: RtKey) -> bool {
+        let stamp = if depth {
+            if self.guest_stale_depth.contains(&key) || self.obsolete_mapping_views.contains(&(true, key)) {
+                return true;
+            }
+            self.depth_generation(key)
+        } else {
+            if self.guest_stale_color.contains(&key) || self.obsolete_mapping_views.contains(&(false, key)) {
+                return true;
+            }
+            self.writeback_stamp(key)
+        };
+        match stamp {
+            Some(stamp) => self.superseded_by_newer_writes(depth, key, stamp),
+            None => true,
+        }
+    }
+
+    fn superseded_by_newer_writes(&self, depth: bool, key: RtKey, stamp: u64) -> bool {
+        let (ranges, index) = if depth {
+            (&self.depth_guest_ranges, &self.depth_guest_range_index)
+        } else {
+            (&self.color_guest_ranges, &self.color_guest_range_index)
+        };
+        let Some((lo, hi)) = index
+            .get(&key)
+            .and_then(|&position| ranges.get(position))
+            .map(|entry| (entry.gpu_lo, entry.gpu_hi))
+        else {
+            return false;
+        };
+        if lo >= hi || self.guest_range_lookup.epoch != Some(self.guest_range_epoch) {
+            return false;
+        }
+        let (colors, depths) = self.guest_range_lookup.hits(0, 0, &[(lo, hi - lo)]);
+        (if depth { depths } else { colors }).into_iter().any(|other| {
+            other != key
+                && (if depth { self.depth_generation(other) } else { self.writeback_stamp(other) })
+                    .is_some_and(|other_stamp| other_stamp > stamp)
+                && ((other.gpu_va == key.gpu_va && other.nvmap_id == key.nvmap_id)
+                    || index
+                        .get(&other)
+                        .and_then(|&position| ranges.get(position))
+                        .is_some_and(|entry| entry.gpu_lo <= lo && hi <= entry.gpu_hi))
+        })
     }
 
     fn cached_bytes(&self) -> u64 {
@@ -2328,7 +2465,13 @@ impl RtCache {
         let budget = rt_cache_budget_bytes();
         let total = self.cached_bytes();
         if total <= budget {
+            *self.budget_check_interval_ns.get_mut() = RT_CACHE_BUDGET_CHECK_INTERVAL_NS;
             return (0, 0);
+        }
+        let epoch = self.guest_range_epoch;
+        if self.guest_range_lookup.epoch != Some(epoch) {
+            self.guest_range_lookup
+                .rebuild(epoch, &self.color_guest_ranges, &self.depth_guest_ranges);
         }
         let now = self.use_frame;
         let mut candidates: Vec<((u64, u64), bool, RtKey, u64)> = Vec::new();
@@ -2347,7 +2490,9 @@ impl RtCache {
                     continue;
                 }
                 let last = uses.get(&key).copied().unwrap_or((0, 0));
-                if now.saturating_sub(last.0) < RT_CACHE_MIN_IDLE_FRAMES {
+                if now.saturating_sub(last.0) < RT_CACHE_MIN_IDLE_FRAMES
+                    || !self.contents_reclaimable(depth, key)
+                {
                     continue;
                 }
                 candidates.push((last, depth, key, bytes));
@@ -2357,10 +2502,11 @@ impl RtCache {
         let mut excess = total - budget;
         let mut count = 0usize;
         let mut bytes_total = 0u64;
-        for (_, depth, key, bytes) in candidates {
+        for (last, depth, key, bytes) in candidates {
             if excess == 0 {
                 break;
             }
+            self.trace_eviction(depth, key, last.0);
             let (retired_count, retired_bytes) = self.retire_view(depth, key, retired);
             count += retired_count;
             bytes_total = bytes_total.saturating_add(retired_bytes);
@@ -2369,6 +2515,14 @@ impl RtCache {
         if let Ok(mut uses) = self.last_use.lock() {
             uses.retain(|key, _| self.cache.contains_key(key) || self.depth_cache.contains_key(key));
         }
+        let interval = self.budget_check_interval_ns.get_mut();
+        *interval = if count == 0 {
+            interval
+                .saturating_mul(2)
+                .min(RT_CACHE_BUDGET_CHECK_MAX_INTERVAL_NS)
+        } else {
+            RT_CACHE_BUDGET_CHECK_INTERVAL_NS
+        };
         if count != 0 {
             static EVICTIONS: AtomicU64 = AtomicU64::new(0);
             let total_evictions =
@@ -2377,6 +2531,14 @@ impl RtCache {
                 log::info!(
                     "[rt-cache-evict] retired={count} bytes={bytes_total} total_evictions={total_evictions} cached_bytes={} budget={budget}",
                     self.cached_bytes()
+                );
+            }
+        } else {
+            static KEPT: AtomicU64 = AtomicU64::new(0);
+            let kept = KEPT.fetch_add(1, Ordering::Relaxed);
+            if kept < 4 || kept % 1024 == 0 {
+                log::info!(
+                    "[rt-cache-evict] over budget but every idle target holds live contents; keeping them cached_bytes={total} budget={budget}"
                 );
             }
         }
@@ -4343,6 +4505,8 @@ impl RtCache {
 }
 
 const RT_CACHE_MIN_IDLE_FRAMES: u64 = 4;
+const RT_CACHE_BUDGET_CHECK_INTERVAL_NS: u64 = 16_000_000;
+const RT_CACHE_BUDGET_CHECK_MAX_INTERVAL_NS: u64 = 1_000_000_000;
 
 fn rt_cache_budget_bytes() -> u64 {
     static BUDGET: OnceLock<u64> = OnceLock::new();
@@ -4814,6 +4978,8 @@ mod tests {
         rt_sampleable_color_alias_equal, rt_sampleable_depth_alias_equal,
         same_d24_depth_allocation_covering, same_physical_backing, GpuImage, RtCache,
         RtColorRegion, RtKey, RtMappingEpochTransition, RtSampleViewKey,
+        RT_CACHE_BUDGET_CHECK_INTERVAL_NS, RT_CACHE_BUDGET_CHECK_MAX_INTERVAL_NS,
+        RT_CACHE_MIN_IDLE_FRAMES,
     };
     use ash::vk;
     use ash::vk::Handle;
@@ -4875,6 +5041,105 @@ mod tests {
         );
         cache.insert_depth_image(key, image);
         cache.mark_depth_written(key);
+    }
+
+    fn drawn_color(cache: &mut RtCache, key: RtKey, image: GpuImage) {
+        cache.insert_color_image(key, image);
+        cache.mark_drawn(key);
+    }
+
+    fn reclaimable_colors(cache: &mut RtCache, keys: &[RtKey]) -> Vec<bool> {
+        let epoch = cache.guest_range_epoch;
+        cache
+            .guest_range_lookup
+            .rebuild(epoch, &cache.color_guest_ranges, &cache.depth_guest_ranges);
+        keys.iter().map(|key| cache.contents_reclaimable(false, *key)).collect()
+    }
+
+    #[test]
+    fn budget_eviction_reclaims_only_unobservable_contents() {
+        let mut cache = RtCache::new();
+        let old = retirement_key(64, 32);
+        let resized = RtKey { width: 48, height: 24, ..old };
+        drawn_color(&mut cache, old, retirement_color(old, 1));
+        drawn_color(&mut cache, resized, retirement_color(resized, 2));
+        let elsewhere = |offset: u64| RtKey {
+            gpu_va: old.gpu_va + offset,
+            cpu_addr: old.cpu_addr + offset,
+            ..old
+        };
+        let live = elsewhere(0x100_0000);
+        drawn_color(&mut cache, live, retirement_color(live, 3));
+        let undrawn = elsewhere(0x200_0000);
+        cache.insert_color_image(undrawn, retirement_color(undrawn, 4));
+        let overwritten = elsewhere(0x300_0000);
+        drawn_color(&mut cache, overwritten, retirement_color(overwritten, 5));
+        cache.mark_guest_written(overwritten);
+        assert_eq!(
+            reclaimable_colors(&mut cache, &[old, resized, live, undrawn, overwritten]),
+            [true, false, false, true, true]
+        );
+    }
+
+    #[test]
+    fn budget_eviction_needs_one_newer_target_over_the_whole_range() {
+        let mut cache = RtCache::new();
+        let base = retirement_key(64, 32).with_guest_size_bytes(0x2000);
+        drawn_color(&mut cache, base, retirement_color(base, 1));
+        let shifted = |nvmap_id: u32, offset: i64, size: u64| RtKey {
+            nvmap_id,
+            gpu_va: base.gpu_va.wrapping_add_signed(offset),
+            cpu_addr: base.cpu_addr.wrapping_add_signed(offset),
+            guest_size_bytes: size,
+            ..base
+        };
+        let tail = shifted(13, 0x1000, 0x2000);
+        let head = shifted(14, -0x800, 0x2000);
+        drawn_color(&mut cache, tail, retirement_color(tail, 2));
+        drawn_color(&mut cache, head, retirement_color(head, 3));
+        assert_eq!(reclaimable_colors(&mut cache, &[base, tail, head]), [false, false, false]);
+        let cover = shifted(15, -0x1000, 0x4000);
+        drawn_color(&mut cache, cover, retirement_color(cover, 4));
+        assert_eq!(
+            reclaimable_colors(&mut cache, &[base, tail, head, cover]),
+            [true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn over_budget_eviction_keeps_live_targets_resident() {
+        let mut cache = RtCache::new();
+        let huge = |key: RtKey, handle: u64| GpuImage {
+            extent: vk::Extent2D { width: 32768, height: 32768 },
+            ..retirement_color(key, handle)
+        };
+        let old = retirement_key(64, 32);
+        let resized = RtKey { width: 48, height: 24, ..old };
+        drawn_color(&mut cache, old, huge(old, 1));
+        drawn_color(&mut cache, resized, huge(resized, 2));
+        for _ in 0..RT_CACHE_MIN_IDLE_FRAMES {
+            cache.reset_frame_draws();
+        }
+        assert!(cache.over_budget());
+        let mut retired = Vec::new();
+        assert_eq!(cache.retire_over_budget(&mut retired, &[]).0, 1);
+        assert_eq!(*cache.budget_check_interval_ns.get_mut(), RT_CACHE_BUDGET_CHECK_INTERVAL_NS);
+        assert!(!cache.cache.contains_key(&old));
+        assert!(cache.cache.contains_key(&resized));
+        assert_eq!(cache.retire_over_budget(&mut retired, &[]), (0, 0));
+        assert_eq!(
+            *cache.budget_check_interval_ns.get_mut(),
+            2 * RT_CACHE_BUDGET_CHECK_INTERVAL_NS
+        );
+        for _ in 0..16 {
+            cache.retire_over_budget(&mut retired, &[]);
+        }
+        assert_eq!(
+            *cache.budget_check_interval_ns.get_mut(),
+            RT_CACHE_BUDGET_CHECK_MAX_INTERVAL_NS
+        );
+        assert!(cache.cache.contains_key(&resized));
+        assert_eq!(retired.len(), 1);
     }
 
     #[test]

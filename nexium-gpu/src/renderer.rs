@@ -13296,6 +13296,9 @@ impl Renderer {
                         rp_tex_gen += profile_elapsed(rp_gen_t0);
                         continue;
                     };
+                    rt_cache.trace_evicted_sample(key.gpu_va, read_size as u64, &|| {
+                        format!("graphics slot={slot} fs={:#x} volume={}", call.fs_gpu_va, key.volume)
+                    });
                     rp_tex_generic_slots += 1;
                     let numeric_type = texture_numeric_types[slot];
                     let numeric_family = texture_numeric_index(numeric_type);
@@ -27682,7 +27685,7 @@ fn ring_wrap_other(
     Ok(())
 }
 
-fn monotonic_nanos() -> u64 {
+pub(crate) fn monotonic_nanos() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static EPOCH: OnceLock<Instant> = OnceLock::new();
