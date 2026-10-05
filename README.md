@@ -37,6 +37,7 @@ Work in progress and rough. Homebrew is the main focus right now; commercial tit
 - Maxwell GPU emulation on wgpu/Vulkan, with a SPIR-V shader path.
 - A Horizon OS kernel: syscalls, IPC, and enough services to get things booting.
 - `.nro` homebrew loading.
+- Firmware installation from your own decrypted dumps: opening a `.dxci` whose update partition carries firmware offers to install it, and dropping a `.dxci` or an NXDecrypt firmware `.dnsp` on the window installs it on its own. Settings → Emulation shows the installed version and has Install Firmware / Remove Firmware. Installed firmware supplies system archives (fonts and other system data) to games that don't bundle them.
 - Audio through cpal, controllers through SDL3, and a 60 Hz frame pacer.
 - A desktop UI (egui) for picking titles and settings.
 
