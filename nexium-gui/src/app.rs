@@ -922,6 +922,8 @@ pub struct HorizonApp {
     game_info_path: Option<std::path::PathBuf>,
     mod_manager: Option<crate::mods::ModManager>,
     content_manager: Option<crate::content_manager::ContentManager>,
+    firmware_prompt: Option<crate::firmware_prompt::FirmwarePrompt>,
+    firmware_status: Option<Result<Option<nexium_loader::firmware::InstalledFirmware>, String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1554,6 +1556,8 @@ impl HorizonApp {
             game_info_path: None,
             mod_manager: None,
             content_manager: None,
+            firmware_prompt: None,
+            firmware_status: None,
         };
         app.reload_profile_texture(&cc.egui_ctx);
         crate::ui_audio::set_sfx_volume(app.app_settings.sfx_volume);
@@ -1667,6 +1671,50 @@ impl HorizonApp {
         self.mod_manager = None;
         self.content_manager = Some(crate::content_manager::ContentManager::new(path, title, cover, accent, ctx));
         crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+    }
+
+    fn open_game_file(&mut self, path: std::path::PathBuf, then: crate::firmware_prompt::Then, ctx: &egui::Context) {
+        if crate::firmware_prompt::may_contain_firmware(&path) {
+            self.game_info_path = None;
+            let accent = self.theme_accent();
+            self.firmware_prompt = Some(crate::firmware_prompt::FirmwarePrompt::new(path, then, accent, ctx));
+            return;
+        }
+        match then {
+            crate::firmware_prompt::Then::Boot => {
+                self.nro_path = path.to_string_lossy().to_string();
+                self.boot_nro(ctx);
+            }
+            crate::firmware_prompt::Then::Select => self.nro_path = path.to_string_lossy().to_string(),
+            crate::firmware_prompt::Then::Nothing => {}
+        }
+    }
+
+    fn firmware_status(&mut self) -> Result<Option<nexium_loader::firmware::InstalledFirmware>, String> {
+        self.firmware_status
+            .get_or_insert_with(|| nexium_loader::firmware::installed_firmware(&nexium_common::paths::firmware_dir()))
+            .clone()
+    }
+
+    fn install_firmware_from_settings(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Install firmware")
+            .add_filter("Firmware (.dnsp or .dxci)", &["dnsp", "dxci"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.show_settings = false;
+        self.prefs_anim = 0.0;
+        self.open_game_file(path, crate::firmware_prompt::Then::Nothing, ctx);
+    }
+
+    fn remove_firmware_from_settings(&mut self) {
+        let Ok(Some(installed)) = self.firmware_status() else { return };
+        self.show_settings = false;
+        self.prefs_anim = 0.0;
+        let accent = self.theme_accent();
+        self.firmware_prompt = Some(crate::firmware_prompt::FirmwarePrompt::remove(installed, accent));
     }
 
     fn open_mod_manager(&mut self, path: std::path::PathBuf, ctx: &egui::Context) {
@@ -1903,8 +1951,7 @@ impl HorizonApp {
                         .add_filter("Switch games", &["nro", "dxci", "dnsp"])
                         .pick_file()
                     {
-                        self.nro_path = p.to_string_lossy().to_string();
-                        self.boot_nro(ctx);
+                        self.open_game_file(p, crate::firmware_prompt::Then::Boot, ctx);
                     }
                 }
                 ui.add_space(8.0);
@@ -2288,6 +2335,7 @@ impl HorizonApp {
             || self.game_info_path.is_some()
             || self.mod_manager.is_some()
             || self.content_manager.is_some()
+            || self.firmware_prompt.is_some()
             || self.vkeyboard.open
     }
 
@@ -7082,6 +7130,7 @@ impl HorizonApp {
                 crate::ui_audio::play_move();
             }
         } else if self.settings_tab == SettingsTab::Emulation {
+            let firmware = self.firmware_status();
             let rows: Vec<(String, String)> = vec![
                 (
                     "Multicore CPU".to_string(),
@@ -7100,6 +7149,19 @@ impl HorizonApp {
                         "Off"
                     }
                     .to_string(),
+                ),
+                (
+                    "Firmware".to_string(),
+                    match &firmware {
+                        Ok(Some(installed)) => installed.display_version.clone(),
+                        Ok(None) => "Not installed".to_string(),
+                        Err(_) => "Unreadable".to_string(),
+                    },
+                ),
+                ("Install Firmware".to_string(), "Choose file".to_string()),
+                (
+                    "Remove Firmware".to_string(),
+                    if matches!(firmware, Ok(Some(_))) { "Remove" } else { "None" }.to_string(),
                 ),
             ];
             let mut row = self.prefs_row;
@@ -7136,6 +7198,8 @@ impl HorizonApp {
                         self.app_settings.async_shaders = !self.app_settings.async_shaders;
                         nexium_common::async_compile::set_enabled(self.app_settings.async_shaders);
                     }
+                    3 => self.install_firmware_from_settings(ctx),
+                    4 => self.remove_firmware_from_settings(),
                     _ => {}
                 }
                 let _ = self.app_settings.save();
@@ -10563,7 +10627,7 @@ impl eframe::App for HorizonApp {
                                     .add_filter("Switch games", &["nro", "dxci", "dnsp"])
                                     .pick_file()
                                 {
-                                    self.nro_path = p.to_string_lossy().to_string();
+                                    self.open_game_file(p, crate::firmware_prompt::Then::Select, ctx);
                                 }
                                 ui.close();
                             }
@@ -11317,6 +11381,30 @@ impl eframe::App for HorizonApp {
                         self.content_manager = None;
                     }
                 }
+                if !self.modal_active() {
+                    let dropped = ctx.input(|input| {
+                        input.raw.dropped_files.iter()
+                            .map(|file| file.path().to_path_buf())
+                            .find(|path| crate::firmware_prompt::may_contain_firmware(path))
+                    });
+                    if let Some(path) = dropped {
+                        self.open_game_file(path, crate::firmware_prompt::Then::Nothing, ctx);
+                    }
+                }
+                if let Some(prompt) = &mut self.firmware_prompt {
+                    if let crate::firmware_prompt::Outcome::Done(then, path) = prompt.show(ctx, &self.last_input, content_game_running) {
+                        self.firmware_prompt = None;
+                        self.firmware_status = None;
+                        match then {
+                            crate::firmware_prompt::Then::Boot => {
+                                self.nro_path = path.to_string_lossy().to_string();
+                                self.boot_nro(ctx);
+                            }
+                            crate::firmware_prompt::Then::Select => self.nro_path = path.to_string_lossy().to_string(),
+                            crate::firmware_prompt::Then::Nothing => {}
+                        }
+                    }
+                }
                 self.update_icon_picker(ctx, ui);
                 if let Some(action) = game_info_action {
                     match action {
@@ -11422,6 +11510,8 @@ impl eframe::App for HorizonApp {
             let pad_list = self.input.as_ref().map(|ib| ib.list_gamepads()).unwrap_or_default();
             let active_pad = self.input.as_ref().and_then(|ib| ib.get_active_id());
             let mut pad_pick = None;
+            let firmware_status = self.firmware_status();
+            let mut firmware_action = None;
 
             let screen = ctx.viewport_rect();
             let max_h = (screen.height() - 80.0).clamp(360.0, 760.0);
@@ -11555,6 +11645,7 @@ impl eframe::App for HorizonApp {
                         }
                         SettingsTab::Emulation => {
                             emulation_settings_content(ui, &mut app_cfg, &mut app_save_needed);
+                            firmware_action = firmware_settings_content(ui, &firmware_status);
                         }
                         SettingsTab::Logging => {
                             logging_settings_content(ui, &mut app_cfg, &mut app_save_needed);
@@ -11595,6 +11686,11 @@ impl eframe::App for HorizonApp {
             }
             if calibrate_now {
                 self.calibrate_motion();
+            }
+            match firmware_action {
+                Some(FirmwareSettingsAction::Install) => self.install_firmware_from_settings(ctx),
+                Some(FirmwareSettingsAction::Remove) => self.remove_firmware_from_settings(),
+                None => {}
             }
             if vibration_test {
                 self.test_vibration();
@@ -12897,6 +12993,66 @@ fn emulation_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_nee
     resp.on_hover_text(
         "Left-clicking the game viewport sends a touchscreen tap at the cursor position — most point-and-click games use this, not the USB mouse",
     );
+}
+
+#[derive(Clone, Copy)]
+enum FirmwareSettingsAction {
+    Install,
+    Remove,
+}
+
+fn firmware_settings_content(
+    ui: &mut egui::Ui,
+    status: &Result<Option<nexium_loader::firmware::InstalledFirmware>, String>,
+) -> Option<FirmwareSettingsAction> {
+    let mut action = None;
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("Firmware")
+            .size(13.0)
+            .strong()
+            .color(TEXT),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(
+            "Install system firmware from your own decrypted dumps: a firmware .dnsp from NXDecrypt, or a .dxci whose update partition carries firmware. Games use its system archives, such as fonts, when they don't bundle their own.",
+        )
+        .size(11.0)
+        .color(MUTED),
+    );
+    ui.add_space(8.0);
+    let installed = match status {
+        Ok(Some(installed)) => {
+            ui.label(egui::RichText::new(format!("Installed: firmware {}", installed.display_version)).color(TEXT));
+            ui.label(
+                egui::RichText::new(format!("{} files, installed from {}", installed.files.len(), installed.source))
+                    .size(10.5)
+                    .color(MUTED),
+            );
+            true
+        }
+        Ok(None) => {
+            ui.label(egui::RichText::new("No firmware installed").color(MUTED));
+            false
+        }
+        Err(error) => {
+            ui.label(egui::RichText::new(format!("Installed firmware can't be read: {error}")).color(Color32::from_rgb(240, 119, 119)));
+            false
+        }
+    };
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Install firmware…").clicked() {
+            action = Some(FirmwareSettingsAction::Install);
+        }
+        if ui.add_enabled(installed, egui::Button::new("Remove firmware")).clicked() {
+            action = Some(FirmwareSettingsAction::Remove);
+        }
+    });
+    action
 }
 
 fn logging_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_needed: &mut bool) {

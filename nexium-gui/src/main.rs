@@ -14,6 +14,7 @@ mod controller_config;
 mod content_manager;
 mod debugger;
 mod depth_emit;
+mod firmware_prompt;
 mod frame_scaler;
 mod hd_rumble;
 mod homebrew;
