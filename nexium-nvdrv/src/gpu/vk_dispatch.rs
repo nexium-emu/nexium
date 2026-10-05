@@ -7051,6 +7051,7 @@ fn render_enable_needs_ordered_read(draw: &DrawCall) -> bool {
     strict_cond_render()
         && draw.render_enable_override == 0
         && matches!(draw.render_enable_mode, 2 | 3 | 4)
+        && !(super::accuracy::normal_accuracy() && !super::completion::guest_writes_pending())
 }
 
 fn strict_cond_render() -> bool {
