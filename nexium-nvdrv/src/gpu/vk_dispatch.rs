@@ -2266,7 +2266,7 @@ impl MirrorPageCache {
     ) -> bool {
         #[cfg(test)]
         CBUF_WATCH_SYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let pre_spans = forward_spans.len();
+        let pre_spans = forward_spans.len().saturating_sub(1);
         let observation = nexium_memory::fastmem::take_write_watch_spans_observed(
             chunk_base,
             MIRROR_CHUNK_SIZE,
@@ -25754,6 +25754,36 @@ mod tests {
                 .mirror_resident_cbuf_pages(&mappings, &requests, &mem_read)
                 .unwrap();
             assert_eq!(slot_bytes(&fresh, 0), vec![0x44u8; 16]);
+        }
+
+        #[test]
+        fn cbuf_write_watch_marks_dirty_when_a_query_extends_the_preceding_span() {
+            let va = 0x79d0_0000u64;
+            if !watch_ready(va, MIRROR_CHUNK_SIZE) {
+                return;
+            }
+            let mut cache = SsboSnapshotCache::default();
+            let key = va >> MIRROR_CHUNK_SHIFT;
+            cache.mirror_ensure_chunk(key);
+            let _ = nexium_memory::fastmem::take_write_watch(va, MIRROR_CHUNK_SIZE);
+            let (serial, generation) =
+                nexium_memory::fastmem::observed_write_snapshot_range(va, MIRROR_CHUNK_SIZE);
+            let chunk = cache.mirror.chunks.get_mut(&key).unwrap();
+            chunk.dirty = 0;
+            chunk.cbuf_dirty = 0;
+            chunk.cbuf_observed_write_serial = serial;
+            chunk.cbuf_observed_write_generation = generation;
+            write_guest(va, &[0x77u8; 16]);
+            let mut spans = vec![(va - MIRROR_PAGE_SIZE as u64, MIRROR_PAGE_SIZE)];
+            assert!(super::super::MirrorPageCache::sync_cbuf_write_watch(chunk, va, &mut spans));
+            assert_eq!(spans, vec![(va - MIRROR_PAGE_SIZE as u64, 2 * MIRROR_PAGE_SIZE)]);
+            assert_eq!(chunk.dirty, 1);
+            assert_eq!(chunk.cbuf_dirty, 1);
+            cache.clear();
+            nexium_memory::fastmem::decommit(
+                unsafe { nexium_memory::fastmem::base().unwrap().add(va as usize) },
+                MIRROR_CHUNK_SIZE,
+            );
         }
 
         #[test]
