@@ -1253,7 +1253,14 @@ impl Pusher {
     ) -> bool {
         match &mut self.prep {
             super::prep::PrepLane::Inline(state) => state.run_event(
-                event, None, engines, mappings, stats, mem_read, mem_write, mem_copy,
+                event,
+                super::prep::DrawVecRecycle::Discard,
+                engines,
+                mappings,
+                stats,
+                mem_read,
+                mem_write,
+                mem_copy,
             ),
             super::prep::PrepLane::Threaded(handle) => {
                 handle.send(event);
@@ -2633,16 +2640,7 @@ impl Pusher {
             }
             if !maxwell.pending_draws.is_empty() {
                 let gs_debug = gs_dump_enabled().then(|| maxwell.gs_debug_regs());
-                let draw_capacity = maxwell.pending_draws.len();
-                let draws = std::mem::replace(
-                    &mut maxwell.pending_draws,
-                    Vec::with_capacity(draw_capacity),
-                );
-                if let super::prep::PrepLane::Threaded(handle) = &self.prep {
-                    if let Some(recycled) = handle.try_take_recycled_draw_vec() {
-                        maxwell.pending_draws = recycled;
-                    }
-                }
+                let draws = self.prep.take_pending_draws(&mut maxwell.pending_draws);
                 if kickprof::enabled() {
                     kickprof::count(
                         kickprof::HOST_DRAWS,
@@ -2663,20 +2661,27 @@ impl Pusher {
                     kepler_compute,
                     kepler_memory,
                 };
-                self.emit_prep(
-                    super::prep::PrepEvent::Draws {
-                        draws,
-                        gs_debug,
-                        replay_constbuf_writes,
-                        constbuf_trace,
-                    },
-                    &mut engines,
-                    mappings,
-                    stats,
-                    mem_read,
-                    mem_write,
-                    mem_copy,
-                );
+                let event = super::prep::PrepEvent::Draws {
+                    draws,
+                    gs_debug,
+                    replay_constbuf_writes,
+                    constbuf_trace,
+                };
+                match &mut self.prep {
+                    super::prep::PrepLane::Inline(state) => {
+                        state.run_event(
+                            event,
+                            super::prep::DrawVecRecycle::Inline(&mut maxwell.pending_draws),
+                            &mut engines,
+                            mappings,
+                            stats,
+                            mem_read,
+                            mem_write,
+                            mem_copy,
+                        );
+                    }
+                    super::prep::PrepLane::Threaded(handle) => handle.send(event),
+                }
             } else {
                 debug_assert!(replay_constbuf_writes.is_empty());
             }
@@ -3790,6 +3795,63 @@ mod tests {
         assert_eq!(pusher.state.method, 0x203);
         assert_eq!(pusher.state.method_count, 0);
         assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn inline_draw_events_preserve_order_and_reuse_pending_capacity() {
+        let mut pusher = Pusher::new();
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x6000, 0x1000, 0xa000, 1);
+        let mut maxwell = Maxwell3D::new();
+        maxwell.pending_draws = Vec::with_capacity(19);
+        maxwell.regs.rt[0].address_lo = 0x6000;
+        maxwell.regs.rt[0].width = 1;
+        maxwell.regs.rt[0].height = 1;
+        maxwell.regs.clear_color.r = 1.0;
+        maxwell.regs.clear_color.a = 1.0;
+        maxwell.dispatch_method(0x674, 1, true);
+        maxwell.regs.clear_color.r = 0.0;
+        maxwell.regs.clear_color.g = 1.0;
+        maxwell.dispatch_method(0x674, 1, true);
+        let pointer = maxwell.pending_draws.as_ptr();
+        let capacity = maxwell.pending_draws.capacity();
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let writes = Mutex::new(Vec::new());
+
+        for command in [(4 << 29) | 0x200, (4 << 29) | (1 << 16) | 0x674] {
+            pusher.process_commands(
+                &[command],
+                &mappings,
+                &mut maxwell,
+                &mut maxwell_dma,
+                &mut fermi_2d,
+                &mut kepler_compute,
+                &mut kepler_memory,
+                &stats,
+                &|_, _| true,
+                &|cpu, bytes| {
+                    writes.lock().unwrap().push((cpu, bytes.to_vec()));
+                    true
+                },
+                &|_, _, _| false,
+            );
+            assert!(maxwell.pending_draws.is_empty());
+            assert_eq!(maxwell.pending_draws.as_ptr(), pointer);
+            assert_eq!(maxwell.pending_draws.capacity(), capacity);
+        }
+
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                (0xa000, vec![255, 0, 0, 255]),
+                (0xa000, vec![0, 255, 0, 255]),
+                (0xa000, vec![0, 255, 0, 255]),
+            ]
+        );
     }
 
     #[test]

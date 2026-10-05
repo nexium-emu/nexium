@@ -77,6 +77,26 @@ pub(crate) enum PrepEvent {
     CompleteAfterGuestWrites(Box<dyn FnOnce() + Send>),
 }
 
+pub(crate) enum DrawVecRecycle<'a> {
+    Inline(&'a mut Vec<DrawCall>),
+    Threaded(&'a crossbeam::channel::Sender<Vec<DrawCall>>),
+    Discard,
+}
+
+impl DrawVecRecycle<'_> {
+    fn recycle(self, mut draws: Vec<DrawCall>) -> bool {
+        match self {
+            Self::Inline(destination) => {
+                draws.clear();
+                *destination = draws;
+                true
+            }
+            Self::Threaded(tx) => recycle_processed_draw_vec(Some(tx), draws),
+            Self::Discard => recycle_processed_draw_vec(None, draws),
+        }
+    }
+}
+
 fn eager_clear_resolve_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -454,7 +474,7 @@ impl PrepState {
     pub(crate) fn run_event(
         &mut self,
         event: PrepEvent,
-        draw_vec_recycle_tx: Option<&crossbeam::channel::Sender<Vec<DrawCall>>>,
+        draw_vec_recycle: DrawVecRecycle<'_>,
         engines: &mut PrepEngines,
         mappings: &GpuMappings,
         stats: &PipelineStats,
@@ -1184,7 +1204,7 @@ impl PrepState {
                 if let Some(probe) = compute_probe {
                     probe.finish();
                 }
-                recycle_processed_draw_vec(draw_vec_recycle_tx, draws);
+                draw_vec_recycle.recycle(draws);
                 draws_completed
             }
             PrepEvent::EngineMethods { class, methods } => {
@@ -2256,6 +2276,16 @@ pub(crate) enum PrepThreadShutdown {
 }
 
 impl PrepLane {
+    pub(crate) fn take_pending_draws(&self, draws: &mut Vec<DrawCall>) -> Vec<DrawCall> {
+        let replacement = match self {
+            Self::Inline(_) => Vec::new(),
+            Self::Threaded(handle) => handle
+                .try_take_recycled_draw_vec()
+                .unwrap_or_else(|| Vec::with_capacity(draws.len())),
+        };
+        std::mem::replace(draws, replacement)
+    }
+
     pub(crate) fn inline_state(&mut self) -> Option<&mut PrepState> {
         match self {
             PrepLane::Inline(state) => Some(state),
@@ -2657,7 +2687,10 @@ pub(crate) fn spawn_prep_thread(
                         };
                         state.run_event(
                             event,
-                            draw_vec_recycle_tx.as_ref(),
+                            draw_vec_recycle_tx
+                                .as_ref()
+                                .map(DrawVecRecycle::Threaded)
+                                .unwrap_or(DrawVecRecycle::Discard),
                             &mut engines,
                             &mappings,
                             &resources.stats,
@@ -2755,8 +2788,8 @@ mod tests {
     use super::{
         fermi_ordered_exact_value_enabled, nonterminal_inline_data_run_end,
         record_prep_event_completion, recycle_processed_draw_vec,
-        texture_cache_invalidate_clear_value_enabled, try_receive_recycled_draw_vec, PrepEvent,
-        PrepState, PrepThreadBehavior, PrepThreadHandle, PrepThreadShutdown,
+        texture_cache_invalidate_clear_value_enabled, try_receive_recycled_draw_vec, DrawVecRecycle,
+        PrepEvent, PrepLane, PrepState, PrepThreadBehavior, PrepThreadHandle, PrepThreadShutdown,
     };
     use crate::gpu::engines::maxwell3d::DrawCall;
     use crate::gpu::GpuMappings;
@@ -2964,6 +2997,103 @@ mod tests {
             Some(&disconnected_tx),
             vec![DrawCall::default()]
         ));
+    }
+
+    #[test]
+    fn inline_draw_vec_recycle_handles_empty_and_failed_events() {
+        let mut state = PrepState::new();
+        let mappings = GpuMappings::new();
+        let stats = crate::PipelineStats::default();
+        let mut maxwell_dma = super::MaxwellDma::new();
+        let mut fermi_2d = super::Fermi2D::new();
+        let mut kepler_compute = super::KeplerCompute::new();
+        let mut kepler_memory = super::KeplerMemory::new();
+        let mut engines = super::PrepEngines {
+            maxwell_dma: &mut maxwell_dma,
+            fermi_2d: &mut fermi_2d,
+            kepler_compute: &mut kepler_compute,
+            kepler_memory: &mut kepler_memory,
+        };
+        let mut pending = Vec::<DrawCall>::with_capacity(13);
+        let pointer = pending.as_ptr();
+        let capacity = pending.capacity();
+        let draws = std::mem::take(&mut pending);
+        assert!(state.run_event(
+            PrepEvent::Draws {
+                draws,
+                gs_debug: None,
+                replay_constbuf_writes: Vec::new(),
+                constbuf_trace: None,
+            },
+            DrawVecRecycle::Inline(&mut pending),
+            &mut engines,
+            &mappings,
+            &stats,
+            &|_, _| panic!("empty draws do not read guest memory"),
+            &|_, _| panic!("empty draws do not write guest memory"),
+            &|_, _, _| false,
+        ));
+        assert!(pending.is_empty());
+        assert_eq!(pending.as_ptr(), pointer);
+        assert_eq!(pending.capacity(), capacity);
+
+        state.vk_flush_completed = false;
+        let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+        assert!(!state.run_event(
+            PrepEvent::DrainBarrier {
+                done: done_tx,
+                flush_small_rts: false,
+            },
+            DrawVecRecycle::Inline(&mut pending),
+            &mut engines,
+            &mappings,
+            &stats,
+            &|_, _| false,
+            &|_, _| false,
+            &|_, _, _| false,
+        ));
+        assert!(!done_rx.try_recv().unwrap());
+        assert!(pending.is_empty());
+        assert_eq!(pending.as_ptr(), pointer);
+        assert_eq!(pending.capacity(), capacity);
+    }
+
+    #[test]
+    fn threaded_draw_vec_recycle_uses_returned_capacity_before_allocating() {
+        let (event_tx, _event_rx) = crossbeam::channel::bounded(1);
+        let worker = std::thread::spawn(PrepState::new);
+        let mut handle = test_prep_handle(event_tx, worker);
+        let (recycle_tx, recycle_rx) = crossbeam::channel::bounded(1);
+        handle.draw_vec_recycle_rx = Some(recycle_rx);
+        let lane = PrepLane::Threaded(handle);
+
+        let recycled = Vec::<DrawCall>::with_capacity(17);
+        let recycled_pointer = recycled.as_ptr();
+        let recycled_capacity = recycled.capacity();
+        assert!(DrawVecRecycle::Threaded(&recycle_tx).recycle(recycled));
+        let mut pending = vec![DrawCall::default(), DrawCall::default()];
+        pending[0].first_vertex = 3;
+        pending[1].first_vertex = 9;
+        let pending_pointer = pending.as_ptr();
+        let draws = lane.take_pending_draws(&mut pending);
+
+        assert_eq!(draws.as_ptr(), pending_pointer);
+        assert_eq!(draws[0].first_vertex, 3);
+        assert_eq!(draws[1].first_vertex, 9);
+        assert!(pending.is_empty());
+        assert_eq!(pending.as_ptr(), recycled_pointer);
+        assert_eq!(pending.capacity(), recycled_capacity);
+
+        pending.push(DrawCall::default());
+        let next = lane.take_pending_draws(&mut pending);
+        assert_eq!(next.as_ptr(), recycled_pointer);
+        assert_eq!(next.len(), 1);
+        assert!(pending.is_empty());
+        assert!(pending.capacity() >= next.len());
+        let PrepLane::Threaded(handle) = lane else {
+            unreachable!()
+        };
+        handle.worker.join().unwrap();
     }
 
     #[test]
