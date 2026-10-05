@@ -2,7 +2,7 @@ pub mod address_space;
 pub mod fastmem;
 pub mod perm;
 pub mod region;
-#[cfg(target_vendor = "sony")]
+#[cfg(any(target_vendor = "sony", windows))]
 pub mod soft_watch;
 
 pub use address_space::{
