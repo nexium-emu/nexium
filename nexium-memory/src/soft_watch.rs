@@ -3,10 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 const DIRTY: u8 = 0;
 const CLEAN: u8 = 1;
-const QUEUED: u8 = 2;
 const GUEST_PAGE: u64 = 4096;
-const QUEUE_PAGES: usize = 512;
-const QUEUE_NANOS: u64 = 1_000_000;
 
 struct Entry {
     guest_base: u64,
@@ -20,16 +17,12 @@ struct Entry {
 
 struct Registry {
     entries: UnsafeCell<Vec<Entry>>,
-    queue: UnsafeCell<Vec<(usize, usize)>>,
-    queued_since: UnsafeCell<u64>,
 }
 
 unsafe impl Sync for Registry {}
 
 static REGISTRY: Registry = Registry {
     entries: UnsafeCell::new(Vec::new()),
-    queue: UnsafeCell::new(Vec::new()),
-    queued_since: UnsafeCell::new(0),
 };
 static LOCK: AtomicBool = AtomicBool::new(false);
 static ENABLED: AtomicU8 = AtomicU8::new(0);
@@ -129,7 +122,6 @@ pub fn unregister(guest_base: u64, host: *mut u8, len: usize) {
     }
     let page = host_page();
     lock(&LOCK);
-    flush_queue(page);
     let entries = unsafe { &mut *REGISTRY.entries.get() };
     let removed = entries
         .iter()
@@ -186,7 +178,7 @@ pub fn take(va: u64, len: usize, dirty: &mut Vec<u64>) -> Option<bool> {
     let host_hi = host_lo + (hi - lo) as usize;
     let to_guest = |host: usize| entry.guest_base + (host - entry.host_base) as u64;
     let mut owner: Option<&Entry> = None;
-    let queue = unsafe { &mut *REGISTRY.queue.get() };
+    let mut batch = ProtectBatch::new(page);
     let mut at = host_lo / page * page;
     while at < host_hi {
         if !owner.is_some_and(|o| at >= o.page_lo && at + page <= o.page_hi) {
@@ -194,19 +186,12 @@ pub fn take(va: u64, len: usize, dirty: &mut Vec<u64>) -> Option<bool> {
         }
         let was_dirty = match owner {
             Some(o) => {
-                let index = (at - o.page_lo) / page;
-                let state = &o.states[index];
-                match state.load(Ordering::Acquire) {
-                    CLEAN => false,
-                    QUEUED => true,
-                    _ => {
-                        state.store(QUEUED, Ordering::Release);
-                        if queue.is_empty() {
-                            unsafe { *REGISTRY.queued_since.get() = now_nanos() };
-                        }
-                        queue.push((at, state as *const AtomicU8 as usize));
-                        true
-                    }
+                let state = &o.states[(at - o.page_lo) / page];
+                if state.load(Ordering::Acquire) == CLEAN {
+                    false
+                } else {
+                    batch.add(at, state);
+                    true
                 }
             }
             None => true,
@@ -218,33 +203,9 @@ pub fn take(va: u64, len: usize, dirty: &mut Vec<u64>) -> Option<bool> {
         }
         at += page;
     }
-    if queue.len() >= QUEUE_PAGES
-        || (!queue.is_empty() && now_nanos().saturating_sub(unsafe { *REGISTRY.queued_since.get() }) >= QUEUE_NANOS)
-    {
-        flush_queue(page);
-    }
+    batch.flush();
     unlock(&LOCK);
     Some(dirty.len() > start)
-}
-
-fn now_nanos() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-fn flush_queue(page: usize) {
-    let queue = unsafe { &mut *REGISTRY.queue.get() };
-    if queue.is_empty() {
-        return;
-    }
-    queue.sort_unstable_by_key(|&(at, _)| at);
-    let mut batch = ProtectBatch::new(page);
-    for &(at, state) in queue.iter() {
-        batch.add(at, unsafe { &*(state as *const AtomicU8) });
-    }
-    batch.flush();
-    queue.clear();
 }
 
 struct ProtectBatch<'a> {
