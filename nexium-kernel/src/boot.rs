@@ -36,6 +36,14 @@ pub struct BootContext {
     pub cpu: Option<Cpu>,
 }
 
+fn add_installed_firmware(archives: &mut std::collections::HashMap<u64, nexium_loader::LazyRomfs>) {
+    match nexium_loader::firmware::add_installed_system_archives(&nexium_common::paths::firmware_dir(), archives) {
+        Ok(0) => {}
+        Ok(count) => log::info!("using {count} system archive(s) from installed firmware"),
+        Err(error) => log::warn!("installed firmware is unavailable: {error}"),
+    }
+}
+
 fn map_extras_and_exit_stub(
     address_space: &AddressSpace,
     env_base: u64,
@@ -167,9 +175,10 @@ impl BootContext {
             ContainerKind::Unknown => Err(format!("unrecognized file format: {}", config.nro_path)),
             _ => {
                 drop(mmap);
-                let app = Application::load_with_content(
+                let mut app = Application::load_with_content(
                     &config.nro_path, &nexium_common::paths::content_dir(),
                 )?;
+                add_installed_firmware(&mut app.system_romfs);
                 Self::new_application(config, app)
             }
         }
@@ -311,6 +320,7 @@ impl BootContext {
         kernel.address_space_end = direct_base + (1u64 << 39).min(nexium_memory::fastmem::arena_size());
         kernel.nro_mmap = Some(nro.mmap_arc());
         kernel.nro_romfs_range = nro.romfs_range();
+        add_installed_firmware(&mut kernel.system_romfs);
         kernel.homebrew_dir = resolve_homebrew_dir(&config.nro_path);
         log::info!("homebrew_dir = {:?}", kernel.homebrew_dir);
 
