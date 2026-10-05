@@ -31622,6 +31622,7 @@ fn queue_submit_tracked(
     if let Err(error) = unsafe { device.queue_submit(queue, &[submit], fence) } {
         return Err(format!("queue_submit(fence): {:?}", error));
     }
+    crate::max_clocks::note_submission();
     if tracked {
         submit_state
             .generation

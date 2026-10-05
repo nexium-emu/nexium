@@ -8,6 +8,7 @@ mod depth;
 pub mod descriptor;
 pub mod deswizzle;
 pub mod draw;
+mod max_clocks;
 pub mod pipeline;
 pub mod presentation;
 pub mod pitch_oracle;

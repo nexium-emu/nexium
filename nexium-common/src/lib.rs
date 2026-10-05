@@ -6,6 +6,7 @@ pub mod dumps;
 pub mod error;
 pub mod fast_gpu_time;
 pub mod fast_hash;
+pub mod force_max_clocks;
 pub mod file_logger;
 pub mod frame_present;
 pub mod gpu_caps;

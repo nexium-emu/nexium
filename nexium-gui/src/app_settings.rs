@@ -528,6 +528,8 @@ pub struct AppSettings {
     #[serde(default = "default_fast_gpu_time")]
     pub fast_gpu_time: bool,
     #[serde(default)]
+    pub force_max_clocks: bool,
+    #[serde(default)]
     pub library_folders: Vec<PathBuf>,
     #[serde(default)]
     pub view_mode: ViewMode,
@@ -828,6 +830,7 @@ impl Default for AppSettings {
             async_shaders: false,
             depth_share: false,
             fast_gpu_time: default_fast_gpu_time(),
+            force_max_clocks: false,
             library_folders: Vec::new(),
             view_mode: ViewMode::Carousel,
             carousel_theme: CarouselTheme::default(),
@@ -1020,15 +1023,19 @@ mod tests {
     fn gpu_clock_settings_default_for_existing_configs() {
         let mut value = serde_json::to_value(AppSettings::default()).unwrap();
         value.as_object_mut().unwrap().remove("fast_gpu_time");
+        value.as_object_mut().unwrap().remove("force_max_clocks");
         let settings: AppSettings = serde_json::from_value(value).unwrap();
         assert!(settings.fast_gpu_time);
+        assert!(!settings.force_max_clocks);
         let settings = AppSettings {
             fast_gpu_time: false,
+            force_max_clocks: true,
             ..AppSettings::default()
         };
         let restored: AppSettings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert!(!restored.fast_gpu_time);
+        assert!(restored.force_max_clocks);
     }
 
     #[test]

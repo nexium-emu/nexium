@@ -5249,7 +5249,7 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 10] = [
+            let rows: [(&str, String); 11] = [
                 ("GPU", self.app_settings.gpu_device_label()),
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
                 ("Output Scale", format!("{}x", scale)),
@@ -5262,6 +5262,7 @@ impl HorizonApp {
                 ("V-Sync", on(self.app_settings.vsync)),
                 ("Async Shaders", on(self.app_settings.async_shaders)),
                 ("Fast GPU Time", on(self.app_settings.fast_gpu_time)),
+                ("Force Max Clocks", on(self.app_settings.force_max_clocks)),
                 ("Depth Share", on(self.app_settings.depth_share)),
             ];
             let n = rows.len();
@@ -5432,6 +5433,12 @@ impl HorizonApp {
                         nexium_common::fast_gpu_time::set_enabled(self.app_settings.fast_gpu_time);
                     }
                     9 => {
+                        self.app_settings.force_max_clocks = !self.app_settings.force_max_clocks;
+                        nexium_common::force_max_clocks::set_enabled(
+                            self.app_settings.force_max_clocks,
+                        );
+                    }
+                    10 => {
                         self.app_settings.depth_share = !self.app_settings.depth_share;
                         nexium_common::depth_share::set_enabled(self.app_settings.depth_share);
                     }
@@ -12657,6 +12664,17 @@ fn graphics_settings_content(
         *save_needed = true;
     }
     ui.label(egui::RichText::new("Reports GPU timestamps 256x faster than real time, so games that scale their resolution from measured GPU time (Mario Kart 8 Deluxe, for one) stay at full resolution. Off = hardware-rate timestamps.").size(10.5).color(MUTED));
+    ui.add_space(6.0);
+    let mut force_max_clocks = cfg.force_max_clocks;
+    if ui
+        .checkbox(&mut force_max_clocks, "Force maximum clocks")
+        .changed()
+    {
+        cfg.force_max_clocks = force_max_clocks;
+        nexium_common::force_max_clocks::set_enabled(force_max_clocks);
+        *save_needed = true;
+    }
+    ui.label(egui::RichText::new("Keeps a small compute job running on the host GPU while a game renders, so the driver doesn't drop to low clocks between the emulator's short bursts of work. Uses more power and runs the GPU warmer.").size(10.5).color(MUTED));
 }
 
 fn audio_settings_content(
