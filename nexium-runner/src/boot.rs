@@ -840,6 +840,7 @@ impl EmulationHandle {
                 )?;
                 let title_id = boot_ctx.kernel.lock().title_id;
                 nexium_nvdrv::gpu::configure_fast_gpu_time(title_id == SWITCH_SPORTS_TITLE_ID);
+                nexium_nvdrv::gpu::configure_gpu_accuracy();
                 nexium_core::services::am::set_title_nifm_offline(
                     title_id == MINECRAFT_DUNGEONS_2_TITLE_ID,
                 );

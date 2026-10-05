@@ -450,6 +450,10 @@ impl PrepState {
         let Some(on_complete) = on_complete else {
             return;
         };
+        if super::accuracy::normal_accuracy() && !super::completion::guest_writes_pending() {
+            on_complete();
+            return;
+        }
         let Some(renderer) = self.renderer.clone() else {
             on_complete();
             return;
@@ -908,6 +912,23 @@ impl PrepState {
                     } else {
                         log::error!("[gpu-sync] deferred report scheduling failed; payloads dropped");
                     }
+                } else if can_complete_asynchronously && super::accuracy::normal_accuracy() {
+                    let memory = self.guest_memory.as_ref().unwrap().clone();
+                    let mut pending = Vec::with_capacity(writes.len());
+                    for write in writes {
+                        self.ssbo_snapshot_cache.invalidate_gpu_write(
+                            mappings,
+                            write.gpu_va,
+                            if write.long { 16 } else { 4 },
+                        );
+                        pending.push((write.gpu_va, write.payload));
+                    }
+                    super::pusher::write_payload_fences(&pending, |gpu_va, bytes| {
+                        memory.write_gpu_with_mappings(mappings, gpu_va, bytes)
+                    });
+                    stats
+                        .fence_releases
+                        .fetch_add(pending.len() as u64, AtomicOrdering::Relaxed);
                 } else if can_complete_asynchronously {
                     let mut pending = Vec::with_capacity(writes.len());
                     for write in writes {

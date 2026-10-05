@@ -9,6 +9,7 @@ pub mod fast_hash;
 pub mod force_max_clocks;
 pub mod file_logger;
 pub mod frame_present;
+pub mod gpu_accuracy;
 pub mod gpu_caps;
 pub mod host_wake;
 pub mod log_init;

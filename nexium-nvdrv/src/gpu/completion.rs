@@ -99,6 +99,10 @@ impl Drop for PendingGuestWriteGuard {
     }
 }
 
+pub(crate) fn guest_writes_pending() -> bool {
+    PENDING_GUEST_WRITES.load(Ordering::Acquire) != 0
+}
+
 pub(crate) fn wait_for_pending_guest_writes(timeout: Duration) -> bool {
     if PENDING_GUEST_WRITES.load(Ordering::Acquire) == 0 {
         return true;

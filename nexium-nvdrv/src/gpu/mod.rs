@@ -1,3 +1,4 @@
+pub(crate) mod accuracy;
 pub(crate) mod clock;
 pub(crate) mod completion;
 pub mod engines;
@@ -1996,6 +1997,10 @@ pub(crate) fn eager_small_rt_writeback_enabled() -> bool {
 
 pub fn configure_fast_gpu_time(title_requires: bool) {
     clock::configure_fast_gpu_time(title_requires);
+}
+
+pub fn configure_gpu_accuracy() {
+    accuracy::configure_gpu_accuracy();
 }
 
 pub(crate) fn gpu_pipeline_enabled() -> bool {
