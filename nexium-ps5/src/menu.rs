@@ -28,6 +28,8 @@ struct Settings {
     show_fps: bool,
     #[serde(default = "yes")]
     stable_resolution: bool,
+    #[serde(default)]
+    normal_gpu_accuracy: bool,
 }
 
 fn yes() -> bool {
@@ -47,7 +49,13 @@ impl Settings {
         std::fs::read_to_string(Self::path())
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or(Self { docked: true, volume: 1.0, show_fps: false, stable_resolution: true })
+            .unwrap_or(Self {
+                docked: true,
+                volume: 1.0,
+                show_fps: false,
+                stable_resolution: true,
+                normal_gpu_accuracy: false,
+            })
     }
 
     fn save(&self) {
@@ -246,7 +254,7 @@ impl App {
                     *cursor -= 1;
                     self.dirty = true;
                 }
-                if fired & DIR_DOWN != 0 && *cursor < 3 {
+                if fired & DIR_DOWN != 0 && *cursor < 4 {
                     *cursor += 1;
                     self.dirty = true;
                 }
@@ -266,7 +274,8 @@ impl App {
                             nexium_runner::audio::set_master_volume(self.settings.volume);
                         }
                         2 => self.settings.show_fps = !self.settings.show_fps,
-                        _ => self.settings.stable_resolution = !self.settings.stable_resolution,
+                        3 => self.settings.stable_resolution = !self.settings.stable_resolution,
+                        _ => self.settings.normal_gpu_accuracy = !self.settings.normal_gpu_accuracy,
                     }
                     self.dirty = true;
                 }
@@ -342,6 +351,7 @@ impl App {
         hid_state::set_docked(self.settings.docked);
         nexium_runner::audio::set_master_volume(self.settings.volume);
         nexium_common::fast_gpu_time::set_enabled(self.settings.stable_resolution);
+        nexium_common::gpu_accuracy::set_normal(self.settings.normal_gpu_accuracy);
         crate::klog!("menu: launching '{title}' {path} docked={}", self.settings.docked);
         match EmulationHandle::new(&path, CpuBackendKind::Dynarmic, None) {
             Ok(emu) => {
@@ -457,6 +467,7 @@ impl App {
                 self.settings.volume,
                 self.settings.show_fps,
                 self.settings.stable_resolution,
+                self.settings.normal_gpu_accuracy,
                 *cursor,
             ),
             Screen::Loading { game, started } => {

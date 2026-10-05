@@ -237,9 +237,17 @@ impl View {
         }
     }
 
-    pub fn settings(&mut self, docked: bool, volume: f32, show_fps: bool, stable_resolution: bool, cursor: usize) {
+    pub fn settings(
+        &mut self,
+        docked: bool,
+        volume: f32,
+        show_fps: bool,
+        stable_resolution: bool,
+        normal_gpu_accuracy: bool,
+        cursor: usize,
+    ) {
         self.header("Settings");
-        let items: [(&str, String, &str); 4] = [
+        let items: [(&str, String, &str); 5] = [
             ("Console mode", if docked { "Docked (TV)".into() } else { "Handheld".into() }, "Docked renders games at 1080p; handheld at 720p."),
             ("Volume", format!("{:.0}%", volume * 100.0), "Game audio level, 0–200%."),
             ("Performance overlay", if show_fps { "On".into() } else { "Off".into() }, "Shows the game's frame rate in the corner."),
@@ -247,6 +255,11 @@ impl View {
                 "Stable resolution",
                 if stable_resolution { "On".into() } else { "Off".into() },
                 "Keeps dynamic-resolution games at full size to save memory. Takes effect next launch.",
+            ),
+            (
+                "GPU accuracy",
+                if normal_gpu_accuracy { "Normal".into() } else { "High".into() },
+                "Normal reports GPU work done when it is submitted. Faster; a few games may glitch. Takes effect next launch.",
             ),
         ];
         for (i, (label, value, help)) in items.iter().enumerate() {
@@ -271,8 +284,8 @@ impl View {
             "NeXium {} for PS5  ·  Dynarmic JIT  ·  RADV Vulkan  ·  saves in /data/homebrew/PPSA99640/data/NeXium",
             env!("CARGO_PKG_VERSION")
         );
-        self.painter.draw(&mut self.canvas, 260.0, 720.0, 22.0, TEXT_DIM, &about);
-        self.painter.draw(&mut self.canvas, 260.0, 756.0, 22.0, TEXT_DIM, "In a game, press Options + Touch Pad together for the pause menu.");
+        self.painter.draw(&mut self.canvas, 260.0, 852.0, 22.0, TEXT_DIM, &about);
+        self.painter.draw(&mut self.canvas, 260.0, 888.0, 22.0, TEXT_DIM, "In a game, press Options + Touch Pad together for the pause menu.");
         self.hints(&[(Glyph::UpDown, "Select"), (Glyph::LeftRight, "Change"), (Glyph::Circle, "Back")]);
     }
 
@@ -408,7 +421,7 @@ mod tests {
         view.library(&list, &sizes, true, 0, 0);
         view.dialog("Quit NeXium?", "You'll return to the PS5 home screen.", &[(Glyph::Cross, "Quit"), (Glyph::Circle, "Cancel")]);
         save(&view, "4-quit-dialog");
-        view.settings(true, 1.2, false, true, 3);
+        view.settings(true, 1.2, false, true, true, 4);
         save(&view, "5-settings");
         view.set_big_icon(list[0].icon.as_deref());
         view.loading("Cave Story+", Duration::from_secs(3));
