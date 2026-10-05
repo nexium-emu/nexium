@@ -4447,9 +4447,12 @@ impl SsboSnapshotCache {
         super::pusher::kickprof::count(super::pusher::kickprof::CBUF_BARRIER_SYNCS, 1);
         let keys: Vec<u64> = self.mirror.cbuf_chunk_registry.clone();
         let mut removed: Vec<u64> = Vec::new();
+        let serial_before = nexium_memory::fastmem::observed_write_serial();
+        let mut pending: Vec<(u64, u64)> = Vec::with_capacity(keys.len());
+        let mut ranges: Vec<HostWatchRange> = Vec::with_capacity(keys.len());
         for key in keys {
             let chunk_base = key << MIRROR_CHUNK_SHIFT;
-            let Some(chunk) = self.mirror.chunks.get_mut(&key) else {
+            let Some(chunk) = self.mirror.chunks.get(&key) else {
                 removed.push(key);
                 continue;
             };
@@ -4457,11 +4460,71 @@ impl SsboSnapshotCache {
                 continue;
             }
             super::pusher::kickprof::count(super::pusher::kickprof::CBUF_BARRIER_CHUNKS, 1);
-            if MirrorPageCache::sync_cbuf_write_watch(chunk, chunk_base, forward_spans) {
-                chunk.cbuf_barrier_seen = barrier_gen;
-            } else {
-                removed.push(key);
+            pending.push((
+                key,
+                nexium_memory::fastmem::observed_write_generation_range(
+                    chunk_base,
+                    MIRROR_CHUNK_SIZE,
+                ),
+            ));
+            ranges.push(HostWatchRange { cpu_addr: chunk_base, len: MIRROR_CHUNK_SIZE });
+        }
+        coalesce_host_watch_ranges(&mut ranges);
+        let mut pending_start = 0usize;
+        let mut dirty_spans: Vec<(u64, usize)> = Vec::new();
+        for range in ranges {
+            let range_end = range.cpu_addr + range.len as u64;
+            let mut pending_end = pending_start;
+            while pending_end < pending.len()
+                && (pending[pending_end].0 << MIRROR_CHUNK_SHIFT) < range_end
+            {
+                pending_end += 1;
             }
+            #[cfg(test)]
+            CBUF_WATCH_SYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
+            let result = nexium_memory::fastmem::take_write_watch(range.cpu_addr, range.len);
+            if result == nexium_memory::fastmem::WriteWatchResult::Unavailable {
+                for &(key, _) in &pending[pending_start..pending_end] {
+                    let chunk = self.mirror.chunks.get_mut(&key).unwrap();
+                    if MirrorPageCache::sync_cbuf_write_watch(
+                        chunk,
+                        key << MIRROR_CHUNK_SHIFT,
+                        forward_spans,
+                    ) {
+                        chunk.cbuf_barrier_seen = barrier_gen;
+                    } else {
+                        removed.push(key);
+                    }
+                }
+            } else {
+                for &(key, generation_before) in &pending[pending_start..pending_end] {
+                    let (serial_after, generation_after) =
+                        nexium_memory::fastmem::observed_write_snapshot_range(
+                            key << MIRROR_CHUNK_SHIFT,
+                            MIRROR_CHUNK_SIZE,
+                        );
+                    let chunk = self.mirror.chunks.get_mut(&key).unwrap();
+                    if generation_before != chunk.cbuf_observed_write_generation {
+                        chunk.dirty = u16::MAX;
+                        chunk.cbuf_dirty = u16::MAX;
+                    }
+                    chunk.cbuf_observed_write_serial = serial_after;
+                    chunk.cbuf_observed_write_generation = generation_after;
+                    chunk.cbuf_barrier_seen = barrier_gen;
+                }
+                dirty_spans.clear();
+                nexium_memory::fastmem::observed_write_spans_since(
+                    range.cpu_addr,
+                    range.len,
+                    serial_before,
+                    &mut dirty_spans,
+                );
+                for &(span_addr, span_len) in &dirty_spans {
+                    self.mirror.mark_dirty(span_addr, span_len);
+                }
+                forward_spans.extend_from_slice(&dirty_spans);
+            }
+            pending_start = pending_end;
         }
         for key in removed {
             self.mirror.remove_chunk(key);
@@ -25757,6 +25820,73 @@ mod tests {
         }
 
         #[test]
+        fn cbuf_barrier_resync_coalesces_chunks_and_replays_fresh_and_foreign_writes() {
+            let va = 0x79a0_0000u64;
+            let len = 3 * MIRROR_CHUNK_SIZE;
+            if !watch_ready(va, len) {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            cache.cbuf_barrier_mode = true;
+            let mut mappings = crate::gpu::GpuMappings::new();
+            let gpu_va = 0x1a_0000_0000u64;
+            mappings.add(gpu_va, len as u64, va, 43);
+            let requests: Vec<_> = (0..3)
+                .map(|index| {
+                    let offset = index * MIRROR_CHUNK_SIZE + 0x100;
+                    write_guest(va + offset as u64, &[0x11 + index as u8; 16]);
+                    ResidentCbufRequest {
+                        logical_slot: index as u32,
+                        word_count: 4,
+                        gpu_addr: gpu_va + offset as u64,
+                        byte_len: 16,
+                        packed_offset: nexium_spirv::GFX_CBUF_MIN_SIZE as usize + index * 16,
+                    }
+                })
+                .collect();
+            let first = cache
+                .mirror_resident_cbuf_pages(&mappings, &requests, &mem_read)
+                .unwrap();
+            write_guest(va + 0x100, &[0x44u8; 16]);
+            write_guest(va + MIRROR_CHUNK_SIZE as u64 + 0x100, &[0x55u8; 16]);
+            assert_eq!(
+                nexium_memory::fastmem::take_write_watch(
+                    va + MIRROR_CHUNK_SIZE as u64,
+                    MIRROR_CHUNK_SIZE,
+                ),
+                nexium_memory::fastmem::WriteWatchResult::Dirty
+            );
+            let calls_before = super::super::CBUF_WATCH_SYNC_CALLS.with(|calls| calls.get());
+            cache.mirror_cbuf_barrier_bump();
+            let fresh = cache
+                .mirror_resident_cbuf_pages(&mappings, &requests, &mem_read)
+                .unwrap();
+            let calls_after = super::super::CBUF_WATCH_SYNC_CALLS.with(|calls| calls.get());
+            assert_eq!(calls_after - calls_before, 1);
+            for (index, expected) in [0x44u8, 0x55, 0x13].into_iter().enumerate() {
+                let slot = &fresh.slots[index];
+                let data = &fresh.chunks[slot.chunk_index as usize].data;
+                assert_eq!(
+                    &data[slot.byte_offset as usize..slot.byte_offset as usize + 16],
+                    &[expected; 16],
+                );
+                let old_slot = &first.slots[index];
+                let old_data = &first.chunks[old_slot.chunk_index as usize].data;
+                assert_eq!(
+                    &old_data[old_slot.byte_offset as usize..old_slot.byte_offset as usize + 16],
+                    &[0x11 + index as u8; 16],
+                );
+            }
+            assert!(std::sync::Arc::ptr_eq(&first.chunks[2].data, &fresh.chunks[2].data));
+            cache.clear();
+            nexium_memory::fastmem::decommit(
+                unsafe { nexium_memory::fastmem::base().unwrap().add(va as usize) },
+                len,
+            );
+        }
+
+        #[test]
         fn cbuf_write_watch_marks_dirty_when_a_query_extends_the_preceding_span() {
             let va = 0x79d0_0000u64;
             if !watch_ready(va, MIRROR_CHUNK_SIZE) {
@@ -25779,6 +25909,115 @@ mod tests {
             assert_eq!(spans, vec![(va - MIRROR_PAGE_SIZE as u64, 2 * MIRROR_PAGE_SIZE)]);
             assert_eq!(chunk.dirty, 1);
             assert_eq!(chunk.cbuf_dirty, 1);
+            cache.clear();
+            nexium_memory::fastmem::decommit(
+                unsafe { nexium_memory::fastmem::base().unwrap().add(va as usize) },
+                MIRROR_CHUNK_SIZE,
+            );
+        }
+
+        #[test]
+        fn cbuf_barrier_resync_falls_back_across_uncommitted_gaps() {
+            let va = 0x79b0_0000u64;
+            let second_va = va + 2 * MIRROR_CHUNK_SIZE as u64;
+            if !watch_ready(va, MIRROR_CHUNK_SIZE)
+                || !watch_ready(second_va, MIRROR_CHUNK_SIZE)
+            {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            cache.cbuf_barrier_mode = true;
+            let mut mappings = crate::gpu::GpuMappings::new();
+            let gpu_va = 0x1b_0000_0000u64;
+            mappings.add(gpu_va, MIRROR_CHUNK_SIZE as u64, va, 47);
+            mappings.add(
+                gpu_va + 2 * MIRROR_CHUNK_SIZE as u64,
+                MIRROR_CHUNK_SIZE as u64,
+                second_va,
+                49,
+            );
+            let requests: Vec<_> = [0usize, 2]
+                .into_iter()
+                .map(|index| {
+                    let offset = index * MIRROR_CHUNK_SIZE + 0x100;
+                    write_guest(va + offset as u64, &[0x33u8; 16]);
+                    ResidentCbufRequest {
+                        logical_slot: index as u32,
+                        word_count: 4,
+                        gpu_addr: gpu_va + offset as u64,
+                        byte_len: 16,
+                        packed_offset: nexium_spirv::GFX_CBUF_MIN_SIZE as usize + index * 16,
+                    }
+                })
+                .collect();
+            let first = cache
+                .mirror_resident_cbuf_pages(&mappings, &requests, &mem_read)
+                .unwrap();
+            write_guest(va + 0x100, &[0x66u8; 16]);
+            write_guest(second_va + 0x100, &[0x66u8; 16]);
+            let calls_before = super::super::CBUF_WATCH_SYNC_CALLS.with(|calls| calls.get());
+            cache.mirror_cbuf_barrier_bump();
+            let fresh = cache
+                .mirror_resident_cbuf_pages(&mappings, &requests, &mem_read)
+                .unwrap();
+            let calls_after = super::super::CBUF_WATCH_SYNC_CALLS.with(|calls| calls.get());
+            assert_eq!(calls_after - calls_before, 3);
+            for (index, slot) in fresh.slots.iter().enumerate() {
+                let data = &fresh.chunks[slot.chunk_index as usize].data;
+                assert_eq!(
+                    &data[slot.byte_offset as usize..slot.byte_offset as usize + 16],
+                    &[0x66u8; 16],
+                );
+                assert!(!std::sync::Arc::ptr_eq(&first.chunks[index].data, data));
+            }
+            cache.clear();
+            for base in [va, second_va] {
+                nexium_memory::fastmem::decommit(
+                    unsafe { nexium_memory::fastmem::base().unwrap().add(base as usize) },
+                    MIRROR_CHUNK_SIZE,
+                );
+            }
+        }
+
+        #[test]
+        fn cbuf_barrier_resync_removes_unavailable_chunks_and_preserves_valid_chunks() {
+            let va = 0x79c0_0000u64;
+            let invalid_va = va + MIRROR_CHUNK_SIZE as u64;
+            if !watch_ready(va, MIRROR_CHUNK_SIZE)
+                || !watch_ready(invalid_va, MIRROR_CHUNK_SIZE)
+            {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            cache.cbuf_barrier_mode = true;
+            let mut spans = Vec::new();
+            for base in [va, invalid_va] {
+                write_guest(base, &[0x11u8; 16]);
+                assert!(cache.mirror_prepare_cbuf_pages(
+                    base >> MIRROR_CHUNK_SHIFT,
+                    1,
+                    &mem_read,
+                    &mut spans,
+                ));
+            }
+            nexium_memory::fastmem::decommit(
+                unsafe { nexium_memory::fastmem::base().unwrap().add(invalid_va as usize) },
+                MIRROR_CHUNK_SIZE,
+            );
+            write_guest(va, &[0x77u8; 16]);
+            cache.mirror_cbuf_barrier_bump();
+            assert!(cache.mirror_prepare_cbuf_pages(
+                va >> MIRROR_CHUNK_SHIFT,
+                1,
+                &mem_read,
+                &mut spans,
+            ));
+            let chunk = &cache.mirror.chunks[&(va >> MIRROR_CHUNK_SHIFT)];
+            assert_eq!(&chunk.cbuf_pages[0].as_ref().unwrap().data[..16], &[0x77u8; 16]);
+            assert!(!cache.mirror.chunks.contains_key(&(invalid_va >> MIRROR_CHUNK_SHIFT)));
+            assert_eq!(cache.mirror.cbuf_chunk_registry, vec![va >> MIRROR_CHUNK_SHIFT]);
             cache.clear();
             nexium_memory::fastmem::decommit(
                 unsafe { nexium_memory::fastmem::base().unwrap().add(va as usize) },
