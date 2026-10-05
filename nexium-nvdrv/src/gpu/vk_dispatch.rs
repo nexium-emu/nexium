@@ -1931,7 +1931,6 @@ pub(crate) struct SsboSnapshotCache {
     prepared_index_max_bytes: usize,
     prepared_index_max_entries: usize,
     prepared_texture_snapshots: PreparedTextureSnapshotMemo,
-    prepared_texture_bounds: Option<(u64, u64, u64, u64)>,
     prepared_tic_plans: PreparedTicPlanCache,
     input_profile: bool,
     watch_query_ranges: Vec<HostWatchRange>,
@@ -2564,7 +2563,6 @@ impl SsboSnapshotCache {
             prepared_index_max_bytes: PREPARED_INDEX_CACHE_MAX_BYTES,
             prepared_index_max_entries: PREPARED_INDEX_CACHE_MAX_ENTRIES,
             prepared_texture_snapshots: PreparedTextureSnapshotMemo::new(),
-            prepared_texture_bounds: None,
             prepared_tic_plans: PreparedTicPlanCache::default(),
             input_profile: input_cache_profile_enabled(),
             watch_query_ranges: Vec::new(),
@@ -5192,12 +5190,10 @@ impl SsboSnapshotCache {
         if !writes.is_empty() {
             self.bump_resource_mutation_epoch();
         }
-        self.prepared_texture_snapshots.retain(|key, _| {
-            !writes.iter().any(|&(gpu_addr, cpu_addr, len)| {
-                byte_ranges_overlap(key.gpu_va, key.len, gpu_addr, len)
-                    || byte_ranges_overlap(key.cpu_va, key.len, cpu_addr, len)
-            })
-        });
+        self.prepared_texture_snapshots.invalidate_spans(
+            writes.iter().map(|&(gpu_addr, _, len)| (gpu_addr, len)),
+            writes.iter().map(|&(_, cpu_addr, len)| (cpu_addr, len)),
+        );
         self.deferred_patched_writes.extend_from_slice(writes);
     }
 
@@ -5221,58 +5217,13 @@ impl SsboSnapshotCache {
         self.invalidate_cpu_spans_inner(spans);
     }
 
-    fn refresh_prepared_texture_bounds(&mut self) {
-        let mut bounds: Option<(u64, u64, u64, u64)> = None;
-        for key in self.prepared_texture_snapshots.keys() {
-            let cpu_hi = key.cpu_va.saturating_add(key.len as u64);
-            let gpu_hi = key.gpu_va.saturating_add(key.len as u64);
-            bounds = Some(match bounds {
-                None => (key.cpu_va, cpu_hi, key.gpu_va, gpu_hi),
-                Some((clo, chi, glo, ghi)) => (
-                    clo.min(key.cpu_va),
-                    chi.max(cpu_hi),
-                    glo.min(key.gpu_va),
-                    ghi.max(gpu_hi),
-                ),
-            });
-        }
-        self.prepared_texture_bounds = bounds;
-    }
-
-    fn prepared_texture_spans_may_overlap(
-        &self,
-        gpu_spans: &[(u64, usize)],
-        cpu_spans: &[(u64, usize)],
-    ) -> bool {
-        let Some((cpu_lo, cpu_hi, gpu_lo, gpu_hi)) = self.prepared_texture_bounds else {
-            return !self.prepared_texture_snapshots.is_empty();
-        };
-        gpu_spans
-            .iter()
-            .any(|&(addr, len)| addr < gpu_hi && addr.saturating_add(len as u64) > gpu_lo)
-            || cpu_spans
-                .iter()
-                .any(|&(addr, len)| addr < cpu_hi && addr.saturating_add(len as u64) > cpu_lo)
-    }
-
     fn invalidate_prepared_texture_spans(
         &mut self,
         gpu_spans: &[(u64, usize)],
         cpu_spans: &[(u64, usize)],
     ) {
-        if self.prepared_texture_snapshots.is_empty()
-            || !self.prepared_texture_spans_may_overlap(gpu_spans, cpu_spans)
-        {
-            return;
-        }
-        self.prepared_texture_snapshots.retain(|key, _| {
-            !gpu_spans
-                .iter()
-                .any(|&(addr, len)| byte_ranges_overlap(key.gpu_va, key.len, addr, len))
-                && !cpu_spans
-                    .iter()
-                    .any(|&(addr, len)| byte_ranges_overlap(key.cpu_va, key.len, addr, len))
-        });
+        self.prepared_texture_snapshots
+            .invalidate_spans(gpu_spans.iter().copied(), cpu_spans.iter().copied());
     }
 
     fn invalidate_cpu_spans_inner(&mut self, spans: &[(u64, usize)]) {
@@ -5482,11 +5433,10 @@ impl SsboSnapshotCache {
                 self.mirror.mark_dirty(cpu_addr, len);
             }
         }
-        let mapped_cpu_writes = mapped_writes
-            .iter()
-            .map(|&(_, cpu_addr, len)| (cpu_addr, len))
-            .collect::<Vec<_>>();
-        self.invalidate_prepared_texture_spans(writes, &mapped_cpu_writes);
+        self.prepared_texture_snapshots.invalidate_spans(
+            writes.iter().copied(),
+            mapped_writes.iter().map(|&(_, cpu_addr, len)| (cpu_addr, len)),
+        );
         if writes.is_empty() || (self.entries.is_empty() && self.input_entries.is_empty()) {
             return;
         }
@@ -5608,12 +5558,10 @@ impl SsboSnapshotCache {
         for chunk in chunks {
             self.mirror.mark_dirty(chunk.cpu_addr, chunk.len);
         }
-        self.prepared_texture_snapshots.retain(|key, _| {
-            !chunks.iter().any(|chunk| {
-                byte_ranges_overlap(key.gpu_va, key.len, chunk.gpu_va, chunk.len)
-                    || byte_ranges_overlap(key.cpu_va, key.len, chunk.cpu_addr, chunk.len)
-            })
-        });
+        self.prepared_texture_snapshots.invalidate_spans(
+            chunks.iter().map(|chunk| (chunk.gpu_va, chunk.len)),
+            chunks.iter().map(|chunk| (chunk.cpu_addr, chunk.len)),
+        );
         if chunks.is_empty() || (self.entries.is_empty() && self.input_entries.is_empty()) {
             return;
         }
@@ -7867,7 +7815,6 @@ fn flush_batch(
         }
     }
     snapshot_cache.prepared_texture_snapshots = prepared_texture_snapshots;
-    snapshot_cache.refresh_prepared_texture_bounds();
     (n, completed)
 }
 
@@ -8128,7 +8075,210 @@ struct ValidatedTextureSnapshot {
     trusted_identity: u64,
 }
 
-type PreparedTextureSnapshotMemo = HashMap<TextureSnapshotCacheKey, ValidatedTextureSnapshot>;
+#[derive(Clone, Copy)]
+struct PreparedTextureAddressRange {
+    start: u64,
+    end: u64,
+    subtree_end: u64,
+    key: TextureSnapshotCacheKey,
+}
+
+#[derive(Default)]
+struct PreparedTextureAddressIndex {
+    ranges: Vec<PreparedTextureAddressRange>,
+}
+
+impl PreparedTextureAddressIndex {
+    fn rebuild(
+        &mut self,
+        keys: impl Iterator<Item = TextureSnapshotCacheKey>,
+        address: impl Fn(TextureSnapshotCacheKey) -> u64,
+    ) {
+        self.ranges.clear();
+        self.ranges.extend(keys.filter_map(|key| {
+            let start = address(key);
+            let end = start.saturating_add(key.len as u64);
+            (key.len != 0 && start < end).then_some(PreparedTextureAddressRange {
+                start,
+                end,
+                subtree_end: end,
+                key,
+            })
+        }));
+        self.ranges.sort_unstable_by_key(|range| range.start);
+        Self::refresh_subtree_ends(&mut self.ranges);
+    }
+
+    fn refresh_subtree_ends(ranges: &mut [PreparedTextureAddressRange]) -> u64 {
+        if ranges.is_empty() {
+            return 0;
+        }
+        let middle = ranges.len() / 2;
+        let (left, rest) = ranges.split_at_mut(middle);
+        let (node, right) = rest.split_first_mut().unwrap();
+        node.subtree_end = node
+            .end
+            .max(Self::refresh_subtree_ends(left))
+            .max(Self::refresh_subtree_ends(right));
+        node.subtree_end
+    }
+
+    fn for_each_overlap(
+        &self,
+        address: u64,
+        len: usize,
+        mut visit: impl FnMut(TextureSnapshotCacheKey),
+    ) {
+        if len != 0 {
+            Self::visit_overlaps(
+                &self.ranges,
+                address,
+                address.saturating_add(len as u64),
+                &mut visit,
+            );
+        }
+    }
+
+    fn visit_overlaps(
+        ranges: &[PreparedTextureAddressRange],
+        start: u64,
+        end: u64,
+        visit: &mut impl FnMut(TextureSnapshotCacheKey),
+    ) {
+        if ranges.is_empty() || ranges[0].start >= end {
+            return;
+        }
+        let middle = ranges.len() / 2;
+        let node = ranges[middle];
+        if node.subtree_end <= start {
+            return;
+        }
+        Self::visit_overlaps(&ranges[..middle], start, end, visit);
+        if node.start < end {
+            if node.end > start {
+                visit(node.key);
+            }
+            Self::visit_overlaps(&ranges[middle + 1..], start, end, visit);
+        }
+    }
+}
+
+#[derive(Default)]
+struct PreparedTextureSnapshotMemo {
+    entries: HashMap<TextureSnapshotCacheKey, ValidatedTextureSnapshot>,
+    gpu_index: PreparedTextureAddressIndex,
+    cpu_index: PreparedTextureAddressIndex,
+    gpu_bounds: Option<(u64, u64)>,
+    cpu_bounds: Option<(u64, u64)>,
+    indexes_dirty: bool,
+}
+
+impl PreparedTextureSnapshotMemo {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, key: &TextureSnapshotCacheKey) -> Option<&ValidatedTextureSnapshot> {
+        self.entries.get(key)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &TextureSnapshotCacheKey> {
+        self.entries.keys()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &TextureSnapshotCacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn insert(&mut self, key: TextureSnapshotCacheKey, value: ValidatedTextureSnapshot) {
+        if self.entries.insert(key, value).is_none() {
+            for (bounds, address) in [
+                (&mut self.gpu_bounds, key.gpu_va),
+                (&mut self.cpu_bounds, key.cpu_va),
+            ] {
+                if key.len != 0 {
+                    let end = address.saturating_add(key.len as u64);
+                    *bounds = Some(match *bounds {
+                        Some((lo, hi)) => (lo.min(address), hi.max(end)),
+                        None => (address, end),
+                    });
+                }
+            }
+            self.indexes_dirty = true;
+        }
+    }
+
+    fn remove(&mut self, key: &TextureSnapshotCacheKey) {
+        self.entries.remove(key);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.gpu_index.ranges.clear();
+        self.cpu_index.ranges.clear();
+        self.gpu_bounds = None;
+        self.cpu_bounds = None;
+        self.indexes_dirty = false;
+    }
+
+    fn invalidate_spans(
+        &mut self,
+        gpu_spans: impl IntoIterator<Item = (u64, usize)>,
+        cpu_spans: impl IntoIterator<Item = (u64, usize)>,
+    ) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let gpu_bounds = self.gpu_bounds;
+        let cpu_bounds = self.cpu_bounds;
+        let may_overlap = |bounds: Option<(u64, u64)>, address: u64, len: usize| {
+            len != 0 && bounds.is_some_and(|(lo, hi)| {
+                address < hi && address.saturating_add(len as u64) > lo
+            })
+        };
+        let mut gpu_spans = gpu_spans
+            .into_iter()
+            .filter(|&(address, len)| may_overlap(gpu_bounds, address, len))
+            .peekable();
+        let mut cpu_spans = cpu_spans
+            .into_iter()
+            .filter(|&(address, len)| may_overlap(cpu_bounds, address, len))
+            .peekable();
+        if gpu_spans.peek().is_none() && cpu_spans.peek().is_none() {
+            return;
+        }
+        if self.indexes_dirty
+            || self.gpu_index.ranges.len() > self.entries.len().saturating_mul(2)
+        {
+            self.gpu_index
+                .rebuild(self.entries.keys().copied(), |key| key.gpu_va);
+            self.cpu_index
+                .rebuild(self.entries.keys().copied(), |key| key.cpu_va);
+            self.indexes_dirty = false;
+        }
+        for (address, len) in gpu_spans {
+            self.gpu_index.for_each_overlap(address, len, |key| {
+                self.entries.remove(&key);
+            });
+        }
+        for (address, len) in cpu_spans {
+            self.cpu_index.for_each_overlap(address, len, |key| {
+                self.entries.remove(&key);
+            });
+        }
+    }
+}
 
 fn prepared_texture_memo_bypass_va() -> Option<u64> {
     static VALUE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -29272,7 +29422,7 @@ mod tests {
         snapshot.insert(0x4000, std::sync::Arc::new(vec![0x5a; 0x100]));
         let mut generations = std::collections::HashMap::new();
         let mut trusted_identities = std::collections::HashMap::new();
-        let mut prepared_snapshots = std::collections::HashMap::new();
+        let mut prepared_snapshots = super::PreparedTextureSnapshotMemo::new();
         let reads = std::cell::Cell::new(0usize);
         let read = |_: u64, len: usize| {
             reads.set(reads.get() + 1);
@@ -29359,7 +29509,7 @@ mod tests {
         let mut snapshot = std::collections::HashMap::new();
         let mut generations = std::collections::HashMap::new();
         let mut trusted_identities = std::collections::HashMap::new();
-        let mut prepared_snapshots = std::collections::HashMap::new();
+        let mut prepared_snapshots = super::PreparedTextureSnapshotMemo::new();
         let copied = snapshot_texture_once(
             &mut snapshot,
             &mut generations,
@@ -29416,7 +29566,7 @@ mod tests {
         let mut snapshot = std::collections::HashMap::new();
         let mut generations = std::collections::HashMap::new();
         let mut trusted_identities = std::collections::HashMap::new();
-        let mut prepared_snapshots = std::collections::HashMap::new();
+        let mut prepared_snapshots = super::PreparedTextureSnapshotMemo::new();
         let copied = snapshot_texture_once(
             &mut snapshot,
             &mut generations,
@@ -29819,7 +29969,7 @@ mod tests {
         };
         let data = std::sync::Arc::new(vec![0x5a; 16]);
         let validations = std::cell::Cell::new(0usize);
-        let mut memo = std::collections::HashMap::new();
+        let mut memo = super::PreparedTextureSnapshotMemo::new();
 
         let first = memoized_validated_texture_snapshot_at_generations(
             &mut memo,
@@ -29914,7 +30064,7 @@ mod tests {
             .expect("untrusted snapshot remains usable");
         }
 
-        let mut next_kick = std::collections::HashMap::new();
+        let mut next_kick = super::PreparedTextureSnapshotMemo::new();
         memoized_validated_texture_snapshot_at_generations(
             &mut next_kick,
             Some(key),
@@ -29979,8 +30129,165 @@ mod tests {
         assert!(cache.prepared_texture_snapshots.contains_key(&disjoint));
 
         seed(&mut cache, direct, &data, 31);
+        cache.invalidate_guest_write_chunks(
+            &mappings,
+            &[GuestWriteChunk {
+                gpu_va: 0x1234,
+                cpu_addr: direct.cpu_va + 0x20,
+                data_offset: 0,
+                len: 4,
+            }],
+        );
+        assert!(!cache.prepared_texture_snapshots.contains_key(&direct));
+        assert!(cache.prepared_texture_snapshots.contains_key(&disjoint));
+
+        seed(&mut cache, direct, &data, 37);
         cache.reset_epoch();
         assert!(cache.prepared_texture_snapshots.is_empty());
+    }
+
+    #[test]
+    fn prepared_texture_interval_index_matches_overlap_scan() {
+        let mut state = 0x1e3b_48a6_770c_52d1u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut keys = Vec::new();
+        for index in 0..192u64 {
+            keys.push(TextureSnapshotCacheKey {
+                mapping_epoch: index + 1,
+                gpu_va: 0x1000 + (random() & 0xffff),
+                cpu_va: 0x10_0000 + (random() & 0xffff),
+                len: (random() & 0x1fff) as usize,
+                nvmap_id: (index % 4) as u32,
+            });
+        }
+        let nested = TextureSnapshotCacheKey {
+            mapping_epoch: 1000,
+            gpu_va: 0x1000,
+            cpu_va: 0x10_0000,
+            len: 0x20_0000,
+            nvmap_id: 7,
+        };
+        keys.extend([
+            nested,
+            TextureSnapshotCacheKey { mapping_epoch: 1001, ..nested },
+            TextureSnapshotCacheKey { mapping_epoch: 1002, len: 0, ..nested },
+            TextureSnapshotCacheKey {
+                mapping_epoch: 1003,
+                gpu_va: u64::MAX - 0x80,
+                cpu_va: u64::MAX - 0x40,
+                len: 0x100,
+                ..nested
+            },
+            TextureSnapshotCacheKey {
+                mapping_epoch: 1004,
+                gpu_va: u64::MAX,
+                cpu_va: u64::MAX,
+                len: 1,
+                ..nested
+            },
+        ]);
+        let mut queries = vec![
+            (vec![(nested.gpu_va, 0)], vec![(nested.cpu_va, 0)]),
+            (vec![(nested.gpu_va - 1, 1)], vec![]),
+            (vec![(nested.gpu_va + nested.len as u64, 1)], vec![]),
+            (vec![(u64::MAX - 0x10, 0x100)], vec![]),
+            (vec![], vec![(u64::MAX - 0x10, 0x100)]),
+            (vec![(u64::MAX, 1)], vec![(u64::MAX, 1)]),
+            (vec![(0, usize::MAX)], vec![]),
+        ];
+        for _ in 0..64 {
+            queries.push((
+                vec![
+                    (0x1000 + (random() & 0x1ffff), (random() & 0x3ff) as usize),
+                    (0x1000 + (random() & 0xffff), (random() & 0x3ff) as usize),
+                ],
+                vec![(0x10_0000 + (random() & 0x1ffff), (random() & 0x3ff) as usize)],
+            ));
+        }
+        let data = Arc::new(vec![0x5a; 16]);
+        for (gpu_spans, cpu_spans) in queries {
+            let mut memo = super::PreparedTextureSnapshotMemo::new();
+            for &key in &keys {
+                memo.insert(key, super::ValidatedTextureSnapshot {
+                    data: data.clone(),
+                    gpu_generation: 11,
+                    commit_generation: 13,
+                    trusted_identity: key.mapping_epoch,
+                });
+            }
+            memo.invalidate_spans(gpu_spans.iter().copied(), cpu_spans.iter().copied());
+            for key in &keys {
+                let expected = !gpu_spans.iter().any(|&(address, len)| {
+                    super::byte_ranges_overlap(key.gpu_va, key.len, address, len)
+                }) && !cpu_spans.iter().any(|&(address, len)| {
+                    super::byte_ranges_overlap(key.cpu_va, key.len, address, len)
+                });
+                assert_eq!(memo.contains_key(key), expected, "key={key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_texture_interval_index_tracks_insert_remove_replace_and_clear() {
+        let first = TextureSnapshotCacheKey {
+            mapping_epoch: 1,
+            gpu_va: 0x4000,
+            cpu_va: 0x10_4000,
+            len: 0x100,
+            nvmap_id: 7,
+        };
+        let alias = TextureSnapshotCacheKey {
+            mapping_epoch: 2,
+            gpu_va: 0x8000,
+            ..first
+        };
+        let later = TextureSnapshotCacheKey {
+            gpu_va: 0x20_0000,
+            cpu_va: 0x30_0000,
+            ..first
+        };
+        let value = super::ValidatedTextureSnapshot {
+            data: Arc::new(vec![0x5a; 16]),
+            gpu_generation: 11,
+            commit_generation: 13,
+            trusted_identity: 17,
+        };
+        let mut memo = super::PreparedTextureSnapshotMemo::new();
+        memo.insert(first, value.clone());
+        memo.insert(alias, value.clone());
+        memo.invalidate_spans([(first.gpu_va + first.len as u64, 1)], []);
+        assert!(!memo.indexes_dirty);
+
+        let replacement = super::ValidatedTextureSnapshot { trusted_identity: 23, ..value.clone() };
+        memo.insert(first, replacement);
+        assert!(!memo.indexes_dirty);
+        assert_eq!(memo.get(&first).unwrap().trusted_identity, 23);
+        memo.remove(&first);
+        memo.invalidate_spans([(first.gpu_va, first.len)], []);
+        assert!(memo.contains_key(&alias));
+
+        memo.insert(later, value.clone());
+        memo.invalidate_spans([], [(later.cpu_va + 0x20, 4)]);
+        assert!(!memo.contains_key(&later));
+        assert!(memo.contains_key(&alias));
+        memo.insert(first, value.clone());
+        memo.invalidate_spans([], [(first.cpu_va + 0x40, 4)]);
+        assert!(memo.is_empty());
+
+        memo.clear();
+        assert!(memo.gpu_index.ranges.is_empty());
+        assert!(memo.cpu_index.ranges.is_empty());
+        memo.insert(later, value);
+        memo.invalidate_spans([(first.gpu_va, first.len)], [(first.cpu_va, first.len)]);
+        assert!(memo.contains_key(&later));
+        assert_eq!(memo.len(), 1);
+        memo.invalidate_spans([(later.gpu_va, 1)], []);
+        assert!(memo.is_empty());
     }
 
     #[test]
