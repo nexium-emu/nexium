@@ -152,9 +152,6 @@ impl App {
             }
         };
         let settings = Settings::load();
-        if settings.stable_resolution && std::env::var_os("NEXIUM_FAST_GPU_TIME").is_none() {
-            std::env::set_var("NEXIUM_FAST_GPU_TIME", "1");
-        }
         let _ = ensure_shared_dir(&format!("{DATA_ROOT}/games"));
         let audio = crate::frontend::open_audio(settings.volume);
         Ok(Self {
@@ -344,6 +341,7 @@ impl App {
         self.view.set_big_icon(game.icon.as_deref());
         hid_state::set_docked(self.settings.docked);
         nexium_runner::audio::set_master_volume(self.settings.volume);
+        nexium_common::fast_gpu_time::set_enabled(self.settings.stable_resolution);
         crate::klog!("menu: launching '{title}' {path} docked={}", self.settings.docked);
         match EmulationHandle::new(&path, CpuBackendKind::Dynarmic, None) {
             Ok(emu) => {
