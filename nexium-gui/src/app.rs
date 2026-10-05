@@ -5297,7 +5297,7 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 11] = [
+            let rows: [(&str, String); 12] = [
                 ("GPU", self.app_settings.gpu_device_label()),
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
                 ("Output Scale", format!("{}x", scale)),
@@ -5311,6 +5311,10 @@ impl HorizonApp {
                 ("Async Shaders", on(self.app_settings.async_shaders)),
                 ("Fast GPU Time", on(self.app_settings.fast_gpu_time)),
                 ("Force Max Clocks", on(self.app_settings.force_max_clocks)),
+                (
+                    "GPU Accuracy",
+                    if self.app_settings.normal_gpu_accuracy { "Normal" } else { "High" }.to_string(),
+                ),
                 ("Depth Share", on(self.app_settings.depth_share)),
             ];
             let n = rows.len();
@@ -5487,6 +5491,10 @@ impl HorizonApp {
                         );
                     }
                     10 => {
+                        self.app_settings.normal_gpu_accuracy = !self.app_settings.normal_gpu_accuracy;
+                        nexium_common::gpu_accuracy::set_normal(self.app_settings.normal_gpu_accuracy);
+                    }
+                    11 => {
                         self.app_settings.depth_share = !self.app_settings.depth_share;
                         nexium_common::depth_share::set_enabled(self.app_settings.depth_share);
                     }
@@ -12771,6 +12779,17 @@ fn graphics_settings_content(
         *save_needed = true;
     }
     ui.label(egui::RichText::new("Keeps a small compute job running on the host GPU while a game renders, so the driver doesn't drop to low clocks between the emulator's short bursts of work. Uses more power and runs the GPU warmer.").size(10.5).color(MUTED));
+    ui.add_space(6.0);
+    let mut normal_gpu_accuracy = cfg.normal_gpu_accuracy;
+    if ui
+        .checkbox(&mut normal_gpu_accuracy, "Normal GPU accuracy (applies on next boot)")
+        .changed()
+    {
+        cfg.normal_gpu_accuracy = normal_gpu_accuracy;
+        nexium_common::gpu_accuracy::set_normal(normal_gpu_accuracy);
+        *save_needed = true;
+    }
+    ui.label(egui::RichText::new("Tells the game its GPU work is finished as soon as it is submitted, instead of waiting for the host GPU, like yuzu's Normal accuracy. Faster in games that wait on the GPU every frame; games that read back GPU results may glitch. Off = High accuracy.").size(10.5).color(MUTED));
 }
 
 fn audio_settings_content(
