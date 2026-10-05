@@ -1,30 +1,54 @@
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 const REPORT_TICKS_PER_SECOND: u64 = 614_400_000;
+const BOOT_MODE_UNSET: u8 = u8::MAX;
+
+static TITLE_FAST_GPU_TIME: AtomicBool = AtomicBool::new(false);
+static BOOT_FAST_GPU_TIME: AtomicU8 = AtomicU8::new(BOOT_MODE_UNSET);
 
 fn fast_gpu_time_value_enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-static TITLE_FAST_GPU_TIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn env_fast_gpu_time() -> Option<bool> {
+    static VALUE: OnceLock<Option<bool>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("NEXIUM_FAST_GPU_TIME")
+            .ok()
+            .map(|value| fast_gpu_time_value_enabled(Some(value.as_str())))
+    })
+}
 
-pub fn set_title_fast_gpu_time(enabled: bool) {
-    TITLE_FAST_GPU_TIME.store(enabled, std::sync::atomic::Ordering::Relaxed);
+fn resolve_fast_gpu_time(env: Option<bool>, preference: bool, title_requires: bool) -> bool {
+    env.unwrap_or(preference || title_requires)
+}
+
+pub fn configure_fast_gpu_time(title_requires: bool) {
+    TITLE_FAST_GPU_TIME.store(title_requires, Ordering::Relaxed);
+    let enabled = resolve_fast_gpu_time(
+        env_fast_gpu_time(),
+        nexium_common::fast_gpu_time::enabled(),
+        title_requires,
+    );
+    BOOT_FAST_GPU_TIME.store(u8::from(enabled), Ordering::Relaxed);
+    if enabled {
+        log::info!("gpu: fast GPU time enabled; guest GPU report timestamps scaled by 1/256; CPU and ioctl clocks unchanged");
+    } else {
+        log::info!("gpu: fast GPU time disabled; guest GPU report timestamps use the hardware rate");
+    }
 }
 
 fn fast_gpu_time_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = match std::env::var("NEXIUM_FAST_GPU_TIME").ok() {
-            Some(value) => fast_gpu_time_value_enabled(Some(value.as_str())),
-            None => TITLE_FAST_GPU_TIME.load(std::sync::atomic::Ordering::Relaxed),
-        };
-        if enabled {
-            log::info!("gpu: fast GPU time compatibility mode enabled; guest GPU report timestamps scaled by 1/256; CPU and ioctl clocks unchanged");
-        }
-        enabled
-    })
+    match BOOT_FAST_GPU_TIME.load(Ordering::Relaxed) {
+        BOOT_MODE_UNSET => resolve_fast_gpu_time(
+            env_fast_gpu_time(),
+            nexium_common::fast_gpu_time::enabled(),
+            TITLE_FAST_GPU_TIME.load(Ordering::Relaxed),
+        ),
+        mode => mode != 0,
+    }
 }
 
 pub(crate) fn nanoseconds() -> u64 {
@@ -65,6 +89,15 @@ mod tests {
             assert!(!fast_gpu_time_value_enabled(value));
         }
         assert!(fast_gpu_time_value_enabled(Some("1")));
+    }
+
+    #[test]
+    fn fast_gpu_time_follows_preference_unless_env_overrides() {
+        assert!(resolve_fast_gpu_time(None, true, false));
+        assert!(!resolve_fast_gpu_time(None, false, false));
+        assert!(resolve_fast_gpu_time(None, false, true));
+        assert!(resolve_fast_gpu_time(Some(true), false, false));
+        assert!(!resolve_fast_gpu_time(Some(false), true, true));
     }
 
     #[test]

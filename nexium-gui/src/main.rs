@@ -158,6 +158,7 @@ fn main() -> Result<(), eframe::Error> {
     fault_logger::install();
 
     nexium_common::async_compile::set_enabled(settings.async_shaders);
+    nexium_common::fast_gpu_time::set_enabled(settings.fast_gpu_time);
     nexium_common::depth_share::set_enabled(
         std::env::var("NEXIUM_DEPTH_SHARE").map_or(settings.depth_share, |v| v != "0"),
     );

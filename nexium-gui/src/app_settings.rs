@@ -525,6 +525,8 @@ pub struct AppSettings {
     pub async_shaders: bool,
     #[serde(default)]
     pub depth_share: bool,
+    #[serde(default = "default_fast_gpu_time")]
+    pub fast_gpu_time: bool,
     #[serde(default)]
     pub library_folders: Vec<PathBuf>,
     #[serde(default)]
@@ -594,6 +596,10 @@ pub struct AppSettings {
 }
 
 fn default_emulated_device() -> bool {
+    true
+}
+
+fn default_fast_gpu_time() -> bool {
     true
 }
 
@@ -821,6 +827,7 @@ impl Default for AppSettings {
             docked: default_docked(),
             async_shaders: false,
             depth_share: false,
+            fast_gpu_time: default_fast_gpu_time(),
             library_folders: Vec::new(),
             view_mode: ViewMode::Carousel,
             carousel_theme: CarouselTheme::default(),
@@ -1007,6 +1014,21 @@ mod tests {
             assert_eq!(restored.fsr_sharpness, sharpness);
             assert_eq!(restored.filter, FilterMode::Fsr);
         }
+    }
+
+    #[test]
+    fn gpu_clock_settings_default_for_existing_configs() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("fast_gpu_time");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(settings.fast_gpu_time);
+        let settings = AppSettings {
+            fast_gpu_time: false,
+            ..AppSettings::default()
+        };
+        let restored: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!restored.fast_gpu_time);
     }
 
     #[test]

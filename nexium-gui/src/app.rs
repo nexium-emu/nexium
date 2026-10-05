@@ -5249,7 +5249,7 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 9] = [
+            let rows: [(&str, String); 10] = [
                 ("GPU", self.app_settings.gpu_device_label()),
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
                 ("Output Scale", format!("{}x", scale)),
@@ -5261,6 +5261,7 @@ impl HorizonApp {
                 ("High-DPI Aware", on(self.app_settings.dpi_aware)),
                 ("V-Sync", on(self.app_settings.vsync)),
                 ("Async Shaders", on(self.app_settings.async_shaders)),
+                ("Fast GPU Time", on(self.app_settings.fast_gpu_time)),
                 ("Depth Share", on(self.app_settings.depth_share)),
             ];
             let n = rows.len();
@@ -5427,6 +5428,10 @@ impl HorizonApp {
                         nexium_common::async_compile::set_enabled(self.app_settings.async_shaders);
                     }
                     8 => {
+                        self.app_settings.fast_gpu_time = !self.app_settings.fast_gpu_time;
+                        nexium_common::fast_gpu_time::set_enabled(self.app_settings.fast_gpu_time);
+                    }
+                    9 => {
                         self.app_settings.depth_share = !self.app_settings.depth_share;
                         nexium_common::depth_share::set_enabled(self.app_settings.depth_share);
                     }
@@ -12633,6 +12638,25 @@ fn graphics_settings_content(
         *save_needed = true;
     }
     ui.label(egui::RichText::new("Copies the guest's main depth buffer with every frame and replays it into a depth attachment on the host device, so ReShade's Generic Depth and add-ons such as DLSS 5 Feed see real depth. Costs one extra readback per frame; leave off unless an overlay needs it.").size(10.5).color(MUTED));
+
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new("GPU Timing")
+            .size(13.0)
+            .strong()
+            .color(TEXT),
+    );
+    ui.add_space(6.0);
+    let mut fast_gpu_time = cfg.fast_gpu_time;
+    if ui
+        .checkbox(&mut fast_gpu_time, "Fast GPU time (applies on next boot)")
+        .changed()
+    {
+        cfg.fast_gpu_time = fast_gpu_time;
+        nexium_common::fast_gpu_time::set_enabled(fast_gpu_time);
+        *save_needed = true;
+    }
+    ui.label(egui::RichText::new("Reports GPU timestamps 256x faster than real time, so games that scale their resolution from measured GPU time (Mario Kart 8 Deluxe, for one) stay at full resolution. Off = hardware-rate timestamps.").size(10.5).color(MUTED));
 }
 
 fn audio_settings_content(

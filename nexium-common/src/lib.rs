@@ -4,6 +4,7 @@ pub mod constants;
 pub mod depth_share;
 pub mod dumps;
 pub mod error;
+pub mod fast_gpu_time;
 pub mod fast_hash;
 pub mod file_logger;
 pub mod frame_present;

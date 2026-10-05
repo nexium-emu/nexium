@@ -1994,8 +1994,8 @@ pub(crate) fn eager_small_rt_writeback_enabled() -> bool {
     })
 }
 
-pub fn set_title_fast_gpu_time(enabled: bool) {
-    clock::set_title_fast_gpu_time(enabled);
+pub fn configure_fast_gpu_time(title_requires: bool) {
+    clock::configure_fast_gpu_time(title_requires);
 }
 
 pub(crate) fn gpu_pipeline_enabled() -> bool {
