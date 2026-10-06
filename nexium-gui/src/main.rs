@@ -22,6 +22,7 @@ mod input;
 mod motion_input;
 mod library;
 mod native_game;
+mod nextendo;
 mod mods;
 mod performance;
 mod playtime;
