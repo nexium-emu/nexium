@@ -50,6 +50,20 @@ pub mod misc;
 pub mod mm;
 pub mod mount;
 pub mod movie_maker;
+#[cfg(not(target_vendor = "sony"))]
+pub mod nextendo_nat;
+#[cfg(not(target_vendor = "sony"))]
+pub mod nextendo_token;
+#[cfg(not(target_vendor = "sony"))]
+pub mod nextendo_watch;
+#[cfg(target_vendor = "sony")]
+pub mod nextendo_token {
+    pub fn id_token(_title_id: u64, _version: &str) -> Option<String> {
+        None
+    }
+
+    pub fn prepare() {}
+}
 pub mod nifm;
 pub mod nim;
 pub mod ns;
