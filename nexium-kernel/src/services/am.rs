@@ -231,6 +231,7 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("acc:u0" | "acc:u1" | "acc:aa", 5) => Some("IProfile"),
         ("acc:u0" | "acc:u1" | "acc:aa", 101) => Some("IManagerForApplication"),
         ("IManagerForApplication", 2) => Some("IAsyncContext"),
+        ("IManagerForApplication", 170) => Some("IAsyncNetworkServiceLicenseKindContext"),
         ("nifm:u" | "nifm:a" | "nifm:s", 4) | ("nifm:u" | "nifm:a" | "nifm:s", 5) => {
             Some("IGeneralService")
         }
@@ -278,6 +279,10 @@ pub fn dispatch_command(
         "IApmManager" => apm_manager(cmd_id),
         "IApmSession" => apm_session(cmd_id),
         "IAsyncContext" => async_context(kernel, cmd_id),
+        "IAsyncNetworkServiceLicenseKindContext" if cmd_id == 100 => {
+            ok(network_service_license_kind().to_le_bytes().to_vec())
+        }
+        "IAsyncNetworkServiceLicenseKindContext" => async_context(kernel, cmd_id),
         "IGeneralService" => general_service(cmd_id),
         "IRequest" => nifm_request(kernel, cmd_id),
         "IScanRequest" => ok_empty(),
@@ -924,9 +929,31 @@ fn account_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
 fn build_profile_base() -> Vec<u8> {
     let mut out = vec![0u8; 0x38];
     out[0..16].copy_from_slice(&ACCOUNT_UID);
-    let name = b"nexium";
-    out[0x18..0x18 + name.len()].copy_from_slice(name);
+    let name = profile_nickname();
+    out[0x18..0x18 + name.len()].copy_from_slice(&name);
     out
+}
+
+fn profile_nickname() -> Vec<u8> {
+    const LIMIT: usize = 0x1F;
+    let linked = nexium_common::nextendo::account()
+        .map(|account| account.username)
+        .filter(|name| !name.trim().is_empty());
+    let Some(name) = linked else {
+        return b"nexium".to_vec();
+    };
+    let mut end = name.len().min(LIMIT);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.as_bytes()[..end].to_vec()
+}
+
+fn network_service_license_kind() -> u32 {
+    u32::from(
+        nexium_common::nextendo::redirect().enabled
+            && nexium_common::nextendo::account().is_some(),
+    )
 }
 
 fn profile(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
