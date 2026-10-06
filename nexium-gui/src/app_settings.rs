@@ -397,6 +397,44 @@ fn default_right_deadzone() -> f32 {
     0.12
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NextendoSettings {
+    pub online_play: bool,
+    pub share_presence: bool,
+    pub friend_alerts: bool,
+    pub server: String,
+    pub nat: String,
+}
+
+impl Default for NextendoSettings {
+    fn default() -> Self {
+        Self {
+            online_play: true,
+            share_presence: true,
+            friend_alerts: true,
+            server: String::new(),
+            nat: String::new(),
+        }
+    }
+}
+
+impl NextendoSettings {
+    pub fn server_ip(&self) -> std::net::Ipv4Addr {
+        self.server
+            .trim()
+            .parse()
+            .unwrap_or(nexium_common::nextendo::DEFAULT_SERVER_IP)
+    }
+
+    pub fn nat_ip(&self) -> std::net::Ipv4Addr {
+        self.nat
+            .trim()
+            .parse()
+            .unwrap_or(nexium_common::nextendo::DEFAULT_NAT_IP)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PerformanceDebugSettings {
@@ -597,6 +635,8 @@ pub struct AppSettings {
     pub vibration_strength: u8,
     #[serde(default)]
     pub performance_debug: PerformanceDebugSettings,
+    #[serde(default)]
+    pub nextendo: NextendoSettings,
 }
 
 fn default_emulated_device() -> bool {
@@ -867,6 +907,7 @@ impl Default for AppSettings {
             vibration_enabled: default_vibration_enabled(),
             vibration_strength: default_vibration_strength(),
             performance_debug: PerformanceDebugSettings::default(),
+            nextendo: NextendoSettings::default(),
         }
     }
 }
@@ -1155,5 +1196,22 @@ mod tests {
         let restored: AppSettings = serde_json::from_str(&json).unwrap();
         assert!(!restored.vibration_enabled);
         assert_eq!(restored.vibration_strength, 40);
+    }
+
+    #[test]
+    fn nextendo_settings_default_for_existing_configs() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("nextendo");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(settings.nextendo.online_play);
+        assert!(settings.nextendo.share_presence);
+        assert_eq!(settings.nextendo.server_ip(), nexium_common::nextendo::DEFAULT_SERVER_IP);
+        let custom = NextendoSettings {
+            server: " 10.0.0.2 ".into(),
+            nat: "bogus".into(),
+            ..NextendoSettings::default()
+        };
+        assert_eq!(custom.server_ip(), std::net::Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(custom.nat_ip(), nexium_common::nextendo::DEFAULT_NAT_IP);
     }
 }
