@@ -68,8 +68,14 @@ pub fn encode_friend(friend: &Friend, requested: Option<u64>) -> [u8; FRIEND_SIZ
     out[0x40..0x48].copy_from_slice(&friend.app_id.to_le_bytes());
     out[0x48..0x50].copy_from_slice(&friend.app_id.to_le_bytes());
     out[0x50..0x58].copy_from_slice(&NEVER_OFFLINE.to_le_bytes());
-    out[0x58..0x5C].copy_from_slice(&(friend.status.max(0) as u32).to_le_bytes());
-    out[0x5C] = u8::from(friend.status > 0);
+    let online = friend.status > nextendo::PRESENCE_OFFLINE;
+    let status = if online {
+        nextendo::PRESENCE_PLAYING
+    } else {
+        nextendo::PRESENCE_OFFLINE
+    };
+    out[0x58..0x5C].copy_from_slice(&(status as u32).to_le_bytes());
+    out[0x5C] = u8::from(online);
     let blob = friend.app_field.len().min(APP_FIELD_SIZE);
     out[0x60..0x60 + blob].copy_from_slice(&friend.app_field[..blob]);
     out[0x128] = 1;
@@ -204,6 +210,19 @@ mod tests {
         assert_eq!(record[0x5C], 1);
         assert_eq!(&record[0x60..0x6D], b"Mode\0cPublic\0");
         assert_eq!(record[0x128], 1);
+    }
+
+    #[test]
+    fn online_friends_are_reported_in_online_play() {
+        let mut online = friend();
+        online.status = nextendo::PRESENCE_ONLINE;
+        let record = encode_friend(&online, None);
+        assert_eq!(&record[0x58..0x5C], &2u32.to_le_bytes());
+        assert_eq!(record[0x5C], 1);
+        online.status = nextendo::PRESENCE_OFFLINE;
+        let record = encode_friend(&online, None);
+        assert_eq!(&record[0x58..0x5C], &0u32.to_le_bytes());
+        assert_eq!(record[0x5C], 0);
     }
 
     #[test]
