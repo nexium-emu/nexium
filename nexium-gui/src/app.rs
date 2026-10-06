@@ -14,6 +14,8 @@ use eframe::egui;
 use eframe::egui::{Color32, CornerRadius, FontId, Sense, Stroke, Vec2};
 use std::sync::Arc;
 
+mod nextendo_glue;
+
 const BG: Color32 = Color32::from_rgb(0x0F, 0x0F, 0x11);
 const BG_RAISED: Color32 = Color32::from_rgb(0x18, 0x18, 0x1C);
 const BG_INPUT: Color32 = Color32::from_rgb(0x20, 0x20, 0x26);
@@ -924,6 +926,16 @@ pub struct HorizonApp {
     content_manager: Option<crate::content_manager::ContentManager>,
     firmware_prompt: Option<crate::firmware_prompt::FirmwarePrompt>,
     firmware_status: Option<Result<Option<nexium_loader::firmware::InstalledFirmware>, String>>,
+    nextendo: crate::nextendo::Nextendo,
+    nextendo_state: crate::nextendo::State,
+    nextendo_hub: crate::nextendo::hub::HubState,
+    nextendo_catalog: crate::nextendo::Catalog,
+    nextendo_toasts: crate::nextendo::toasts::Toasts,
+    nextendo_reported_title: Option<u64>,
+    nextendo_session_path: Option<std::path::PathBuf>,
+    nextendo_decorated: Option<std::time::Instant>,
+    show_nextendo: bool,
+    nextendo_anim: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1407,6 +1419,10 @@ impl HorizonApp {
             None
         });
         let nro_path = nro_arg.unwrap_or_default();
+        let nextendo = crate::nextendo::Nextendo::start(
+            cc.egui_ctx.clone(),
+            nextendo_glue::preferences(&app_settings.nextendo),
+        );
         let mut app = Self {
             nro_path: nro_path.clone(),
             emulation_handle: None,
@@ -1558,6 +1574,16 @@ impl HorizonApp {
             content_manager: None,
             firmware_prompt: None,
             firmware_status: None,
+            nextendo,
+            nextendo_state: crate::nextendo::State::default(),
+            nextendo_hub: crate::nextendo::hub::HubState::new(),
+            nextendo_catalog: crate::nextendo::Catalog::new(cc.egui_ctx.clone()),
+            nextendo_toasts: crate::nextendo::toasts::Toasts::new(),
+            nextendo_reported_title: None,
+            nextendo_session_path: None,
+            nextendo_decorated: None,
+            show_nextendo: false,
+            nextendo_anim: 0.0,
         };
         app.reload_profile_texture(&cc.egui_ctx);
         crate::ui_audio::set_sfx_volume(app.app_settings.sfx_volume);
@@ -2352,6 +2378,7 @@ impl HorizonApp {
             && !self.show_settings
             && !self.show_profile
             && self.profile_anim == 0.0
+            && !self.nextendo_overlay_active()
             && self.pause_anim.is_none()
             && self.resume_anim.is_none()
             && !(self.vk_target == VkTarget::Swkbd && self.vkeyboard.active())
@@ -7621,7 +7648,7 @@ impl HorizonApp {
         if self.pending_quick.is_none() {
             return;
         }
-        if self.show_profile || self.profile_anim > 0.02 {
+        if self.show_profile || self.profile_anim > 0.02 || self.nextendo_overlay_active() {
             ctx.request_repaint();
             return;
         }
@@ -7963,7 +7990,8 @@ impl HorizonApp {
     fn native_game_visible(&self, carousel_mode: bool) -> bool {
         !carousel_mode && self.emulation_handle.as_ref().is_some_and(|h| h.is_running() && !h.is_paused())
             && !self.modal_active() && !self.show_settings && !self.show_profile
-            && self.profile_anim == 0.0 && self.pause_anim.is_none() && self.resume_anim.is_none()
+            && self.profile_anim == 0.0 && !self.nextendo_overlay_active()
+            && self.pause_anim.is_none() && self.resume_anim.is_none()
             && !self.debugger.show_memory && !self.debugger.show_registers && !self.debugger.show_disasm
             && !self.debugger.show_logs && !self.debugger.show_performance && !self.debugger.show_wait_tree
     }
@@ -10025,6 +10053,7 @@ impl eframe::App for HorizonApp {
             return;
         }
         gui_rate_stats(0, 1);
+        self.nextendo_tick(ctx);
         let frame_driven_game = self
             .emulation_handle
             .as_ref()
@@ -10034,6 +10063,7 @@ impl eframe::App for HorizonApp {
             && !self.show_settings
             && !self.show_profile
             && self.profile_anim == 0.0
+            && !self.nextendo_overlay_active()
             && self.pause_anim.is_none()
             && self.resume_anim.is_none();
         if self.splash.active() {
@@ -10162,7 +10192,8 @@ impl eframe::App for HorizonApp {
                 0.0
             };
             let mut lowpass = 0.0f32;
-            let profiling = self.show_profile || self.profile_anim > 0.01;
+            let profiling =
+                self.show_profile || self.profile_anim > 0.01 || self.nextendo_overlay_active();
             let on_music_slider = profiling
                 && self.profile.tab == crate::profile::ProfileTab::Settings
                 && self.profile.focus_content
@@ -10714,6 +10745,8 @@ impl eframe::App for HorizonApp {
                                 }
                             },
                         );
+                        ui.add_space(2.0);
+                        self.nextendo_menu_button(ui);
 
                         let left_end = ui.min_rect().max.x;
                         let paused = false;
@@ -10886,7 +10919,39 @@ impl eframe::App for HorizonApp {
             .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| {
                 let full_rect = ui.max_rect();
-                if profile_showing {
+                if self.nextendo_overlay_active() {
+                    if carousel_mode {
+                        let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
+                        let _ = crate::carousel::carousel_view(
+                            &mut self.carousel,
+                            &mut self.library,
+                            ctx,
+                            ui,
+                            &self.last_input,
+                            &mut self.input,
+                            running,
+                            playing_index,
+                            playing_alpha,
+                            self.app_settings.carousel_theme,
+                            profile_tex,
+                            &self.app_settings.profile_name,
+                            false,
+                            1.0,
+                            1.0,
+                            self.app_settings.backdrop_theme,
+                            self.app_settings.light_mode,
+                            &self.app_settings.favorites,
+                            self.app_settings.eu_dates,
+                            self.app_settings.dockbar_theme,
+                            &self.app_settings.carousel_order,
+                            &self.app_settings.carousel_lists,
+                            None,
+                            false,
+                        );
+                    }
+                    self.draw_nextendo_hub(ctx, ui, full_rect, running);
+                    ctx.request_repaint();
+                } else if profile_showing {
                     let avatar_tex = self.profile_texture.as_ref().map(|t| t.id());
                     let ambient = self.carousel.ambient_color;
                     let accent = self.theme_accent();
@@ -11236,6 +11301,9 @@ impl eframe::App for HorizonApp {
                             }
                             crate::carousel::CarouselAction::OpenUpdate => {
                                 self.open_update_confirm();
+                            }
+                            crate::carousel::CarouselAction::OpenNextendo => {
+                                self.open_nextendo(crate::nextendo::hub::Tab::Overview);
                             }
                             crate::carousel::CarouselAction::None => {}
                         }
@@ -11809,9 +11877,17 @@ impl eframe::App for HorizonApp {
             &mut self.app_settings,
         );
 
+        let toast_top = if self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel {
+            0.0
+        } else {
+            36.0
+        };
+        self.draw_nextendo_toasts(ctx, toast_top);
+
         let native_visible = self.native_game_visible(carousel_mode);
         if let Some(window) = &mut self.native_game {
             let mut holes: Vec<_> = self.native_overlay_rect.into_iter().chain(self.game_bar_tab_rect).collect();
+            holes.extend(self.nextendo_toasts.shown().iter().copied());
             if self.download_toast.is_some() {
                 let screen = ctx.viewport_rect();
                 holes.push(egui::Rect::from_min_size(egui::pos2(screen.center().x - 184.0, screen.min.y + 20.0), egui::vec2(368.0, 74.0)));

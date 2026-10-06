@@ -64,6 +64,8 @@ pub struct CarouselState {
     pub nav_held_since: f64,
     pub nav_cd: f64,
     pub nx_logo: Option<egui::TextureHandle>,
+    pub online_chip: Option<crate::nextendo::widgets::HeaderChip>,
+    pub online_badges: std::collections::HashMap<std::path::PathBuf, crate::nextendo::widgets::OnlineBadge>,
 }
 
 impl CarouselState {
@@ -116,6 +118,8 @@ impl CarouselState {
             nav_held_since: 0.0,
             nav_cd: 0.0,
             nx_logo: None,
+            online_chip: None,
+            online_badges: std::collections::HashMap::new(),
         }
     }
 }
@@ -142,9 +146,14 @@ pub enum CarouselAction {
     OpenShop,
     OpenCarouselSettings,
     OpenUpdate,
+    OpenNextendo,
 }
 
-const DOCK_COUNT: usize = 10;
+const DOCK_COUNT: usize = 11;
+const DOCK_NEXTENDO: usize = 7;
+const DOCK_PALETTE: usize = 8;
+const DOCK_DEBUG: usize = 9;
+const DOCK_QUIT: usize = 10;
 
 pub const CS_FRONT: usize = 1;
 
@@ -3261,6 +3270,12 @@ pub fn carousel_view(
                 lib_first = Some(draw_rect);
             }
 
+            if playing != Some(real_idx) && state.boot_stage == BootStage::None {
+                if let Some(badge) = state.online_badges.get(&lib.games[real_idx].path) {
+                    crate::nextendo::widgets::card_badge(ui, &painter, draw_rect, badge, alpha_f);
+                }
+            }
+
             if playing == Some(real_idx)
                 && playing_alpha > 0.01
                 && state.boot_stage == BootStage::None
@@ -3545,6 +3560,24 @@ pub fn carousel_view(
             Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sub_alpha),
             false,
         );
+        if let Some(badge) = game_of(state.selected)
+            .and_then(|gi| state.online_badges.get(&lib.games[gi].path))
+        {
+            crate::nextendo::widgets::status_line(
+                ui,
+                &painter,
+                scaled_meta_pos + Vec2::new(0.0, 66.0 * scale_factor),
+                scale_factor,
+                badge,
+                crate::nextendo::widgets::ChipColors {
+                    bar: col_bar,
+                    border: col_border,
+                    text: col_text,
+                    muted: col_muted,
+                },
+                ui_opacity,
+            );
+        }
     }
 
     let dock_items: [(&str, &str); DOCK_COUNT] = [
@@ -3555,6 +3588,7 @@ pub fn carousel_view(
         ("⌨", "Controller"),
         ("⚙", "Settings"),
         ("🛍", "Shop"),
+        ("◎", "Nextendo"),
         ("🎨", "Color"),
         ("🪳", "Debug"),
         ("✕", "Quit"),
@@ -3717,7 +3751,7 @@ pub fn carousel_view(
             let resp = ui.allocate_rect(base, Sense::click());
             if interactive && resp.clicked() && state.boot_stage == BootStage::None {
                 if state.active_dock && state.dock_selected == idx {
-                    if idx == 7 {
+                    if idx == DOCK_PALETTE {
                         if state.palette_open {
                             state.palette_open = false;
                             crate::ui_audio::play(crate::ui_audio::Sfx::Back);
@@ -3744,8 +3778,9 @@ pub fn carousel_view(
                             4 => CarouselAction::OpenController,
                             5 => CarouselAction::OpenSettings,
                             6 => CarouselAction::OpenShop,
-                            8 => CarouselAction::OpenDebug,
-                            9 => CarouselAction::Quit,
+                            DOCK_NEXTENDO => CarouselAction::OpenNextendo,
+                            DOCK_DEBUG => CarouselAction::OpenDebug,
+                            DOCK_QUIT => CarouselAction::Quit,
                             _ => CarouselAction::None,
                         };
                     }
@@ -3977,6 +4012,22 @@ pub fn carousel_view(
                     FontId::proportional(u * 1.4),
                     hole,
                 );
+            } else if *label == "Nextendo" {
+                crate::nextendo::look::network_glyph(
+                    &painter,
+                    draw.center(),
+                    draw.width() * 0.2,
+                    final_icon_color,
+                );
+                let alerts = state.online_chip.as_ref().map_or(0, |chip| chip.alerts);
+                if alerts > 0 {
+                    crate::nextendo::look::counter_badge(
+                        &painter,
+                        draw.center() + Vec2::new(draw.width() * 0.34, -draw.width() * 0.34),
+                        draw.width() * 0.32,
+                        alerts,
+                    );
+                }
             } else {
                 painter.text(
                     draw.center(),
@@ -4577,6 +4628,7 @@ pub fn carousel_view(
             false,
         );
 
+        let mut cluster_right = date_pos.x - date_w - 34.0 * top_s;
         if update_available
             && interactive
             && top_alpha > 40
@@ -4589,6 +4641,7 @@ pub fn carousel_view(
             let green = Color32::from_rgb(0x35, 0xD0, 0x6A);
             let cy = bg_rect.min.y + 35.5 * top_s;
             let pill_r = date_pos.x - date_w - 34.0 * top_s;
+            cluster_right = pill_r - 162.0 * top_s - 12.0 * top_s;
             let pw = 162.0 * top_s;
             let ph = 26.0 * top_s;
             let pill = egui::Rect::from_min_max(
@@ -4652,6 +4705,40 @@ pub fn carousel_view(
             );
             if ui.allocate_rect(spill, egui::Sense::click()).clicked() {
                 action = CarouselAction::OpenUpdate;
+            }
+        }
+
+        if let Some(chip) = state.online_chip.clone() {
+            if top_alpha > 40 && state.boot_stage == BootStage::None {
+                let sp = |p: egui::Pos2| screen_center + (p - screen_center) * scale_factor;
+                let anchor = sp(egui::pos2(cluster_right, bg_rect.min.y + 35.5 * top_s));
+                let colors = crate::nextendo::widgets::ChipColors {
+                    bar: col_bar,
+                    border: col_border,
+                    text: col_text,
+                    muted: col_muted,
+                };
+                let response = crate::nextendo::widgets::header_chip(
+                    ui,
+                    &painter,
+                    anchor.x,
+                    anchor.y,
+                    top_s * scale_factor,
+                    &chip,
+                    colors,
+                    top_alpha as f32 / 255.0,
+                    ui.input(|i| i.time),
+                    false,
+                );
+                if interactive
+                    && response.clicked()
+                    && !state.palette_open
+                    && !state.game_menu_open
+                    && !state.search_kb.open
+                {
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                    action = CarouselAction::OpenNextendo;
+                }
             }
         }
 
@@ -5249,7 +5336,7 @@ fn handle_input(
             }
         }
         if state.active_dock {
-            if state.dock_selected == 7 {
+            if state.dock_selected == DOCK_PALETTE {
                 state.palette_open = true;
                 state.palette_selected = crate::app_settings::CarouselTheme::all()
                     .iter()
@@ -5270,8 +5357,9 @@ fn handle_input(
                     4 => CarouselAction::OpenController,
                     5 => CarouselAction::OpenSettings,
                     6 => CarouselAction::OpenShop,
-                    8 => CarouselAction::OpenDebug,
-                    9 => CarouselAction::Quit,
+                    DOCK_NEXTENDO => CarouselAction::OpenNextendo,
+                    DOCK_DEBUG => CarouselAction::OpenDebug,
+                    DOCK_QUIT => CarouselAction::Quit,
                     _ => CarouselAction::None,
                 };
             }
