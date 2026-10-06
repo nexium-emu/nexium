@@ -41,7 +41,7 @@ directories.workspace = true
 socket2 = "0.6"
 
 [target.'cfg(not(target_vendor = "sony"))'.dependencies]
-base64 = "0.22"
+base64 = "0.23"
 rsa = { version = "0.9", features = ["getrandom"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 sha2 = { version = "0.10", features = ["oid"] }
