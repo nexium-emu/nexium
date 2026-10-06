@@ -14,6 +14,7 @@ pub mod gpu_caps;
 pub mod host_wake;
 pub mod log_init;
 pub mod log_sink;
+pub mod nextendo;
 pub mod paths;
 pub mod result;
 pub mod shader_progress;
