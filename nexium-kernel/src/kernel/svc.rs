@@ -5245,6 +5245,8 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             if port_name == "IAudioRenderer" {
                 kernel.close_audio_renderer_session(session_handle);
             }
+            let services = &mut kernel.services;
+            services.ssl.close_handle(session_handle, &mut services.bsd);
             kernel.sessions.remove(&session_handle);
             if let Some(cpu) = cpu_mut() {
                 cpu.set_register(0, SUCCESS as u64);
@@ -5297,6 +5299,8 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         if d.kind == 2 {
             let group = domain_group(kernel, session_handle);
             let domain_handles = close_domain_object(kernel, session_handle, d.object_id);
+            let services = &mut kernel.services;
+            services.ssl.close_object((group, d.object_id), &mut services.bsd);
             kernel.hwopus_decoders.remove(&(group, d.object_id));
             kernel.close_audio_renderer_object(group, d.object_id);
             for handle in domain_handles {
@@ -5812,6 +5816,272 @@ fn first_ipc_buffer(buffers: &[ipc::IpcBuffer], statics: &[ipc::IpcBuffer]) -> O
         .copied()
 }
 
+fn indexed_ipc_buffer(
+    buffers: &[ipc::IpcBuffer],
+    statics: &[ipc::IpcBuffer],
+    index: usize,
+) -> Option<ipc::IpcBuffer> {
+    match buffers.get(index) {
+        Some(buffer) if buffer.addr != 0 && buffer.size > 0 => Some(*buffer),
+        _ => statics
+            .get(index)
+            .filter(|buffer| buffer.addr != 0 && buffer.size > 0)
+            .copied(),
+    }
+}
+
+fn read_ipc_bytes(kernel: &Kernel, buffer: Option<ipc::IpcBuffer>, limit: usize) -> Vec<u8> {
+    let Some(buffer) = buffer else {
+        return Vec::new();
+    };
+    let mut bytes = vec![0u8; (buffer.size as usize).min(limit)];
+    if kernel.address_space.read(buffer.addr, &mut bytes).is_err() {
+        return Vec::new();
+    }
+    bytes
+}
+
+fn dispatch_nextendo_lookup(kernel: &mut Kernel, ctx: &ipc::IpcCtx, cmd_id: u32) -> Option<Vec<u8>> {
+    use crate::services::resolver;
+    if !matches!(cmd_id, 2 | 6 | 10 | 12) {
+        return None;
+    }
+    let host = resolver::nsd_resolve(&resolver::c_string(&read_ipc_bytes(
+        kernel,
+        indexed_ipc_buffer(&ctx.send_buffers, &ctx.send_statics, 0),
+        0x100,
+    )));
+    let lookup = resolver::nextendo_lookup(&host)?;
+    let addrinfo = matches!(cmd_id, 6 | 12);
+    let mut port = 0;
+    let result = lookup.and_then(|address| {
+        let payload = if addrinfo {
+            let service = resolver::c_string(&read_ipc_bytes(
+                kernel,
+                indexed_ipc_buffer(&ctx.send_buffers, &ctx.send_statics, 1),
+                0x40,
+            ));
+            let hints = resolver::parse_hints(&read_ipc_bytes(
+                kernel,
+                indexed_ipc_buffer(&ctx.send_buffers, &ctx.send_statics, 2),
+                0x400,
+            ));
+            port = resolver::parse_service(&service);
+            nexium_common::nextendo::remember_port(port, address);
+            resolver::serialize_addrinfo(&host, address, port, hints)
+        } else {
+            resolver::serialize_hostent(&host, address)
+        };
+        let output = indexed_ipc_buffer(&ctx.recv_buffers, &ctx.recv_statics, 0)
+            .filter(|buffer| buffer.size as usize >= payload.len())
+            .ok_or(resolver::LookupFailure::NotFound)?;
+        kernel
+            .address_space
+            .write(output.addr, &payload)
+            .map_err(|_| resolver::LookupFailure::NotFound)?;
+        Ok(payload.len() as u32)
+    });
+    match &result {
+        Ok(_) => log::info!("sfdnsres: '{}' port {} resolved through Nextendo (cmd {})", host, port, cmd_id),
+        Err(_) => log::info!("sfdnsres: '{}' is not served while Nextendo is on", host),
+    }
+    let reply = if addrinfo {
+        resolver::addrinfo_reply(cmd_id, result)
+    } else {
+        resolver::hostent_reply(cmd_id, result)
+    };
+    Some(build_ipc_response(ctx, 0, &reply, &[]))
+}
+
+fn read_requested_ids(kernel: &Kernel, ctx: &ipc::IpcCtx) -> Vec<u64> {
+    read_ipc_bytes(
+        kernel,
+        indexed_ipc_buffer(&ctx.send_buffers, &ctx.send_statics, 0),
+        300 * 8,
+    )
+    .chunks_exact(8)
+    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+    .collect()
+}
+
+fn write_records(kernel: &Kernel, ctx: &ipc::IpcCtx, records: &[u8], record_size: usize) -> usize {
+    let Some(output) = indexed_ipc_buffer(&ctx.recv_buffers, &ctx.recv_statics, 0) else {
+        return 0;
+    };
+    let fit = (output.size as usize / record_size).min(records.len() / record_size);
+    if fit > 0
+        && kernel
+            .address_space
+            .write(output.addr, &records[..fit * record_size])
+            .is_err()
+    {
+        return 0;
+    }
+    fit
+}
+
+fn dispatch_nextendo_friends(kernel: &mut Kernel, ctx: &ipc::IpcCtx, cmd_id: u32) -> Option<Vec<u8>> {
+    use crate::services::friends;
+    use nexium_common::nextendo;
+    if !friends::active() {
+        return None;
+    }
+    let ok = |data: &[u8]| Some(build_ipc_response(ctx, 0, data, &[]));
+    match cmd_id {
+        10100 => {
+            let offset = ipc_input_u32(ctx, 0).unwrap_or(0) as usize;
+            let ids: Vec<u8> = nextendo::friends()
+                .iter()
+                .skip(offset)
+                .flat_map(|friend| friends::advertised_id(friend).to_le_bytes())
+                .collect();
+            let count = write_records(kernel, ctx, &ids, 8);
+            ok(&(count as u32).to_le_bytes())
+        }
+        10101 | 20105 => {
+            let offset = ipc_input_u32(ctx, 0).unwrap_or(0) as usize;
+            let records: Vec<u8> = nextendo::friends()
+                .iter()
+                .skip(offset)
+                .flat_map(|friend| friends::encode_friend(friend, None))
+                .collect();
+            let count = write_records(kernel, ctx, &records, friends::FRIEND_SIZE);
+            log::debug!("friend: GetFriendList offset={} -> {}", offset, count);
+            ok(&(count as u32).to_le_bytes())
+        }
+        10102 | 20102 | 20107 => {
+            let list = nextendo::friends();
+            let records: Vec<u8> = read_requested_ids(kernel, ctx)
+                .into_iter()
+                .flat_map(|id| {
+                    list.iter()
+                        .find(|friend| friends::matches_id(friend, id))
+                        .map_or([0u8; friends::FRIEND_SIZE], |friend| {
+                            friends::encode_friend(friend, Some(id))
+                        })
+                })
+                .collect();
+            write_records(kernel, ctx, &records, friends::FRIEND_SIZE);
+            ok(&[])
+        }
+        10500 | 10501 => {
+            let records: Vec<u8> = read_requested_ids(kernel, ctx)
+                .into_iter()
+                .flat_map(|id| friends::profile_for(id).unwrap_or([0u8; friends::PROFILE_SIZE]))
+                .collect();
+            write_records(kernel, ctx, &records, friends::PROFILE_SIZE);
+            ok(&[])
+        }
+        10600 | 10601 => {
+            friends::declare_session(cmd_id == 10600);
+            ok(&[])
+        }
+        10610 => {
+            let bytes = read_ipc_bytes(
+                kernel,
+                indexed_ipc_buffer(&ctx.send_buffers, &ctx.send_statics, 0),
+                friends::USER_PRESENCE_SIZE,
+            );
+            let previous = nextendo::local_presence();
+            if let Some(presence) = friends::presence_from_guest(&bytes, previous.as_ref()) {
+                nextendo::set_local_presence(Some(presence));
+            }
+            ok(&[])
+        }
+        20100 => ok(&(nextendo::friends().len() as u32).to_le_bytes()),
+        _ => None,
+    }
+}
+
+fn dispatch_friend_notifications(kernel: &mut Kernel, ctx: &ipc::IpcCtx, cmd_id: u32) -> Vec<u8> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const NO_NOTIFICATIONS: u32 = 124 | (15 << 9);
+    const FRIEND_LIST_UPDATED: u32 = 0x65;
+    static DELIVERED: AtomicU64 = AtomicU64::new(u64::MAX);
+    let pending = || {
+        crate::services::friends::active()
+            && DELIVERED.load(Ordering::Relaxed)
+                != nexium_common::nextendo::friends_generation()
+    };
+    match cmd_id {
+        0 => {
+            let handle = kernel.handles.create_handle(HandleType::Event);
+            kernel.event_signals.insert(handle, pending());
+            build_ipc_response_copy(ctx, 0, &[], &[handle])
+        }
+        2 if pending() => {
+            DELIVERED.store(
+                nexium_common::nextendo::friends_generation(),
+                Ordering::Relaxed,
+            );
+            let mut info = FRIEND_LIST_UPDATED.to_le_bytes().to_vec();
+            info.extend_from_slice(&[0u8; 12]);
+            build_ipc_response(ctx, 0, &info, &[])
+        }
+        2 => build_ipc_response(ctx, NO_NOTIFICATIONS, &[], &[]),
+        _ => build_ipc_response(ctx, 0, &[], &[]),
+    }
+}
+
+fn ssl_object_key(kernel: &Kernel, session_handle: u32, ctx: &ipc::IpcCtx) -> (u32, u32) {
+    match ctx.domain {
+        Some(domain) => (domain_group(kernel, session_handle), domain.object_id),
+        None => (session_handle, 0),
+    }
+}
+
+fn application_version(kernel: &Kernel) -> String {
+    crate::services::resolver::c_string(&kernel.application_display_version)
+}
+
+fn nextendo_identity(kernel: &Kernel) -> Option<nexium_common::nextendo::LinkedAccount> {
+    use nexium_common::nextendo;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WARNED_TITLE: AtomicU64 = AtomicU64::new(0);
+    if !nextendo::redirect().enabled {
+        return None;
+    }
+    let account = nextendo::account().filter(|account| account.pid != 0)?;
+    let version = application_version(kernel);
+    if !nextendo::version_matches(kernel.title_id, &version) {
+        if WARNED_TITLE.swap(kernel.title_id, Ordering::Relaxed) != kernel.title_id {
+            log::warn!(
+                "nextendo: {:016X} {} is not the version the servers accept; staying offline",
+                kernel.title_id,
+                version
+            );
+        }
+        return None;
+    }
+    Some(account)
+}
+
+fn dispatch_nextendo_account(
+    kernel: &mut Kernel,
+    ctx: &ipc::IpcCtx,
+    port_name: &str,
+    cmd_id: u32,
+) -> Option<Vec<u8>> {
+    if !matches!(port_name, "IManagerForApplication" | "IManagerForSystemService")
+        || !matches!(cmd_id, 1 | 3 | 4 | 130 | 136)
+    {
+        return None;
+    }
+    let account = nextendo_identity(kernel)?;
+    if matches!(cmd_id, 1 | 130 | 136) {
+        return Some(build_ipc_response(ctx, 0, &account.pid.to_le_bytes(), &[]));
+    }
+    let token = crate::services::nextendo_token::id_token(kernel.title_id, &application_version(kernel))?;
+    let output = indexed_ipc_buffer(&ctx.recv_buffers, &ctx.recv_statics, 0)?;
+    let bytes = token.as_bytes();
+    let len = bytes.len().min(output.size as usize);
+    if kernel.address_space.write(output.addr, &bytes[..len]).is_err() {
+        return None;
+    }
+    log::info!("acc: LoadIdTokenCache served the Nextendo id_token ({} bytes)", len);
+    Some(build_ipc_response(ctx, 0, &(len as u32).to_le_bytes(), &[]))
+}
+
 fn rewind_svc_for_retry(kernel: &mut Kernel) -> bool {
     if kernel.threads.current_handle().is_none() {
         return false;
@@ -6218,6 +6488,9 @@ fn dispatch_service_v2(
     }
 
     if port_name == "sfdnsres" {
+        if let Some(response) = dispatch_nextendo_lookup(kernel, ctx, cmd_id) {
+            return response;
+        }
         if let Some(data) = crate::services::resolver::sfdnsres_lookup_reply(cmd_id) {
             let host = first_ipc_buffer(&ctx.send_buffers, &ctx.send_statics)
                 .and_then(|buffer| {
@@ -6265,6 +6538,28 @@ fn dispatch_service_v2(
         return build_ipc_response(ctx, reply.rc, &reply.data, &[]);
     }
 
+    if port_name == "ISslConnection" {
+        let key = ssl_object_key(kernel, session_handle, ctx);
+        let address_space = std::sync::Arc::clone(&kernel.address_space);
+        let thread = kernel.threads.current_handle().unwrap_or(0);
+        let services = &mut kernel.services;
+        if let Some(reply) =
+            services
+                .ssl
+                .dispatch_connection(&mut services.bsd, &address_space, ctx, key, thread)
+        {
+            if reply.retry && rewind_svc_for_retry(kernel) {
+                kernel.ipc_retry_pending = true;
+                return Vec::new();
+            }
+            return build_ipc_response(ctx, reply.rc, &reply.data, &[]);
+        }
+    }
+
+    if let Some(response) = dispatch_nextendo_account(kernel, ctx, port_name, cmd_id) {
+        return response;
+    }
+
     if let Some((rc, data, handles)) =
         crate::services::am::dispatch_command(kernel, port_name, cmd_id)
     {
@@ -6279,7 +6574,14 @@ fn dispatch_service_v2(
         return build_ipc_response_copy(ctx, rc, &data, &handles);
     }
 
+    if port_name == "INotificationService" {
+        return dispatch_friend_notifications(kernel, ctx, cmd_id);
+    }
+
     if port_name == "IFriendService" {
+        if let Some(response) = dispatch_nextendo_friends(kernel, ctx, cmd_id) {
+            return response;
+        }
         match cmd_id {
             0 => {
                 let h = kernel.handles.create_handle(HandleType::Event);
@@ -12783,6 +13085,9 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("friend:u" | "friend:a" | "friend:s" | "friend:v" | "friend:m", 0) => {
             Some("IFriendService")
         }
+        ("friend:u" | "friend:a" | "friend:s" | "friend:v" | "friend:m", 1) => {
+            Some("INotificationService")
+        }
         ("mii:u" | "mii:e", 0) => Some("IDatabaseService"),
         ("nfp:user", 0) => Some("INfpUser"),
         ("bcat:u" | "bcat:a" | "bcat:m" | "bcat:s", 0) => Some("IBcatService"),
@@ -13884,6 +14189,10 @@ fn svc_close_handle(kernel: &mut Kernel) -> u32 {
     log::debug!("svcCloseHandle handle={:#x} ({})", handle, kind);
     dump_regs(kernel, "CloseHandle ENTRY");
     release_hwopus_session_state(kernel, handle);
+    if kernel.sessions.contains_key(&handle) {
+        let services = &mut kernel.services;
+        services.ssl.close_handle(handle, &mut services.bsd);
+    }
     let is_audio_out = kernel
         .sessions
         .get(&handle)
