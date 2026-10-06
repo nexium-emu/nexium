@@ -2,7 +2,7 @@ use nexium_ipc::{IpcBuffer, IpcCtx};
 use nexium_memory::AddressSpace;
 use parking_lot::Mutex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4};
@@ -58,11 +58,11 @@ const MSG_DONTWAIT: u32 = 0x80;
 const O_NONBLOCK: i32 = 0x800;
 const SOCK_NONBLOCK_FLAG: u32 = 0x2000_0000;
 
-const POLLIN: u16 = 0x01;
+pub(crate) const POLLIN: u16 = 0x01;
 const POLLPRI: u16 = 0x02;
-const POLLOUT: u16 = 0x04;
-const POLLERR: u16 = 0x08;
-const POLLHUP: u16 = 0x10;
+pub(crate) const POLLOUT: u16 = 0x04;
+pub(crate) const POLLERR: u16 = 0x08;
+pub(crate) const POLLHUP: u16 = 0x10;
 const POLLNVAL: u16 = 0x20;
 const POLLRDNORM: u16 = 0x40;
 const POLLRDBAND: u16 = 0x80;
@@ -92,7 +92,7 @@ const FCNTL_SETFL: i32 = 4;
 const EFD_SEMAPHORE: u32 = 1;
 const EFD_NONBLOCK: u32 = 4;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct BsdAddress {
     ip: [u8; 4],
     port: u16,
@@ -140,9 +140,23 @@ impl BsdAddress {
     fn any(port: u16) -> Self {
         Self { ip: [0; 4], port }
     }
+
+    fn recover_lost(self) -> Self {
+        if self.ip != [0; 4] || self.port == 0 {
+            return self;
+        }
+        nexium_common::nextendo::redirect_for_port(self.port).map_or(self, |ip| Self {
+            ip: ip.octets(),
+            port: self.port,
+        })
+    }
+
+    fn is_nextendo(self) -> bool {
+        nexium_common::nextendo::is_redirected_ip(Ipv4Addr::from(self.ip))
+    }
 }
 
-struct HostSocket {
+pub(crate) struct HostSocket {
     socket: Socket,
     socket_type: u32,
     flags: i32,
@@ -150,11 +164,15 @@ struct HostSocket {
     pending_error: Option<u32>,
     recv_timeout: Option<Duration>,
     send_timeout: Option<Duration>,
+    tls_pending: usize,
 }
 
 impl HostSocket {
     fn new(socket: Socket, socket_type: u32, nonblocking: bool) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
+        if socket_type == SOCK_DGRAM {
+            ignore_udp_port_unreachable(&socket);
+        }
         Ok(Self {
             socket,
             socket_type,
@@ -163,7 +181,24 @@ impl HostSocket {
             pending_error: None,
             recv_timeout: None,
             send_timeout: None,
+            tls_pending: 0,
         })
+    }
+
+    pub(crate) fn os_socket(&self) -> &Socket {
+        &self.socket
+    }
+
+    pub(crate) fn set_tls_pending(&mut self, pending: usize) {
+        self.tls_pending = pending;
+    }
+
+    fn tls_readable(&self, events: u16) -> u16 {
+        if self.tls_pending > 0 {
+            events & (POLLIN | POLLRDNORM)
+        } else {
+            0
+        }
     }
 
     fn guest_blocking(&self, message_flags: u32) -> bool {
@@ -175,7 +210,7 @@ impl HostSocket {
     }
 }
 
-type SharedSocket = Arc<Mutex<HostSocket>>;
+pub(crate) type SharedSocket = Arc<Mutex<HostSocket>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct EventFd {
@@ -258,11 +293,71 @@ enum ConnectStatus {
     Failed(u32),
 }
 
+const UDP_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+
+struct UdpActivity {
+    since: Instant,
+    peers: HashSet<BsdAddress>,
+    peer_sent: u32,
+    peer_received: u32,
+    server_sent: u32,
+    server_received: u32,
+}
+
+impl UdpActivity {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            peers: HashSet::new(),
+            peer_sent: 0,
+            peer_received: 0,
+            server_sent: 0,
+            server_received: 0,
+        }
+    }
+
+    fn note(&mut self, remote: BsdAddress, outgoing: bool) {
+        if !nexium_common::nextendo::redirect().enabled {
+            return;
+        }
+        let counter = match (remote.is_nextendo(), outgoing) {
+            (true, true) => &mut self.server_sent,
+            (true, false) => &mut self.server_received,
+            (false, true) => &mut self.peer_sent,
+            (false, false) => &mut self.peer_received,
+        };
+        *counter = counter.saturating_add(1);
+        if !remote.is_nextendo() {
+            self.peers.insert(remote);
+        }
+    }
+
+    fn tick(&mut self) {
+        let elapsed = self.since.elapsed();
+        if elapsed < UDP_REPORT_INTERVAL {
+            return;
+        }
+        if self.peer_sent + self.peer_received + self.server_sent + self.server_received > 0 {
+            log::info!(
+                "bsd: UDP over the last {}s: {} peer endpoint(s) sent {} received {}; Nextendo servers sent {} received {}",
+                elapsed.as_secs(),
+                self.peers.len(),
+                self.peer_sent,
+                self.peer_received,
+                self.server_sent,
+                self.server_received
+            );
+        }
+        *self = Self::new();
+    }
+}
+
 pub struct BsdService {
     sockets: Vec<Option<SharedSocket>>,
     event_fds: Vec<Option<EventFd>>,
     waits: HashMap<u32, PendingWait>,
     active_wait: Option<PendingWait>,
+    udp: UdpActivity,
 }
 
 impl BsdService {
@@ -272,6 +367,7 @@ impl BsdService {
             event_fds: vec![None; MAX_SOCKETS],
             waits: HashMap::new(),
             active_wait: None,
+            udp: UdpActivity::new(),
         }
     }
 
@@ -281,6 +377,7 @@ impl BsdService {
     }
 
     pub fn dispatch_ipc(&mut self, memory: &AddressSpace, ctx: &IpcCtx, thread: u32) -> BsdReply {
+        self.udp.tick();
         let cmd_id = ctx.cmif_in.cmd_id;
         self.active_wait = self
             .waits
@@ -434,9 +531,10 @@ impl BsdService {
         let Some(fd) = input_i32(ctx, 0) else {
             return done(-1, EINVAL);
         };
-        let Some(address) = read_address(memory, ctx, 0) else {
+        let Some(requested) = read_address(memory, ctx, 0) else {
             return done(-1, EINVAL);
         };
+        let address = requested.recover_lost();
         let Some(shared) = self.socket(fd) else {
             return done(-1, EBADF);
         };
@@ -455,12 +553,18 @@ impl BsdService {
                 }
                 ConnectStatus::Connected => {
                     socket.connecting = false;
+                    if address.is_nextendo() {
+                        log::info!("bsd: connected to the Nextendo server on port {}", address.port);
+                    }
                     log::debug!("bsd.Connect fd={} address={:?} established", fd, address);
                     done(0, 0)
                 }
                 ConnectStatus::Failed(errno) => {
                     socket.connecting = false;
                     socket.pending_error = Some(errno);
+                    if address.is_nextendo() {
+                        log::info!("bsd: connection to the Nextendo server on port {} failed (errno {})", address.port, errno);
+                    }
                     log::debug!(
                         "bsd.Connect fd={} address={:?} failed errno={}",
                         fd,
@@ -470,6 +574,14 @@ impl BsdService {
                     done(-1, errno)
                 }
             };
+        }
+        if address != requested {
+            log::info!("bsd: connect to 0.0.0.0:{} lost its address; using the Nextendo server resolved for that port", address.port);
+        }
+        if address.is_nextendo() {
+            log::info!("bsd: connecting to the Nextendo server on port {}", address.port);
+        } else if address.ip == [0; 4] && nexium_common::nextendo::redirect().enabled {
+            log::info!("bsd: game tried to connect to 0.0.0.0:{} with no Nextendo server known for that port", address.port);
         }
         match socket.socket.connect(&address.to_sock_addr()) {
             Ok(()) => {
@@ -489,6 +601,9 @@ impl BsdService {
                 }
             }
             Err(error) => {
+                if address.is_nextendo() {
+                    log::info!("bsd: connection to the Nextendo server on port {} failed: {}", address.port, error);
+                }
                 log::debug!("bsd.Connect fd={} address={:?} failed: {}", fd, address, error);
                 done(-1, errno_from(&error))
             }
@@ -586,7 +701,7 @@ impl BsdService {
             match send_buffer(ctx, 1) {
                 Some(buffer) if buffer.size >= 8 => match read_guest(memory, buffer, 64) {
                     Ok(bytes) => match BsdAddress::parse(&bytes) {
-                        Some(address) => Some(address),
+                        Some(address) => Some(address.recover_lost()),
                         None => return done(-1, EINVAL),
                     },
                     Err(()) => return done(-1, EFAULT),
@@ -617,6 +732,9 @@ impl BsdService {
         };
         match result {
             Ok(sent) => {
+                if let Some(address) = destination.filter(|_| !socket.is_stream()) {
+                    self.udp.note(address, true);
+                }
                 log::trace!(
                     "bsd.{} fd={} destination={:?} bytes={}",
                     if with_addr { "SendTo" } else { "Send" },
@@ -721,6 +839,12 @@ impl BsdService {
                 if memory.write(message_buffer.addr, &bytes).is_err() {
                     return fail(-1, EFAULT);
                 }
+                if let Some(source) = source {
+                    observe_nat_check_reply(source, &bytes);
+                    if !peek {
+                        self.udp.note(source, false);
+                    }
+                }
                 let addr_len = match (with_addr, source, recv_buffer(ctx, 1)) {
                     (true, Some(source), Some(buffer)) if buffer.size > 0 => {
                         let encoded = source.encode();
@@ -821,8 +945,15 @@ impl BsdService {
             }
             match self.socket(fd) {
                 Some(shared) => {
+                    let socket = shared.lock();
+                    let tls = socket.tls_readable(events);
+                    if tls != 0 {
+                        revents[index] = tls;
+                        ready += 1;
+                        continue;
+                    }
                     host_entries.push(HostPollFd {
-                        raw: raw_handle(&shared.lock().socket),
+                        raw: raw_handle(&socket.socket),
                         events,
                         revents: 0,
                     });
@@ -911,8 +1042,14 @@ impl BsdService {
             let Some(shared) = self.socket(fd as i32) else {
                 return done(-1, EBADF);
             };
+            let socket = shared.lock();
+            let tls = socket.tls_readable(events);
+            if tls != 0 {
+                event_entries.push((fd, events, tls));
+                continue;
+            }
             host_entries.push(HostPollFd {
-                raw: raw_handle(&shared.lock().socket),
+                raw: raw_handle(&socket.socket),
                 events,
                 revents: 0,
             });
@@ -1257,6 +1394,42 @@ impl BsdService {
             .and_then(|slot| slot.clone())
     }
 
+    pub(crate) fn shared_socket(&self, fd: i32) -> Option<SharedSocket> {
+        self.socket(fd)
+    }
+
+    pub(crate) fn duplicate_socket(&mut self, fd: i32) -> Option<i32> {
+        let shared = self.socket(fd)?;
+        let new_fd = self.free_slot()?;
+        self.sockets[new_fd] = Some(shared);
+        Some(new_fd as i32)
+    }
+
+    pub(crate) fn close_if_same(&mut self, fd: i32, socket: &SharedSocket) {
+        let Ok(index) = usize::try_from(fd) else {
+            return;
+        };
+        if let Some(slot) = self.sockets.get_mut(index) {
+            if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, socket)) {
+                *slot = None;
+                log::debug!("bsd: ssl released fd={}", fd);
+            }
+        }
+    }
+
+    pub(crate) fn poll_socket(socket: &SharedSocket, events: u16) -> u16 {
+        let raw = raw_handle(&socket.lock().socket);
+        let mut entries = [HostPollFd {
+            raw,
+            events,
+            revents: 0,
+        }];
+        match host_poll(&mut entries) {
+            Ok(_) => entries[0].revents,
+            Err(_) => POLLERR,
+        }
+    }
+
     fn event_fd(&self, fd: i32) -> Option<EventFd> {
         usize::try_from(fd).ok().and_then(|fd| self.event_fds.get(fd).copied().flatten())
     }
@@ -1428,6 +1601,54 @@ struct HostPollFd {
     events: u16,
     revents: u16,
 }
+
+#[cfg(test)]
+pub(crate) fn test_shared_socket(socket: Socket) -> SharedSocket {
+    Arc::new(Mutex::new(
+        HostSocket::new(socket, SOCK_STREAM, false).expect("host socket"),
+    ))
+}
+
+fn observe_nat_check_reply(source: BsdAddress, bytes: &[u8]) {
+    if bytes.len() != 16 || !matches!(source.port, 10025 | 10125) {
+        return;
+    }
+    if !nexium_common::nextendo::redirect().enabled {
+        return;
+    }
+    let external = Ipv4Addr::new(bytes[8], bytes[9], bytes[10], bytes[11]);
+    if !external.is_unspecified() {
+        nexium_common::nextendo::set_external_ip(external);
+    }
+}
+
+#[cfg(windows)]
+fn ignore_udp_port_unreachable(socket: &Socket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SOCKET};
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+    let disabled: u32 = 0;
+    let mut returned: u32 = 0;
+    let result = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            &disabled as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if result != 0 {
+        log::debug!("bsd: could not disable UDP connection reset reporting");
+    }
+}
+
+#[cfg(not(windows))]
+fn ignore_udp_port_unreachable(_socket: &Socket) {}
 
 #[cfg(windows)]
 type RawHandle = std::os::windows::io::RawSocket;
@@ -1609,7 +1830,7 @@ fn read_address(memory: &AddressSpace, ctx: &IpcCtx, index: usize) -> Option<Bsd
     BsdAddress::parse(&bytes)
 }
 
-fn input_u32(ctx: &IpcCtx, index: usize) -> Option<u32> {
+pub(crate) fn input_u32(ctx: &IpcCtx, index: usize) -> Option<u32> {
     let start = ctx.cmif_in_data_off.checked_add(index.checked_mul(4)?)?;
     let end = start.checked_add(4)?;
     let data_end = ctx
@@ -1620,7 +1841,7 @@ fn input_u32(ctx: &IpcCtx, index: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
-fn input_i32(ctx: &IpcCtx, index: usize) -> Option<i32> {
+pub(crate) fn input_i32(ctx: &IpcCtx, index: usize) -> Option<i32> {
     input_u32(ctx, index).map(|value| value as i32)
 }
 
@@ -1631,15 +1852,15 @@ fn pick_buffer(buffers: &[IpcBuffer], statics: &[IpcBuffer], index: usize) -> Op
     }
 }
 
-fn send_buffer(ctx: &IpcCtx, index: usize) -> Option<IpcBuffer> {
+pub(crate) fn send_buffer(ctx: &IpcCtx, index: usize) -> Option<IpcBuffer> {
     pick_buffer(&ctx.send_buffers, &ctx.send_statics, index)
 }
 
-fn recv_buffer(ctx: &IpcCtx, index: usize) -> Option<IpcBuffer> {
+pub(crate) fn recv_buffer(ctx: &IpcCtx, index: usize) -> Option<IpcBuffer> {
     pick_buffer(&ctx.recv_buffers, &ctx.recv_statics, index)
 }
 
-fn read_guest(memory: &AddressSpace, buffer: IpcBuffer, limit: usize) -> Result<Vec<u8>, ()> {
+pub(crate) fn read_guest(memory: &AddressSpace, buffer: IpcBuffer, limit: usize) -> Result<Vec<u8>, ()> {
     let size = usize::try_from(buffer.size).map_err(|_| ())?;
     if size > limit {
         return Err(());
