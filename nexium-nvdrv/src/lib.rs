@@ -1827,6 +1827,98 @@ impl IoctlOutcome {
     }
 }
 
+#[derive(Clone)]
+pub struct GpuDrainHandle {
+    frame_queue: FrameQueue,
+    gpu: Arc<GpuContext>,
+    gpu_async: Option<Arc<AsyncGpuQueue>>,
+    retired_syncpts: Arc<Mutex<HashMap<u32, (u32, u32)>>>,
+    ctrl_event_wait_failures: Arc<Mutex<HashMap<(u32, u32), CtrlEventWaitFailure>>>,
+    sync_prep_thread: bool,
+}
+
+static GPU_DRAIN: Mutex<()> = Mutex::new(());
+
+impl GpuDrainHandle {
+    fn poll(&self) {
+        Nvdrv::poll_completions_with(&self.gpu, &self.retired_syncpts, &self.ctrl_event_wait_failures);
+    }
+
+    pub fn wait_idle(&self) -> bool {
+        let _serialized = GPU_DRAIN.lock();
+        let interrupted = || {
+            self.frame_queue.closed.load(Ordering::Acquire)
+                || self
+                    .gpu_async
+                    .as_ref()
+                    .is_some_and(|queue| queue.wait_context().interrupted())
+        };
+        if interrupted() {
+            return false;
+        }
+        let prep_completed = if self.sync_prep_thread {
+            self.gpu.drain_prep_thread(false)
+        } else {
+            true
+        };
+        let mut queue_profile = None;
+        let mut queue_completed = true;
+        if let Some(queue) = &self.gpu_async {
+            let queue_started = std::time::Instant::now();
+            let drain = queue.drain();
+            if !drain.completed {
+                self.poll();
+                return false;
+            }
+            queue_completed = drain.completed;
+            let queue_ns = queue_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            queue_profile = Some((
+                queue,
+                queue_ns,
+                drain.completed,
+                drain.barrier_send_ns,
+                drain.barrier_wait_ns,
+            ));
+            self.poll();
+        }
+        let render_started = std::time::Instant::now();
+        let render_completed = gpu::vk_dispatch::sync_render_thread_until(interrupted);
+        let render_ns = render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.poll();
+        if !render_completed {
+            return false;
+        }
+        let mut completions_completed = true;
+        if let Some((queue, ..)) = queue_profile {
+            let mut report = AsyncGpuWaitReport::new(std::time::Duration::from_secs(3));
+            while queue.pending.load(Ordering::Acquire) != 0 {
+                if interrupted() {
+                    return false;
+                }
+                self.poll();
+                report.waiting("renderer-backed completions");
+                std::thread::yield_now();
+            }
+            if queue.failed.load(Ordering::Acquire) {
+                log::error!("[gpu-sync] asynchronous GPU queue failed");
+                completions_completed = false;
+            }
+            self.poll();
+        }
+        if let Some((queue, queue_ns, queue_completed, barrier_send_ns, barrier_wait_ns)) =
+            queue_profile
+        {
+            queue.profile_idle_wait(
+                queue_ns,
+                if queue_completed { render_ns } else { 0 },
+                barrier_send_ns,
+                barrier_wait_ns,
+            );
+        }
+        prep_completed && queue_completed && render_completed && completions_completed
+    }
+}
+
 pub struct Nvdrv {
     pub files: HashMap<u32, NvFile>,
     pub next_fd: u32,
@@ -1856,6 +1948,7 @@ pub struct Nvdrv {
     gpu_async: Option<Arc<AsyncGpuQueue>>,
     sync_prep_thread: bool,
     async_present_pending: Arc<std::sync::atomic::AtomicUsize>,
+    drain_already_done: bool,
 }
 
 impl Nvdrv {
@@ -1891,6 +1984,7 @@ impl Nvdrv {
             gpu_async: None,
             sync_prep_thread: false,
             async_present_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drain_already_done: false,
         }
     }
 
@@ -1964,6 +2058,39 @@ impl Nvdrv {
         } else {
             job();
         }
+    }
+
+    fn map_buffer_targets_unused_range(&self, req: &IoctlRequest) -> bool {
+        let data = &req.in_data;
+        if data.len() < 40 {
+            return false;
+        }
+        let word = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        let quad = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+        let flags = word(0);
+        if flags & 0x100 != 0 {
+            return false;
+        }
+        if flags & 0x1 == 0 {
+            return true;
+        }
+        let size = match quad(24) {
+            0 => self
+                .nvmap_handles
+                .get(&word(8))
+                .map_or(0, |handle| u64::from(handle.size)),
+            size => size,
+        };
+        let start = quad(32);
+        let Some(end) = start.checked_add(size).filter(|_| size != 0) else {
+            return false;
+        };
+        !self
+            .gpu
+            .mappings
+            .read()
+            .iter()
+            .any(|mapping| mapping.gpu_va < end && start < mapping.gpu_va.saturating_add(mapping.size))
     }
 
     fn as_gpu_allocation_containing(
@@ -2148,77 +2275,19 @@ impl Nvdrv {
         }
     }
 
+    pub fn drain_handle(&self) -> GpuDrainHandle {
+        GpuDrainHandle {
+            frame_queue: Arc::clone(&self.frame_queue),
+            gpu: Arc::clone(&self.gpu),
+            gpu_async: self.gpu_async.clone(),
+            retired_syncpts: Arc::clone(&self.retired_syncpts),
+            ctrl_event_wait_failures: Arc::clone(&self.ctrl_event_wait_failures),
+            sync_prep_thread: self.sync_prep_thread,
+        }
+    }
+
     pub fn wait_gpu_idle_checked(&self) -> bool {
-        let interrupted = || {
-            self.frame_queue.closed.load(Ordering::Acquire)
-                || self
-                    .gpu_async
-                    .as_ref()
-                    .is_some_and(|queue| queue.wait_context().interrupted())
-        };
-        if interrupted() {
-            return false;
-        }
-        let prep_completed = if self.sync_prep_thread {
-            self.gpu.drain_prep_thread(false)
-        } else {
-            true
-        };
-        let mut queue_profile = None;
-        let mut queue_completed = true;
-        if let Some(queue) = &self.gpu_async {
-            let queue_started = std::time::Instant::now();
-            let drain = queue.drain();
-            if !drain.completed {
-                self.poll_gpu_completions();
-                return false;
-            }
-            queue_completed = drain.completed;
-            let queue_ns = queue_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            queue_profile = Some((
-                queue,
-                queue_ns,
-                drain.completed,
-                drain.barrier_send_ns,
-                drain.barrier_wait_ns,
-            ));
-            self.poll_gpu_completions();
-        }
-        let render_started = std::time::Instant::now();
-        let render_completed = gpu::vk_dispatch::sync_render_thread_until(&interrupted);
-        let render_ns = render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        self.poll_gpu_completions();
-        if !render_completed {
-            return false;
-        }
-        let mut completions_completed = true;
-        if let Some((queue, ..)) = queue_profile {
-            let mut report = AsyncGpuWaitReport::new(std::time::Duration::from_secs(3));
-            while queue.pending.load(Ordering::Acquire) != 0 {
-                if interrupted() {
-                    return false;
-                }
-                self.poll_gpu_completions();
-                report.waiting("renderer-backed completions");
-                std::thread::yield_now();
-            }
-            if queue.failed.load(Ordering::Acquire) {
-                log::error!("[gpu-sync] asynchronous GPU queue failed");
-                completions_completed = false;
-            }
-            self.poll_gpu_completions();
-        }
-        if let Some((queue, queue_ns, queue_completed, barrier_send_ns, barrier_wait_ns)) =
-            queue_profile
-        {
-            queue.profile_idle_wait(
-                queue_ns,
-                queue_completed.then_some(render_ns).unwrap_or(0),
-                barrier_send_ns,
-                barrier_wait_ns,
-            );
-        }
-        prep_completed && queue_completed && render_completed && completions_completed
+        self.drain_handle().wait_idle()
     }
 
     pub fn wait_gpu_idle(&self) {
@@ -2274,11 +2343,19 @@ impl Nvdrv {
     }
 
     fn poll_gpu_completions(&self) {
+        Self::poll_completions_with(&self.gpu, &self.retired_syncpts, &self.ctrl_event_wait_failures);
+    }
+
+    fn poll_completions_with(
+        gpu: &GpuContext,
+        retired_syncpts: &Mutex<HashMap<u32, (u32, u32)>>,
+        ctrl_event_wait_failures: &Mutex<HashMap<(u32, u32), CtrlEventWaitFailure>>,
+    ) {
         {
-            let mut events = self.gpu.syncpoint_events();
+            let mut events = gpu.syncpoint_events();
             if !events.is_empty() {
-                let mut channels = self.gpu.channels.lock();
-                let mut retired = self.retired_syncpts.lock();
+                let mut channels = gpu.channels.lock();
+                let mut retired = retired_syncpts.lock();
                 while let Some(event) = events.pop_front() {
                     match event {
                         gpu::PendingSyncpointEvent::Increment { syncpt_id, count } => {
@@ -2359,16 +2436,20 @@ impl Nvdrv {
             }
         }
 
-        self.cleanup_reached_ctrl_event_wait_failures();
+        Self::cleanup_reached_failures_with(gpu, retired_syncpts, ctrl_event_wait_failures);
     }
 
-    fn cleanup_reached_ctrl_event_wait_failures(&self) {
-        if self.ctrl_event_wait_failures.lock().is_empty() {
+    fn cleanup_reached_failures_with(
+        gpu: &GpuContext,
+        retired_syncpts: &Mutex<HashMap<u32, (u32, u32)>>,
+        ctrl_event_wait_failures: &Mutex<HashMap<(u32, u32), CtrlEventWaitFailure>>,
+    ) {
+        if ctrl_event_wait_failures.lock().is_empty() {
             return;
         }
-        let channels = self.gpu.channels.lock();
-        let retired = self.retired_syncpts.lock();
-        self.ctrl_event_wait_failures
+        let channels = gpu.channels.lock();
+        let retired = retired_syncpts.lock();
+        ctrl_event_wait_failures
             .lock()
             .retain(|(id, threshold), _| {
                 let current = channels
@@ -2822,6 +2903,27 @@ impl Nvdrv {
         self.files.get(&fd).map(|f| f.device)
     }
 
+    fn drain_required(&self, device: NvDevice, cmd: u16, req: &IoctlRequest) -> bool {
+        if self.gpu_async.is_none() || !ioctl_requires_async_gpu_drain(device, cmd) {
+            return false;
+        }
+        let reuses_video_mappings = matches!(device, NvDevice::NvhostNvdec | NvDevice::NvhostVic)
+            && cmd == 0x0009
+            && self.channel_map_reuses_addresses(req);
+        let maps_unused_range =
+            device == NvDevice::NvhostAsGpu && cmd == 0x4106 && self.map_buffer_targets_unused_range(req);
+        !reuses_video_mappings && !maps_unused_range
+    }
+
+    pub fn ioctl_needs_drain(&self, req: &IoctlRequest) -> bool {
+        self.device_for_fd(req.fd)
+            .is_some_and(|device| self.drain_required(device, (req.ioctl_id & 0xFFFF) as u16, req))
+    }
+
+    pub fn set_drain_already_done(&mut self, done: bool) {
+        self.drain_already_done = done;
+    }
+
     pub fn dispatch_ioctl(&mut self, req: IoctlRequest) -> IoctlOutcome {
         self.dispatch_ioctl_with_mem(req, &|_, _| false, &|_, _| false)
     }
@@ -2887,20 +2989,31 @@ impl Nvdrv {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) -> IoctlOutcome {
-        let reuses_video_mappings = matches!(device, NvDevice::NvhostNvdec | NvDevice::NvhostVic)
-            && cmd == 0x0009
-            && self.channel_map_reuses_addresses(req);
-        if self.gpu_async.is_some()
-            && ioctl_requires_async_gpu_drain(device, cmd)
-            && !reuses_video_mappings
-            && !self.wait_gpu_idle_checked()
-        {
-            log::error!(
-                "nvdrv:Ioctl device={:?} cmd={:#06x} rejected after GPU drain failure",
-                device,
-                cmd
-            );
-            return IoctlOutcome::error(0xA);
+        if !self.drain_already_done && self.drain_required(device, cmd, req) {
+            let started = std::time::Instant::now();
+            let drained = self.wait_gpu_idle_checked();
+            let waited = started.elapsed();
+            if waited >= std::time::Duration::from_millis(25) {
+                let flags = req
+                    .in_data
+                    .get(0..4)
+                    .map_or(0, |flags| u32::from_le_bytes(flags.try_into().unwrap()));
+                log::info!(
+                    "[stall] GPU drain before {:?} ioctl {:#06x} (flags {:#x}) took {} ms",
+                    device,
+                    cmd,
+                    flags,
+                    waited.as_millis()
+                );
+            }
+            if !drained {
+                log::error!(
+                    "nvdrv:Ioctl device={:?} cmd={:#06x} rejected after GPU drain failure",
+                    device,
+                    cmd
+                );
+                return IoctlOutcome::error(0xA);
+            }
         }
         match device {
             NvDevice::Nvmap => self.nvmap_ioctl(cmd, &req),
@@ -7661,6 +7774,35 @@ mod tests {
             mappings.cpu_address_for(target + 0x800),
             Some(source_cpu - 0x10000 + 0x800)
         );
+    }
+
+    #[test]
+    fn only_maps_into_unused_ranges_skip_the_gpu_drain() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let handle = 81;
+        let base = 0x7240_0000u64;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, 0x10000, 0x5341_0000));
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, base, 1, 0x10000, 1).result,
+            0
+        );
+        let map = |flags: u32, offset: u64| {
+            let mut input = vec![0u8; 40];
+            input[0..4].copy_from_slice(&flags.to_le_bytes());
+            input[8..12].copy_from_slice(&handle.to_le_bytes());
+            input[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+            input[32..40].copy_from_slice(&offset.to_le_bytes());
+            request(fd, 0xc028_4106, input, 40)
+        };
+        assert!(nvdrv.map_buffer_targets_unused_range(&map(1, base)));
+        assert!(nvdrv.map_buffer_targets_unused_range(&map(0, 0)));
+        assert!(!nvdrv.map_buffer_targets_unused_range(&map(0x101, base)));
+        assert_eq!(nvdrv.dispatch_ioctl(map(1, base)).result, 0);
+        assert!(!nvdrv.map_buffer_targets_unused_range(&map(1, base)));
+        assert!(!nvdrv.map_buffer_targets_unused_range(&map(1, base + 0x8000)));
     }
 
     #[test]
