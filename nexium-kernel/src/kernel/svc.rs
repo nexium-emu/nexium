@@ -12276,6 +12276,58 @@ fn nvdrv_buffer(
         .copied()
 }
 
+enum DrainGate {
+    Proceed { already_drained: bool },
+    Retry,
+}
+
+fn gate_gpu_drain(kernel: &mut Kernel, req: &nexium_nvdrv::IoctlRequest) -> DrainGate {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let thread = kernel.threads.current_handle().unwrap_or(0);
+    if let Some(gate) = kernel.gpu_drain_gate.as_ref() {
+        let done = Arc::clone(&gate.done);
+        if done.load(Ordering::Acquire) && gate.owner == thread {
+            let gate = kernel.gpu_drain_gate.take().unwrap();
+            crate::kernel::stall_watch::off_lock_drain(gate.ioctl_id, gate.started.elapsed());
+            return DrainGate::Proceed {
+                already_drained: gate.drained.load(Ordering::Acquire),
+            };
+        }
+        if rewind_svc_for_retry(kernel) {
+            return DrainGate::Retry;
+        }
+        while !done.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        return DrainGate::Proceed { already_drained: false };
+    }
+    if !kernel.nvdrv.ioctl_needs_drain(req) || !rewind_svc_for_retry(kernel) {
+        return DrainGate::Proceed { already_drained: false };
+    }
+    let handle = kernel.nvdrv.drain_handle();
+    let done = Arc::new(AtomicBool::new(false));
+    let drained = Arc::new(AtomicBool::new(false));
+    let (done_worker, drained_worker) = (Arc::clone(&done), Arc::clone(&drained));
+    let spawned = std::thread::Builder::new()
+        .name("nexium-gpu-drain".into())
+        .spawn(move || {
+            drained_worker.store(handle.wait_idle(), Ordering::Release);
+            done_worker.store(true, Ordering::Release);
+        });
+    if spawned.is_err() {
+        done.store(true, Ordering::Release);
+    }
+    kernel.gpu_drain_gate = Some(crate::kernel::GpuDrainGate {
+        owner: thread,
+        ioctl_id: req.ioctl_id,
+        started: std::time::Instant::now(),
+        done,
+        drained,
+    });
+    DrainGate::Retry
+}
+
 fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name: &str) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
     log::trace!("nvdrv:{}.cmd_{}", port_name, cmd_id);
@@ -12406,12 +12458,22 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             } else {
                 None
             };
+            match gate_gpu_drain(kernel, &req) {
+                DrainGate::Retry => {
+                    kernel.ipc_retry_pending = true;
+                    return Vec::new();
+                }
+                DrainGate::Proceed { already_drained } => {
+                    kernel.nvdrv.set_drain_already_done(already_drained)
+                }
+            }
             let outcome = kernel.nvdrv.dispatch_ioctl_with_mem_and_copy(
                 req,
                 &|addr, buf| addr_space.read(addr, buf).is_ok(),
                 &|addr, buf| addr_space_w.write(addr, buf).is_ok(),
                 &|src, dst, len| addr_space_c.copy(src, dst, len).is_ok(),
             );
+            kernel.nvdrv.set_drain_already_done(false);
             if let Some((start, key)) = ioctl_profile {
                 crate::kernel::profile::record_ipc(&key, start);
             }

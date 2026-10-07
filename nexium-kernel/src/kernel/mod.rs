@@ -33,6 +33,14 @@ pub(crate) struct PresentMetadata {
 
 pub(crate) type PresentMetadataQueue = Arc<Mutex<HashMap<u64, PresentMetadata>>>;
 
+pub struct GpuDrainGate {
+    pub owner: u32,
+    pub ioctl_id: u32,
+    pub started: std::time::Instant,
+    pub done: Arc<std::sync::atomic::AtomicBool>,
+    pub drained: Arc<std::sync::atomic::AtomicBool>,
+}
+
 pub(crate) type PresentDeliveryLanes = Arc<Mutex<HashMap<u32, Arc<Mutex<()>>>>>;
 
 pub(crate) fn present_delivery_lane(
@@ -156,6 +164,7 @@ pub struct Kernel {
     pub last_ipc_target: String,
     pub last_ipc_cmd: u32,
     pub last_ipc_detail: u32,
+    pub gpu_drain_gate: Option<GpuDrainGate>,
     pub preempt_after_svc: bool,
     pub present_pace_until: Option<std::time::Instant>,
     pub(crate) next_present_id: u64,
@@ -419,6 +428,7 @@ impl Kernel {
             last_ipc_target: String::new(),
             last_ipc_cmd: 0,
             last_ipc_detail: 0,
+            gpu_drain_gate: None,
             preempt_after_svc: false,
             present_pace_until: None,
             next_present_id: 1,
