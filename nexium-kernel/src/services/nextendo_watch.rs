@@ -6,9 +6,9 @@ const PRUDP_LITE_MAGIC: u8 = 0x80;
 const PRUDP_DATA: u16 = 2;
 const PRUDP_DISCONNECT: u16 = 3;
 const PRUDP_FLAG_ACK: u16 = 0x1;
-const OPTION_FRAGMENT: u8 = 2;
 const WEBSOCKET_BINARY: u8 = 0x2;
 const WEBSOCKET_CLOSE: u8 = 0x8;
+const TICKET_GRANTING: u16 = 10;
 const NOTIFICATION_EVENTS: u16 = 14;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -21,6 +21,7 @@ enum Rmc<'a> {
     },
     Success {
         call: u32,
+        body: &'a [u8],
     },
     Failure {
         error: u32,
@@ -139,14 +140,26 @@ impl NexWatch {
                     None => log::info!("nex: {} rejected call {} with error {:#010X}", self.host, call, error),
                 }
             }
-            Some(Rmc::Success { call }) => {
-                self.calls.remove(&call);
+            Some(Rmc::Success { call, body }) => {
+                if let Some((protocol, method)) = self.calls.remove(&call) {
+                    if protocol == TICKET_GRANTING {
+                        match login_result(method, body) {
+                            Some(Ok(())) => {
+                                log::info!("nex: {} accepted {}", self.host, describe(protocol, method))
+                            }
+                            Some(Err(result)) => log::info!(
+                                "nex: {} refused {} with {:#010X}",
+                                self.host,
+                                describe(protocol, method),
+                                result
+                            ),
+                            None => {}
+                        }
+                    }
+                }
             }
             Some(Rmc::Request { protocol, params, .. }) if protocol == NOTIFICATION_EVENTS => {
-                let kind = params
-                    .get(8..12)
-                    .map_or(0, |kind| u32::from_le_bytes(kind.try_into().unwrap()));
-                log::info!("nex: {} sent notification type {}", self.host, kind);
+                log::info!("nex: {} sent notification type {}", self.host, notification_type(params));
             }
             Some(Rmc::Request { protocol, method, .. }) => {
                 log::info!("nex: {} asked this console for {}", self.host, describe(protocol, method));
@@ -180,6 +193,24 @@ impl Drop for NexWatch {
             );
         }
     }
+}
+
+fn login_result(method: u32, body: &[u8]) -> Option<Result<(), u32>> {
+    if !matches!(method, 1 | 2 | 3 | 6) {
+        return None;
+    }
+    let result = u32::from_le_bytes(body.get(4..8)?.try_into().ok()?);
+    Some(if result & 0x8000_0000 != 0 { Err(result) } else { Ok(()) })
+}
+
+fn notification_type(params: &[u8]) -> u32 {
+    let start = match params.get(1..5) {
+        Some(size) if u32::from_le_bytes(size.try_into().unwrap()) as usize + 5 == params.len() => 5,
+        _ => 0,
+    };
+    params
+        .get(start + 8..start + 12)
+        .map_or(0, |kind| u32::from_le_bytes(kind.try_into().unwrap()))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -236,26 +267,12 @@ fn packets(payload: &[u8]) -> impl Iterator<Item = Packet<'_>> {
         let packet = Packet {
             kind: type_flags & 0xF,
             flags: type_flags >> 4,
-            fragment: fragment_id(&rest[12..12 + options]),
+            fragment: rest[7],
             body: &rest[12 + options..total],
         };
         rest = &rest[total..];
         Some(packet)
     })
-}
-
-fn fragment_id(mut options: &[u8]) -> u8 {
-    while options.len() >= 2 {
-        let (id, size) = (options[0], options[1] as usize);
-        let Some(value) = options.get(2..2 + size) else {
-            return 0;
-        };
-        if id == OPTION_FRAGMENT {
-            return value.first().copied().unwrap_or(0);
-        }
-        options = &options[2 + size..];
-    }
-    0
 }
 
 fn messages(payload: &[u8], fragments: &mut Vec<u8>) -> Vec<Vec<u8>> {
@@ -296,7 +313,10 @@ fn parse_rmc(message: &[u8]) -> Option<Rmc<'_>> {
     let success = *message.get(pos)?;
     pos += 1;
     if success == 1 {
-        Some(Rmc::Success { call: word(pos)? })
+        Some(Rmc::Success {
+            call: word(pos)?,
+            body: message.get(pos + 4..)?,
+        })
     } else {
         Some(Rmc::Failure {
             error: word(pos)?,
@@ -355,10 +375,10 @@ mod tests {
         rmc
     }
 
-    fn prudp(kind: u16, options: &[u8], body: &[u8]) -> Vec<u8> {
+    fn prudp(kind: u16, fragment: u8, options: &[u8], body: &[u8]) -> Vec<u8> {
         let mut packet = vec![PRUDP_LITE_MAGIC, options.len() as u8];
         packet.extend_from_slice(&(body.len() as u16).to_le_bytes());
-        packet.extend_from_slice(&[0, 0, 0, 0]);
+        packet.extend_from_slice(&[0, 0, 0, fragment]);
         packet.extend_from_slice(&kind.to_le_bytes());
         packet.extend_from_slice(&[0, 0]);
         packet.extend_from_slice(options);
@@ -403,10 +423,10 @@ mod tests {
         let mut watch = NexWatch::new("test");
         watch.incoming(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
         assert!(watch.upgraded);
-        let request = frame(WEBSOCKET_BINARY, &prudp(PRUDP_DATA, &[], &rmc_request(109, 9, 0x28, &[])), Some([9, 8, 7, 6]));
+        let request = frame(WEBSOCKET_BINARY, &prudp(PRUDP_DATA, 0, &[], &rmc_request(109, 9, 0x28, &[])), Some([9, 8, 7, 6]));
         watch.outgoing(&request);
         assert_eq!(watch.calls.get(&9), Some(&(109, 0x28)));
-        let reply = frame(WEBSOCKET_BINARY, &prudp(PRUDP_DATA, &[], &rmc_failure(109, 0x8001_0002, 9)), None);
+        let reply = frame(WEBSOCKET_BINARY, &prudp(PRUDP_DATA, 0, &[], &rmc_failure(109, 0x8001_0002, 9)), None);
         let (head, tail) = reply.split_at(5);
         watch.incoming(head);
         assert_eq!(watch.failures, 0);
@@ -421,9 +441,50 @@ mod tests {
         let message = rmc_request(11, 3, 0x7, &[0u8; 40]);
         let (first, second) = message.split_at(20);
         let mut fragments = Vec::new();
-        assert!(messages(&prudp(PRUDP_DATA, &[OPTION_FRAGMENT, 1, 1], first), &mut fragments).is_empty());
-        let done = messages(&prudp(PRUDP_DATA, &[OPTION_FRAGMENT, 1, 0], second), &mut fragments);
+        assert!(messages(&prudp(PRUDP_DATA, 1, &[0, 1, 0], first), &mut fragments).is_empty());
+        let done = messages(&prudp(PRUDP_DATA, 0, &[], second), &mut fragments);
         assert_eq!(done, vec![message]);
+    }
+
+    #[test]
+    fn split_logins_are_counted_and_their_result_reported() {
+        let mut watch = NexWatch::new("test");
+        watch.incoming(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+        let login = rmc_request(TICKET_GRANTING as u8, 4, 2, &[7u8; 1500]);
+        let (first, second) = login.split_at(1000);
+        watch.outgoing(&frame(WEBSOCKET_BINARY, &prudp(PRUDP_DATA, 1, &[], first), Some([1, 2, 3, 4])));
+        assert_eq!(watch.requests, 0);
+        watch.outgoing(&frame(WEBSOCKET_BINARY, &prudp(PRUDP_DATA, 0, &[], second), Some([1, 2, 3, 4])));
+        assert_eq!(watch.requests, 1);
+        assert_eq!(watch.calls.get(&4), Some(&(TICKET_GRANTING, 2)));
+        let mut reply = 14u32.to_le_bytes().to_vec();
+        reply.extend_from_slice(&[TICKET_GRANTING as u8, 1]);
+        reply.extend_from_slice(&4u32.to_le_bytes());
+        reply.extend_from_slice(&0x8002u32.to_le_bytes());
+        reply.extend_from_slice(&0x8068_000Bu32.to_le_bytes());
+        watch.incoming(&frame(WEBSOCKET_BINARY, &prudp(PRUDP_DATA, 0, &[], &reply), None));
+        assert!(watch.calls.is_empty());
+    }
+
+    #[test]
+    fn login_replies_carry_their_result_code() {
+        let reply = |result: u32| [0x8002u32.to_le_bytes(), result.to_le_bytes()].concat();
+        assert_eq!(login_result(2, &reply(0x8068_000B)), Some(Err(0x8068_000B)));
+        assert_eq!(login_result(6, &reply(0x0001_0001)), Some(Ok(())));
+        assert_eq!(login_result(4, &reply(0x8068_000B)), None);
+        assert_eq!(login_result(2, &[2, 0x80]), None);
+    }
+
+    #[test]
+    fn notification_types_skip_the_structure_header() {
+        let mut event = 1_800_003_542u64.to_le_bytes().to_vec();
+        event.extend_from_slice(&3001u32.to_le_bytes());
+        event.extend_from_slice(&[0u8; 12]);
+        let mut versioned = vec![0];
+        versioned.extend_from_slice(&(event.len() as u32).to_le_bytes());
+        versioned.extend_from_slice(&event);
+        assert_eq!(notification_type(&versioned), 3001);
+        assert_eq!(notification_type(&event), 3001);
     }
 
     #[test]
