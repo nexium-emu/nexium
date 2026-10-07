@@ -5350,6 +5350,9 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         ctx.cmif_in_data_len,
         is_domain
     );
+    kernel.last_ipc_target.clone_from(&dispatch_target);
+    kernel.last_ipc_cmd = cmd_id;
+    kernel.last_ipc_detail = 0;
     ipc_trace_request(
         kernel,
         session_handle,
@@ -12321,6 +12324,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 0
             };
             let ioctl_cmd = (ioctl_id & 0xFFFF) as u16;
+            kernel.last_ipc_detail = ioctl_id;
 
             let read_input = |buf: Option<ipc::IpcBuffer>| -> Vec<u8> {
                 let Some(sb) = buf else {

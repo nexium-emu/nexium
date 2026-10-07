@@ -1186,7 +1186,12 @@ impl EmulationHandle {
                                     }
                                     continue;
                                 }
-                                kernel_v.lock().signal_vsync();
+                                nexium_core::kernel::stall_watch::late_tick("vsync", now - next);
+                                let waiting = std::time::Instant::now();
+                                let mut kernel = kernel_v.lock();
+                                nexium_core::kernel::stall_watch::lock_wait("vsync", waiting.elapsed());
+                                kernel.signal_vsync();
+                                drop(kernel);
                                 next += PERIOD;
                                 let after = std::time::Instant::now();
                                 if after > next + PERIOD {

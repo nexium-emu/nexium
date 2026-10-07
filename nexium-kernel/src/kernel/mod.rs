@@ -4,6 +4,7 @@ pub mod handles;
 pub mod hid;
 pub mod profile;
 pub mod session;
+pub mod stall_watch;
 pub mod svc;
 pub mod svc_abi32;
 pub mod svc_defs;
@@ -152,6 +153,9 @@ pub struct Kernel {
 
     pub yield_after_svc: bool,
     pub ipc_retry_pending: bool,
+    pub last_ipc_target: String,
+    pub last_ipc_cmd: u32,
+    pub last_ipc_detail: u32,
     pub preempt_after_svc: bool,
     pub present_pace_until: Option<std::time::Instant>,
     pub(crate) next_present_id: u64,
@@ -412,6 +416,9 @@ impl Kernel {
             open_dir_lists: HashMap::new(),
             yield_after_svc: false,
             ipc_retry_pending: false,
+            last_ipc_target: String::new(),
+            last_ipc_cmd: 0,
+            last_ipc_detail: 0,
             preempt_after_svc: false,
             present_pace_until: None,
             next_present_id: 1,
@@ -1695,11 +1702,26 @@ impl Kernel {
             return self.dispatch_svc_a32(imm);
         }
         self.defer_user_preemption_if_disabled();
-        let status = svc::dispatch(self, imm);
+        let status = self.timed_dispatch(imm);
         if !matches!(imm, 0x10 | 0x1e | 0x7f) {
             if let Some(cpu) = cpu_local::cpu_mut() {
                 cpu.set_register(0, status as u64);
             }
+        }
+        status
+    }
+
+    fn timed_dispatch(&mut self, imm: u16) -> u32 {
+        let started = std::time::Instant::now();
+        let status = svc::dispatch(self, imm);
+        let held = started.elapsed();
+        if held >= stall_watch::SLOW_SVC {
+            let ipc = stall_watch::is_ipc_svc(imm).then_some((
+                self.last_ipc_target.as_str(),
+                self.last_ipc_cmd,
+                self.last_ipc_detail,
+            ));
+            stall_watch::slow_svc(imm, held, ipc);
         }
         status
     }
@@ -1713,7 +1735,7 @@ impl Kernel {
             cpu.svc_shadow_enter(svc_abi32::gather(imm, &regs));
         }
         self.defer_user_preemption_if_disabled();
-        let status = svc::dispatch(self, imm);
+        let status = self.timed_dispatch(imm);
         if let Some(cpu) = cpu_local::cpu_mut() {
             if !matches!(imm, 0x10 | 0x1e | 0x7f) {
                 cpu.set_register(0, status as u64);
