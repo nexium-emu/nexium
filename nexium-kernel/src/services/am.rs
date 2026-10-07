@@ -812,6 +812,7 @@ static MII_EDIT_MODE: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_STORAGE_WRITE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
 
 pub const APPLET_ID_CONTROLLER: u32 = 0x0c;
+pub const APPLET_ID_ERROR: u32 = 0x0e;
 pub const APPLET_ID_SWKBD: u32 = 0x11;
 pub const APPLET_ID_MII_EDIT: u32 = 0x12;
 pub const APPLET_ID_OFFLINE_WEB: u32 = 0x17;
@@ -838,9 +839,91 @@ pub fn reset_mii_edit_mode() {
 }
 
 pub fn record_storage_write(bytes: &[u8]) {
+    if pending_applet_id() == APPLET_ID_ERROR {
+        if let Some(error) = describe_error_argument(bytes) {
+            log::info!("am: the game opened its error screen: {error}");
+        }
+    }
     if let Ok(mut last) = LAST_STORAGE_WRITE.lock() {
         last.clear();
         last.extend_from_slice(&bytes[..bytes.len().min(0x200)]);
+    }
+}
+
+fn describe_error_argument(bytes: &[u8]) -> Option<String> {
+    let word = |at: usize| -> Option<u32> { Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?)) };
+    if word(4) == Some(0x20) {
+        return None;
+    }
+    let code = |category: u32, number: u32| format!("{category:04}-{number:04}");
+    let wide = |at: usize| -> Option<String> { Some(code(word(at)?, word(at + 4)?)) };
+    let text = |at: usize| -> String {
+        let field = bytes.get(at..).unwrap_or_default();
+        let end = field.iter().position(|&byte| byte == 0).unwrap_or(field.len());
+        String::from_utf8_lossy(&field[..end]).trim().to_string()
+    };
+    match *bytes.first()? {
+        0 if bytes.get(6) == Some(&1) => Some(format!("error {}", wide(8)?)),
+        0 => {
+            let result = word(0x10)?;
+            Some(format!(
+                "error {} (result {result:#x})",
+                code(2000 + (result & 0x1FF), (result >> 9) & 0x1FFF)
+            ))
+        }
+        1 => Some(format!("system error {} \"{}\"", wide(8)?, text(0x18))),
+        2 => Some(format!("application error {} \"{}\"", word(8)?, text(0x14))),
+        4 | 5 => Some(format!("error record {}", wide(8)?)),
+        mode => Some(format!("mode {mode}")),
+    }
+}
+
+#[cfg(test)]
+mod error_argument_tests {
+    use super::describe_error_argument;
+
+    #[test]
+    fn common_arguments_are_not_errors() {
+        let mut common = vec![0u8; 0x20];
+        common[0] = 1;
+        common[4] = 0x20;
+        assert_eq!(describe_error_argument(&common), None);
+    }
+
+    #[test]
+    fn plain_errors_read_either_code_form() {
+        let mut wide = vec![0u8; 0x14];
+        wide[6] = 1;
+        wide[8..12].copy_from_slice(&2618u32.to_le_bytes());
+        wide[12..16].copy_from_slice(&516u32.to_le_bytes());
+        assert_eq!(describe_error_argument(&wide).as_deref(), Some("error 2618-0516"));
+        let mut result = vec![0u8; 0x14];
+        result[0x10..0x14].copy_from_slice(&((52u32 << 9) | 126).to_le_bytes());
+        assert_eq!(
+            describe_error_argument(&result).as_deref(),
+            Some("error 2126-0052 (result 0x687e)")
+        );
+    }
+
+    #[test]
+    fn system_and_application_errors_carry_their_text() {
+        let mut system = vec![0u8; 0x200];
+        system[0] = 1;
+        system[8..12].copy_from_slice(&2618u32.to_le_bytes());
+        system[12..16].copy_from_slice(&6u32.to_le_bytes());
+        system[0x18..0x18 + 14].copy_from_slice(b"Could not join");
+        assert_eq!(
+            describe_error_argument(&system).as_deref(),
+            Some("system error 2618-0006 \"Could not join\"")
+        );
+        let mut application = vec![0u8; 0x200];
+        application[0] = 2;
+        application[8..12].copy_from_slice(&1234u32.to_le_bytes());
+        application[0x14..0x14 + 5].copy_from_slice(b"Oops!");
+        assert_eq!(
+            describe_error_argument(&application).as_deref(),
+            Some("application error 1234 \"Oops!\"")
+        );
     }
 }
 
