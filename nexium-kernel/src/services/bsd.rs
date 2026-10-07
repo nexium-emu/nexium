@@ -295,9 +295,12 @@ enum ConnectStatus {
 
 const UDP_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 
+const MAX_ANNOUNCED_PEERS: usize = 256;
+
 struct UdpActivity {
     since: Instant,
     peers: HashSet<BsdAddress>,
+    announced: HashSet<(BsdAddress, bool)>,
     peer_sent: u32,
     peer_received: u32,
     server_sent: u32,
@@ -309,11 +312,24 @@ impl UdpActivity {
         Self {
             since: Instant::now(),
             peers: HashSet::new(),
+            announced: HashSet::new(),
             peer_sent: 0,
             peer_received: 0,
             server_sent: 0,
             server_received: 0,
         }
+    }
+
+    fn announce(&mut self, remote: BsdAddress, outgoing: bool) {
+        if self.announced.len() >= MAX_ANNOUNCED_PEERS || !self.announced.insert((remote, outgoing)) {
+            return;
+        }
+        log::info!(
+            "bsd: first packet {} a {} peer address, port {}",
+            if outgoing { "sent to" } else { "received from" },
+            address_class(remote.ip),
+            remote.port
+        );
     }
 
     fn note(&mut self, remote: BsdAddress, outgoing: bool) {
@@ -329,6 +345,7 @@ impl UdpActivity {
         *counter = counter.saturating_add(1);
         if !remote.is_nextendo() {
             self.peers.insert(remote);
+            self.announce(remote, outgoing);
         }
     }
 
@@ -348,8 +365,18 @@ impl UdpActivity {
                 self.server_received
             );
         }
+        let announced = std::mem::take(&mut self.announced);
         *self = Self::new();
+        self.announced = announced;
     }
+}
+
+const PARK_DURATION: Duration = Duration::from_secs(5);
+const MAX_PARKED: usize = 8;
+
+struct ParkedSocket {
+    socket: Socket,
+    expires: Instant,
 }
 
 pub struct BsdService {
@@ -358,6 +385,7 @@ pub struct BsdService {
     waits: HashMap<u32, PendingWait>,
     active_wait: Option<PendingWait>,
     udp: UdpActivity,
+    parked: HashMap<u16, ParkedSocket>,
 }
 
 impl BsdService {
@@ -368,7 +396,51 @@ impl BsdService {
             waits: HashMap::new(),
             active_wait: None,
             udp: UdpActivity::new(),
+            parked: HashMap::new(),
         }
+    }
+
+    fn release_expired_parked(&mut self) {
+        if self.parked.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.parked.retain(|_, parked| parked.expires > now);
+    }
+
+    fn park_udp(&mut self, shared: SharedSocket) {
+        if !nexium_common::nextendo::redirect().enabled {
+            return;
+        }
+        let Ok(mutex) = Arc::try_unwrap(shared) else {
+            return;
+        };
+        let host = mutex.into_inner();
+        if host.socket_type != SOCK_DGRAM || host.socket.peer_addr().is_ok() {
+            return;
+        }
+        let Some(port) = host
+            .socket
+            .local_addr()
+            .ok()
+            .and_then(|address| address.as_socket_ipv4())
+            .map(|address| address.port())
+            .filter(|&port| port != 0)
+        else {
+            return;
+        };
+        self.release_expired_parked();
+        if !self.parked.contains_key(&port) && self.parked.len() >= MAX_PARKED {
+            return;
+        }
+        self.parked.insert(
+            port,
+            ParkedSocket {
+                socket: host.socket,
+                expires: Instant::now() + PARK_DURATION,
+            },
+        );
+        log::info!("bsd: holding UDP port {} briefly so a reopened socket keeps its NAT mapping", port);
     }
 
     pub fn dispatch(&self, cmd_id: u32) -> u32 {
@@ -378,6 +450,7 @@ impl BsdService {
 
     pub fn dispatch_ipc(&mut self, memory: &AddressSpace, ctx: &IpcCtx, thread: u32) -> BsdReply {
         self.udp.tick();
+        self.release_expired_parked();
         let cmd_id = ctx.cmif_in.cmd_id;
         self.active_wait = self
             .waits
@@ -504,7 +577,19 @@ impl BsdService {
         let Some(shared) = self.socket(fd) else {
             return done(-1, EBADF);
         };
-        let socket = shared.lock();
+        let mut socket = shared.lock();
+        let nextendo = nexium_common::nextendo::redirect().enabled;
+        if socket.socket_type == SOCK_DGRAM && address.port != 0 {
+            self.release_expired_parked();
+            if let Some(parked) = self.parked.remove(&address.port) {
+                socket.socket = parked.socket;
+                log::info!(
+                    "bsd: reusing the held UDP socket on port {} so its NAT mapping stays valid",
+                    address.port
+                );
+                return done(0, 0);
+            }
+        }
         let mut result = socket.socket.bind(&address.to_sock_addr());
         if result
             .as_ref()
@@ -517,6 +602,15 @@ impl BsdService {
         }
         match result {
             Ok(()) => {
+                if nextendo && socket.socket_type == SOCK_DGRAM {
+                    let port = socket
+                        .socket
+                        .local_addr()
+                        .ok()
+                        .and_then(|address| address.as_socket_ipv4())
+                        .map_or(address.port, |address| address.port());
+                    log::info!("bsd: UDP socket bound to port {}", port);
+                }
                 log::debug!("bsd.Bind fd={} address={:?}", fd, address);
                 done(0, 0)
             }
@@ -840,7 +934,13 @@ impl BsdService {
                     return fail(-1, EFAULT);
                 }
                 if let Some(source) = source {
-                    observe_nat_check_reply(source, &bytes);
+                    let local_port = socket
+                        .socket
+                        .local_addr()
+                        .ok()
+                        .and_then(|address| address.as_socket_ipv4())
+                        .map(|address| address.port());
+                    observe_nat_check_reply(source, &bytes, local_port);
                     if !peek {
                         self.udp.note(source, false);
                     }
@@ -1363,10 +1463,13 @@ impl BsdService {
         let Some(slot) = self.sockets.get_mut(index) else {
             return done(-1, EBADF);
         };
-        let closed_socket = slot.take().is_some();
+        let closed_socket = slot.take();
         let closed_event = self.event_fds[index].take().is_some();
-        if !closed_socket && !closed_event {
+        if closed_socket.is_none() && !closed_event {
             return done(-1, EBADF);
+        }
+        if let Some(shared) = closed_socket {
+            self.park_udp(shared);
         }
         log::debug!("bsd.Close fd={}", fd);
         done(0, 0)
@@ -1609,7 +1712,7 @@ pub(crate) fn test_shared_socket(socket: Socket) -> SharedSocket {
     ))
 }
 
-fn observe_nat_check_reply(source: BsdAddress, bytes: &[u8]) {
+fn observe_nat_check_reply(source: BsdAddress, bytes: &[u8], local_port: Option<u16>) {
     if bytes.len() != 16 || !matches!(source.port, 10025 | 10125) {
         return;
     }
@@ -1619,6 +1722,33 @@ fn observe_nat_check_reply(source: BsdAddress, bytes: &[u8]) {
     let external = Ipv4Addr::new(bytes[8], bytes[9], bytes[10], bytes[11]);
     if !external.is_unspecified() {
         nexium_common::nextendo::set_external_ip(external);
+    }
+    let external_port = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if let (Some(local), Ok(external_port)) = (local_port, u16::try_from(external_port)) {
+        static LAST: parking_lot::Mutex<Option<(u16, u16)>> = parking_lot::Mutex::new(None);
+        let mut last = LAST.lock();
+        if *last != Some((local, external_port)) {
+            *last = Some((local, external_port));
+            log::info!(
+                "nextendo: NAT check sees local port {} as external port {} ({})",
+                local,
+                external_port,
+                if local == external_port { "preserved" } else { "remapped" }
+            );
+        }
+    }
+}
+
+fn address_class(ip: [u8; 4]) -> &'static str {
+    let address = Ipv4Addr::from(ip);
+    if address.is_private() {
+        "private"
+    } else if ip[0] == 100 && (64..=127).contains(&ip[1]) {
+        "CGNAT"
+    } else if address.is_loopback() || address.is_unspecified() {
+        "local"
+    } else {
+        "public"
     }
 }
 
