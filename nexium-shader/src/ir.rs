@@ -800,6 +800,22 @@ pub enum Op {
         ftz: bool,
     },
 
+    HSet {
+        cmp: FComp,
+        bop: BoolOp,
+        src_a: Value,
+        src_b: Value,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        neg_a: bool,
+        abs_a: bool,
+        neg_b: bool,
+        abs_b: bool,
+        bf: bool,
+        src_pred: u8,
+        src_pred_inv: bool,
+    },
+
     PSetPred {
         dest_p: u8,
         dest_np: u8,
@@ -1546,6 +1562,14 @@ impl Inst {
                 f,
                 "HSetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}, P{src_pred}"
             ),
+            Op::HSet {
+                cmp,
+                bop,
+                src_a,
+                src_b,
+                src_pred,
+                ..
+            } => write!(f, "HSet.{cmp:?}.{bop:?} {src_a}, {src_b}, P{src_pred}"),
             Op::PSetPred {
                 dest_p,
                 pred_a,

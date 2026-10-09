@@ -1503,6 +1503,39 @@ impl Translator {
         }
     }
 
+    fn emit_hset2(
+        &mut self,
+        raw: u64,
+        src_b: Value,
+        swizzle_b: HalfSwizzle,
+        neg_b: bool,
+        abs_b: bool,
+        cmp: FComp,
+        bf: bool,
+        pred: Option<Predicate>,
+    ) {
+        let src_a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            reg_dest(raw),
+            Op::HSet {
+                cmp,
+                bop: BoolOp::from_bits(half_bop(raw) as u64),
+                src_a,
+                src_b,
+                swizzle_a: Self::half_swizzle(half_swizzle_a(raw)),
+                swizzle_b,
+                neg_a: ((raw >> 43) & 1) != 0,
+                abs_a: ((raw >> 44) & 1) != 0,
+                neg_b,
+                abs_b,
+                bf,
+                src_pred: half_src_pred(raw),
+                src_pred_inv: half_src_pred_inv(raw),
+            },
+            pred,
+        );
+    }
+
     fn video_operand(&mut self, value: Value, width: u32, selector: u32, signed: bool) -> Value {
         let (bits, offset) = match width {
             0 | 1 => (8, selector * 8),
@@ -3226,6 +3259,43 @@ impl Translator {
                 half_src_pred_inv(raw),
                 half_h_and(raw, 53),
                 half_h_and(raw, 6),
+                pred,
+            ),
+
+            Opcode::HSET2_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_hset2(
+                    raw,
+                    b,
+                    Self::half_swizzle(half_swizzle_b(raw)),
+                    ((raw >> 31) & 1) != 0,
+                    ((raw >> 30) & 1) != 0,
+                    FComp::from_bits(half_compare(raw, 35) as u64),
+                    ((raw >> 49) & 1) != 0,
+                    pred,
+                );
+            }
+            Opcode::HSET2_cbuf => {
+                let b = Value::Inst(self.load_cbuf(raw));
+                self.emit_hset2(
+                    raw,
+                    b,
+                    HalfSwizzle::F32,
+                    ((raw >> 56) & 1) != 0,
+                    false,
+                    FComp::from_bits(half_compare(raw, 49) as u64),
+                    ((raw >> 53) & 1) != 0,
+                    pred,
+                );
+            }
+            Opcode::HSET2_imm => self.emit_hset2(
+                raw,
+                Self::half_imm(raw),
+                HalfSwizzle::H1H0,
+                false,
+                false,
+                FComp::from_bits(half_compare(raw, 49) as u64),
+                ((raw >> 53) & 1) != 0,
                 pred,
             ),
 
@@ -9076,6 +9146,50 @@ mod tests {
                 } if tex_id == expected_tex_id && actual_lane == lane as u8
             ));
         }
+    }
+
+    #[test]
+    fn hset2_imm_packs_both_half_compares_into_the_destination() {
+        let raw = (0b0111110u64 << 57)
+            | (1u64 << 53)
+            | (u64::from(1u8) << 49)
+            | (0b11u64 << 47)
+            | (1u64 << 43)
+            | (u64::from(PT) << 39)
+            | (0x1c0u64 << 30)
+            | (0x0f0u64 << 20)
+            | (u64::from(PT) << 16)
+            | (4u64 << 8)
+            | 6;
+        assert_eq!(decode_one(raw).map(|decoded| decoded.opcode), Some(Opcode::HSET2_imm));
+        let mut translator = Translator::new_fragment();
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+        let set = translator
+            .program
+            .instructions
+            .iter()
+            .find(|inst| matches!(inst.op, Op::HSet { .. }))
+            .expect("HSET2 must lower to HSet");
+        assert_eq!(set.dest_reg, Some(6));
+        assert!(matches!(
+            set.op,
+            Op::HSet {
+                cmp: FComp::Lt,
+                bop: BoolOp::And,
+                src_a: Value::GprIn(4),
+                src_b: Value::ImmU32(0x7000_3c00),
+                swizzle_a: HalfSwizzle::H1H1,
+                swizzle_b: HalfSwizzle::H1H0,
+                neg_a: true,
+                abs_a: false,
+                neg_b: false,
+                abs_b: false,
+                bf: true,
+                src_pred: PT,
+                src_pred_inv: false,
+            }
+        ));
     }
 
     #[test]

@@ -7122,6 +7122,47 @@ impl Emitter {
                 self.write_pred_reg(*dest_np, result_np, guard);
                 Some(result_p)
             }
+            IrOp::HSet {
+                cmp,
+                bop,
+                src_a,
+                src_b,
+                swizzle_a,
+                swizzle_b,
+                neg_a,
+                abs_a,
+                neg_b,
+                abs_b,
+                bf,
+                src_pred,
+                src_pred_inv,
+            } => {
+                let [a0, a1] = self.lower_half_pair(src_a, *swizzle_a);
+                let [b0, b1] = self.lower_half_pair(src_b, *swizzle_b);
+                let a0 = self.lower_half_abs_neg(a0, *abs_a, *neg_a);
+                let a1 = self.lower_half_abs_neg(a1, *abs_a, *neg_a);
+                let b0 = self.lower_half_abs_neg(b0, *abs_b, *neg_b);
+                let b1 = self.lower_half_abs_neg(b1, *abs_b, *neg_b);
+                let src_pred_word = self.resolve_pred(*src_pred, *src_pred_inv);
+                let cmp0 = self.lower_fcompare(cmp, a0, b0);
+                let cmp1 = self.lower_fcompare(cmp, a1, b1);
+                let result0 = self.lower_boolop(bop, cmp0, src_pred_word);
+                let result1 = self.lower_boolop(bop, cmp1, src_pred_word);
+                let truth: u32 = if *bf { 0x3c00 } else { 0xffff };
+                let low_true = self.const_u32(truth);
+                let high_true = self.const_u32(truth << 16);
+                let zero = self.const_u32(0);
+                let low = self
+                    .b
+                    .select(self.u32_t, None, result0, low_true, zero)
+                    .unwrap();
+                let high = self
+                    .b
+                    .select(self.u32_t, None, result1, high_true, zero)
+                    .unwrap();
+                let bits = self.b.bitwise_or(self.u32_t, None, low, high).unwrap();
+                Some(self.store_bits(bits))
+            }
             IrOp::FSetPred {
                 cmp,
                 bop,
