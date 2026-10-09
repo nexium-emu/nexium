@@ -1254,17 +1254,58 @@ impl Translator {
                 FMods { neg_a: m.neg, abs_a: m.abs, ..FMods::default() }, pred);
             return true;
         }
-        self.write_reg(
-            dest,
-            Op::F2F {
-                src,
-                neg: m.neg,
-                abs: m.abs,
-                sat: m.sat,
-                round: m.round,
-            },
-            pred,
-        );
+        let input = if src_size == 1 {
+            let src = if decode_one(raw).map(|decoded| decoded.opcode) == Some(Opcode::F2F_imm) {
+                let half = ((raw >> 20) & 0xffff) as u32;
+                Value::ImmU32(half | (half << 16))
+            } else {
+                src
+            };
+            let swizzle_a = if (raw >> 41) & 1 != 0 {
+                HalfSwizzle::H1H1
+            } else {
+                HalfSwizzle::H0H0
+            };
+            Value::Inst(self.program.emit(
+                Op::HAdd {
+                    a: src,
+                    b: Value::Zero,
+                    old: Value::Zero,
+                    merge: HalfMerge::F32,
+                    swizzle_a,
+                    swizzle_b: HalfSwizzle::F32,
+                    abs_a: false,
+                    neg_a: false,
+                    abs_b: false,
+                    neg_b: true,
+                    sat: false,
+                    ftz: false,
+                },
+                None,
+            ))
+        } else {
+            src
+        };
+        let convert = Op::F2F {
+            src: input,
+            neg: m.neg,
+            abs: m.abs,
+            sat: m.sat,
+            round: m.round,
+        };
+        if dst_size == 1 {
+            let value = Value::Inst(self.program.emit(convert, None));
+            self.write_reg(
+                dest,
+                Op::PackHalf2 {
+                    lo: value,
+                    hi: Value::Zero,
+                },
+                pred,
+            );
+        } else {
+            self.write_reg(dest, convert, pred);
+        }
         true
     }
 
@@ -9228,6 +9269,53 @@ mod tests {
             assert_eq!(bfe_source(u, 4), (reg, position | (6 << 8)));
             assert_eq!(bfe_source(v, 5), (reg, (position + 8) | (6 << 8)));
         }
+    }
+
+    #[test]
+    fn f2f_to_f16_packs_half_bits_into_the_low_half() {
+        let raw = 0x5ca8_0180_00f7_0903u64;
+        assert_eq!(decode_one(raw).map(|decoded| decoded.opcode), Some(Opcode::F2F_reg));
+        let mut translator = Translator::new_compute();
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+        let program = &translator.program;
+        let pack = program
+            .instructions
+            .iter()
+            .find(|inst| inst.dest_reg == Some(3))
+            .expect("F2F must write R3");
+        let Op::PackHalf2 { lo: Value::Inst(converted), hi: Value::Zero } = pack.op else {
+            panic!("F2F.F16 must pack a half, got {:?}", pack.op);
+        };
+        assert!(program.instructions.iter().any(|inst| inst.result == Some(converted)
+            && matches!(inst.op, Op::F2F { src: Value::GprIn(15), .. })));
+    }
+
+    #[test]
+    fn f2f_from_f16_reads_the_selected_half() {
+        let raw = 0x5ca8_0180_00f7_0603u64 | (1 << 41);
+        let mut translator = Translator::new_compute();
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+        let program = &translator.program;
+        let convert = program
+            .instructions
+            .iter()
+            .find(|inst| inst.dest_reg == Some(3))
+            .expect("F2F must write R3");
+        let Op::F2F { src: Value::Inst(unpacked), .. } = convert.op else {
+            panic!("F2F.F32.F16 must convert an unpacked half, got {:?}", convert.op);
+        };
+        assert!(program.instructions.iter().any(|inst| inst.result == Some(unpacked)
+            && matches!(
+                inst.op,
+                Op::HAdd {
+                    a: Value::GprIn(15),
+                    merge: HalfMerge::F32,
+                    swizzle_a: HalfSwizzle::H1H1,
+                    ..
+                }
+            )));
     }
 
     #[test]
