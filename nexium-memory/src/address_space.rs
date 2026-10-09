@@ -136,6 +136,16 @@ impl Region {
         }
     }
 
+    fn split(source: &Region, lo: u64, hi: u64) -> Self {
+        let len = (hi - lo) as usize;
+        let piece = Region::new(lo, len, source.perm(), source.name.clone());
+        let src = unsafe { source.buf.as_ptr().add((lo - source.base) as usize) };
+        if piece.buf.as_ptr() != src {
+            unsafe { std::ptr::copy_nonoverlapping(src, piece.buf.as_ptr(), len) };
+        }
+        piece
+    }
+
     fn alias(base: u64, source: &Arc<Region>, offset: usize, len: usize, perm: Perm, name: String) -> Self {
         let (source, offset) = match &source.alias_backing {
             Some(backing) => (Arc::clone(&backing.source), backing.offset + offset),
@@ -480,6 +490,86 @@ impl AddressSpace {
         regs.splice(first..=last, survivors);
         for change in changes { self.publish_host_change(change); }
         Ok(())
+    }
+
+    pub fn unmap(&self, va: u64, len: u64) -> Result<u64> {
+        check_aligned("va", va)?;
+        check_aligned("len", len)?;
+        if len == 0 {
+            return Err(AddressSpaceError::ZeroLength { va });
+        }
+        let end = va
+            .checked_add(len)
+            .ok_or(AddressSpaceError::Overflow { va, len })?;
+        let mut regs = self.regions.lock();
+        let first = regs.partition_point(|region| region.end() <= va);
+        let last = first
+            + regs[first..]
+                .iter()
+                .take_while(|region| region.base < end)
+                .count();
+        if first == last {
+            return Ok(0);
+        }
+        for region in &regs[first..last] {
+            let splits = region.base < va || region.end() > end;
+            if region.alias_backing.is_some()
+                || (splits && !region.arena && region.alias_users.load(Ordering::Acquire) != 0)
+            {
+                return Err(AddressSpaceError::AliasInUse { va, len });
+            }
+            if splits && region.committed_len() != region.len {
+                return Err(AddressSpaceError::Unmapped {
+                    va: region.base,
+                    len: region.len,
+                });
+            }
+        }
+        let mut survivors = Vec::new();
+        let mut changes = Vec::new();
+        let mut removed = 0;
+        for region in &regs[first..last] {
+            removed += end.min(region.end()) - va.max(region.base);
+            if region.base < va {
+                survivors.push(Arc::new(Region::split(region, region.base, va)));
+            }
+            if region.end() > end {
+                survivors.push(Arc::new(Region::split(region, end, region.end())));
+            }
+            changes.push(HostRegionChange::Remove {
+                base: region.base,
+                size: region.len as u64,
+            });
+        }
+        for survivor in &survivors {
+            changes.push(HostRegionChange::Upsert(HostRegion {
+                base: survivor.base,
+                size: survivor.len as u64,
+                perm: survivor.perm(),
+                host_ptr: survivor.buf.as_ptr(),
+            }));
+        }
+        regs.splice(first..last, survivors);
+        for change in changes {
+            self.publish_host_change(change);
+        }
+        Ok(removed)
+    }
+
+    pub fn regions_in(&self, va: u64, len: u64) -> Vec<RegionInfo> {
+        let end = va.saturating_add(len);
+        let regs = self.regions.lock();
+        let first = regs.partition_point(|region| region.end() <= va);
+        regs[first..]
+            .iter()
+            .take_while(|region| region.base < end)
+            .map(|region| RegionInfo {
+                base: region.base,
+                size: region.len as u64,
+                perm: region.perm(),
+                name: region.name.clone(),
+            })
+            .collect()
     }
 
     pub fn resize_committed(&self, va: u64, len: u64) -> Result<()> {
@@ -1371,6 +1461,52 @@ mod tests {
             err,
             AddressSpaceError::Unaligned { what: "len", .. }
         ));
+    }
+
+    #[test]
+    fn unmap_splits_a_region_and_keeps_the_survivors_contents() {
+        let a = fresh();
+        let base = 0x6a00_0000;
+        a.map(base, PAGE_SIZE * 4, Perm::RW, "physmem").unwrap();
+        a.write(base, &[1, 2]).unwrap();
+        a.write(base + PAGE_SIZE * 3, &[3, 4]).unwrap();
+        let generation = a.generation();
+        assert_eq!(a.unmap(base + PAGE_SIZE, PAGE_SIZE * 2).unwrap(), PAGE_SIZE * 2);
+        let mut bytes = [0; 2];
+        a.read(base, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2]);
+        a.read(base + PAGE_SIZE * 3, &mut bytes).unwrap();
+        assert_eq!(bytes, [3, 4]);
+        assert!(a.read(base + PAGE_SIZE, &mut bytes).is_err());
+        assert_eq!(
+            a.unmapped_gaps(base, PAGE_SIZE * 4).unwrap(),
+            vec![(base + PAGE_SIZE, base + PAGE_SIZE * 3)]
+        );
+        let changes = a.host_region_changes_since(generation).changes;
+        assert!(matches!(changes[0], HostRegionChange::Remove { base: removed, size } if removed == base && size == PAGE_SIZE * 4));
+        assert_eq!(changes.iter().filter(|change| matches!(change, HostRegionChange::Upsert(_))).count(), 2);
+        assert_eq!(a.unmap(base + PAGE_SIZE, PAGE_SIZE).unwrap(), 0);
+        assert_eq!(a.unmap(base, PAGE_SIZE * 4).unwrap(), PAGE_SIZE * 2);
+        assert!(a.regions().is_empty());
+    }
+
+    #[test]
+    fn unmap_beside_an_aliased_range_keeps_the_alias_working() {
+        let a = fresh();
+        let src = 0x6a10_0000;
+        let dst = 0x6a20_0000;
+        a.map(src, PAGE_SIZE * 4, Perm::RW, "physmem").unwrap();
+        a.write(src + PAGE_SIZE, &[7, 8]).unwrap();
+        a.map_alias(dst, src + PAGE_SIZE, PAGE_SIZE, Perm::RX, "aliascode").unwrap();
+        assert_eq!(a.unmap(src + PAGE_SIZE * 3, PAGE_SIZE).unwrap(), PAGE_SIZE);
+        let mut bytes = [0; 2];
+        a.read(dst, &mut bytes).unwrap();
+        assert_eq!(bytes, [7, 8]);
+        assert!(matches!(a.unmap(dst, PAGE_SIZE), Err(AddressSpaceError::AliasInUse { .. })));
+        a.unmap_alias(dst, src + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert!(a.host_region_at(dst).is_none());
+        a.read(src + PAGE_SIZE, &mut bytes).unwrap();
+        assert_eq!(bytes, [7, 8]);
     }
 
     #[test]

@@ -588,6 +588,22 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
     Some(ptr)
 }
 
+pub fn committed_any(va: u64, len: usize) -> bool {
+    if arena().is_null() || len == 0 {
+        return false;
+    }
+    let Some(lo) = va_offset(va) else {
+        return false;
+    };
+    let Some(hi) = lo.checked_add(len as u64) else {
+        return false;
+    };
+    let ranges = committed_ranges()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ranges.iter().any(|range| range.lo < hi && lo < range.hi)
+}
+
 pub fn decommit(ptr: *mut u8, len: usize) {
     let base = arena();
     let base_addr = base as usize;
