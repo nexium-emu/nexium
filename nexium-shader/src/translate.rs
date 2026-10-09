@@ -1503,6 +1503,78 @@ impl Translator {
         }
     }
 
+    fn shift_gather_coord(
+        &mut self,
+        tex_id: u32,
+        value: Value,
+        offset: Value,
+        position: u32,
+        component: u8,
+    ) -> Value {
+        let delta = self.program.emit(
+            Op::Bfe {
+                a: offset,
+                b: Value::ImmU32(position | (6 << 8)),
+                signed: true,
+            },
+            None,
+        );
+        let delta = self.program.emit(
+            Op::I2F {
+                src: Value::Inst(delta),
+                signed: true,
+                neg: false,
+                abs: false,
+                int_format: 2,
+                selector: 0,
+            },
+            None,
+        );
+        let size = self.program.emit(
+            Op::TextureQueryDimension {
+                handle: crate::texture_handle_for_id(tex_id),
+                lod: Value::Zero,
+                component,
+            },
+            None,
+        );
+        let size = self.program.emit(
+            Op::I2F {
+                src: Value::Inst(size),
+                signed: false,
+                neg: false,
+                abs: false,
+                int_format: 2,
+                selector: 0,
+            },
+            None,
+        );
+        let texel = self.program.emit(
+            Op::MultiFunc {
+                src: Value::Inst(size),
+                func: MufuFunc::Rcp,
+                mods: FMods::default(),
+            },
+            None,
+        );
+        let step = self.program.emit(
+            Op::FMul {
+                a: Value::Inst(delta),
+                b: Value::Inst(texel),
+                mods: FMods::default(),
+            },
+            None,
+        );
+        Value::Inst(self.program.emit(
+            Op::FAdd {
+                a: value,
+                b: Value::Inst(step),
+                mods: FMods::default(),
+            },
+            None,
+        ))
+    }
+
     fn emit_hset2(
         &mut self,
         raw: u64,
@@ -4520,7 +4592,7 @@ impl Translator {
                     || !matches!(tex_type, 2 | 3)
                     || dc
                     || sparse_pred != PT
-                    || offset_type > 1
+                    || offset_type > 2
                 {
                     log::debug!(
                         "TLD4 unsupported form raw={:#018x} bindless={} stage={:?} type={} mask={:#x} dc={} sparse_pred={} offset={}",
@@ -4592,80 +4664,37 @@ impl Translator {
                 let array = arrayed.then(|| self.read_reg(coord));
                 let u = self.read_reg(coord.wrapping_add(u8::from(arrayed)));
                 let v = self.read_reg(coord.wrapping_add(1 + u8::from(arrayed)));
-                let (u, v) = if offset_type == 1 {
-                    let offset = self.read_reg(reg_b(raw).wrapping_add(u8::from(bindless)));
-                    let handle = crate::texture_handle_for_id(tex_id);
-                    let mut shifted = |value: Value, position: u32, component: u8| {
-                        let delta = self.program.emit(
-                            Op::Bfe {
-                                a: offset,
-                                b: Value::ImmU32(position | (6 << 8)),
-                                signed: true,
-                            },
-                            None,
-                        );
-                        let delta = self.program.emit(
-                            Op::I2F {
-                                src: Value::Inst(delta),
-                                signed: true,
-                                neg: false,
-                                abs: false,
-                                int_format: 2,
-                                selector: 0,
-                            },
-                            None,
-                        );
-                        let size = self.program.emit(
-                            Op::TextureQueryDimension {
-                                handle,
-                                lod: Value::Zero,
-                                component,
-                            },
-                            None,
-                        );
-                        let size = self.program.emit(
-                            Op::I2F {
-                                src: Value::Inst(size),
-                                signed: false,
-                                neg: false,
-                                abs: false,
-                                int_format: 2,
-                                selector: 0,
-                            },
-                            None,
-                        );
-                        let texel = self.program.emit(
-                            Op::MultiFunc {
-                                src: Value::Inst(size),
-                                func: MufuFunc::Rcp,
-                                mods: FMods::default(),
-                            },
-                            None,
-                        );
-                        let step = self.program.emit(
-                            Op::FMul {
-                                a: Value::Inst(delta),
-                                b: Value::Inst(texel),
-                                mods: FMods::default(),
-                            },
-                            None,
-                        );
-                        Value::Inst(self.program.emit(
-                            Op::FAdd {
-                                a: value,
-                                b: Value::Inst(step),
-                                mods: FMods::default(),
-                            },
-                            None,
-                        ))
-                    };
-                    (shifted(u, 0, 0), shifted(v, 8, 1))
-                } else {
-                    (u, v)
+                let offset_reg = reg_b(raw).wrapping_add(u8::from(bindless));
+                let lanes: [(Value, Value, u8); 4] = match offset_type {
+                    1 => {
+                        let offset = self.read_reg(offset_reg);
+                        let u = self.shift_gather_coord(tex_id, u, offset, 0, 0);
+                        let v = self.shift_gather_coord(tex_id, v, offset, 8, 1);
+                        [(u, v, 0), (u, v, 1), (u, v, 2), (u, v, 3)]
+                    }
+                    2 => {
+                        let offsets = if reg_b(raw) == RZ {
+                            [Value::Zero, Value::Zero]
+                        } else {
+                            [
+                                self.read_reg(offset_reg),
+                                self.read_reg(offset_reg.wrapping_add(1)),
+                            ]
+                        };
+                        let mut lanes = [(u, v, 3); 4];
+                        for (index, lane) in lanes.iter_mut().enumerate() {
+                            let offset = offsets[index / 2];
+                            let position = (index as u32 % 2) * 16;
+                            lane.0 = self.shift_gather_coord(tex_id, u, offset, position, 0);
+                            lane.1 = self.shift_gather_coord(tex_id, v, offset, position + 8, 1);
+                        }
+                        lanes
+                    }
+                    _ => [(u, v, 0), (u, v, 1), (u, v, 2), (u, v, 3)],
                 };
                 let mut dst = reg_dest(raw);
-                for lane in 0..4u8 {
-                    if (mask >> lane) & 1 == 0 {
+                for (index, (u, v, lane)) in lanes.into_iter().enumerate() {
+                    if (mask >> index) & 1 == 0 {
                         continue;
                     }
                     self.write_reg(
@@ -9149,6 +9178,59 @@ mod tests {
     }
 
     #[test]
+    fn graphics_tld4_ptp_gathers_the_base_texel_of_each_offset() {
+        let raw = tld4_raw(false, 8, 4, 0x24, 2, 0xf, 1, 2, false, PT) | (10u64 << 20);
+        let mut translator = Translator::new_fragment();
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+        let program = &translator.program;
+        let def = |value: Value| match value {
+            Value::Inst(id) => program
+                .instructions
+                .iter()
+                .find(|inst| inst.result == Some(id))
+                .map(|inst| inst.op.clone()),
+            _ => None,
+        };
+        let bfe_source = |coordinate: Value, base: u8| {
+            let Some(Op::FAdd { a, b: step, .. }) = def(coordinate) else {
+                panic!("coordinate is not offset");
+            };
+            assert_eq!(a, Value::GprIn(base));
+            let Some(Op::FMul { a: delta, .. }) = def(step) else {
+                panic!("offset step is not scaled");
+            };
+            let Some(Op::I2F { src: bits, .. }) = def(delta) else {
+                panic!("offset is not converted");
+            };
+            let Some(Op::Bfe { a: Value::GprIn(reg), b: Value::ImmU32(field), signed: true }) =
+                def(bits)
+            else {
+                panic!("offset is not extracted");
+            };
+            (reg, field)
+        };
+        let gathers = program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::GatherTex { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(gathers.len(), 4);
+        for (index, gather) in gathers.into_iter().enumerate() {
+            assert_eq!(gather.dest_reg, Some(8 + index as u8));
+            let Op::GatherTex { tex_id: 0x24, u, v, array: None, gather_component: 1, lane: 3 } =
+                gather.op
+            else {
+                panic!("unexpected gather {:?}", gather.op);
+            };
+            let reg = 10 + (index / 2) as u8;
+            let position = (index as u32 % 2) * 16;
+            assert_eq!(bfe_source(u, 4), (reg, position | (6 << 8)));
+            assert_eq!(bfe_source(v, 5), (reg, (position + 8) | (6 << 8)));
+        }
+    }
+
+    #[test]
     fn hset2_imm_packs_both_half_compares_into_the_destination() {
         let raw = (0b0111110u64 << 57)
             | (1u64 << 53)
@@ -9196,7 +9278,7 @@ mod tests {
     fn tld4_unsupported_forms_fail_closed_without_zero_results() {
         let direct_base = tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, PT);
         let unsupported = [
-            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 2, false, PT),
+            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 3, false, PT),
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, true, PT),
             tld4_raw(false, 8, 4, 0x24, 4, 0xf, 0, 0, false, PT),
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, 6),
