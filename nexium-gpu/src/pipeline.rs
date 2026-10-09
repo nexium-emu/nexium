@@ -943,6 +943,10 @@ impl PipelineCache {
         }
     }
 
+    pub fn can_queue_build(&self, key: &PipelineKey) -> bool {
+        self.worker.is_some() && !self.failed.contains(key)
+    }
+
     pub fn queue_build(&mut self, req: PipelineBuildRequest) -> bool {
         if self.pipelines.contains_key(&req.key) || self.failed.contains(&req.key) {
             return false;

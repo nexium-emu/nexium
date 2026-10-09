@@ -4741,6 +4741,13 @@ pub enum PipelineCompileMode {
     Build,
     Probe,
     Queue,
+    Async,
+}
+
+fn draw_may_skip_while_pipeline_compiles(call: &crate::draw::Maxwell3dDrawCall) -> bool {
+    call.storage_readback.is_none()
+        && !call_writes_resident_graphics_storage(call)
+        && (call.depth_key.is_some() || call.index_count.unwrap_or(call.vertex_count) > 6)
 }
 
 impl Renderer {
@@ -9541,7 +9548,7 @@ impl Renderer {
             return Ok(Some(p));
         }
         if mode == PipelineCompileMode::Probe
-            || (mode == PipelineCompileMode::Queue && pipeline_cache.has_in_flight(&key))
+            || (mode != PipelineCompileMode::Build && pipeline_cache.has_in_flight(&key))
         {
             return Ok(None);
         }
@@ -9707,7 +9714,9 @@ impl Renderer {
             depth_clip_control_enabled,
         });
 
-        if mode == PipelineCompileMode::Queue {
+        if mode == PipelineCompileMode::Queue
+            || (mode == PipelineCompileMode::Async && pipeline_cache.can_queue_build(&key))
+        {
             pipeline_cache.queue_build(req);
             return Ok(None);
         }
@@ -11714,6 +11723,7 @@ impl Renderer {
         }
         let mut group_preps = Vec::with_capacity(groups.len());
         let mut pipeline_mode = PipelineCompileMode::Probe;
+        let async_pipelines = async_shaders_enabled();
         for (group_index, calls) in groups.iter().copied().enumerate() {
             let mut preps = Vec::with_capacity(calls.len());
             let mut texture_memo = GroupTexturePrepMemo::default();
@@ -11756,18 +11766,23 @@ impl Renderer {
                 }
                 let call_color_formats: &[vk::Format] =
                     if storage_only { &[] } else { &batch_color_formats };
+                let mode = if async_pipelines && draw_may_skip_while_pipeline_compiles(call) {
+                    PipelineCompileMode::Async
+                } else {
+                    pipeline_mode
+                };
                 let mut pipeline = self
                     .compile_call_pipeline(
                         call,
                         call_color_formats,
                         depth_format,
                         depth_aspects,
-                        pipeline_mode,
+                        mode,
                     )
                     .map_err(|error| {
                         graphics_draw_call_error(call_index, call, "pipeline", error)
                     })?;
-                if pipeline.is_none() && pipeline_mode == PipelineCompileMode::Probe {
+                if pipeline.is_none() && mode == PipelineCompileMode::Probe {
                     pipeline_mode = PipelineCompileMode::Build;
                     self.queue_draw_group_pipelines(groups, group_index, call_index + 1);
                     pipeline = self
@@ -33763,6 +33778,26 @@ mod tests {
             storage_readback: Default::default(),
             present_flip_y: Default::default(),
         }
+    }
+
+    #[test]
+    fn async_pipelines_skip_depth_and_large_draws_but_not_fullscreen_passes() {
+        let mut call = texture_prepare_test_call();
+        call.vertex_count = 6;
+        assert!(!super::draw_may_skip_while_pipeline_compiles(&call));
+        call.vertex_count = 7;
+        assert!(super::draw_may_skip_while_pipeline_compiles(&call));
+        call.index_count = Some(6);
+        assert!(!super::draw_may_skip_while_pipeline_compiles(&call));
+        call.depth_key = Some(RtKey::new(3, 64, 64, 0x20000));
+        assert!(super::draw_may_skip_while_pipeline_compiles(&call));
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        call.storage_readback = Some(crate::draw::GraphicsStorageReadbackRequest {
+            bindings: vec![0],
+            aliases: Vec::new(),
+            sender,
+        });
+        assert!(!super::draw_may_skip_while_pipeline_compiles(&call));
     }
 
     fn texture_prepare_test_raw(gpu_va: u32, texture_type: u32, depth: u32) -> Vec<u8> {
