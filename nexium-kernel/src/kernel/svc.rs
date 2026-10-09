@@ -9556,11 +9556,15 @@ fn igbp_handle_transact(
             p.finish()
         }
         IGBP_QUEUE_BUFFER => {
-            kernel
+            let queued = kernel
                 .nvdrv
                 .stats
                 .queue_buffer_calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if queued % 300 == 0 {
+                log::info!("[guest-present] queued={}", queued);
+            }
             let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
             let flattened_size = reader.read_u32().unwrap_or(0);
             let flattened_size_hi = reader.read_u32().unwrap_or(0);
