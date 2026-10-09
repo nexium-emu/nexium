@@ -4736,6 +4736,13 @@ fn sync_pipeline_should_wait(_use_async_skip: bool, exact_in_flight: bool) -> bo
     exact_in_flight
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PipelineCompileMode {
+    Build,
+    Probe,
+    Queue,
+}
+
 impl Renderer {
     pub fn compute_raw_storage_is_resident(
         &self,
@@ -9434,6 +9441,7 @@ impl Renderer {
         depth_aspects: vk::ImageAspectFlags,
         stencil: crate::draw::StencilState,
         _vertex_count: u32,
+        mode: PipelineCompileMode,
     ) -> Result<Option<vk::Pipeline>, String> {
         if crate::pipeline::known_driver_hostile_pipeline(vs_hash, fs_hash) {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -9531,6 +9539,11 @@ impl Renderer {
         pipeline_cache.drain_completed(device);
         if let Some(p) = pipeline_cache.get(&key) {
             return Ok(Some(p));
+        }
+        if mode == PipelineCompileMode::Probe
+            || (mode == PipelineCompileMode::Queue && pipeline_cache.has_in_flight(&key))
+        {
+            return Ok(None);
         }
 
         let use_async_skip = async_shaders_enabled() && has_depth;
@@ -9694,12 +9707,98 @@ impl Renderer {
             depth_clip_control_enabled,
         });
 
+        if mode == PipelineCompileMode::Queue {
+            pipeline_cache.queue_build(req);
+            return Ok(None);
+        }
+
         let pipeline = {
             let _g = nexium_common::shader_progress::guard();
             pipeline_cache.build(device, &req)?
         };
         pipeline_cache.insert(key, pipeline);
         Ok(Some(pipeline))
+    }
+
+    fn compile_call_pipeline(
+        &self,
+        call: &crate::draw::Maxwell3dDrawCall,
+        color_formats: &[vk::Format],
+        depth_format: vk::Format,
+        depth_aspects: vk::ImageAspectFlags,
+        mode: PipelineCompileMode,
+    ) -> Result<Option<vk::Pipeline>, String> {
+        self.compile_pipeline(
+            &call.vs_spirv,
+            &call.gs_spirv,
+            &call.fs_spirv,
+            call.vs_hash,
+            call.fs_hash,
+            call.vs_cbuf_mask,
+            call.fs_cbuf_mask,
+            &call.vertex_layout,
+            call.state.topology,
+            call.host_primitive_restart_enabled(),
+            color_formats,
+            call.blend,
+            call.cull_test_enable,
+            call.cull_face,
+            call.front_face,
+            call.depth_clamp_enabled,
+            call.poly_offset_enable,
+            call.poly_offset_units,
+            call.poly_offset_factor,
+            call.depth,
+            depth_format,
+            depth_aspects,
+            call.stencil,
+            call.vertex_count,
+            mode,
+        )
+    }
+
+    fn queue_draw_group_pipelines(
+        &self,
+        groups: &[&[crate::draw::Maxwell3dDrawCall]],
+        first_group: usize,
+        first_call: usize,
+    ) {
+        let backlog = self.inner.lock().pipeline_cache.has_any_in_flight();
+        if backlog {
+            return;
+        }
+        for (group_index, calls) in groups.iter().copied().enumerate().skip(first_group) {
+            let batch_color_formats = calls
+                .iter()
+                .find(|call| call_writes_any_color(call))
+                .map(|call| {
+                    let color_keys = active_color_keys_for_call(call);
+                    color_formats_for_call(call, color_keys.len())
+                })
+                .unwrap_or_default();
+            let skip = if group_index == first_group { first_call } else { 0 };
+            for call in calls.iter().skip(skip) {
+                let use_depth = call.depth_key.is_some();
+                let storage_only = graphics_storage_only_draw(call);
+                if !use_depth && !call_writes_any_color(call) && !storage_only {
+                    continue;
+                }
+                let (depth_format, depth_aspects) = if use_depth {
+                    (call.depth_format, call.depth_aspects)
+                } else {
+                    (vk::Format::UNDEFINED, vk::ImageAspectFlags::empty())
+                };
+                let color_formats: &[vk::Format] =
+                    if storage_only { &[] } else { &batch_color_formats };
+                let _ = self.compile_call_pipeline(
+                    call,
+                    color_formats,
+                    depth_format,
+                    depth_aspects,
+                    PipelineCompileMode::Queue,
+                );
+            }
+        }
     }
 
     pub fn execute_draw<F>(
@@ -9755,6 +9854,7 @@ impl Renderer {
             depth_aspects,
             call.stencil,
             call.vertex_count,
+            PipelineCompileMode::Build,
         )? {
             Some(p) => p,
             None => return Ok(()),
@@ -11613,6 +11713,7 @@ impl Renderer {
             draw_vertex_count: u32,
         }
         let mut group_preps = Vec::with_capacity(groups.len());
+        let mut pipeline_mode = PipelineCompileMode::Probe;
         for (group_index, calls) in groups.iter().copied().enumerate() {
             let mut preps = Vec::with_capacity(calls.len());
             let mut texture_memo = GroupTexturePrepMemo::default();
@@ -11653,36 +11754,35 @@ impl Renderer {
                     trace_skipped_graphics_storage_writer(call, "no attachment output");
                     continue;
                 }
-                let pipeline = match self
-                    .compile_pipeline(
-                        &call.vs_spirv,
-            &call.gs_spirv,
-                        &call.fs_spirv,
-                        call.vs_hash,
-                        call.fs_hash,
-                        call.vs_cbuf_mask,
-                        call.fs_cbuf_mask,
-                        &call.vertex_layout,
-                        call.state.topology,
-                        call.host_primitive_restart_enabled(),
-                        if storage_only { &[] } else { &batch_color_formats },
-                        call.blend,
-                        call.cull_test_enable,
-                        call.cull_face,
-                        call.front_face,
-                        call.depth_clamp_enabled,
-                        call.poly_offset_enable,
-                        call.poly_offset_units,
-                        call.poly_offset_factor,
-                        call.depth,
+                let call_color_formats: &[vk::Format] =
+                    if storage_only { &[] } else { &batch_color_formats };
+                let mut pipeline = self
+                    .compile_call_pipeline(
+                        call,
+                        call_color_formats,
                         depth_format,
                         depth_aspects,
-                        call.stencil,
-                        call.vertex_count,
+                        pipeline_mode,
                     )
                     .map_err(|error| {
                         graphics_draw_call_error(call_index, call, "pipeline", error)
-                    })? {
+                    })?;
+                if pipeline.is_none() && pipeline_mode == PipelineCompileMode::Probe {
+                    pipeline_mode = PipelineCompileMode::Build;
+                    self.queue_draw_group_pipelines(groups, group_index, call_index + 1);
+                    pipeline = self
+                        .compile_call_pipeline(
+                            call,
+                            call_color_formats,
+                            depth_format,
+                            depth_aspects,
+                            PipelineCompileMode::Build,
+                        )
+                        .map_err(|error| {
+                            graphics_draw_call_error(call_index, call, "pipeline", error)
+                        })?;
+                }
+                let pipeline = match pipeline {
                     Some(p) => p,
                     None if call.storage_readback.is_some() => {
                         return Err("graphics storage writer pipeline is not ready".to_string());
