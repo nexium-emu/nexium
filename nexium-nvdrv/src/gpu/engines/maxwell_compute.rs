@@ -869,13 +869,35 @@ pub(crate) fn has_pending_writebacks() -> bool {
 }
 
 pub(crate) fn pending_writeback_overlaps(gpu_va: u64, cpu_addr: u64, size: usize) -> bool {
+    pending_writeback_overlaps_where(gpu_va, cpu_addr, size, |_| true)
+}
+
+fn unlanded_pending_writeback_overlaps(gpu_va: u64, cpu_addr: u64, size: usize) -> bool {
+    pending_writeback_overlaps_where(gpu_va, cpu_addr, size, |record| {
+        !pending_writeback_has_landed(record)
+    })
+}
+
+fn pending_writeback_has_landed(record: &PendingComputeWriteback) -> bool {
+    record
+        .landed
+        .as_ref()
+        .is_some_and(|landed| !landed.is_empty())
+}
+
+fn pending_writeback_overlaps_where(
+    gpu_va: u64,
+    cpu_addr: u64,
+    size: usize,
+    include: impl Fn(&PendingComputeWriteback) -> bool,
+) -> bool {
     if size == 0 {
         return false;
     }
     let pending = pending_writebacks()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    pending.iter().any(|record| {
+    pending.iter().filter(|record| include(record)).any(|record| {
         record.output_targets.iter().any(|target| {
             mapped_resources_overlap(
                 gpu_va,
@@ -919,27 +941,30 @@ fn pending_writeback_requires_raw_storage_resolution(
     let pending = pending_writebacks()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    pending.iter().any(|record| {
-        record.output_targets.iter().any(|target| {
-            mapped_resources_overlap(
-                gpu_va,
-                cpu_addr,
-                size,
-                target.gpu_va,
-                target.cpu_addr,
-                target.guest_size,
-            )
-        }) || record.texel_targets.iter().any(|target| {
-            mapped_resources_overlap(
-                gpu_va,
-                cpu_addr,
-                size,
-                target.gpu_va,
-                target.cpu_addr,
-                target.guest_size,
-            ) && !resident_raw_overlap_is_compatible(key, target.raw_storage_key, resident)
+    pending
+        .iter()
+        .filter(|record| !pending_writeback_has_landed(record))
+        .any(|record| {
+            record.output_targets.iter().any(|target| {
+                mapped_resources_overlap(
+                    gpu_va,
+                    cpu_addr,
+                    size,
+                    target.gpu_va,
+                    target.cpu_addr,
+                    target.guest_size,
+                )
+            }) || record.texel_targets.iter().any(|target| {
+                mapped_resources_overlap(
+                    gpu_va,
+                    cpu_addr,
+                    size,
+                    target.gpu_va,
+                    target.cpu_addr,
+                    target.guest_size,
+                ) && !resident_raw_overlap_is_compatible(key, target.raw_storage_key, resident)
+            })
         })
-    })
 }
 
 fn pending_writeback_target_spans(
@@ -1728,7 +1753,7 @@ fn prepare_and_execute(
             if resource.tic.is_sparse {
                 return sparse_texture_ranges(&resource.tic, mappings).is_ok_and(|ranges| {
                     ranges.into_iter().any(|(gpu, cpu, len)| {
-                        cpu.is_some_and(|cpu| pending_writeback_overlaps(gpu, cpu, len))
+                        cpu.is_some_and(|cpu| unlanded_pending_writeback_overlaps(gpu, cpu, len))
                     })
                 });
             }
@@ -1738,7 +1763,7 @@ fn prepare_and_execute(
             let Some((cpu_addr, _)) = mapped_range(mappings, view_tic.gpu_va) else {
                 return false;
             };
-            pending_writeback_overlaps(view_tic.gpu_va, cpu_addr, size)
+            unlanded_pending_writeback_overlaps(view_tic.gpu_va, cpu_addr, size)
         });
         let raw_storage_overlap =
             raw_storage_ranges
