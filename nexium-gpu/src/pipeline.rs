@@ -66,6 +66,7 @@ impl CurrentPipeline {
 const SPEC_VERSION: u32 = 62;
 const MAX_SPEC_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const SPECS_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
     &[(0x59b9_0e74_4b2a_7537, 0xe505_d075_601e_e633)];
 
@@ -80,6 +81,10 @@ fn cache_save_due(
     builds_in_flight: bool,
 ) -> bool {
     !builds_in_flight && (dirty || specs_dirty) && idle >= CACHE_SAVE_IDLE_INTERVAL
+}
+
+fn specs_save_due(specs_dirty: bool, since_last_save: std::time::Duration) -> bool {
+    specs_dirty && since_last_save >= SPECS_SAVE_INTERVAL
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -717,6 +722,7 @@ pub struct PipelineCache {
     specs: HashMap<PipelineKey, Arc<PipelineSpec>>,
     specs_dirty: bool,
     specs_saved_count: usize,
+    specs_saved_at: std::time::Instant,
     specs_tx: Option<std::sync::mpsc::SyncSender<Vec<Arc<PipelineSpec>>>>,
 }
 
@@ -925,6 +931,7 @@ impl PipelineCache {
             specs,
             specs_dirty: false,
             specs_saved_count: specs_count,
+            specs_saved_at: std::time::Instant::now(),
             specs_tx: Some(specs_tx),
         })
     }
@@ -967,6 +974,7 @@ impl PipelineCache {
         if tx.try_send(snapshot).is_ok() {
             self.specs_saved_count = self.specs.len();
             self.specs_dirty = false;
+            self.specs_saved_at = std::time::Instant::now();
         }
     }
 
@@ -1112,6 +1120,8 @@ impl PipelineCache {
             self.save(device);
             self.save_specs();
             self.dirty = false;
+        } else if specs_save_due(self.specs_dirty, self.specs_saved_at.elapsed()) {
+            self.save_specs();
         }
     }
 
@@ -1225,8 +1235,8 @@ mod tests {
     use ash::vk::Handle;
 
     use super::{
-        cache_save_due, known_driver_hostile_pipeline, CurrentPipeline, PipelineKey,
-        CACHE_SAVE_IDLE_INTERVAL,
+        cache_save_due, known_driver_hostile_pipeline, specs_save_due, CurrentPipeline,
+        PipelineKey, CACHE_SAVE_IDLE_INTERVAL, SPECS_SAVE_INTERVAL,
     };
 
     #[test]
@@ -1315,5 +1325,15 @@ mod tests {
             false
         ));
         assert!(!cache_save_due(true, true, CACHE_SAVE_IDLE_INTERVAL, true));
+    }
+
+    #[test]
+    fn new_specs_save_on_an_interval_while_pipelines_keep_arriving() {
+        assert!(!specs_save_due(
+            true,
+            SPECS_SAVE_INTERVAL - std::time::Duration::from_nanos(1)
+        ));
+        assert!(specs_save_due(true, SPECS_SAVE_INTERVAL));
+        assert!(!specs_save_due(false, SPECS_SAVE_INTERVAL * 10));
     }
 }
