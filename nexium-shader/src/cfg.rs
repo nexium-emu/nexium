@@ -562,8 +562,16 @@ fn fold_stable_predicate_choices(cfg: &mut Cfg) {
                     }
                 }
             }
-            if let (Some(id), Op::SelectPred { pred, if_true, if_false }) = (inst.result, &inst.op) {
-                choices.insert(id.0, (*pred, versions[pred.idx as usize], *if_true, *if_false));
+            match (inst.result, &inst.op) {
+                (Some(id), Op::SelectPred { pred, if_true, if_false }) => {
+                    choices.insert(id.0, (*pred, versions[pred.idx as usize], *if_true, *if_false));
+                }
+                (Some(id), Op::Mov(Value::Inst(source))) if inst.pred.is_none() => {
+                    if let Some(&choice) = choices.get(&source.0) {
+                        choices.insert(id.0, choice);
+                    }
+                }
+                _ => {}
             }
             for pred in 0..8 {
                 if writes_predicate(&inst.op, pred) { versions[pred as usize] += 1; }
