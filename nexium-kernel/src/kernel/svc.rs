@@ -14090,6 +14090,7 @@ fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {
     };
 
     for (gs, ge) in &gaps {
+        let stale = nexium_memory::fastmem::committed_any(*gs, (ge - gs) as usize);
         if let Err(e) = kernel
             .address_space
             .map(*gs, ge - gs, nexium_memory::Perm::RW, "physmem")
@@ -14105,41 +14106,9 @@ fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {
             }
             return KERNEL_OUT_OF_MEMORY;
         }
-        if let Some(region) = kernel.address_space.host_region_at(*gs) {
-            if let Some(cpu) = cpu_mut() {
-                let plumb = unsafe {
-                    cpu.map_host(
-                        region.base,
-                        region.size,
-                        region.perm,
-                        region.host_ptr as *mut u8,
-                    )
-                };
-                if let Err(e) = plumb {
-                    log::warn!(
-                        "svcMapPhysicalMemory: JIT map_host {:#x} len={:#x} failed (error: {}), attempting unmap-and-remap",
-                        region.base,
-                        region.size,
-                        e
-                    );
-                    let _ = unsafe { cpu.unmap_host(region.base, region.size) };
-                    let retry = unsafe {
-                        cpu.map_host(
-                            region.base,
-                            region.size,
-                            region.perm,
-                            region.host_ptr as *mut u8,
-                        )
-                    };
-                    if let Err(re) = retry {
-                        log::error!(
-                            "svcMapPhysicalMemory: JIT map_host retry {:#x} len={:#x} failed: {}",
-                            region.base,
-                            region.size,
-                            re
-                        );
-                    }
-                }
+        if stale {
+            if let Some(region) = kernel.address_space.host_region_at(*gs) {
+                unsafe { std::ptr::write_bytes(region.host_ptr, 0, region.size as usize) };
             }
         }
     }
@@ -14156,15 +14125,61 @@ fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_unmap_physical_memory(_kernel: &mut Kernel) -> u32 {
+fn svc_unmap_physical_memory(kernel: &mut Kernel) -> u32 {
+    const KERNEL_INVALID_CURRENT_MEMORY: u32 = 1 | (106 << 9);
     let (addr, size) = if let Some(cpu) = cpu_ref() {
         (cpu.get_register(0), cpu.get_register(1))
     } else {
         return 1;
     };
-    log::debug!("svcUnmapPhysicalMemory addr={:#x} size={:#x}", addr, size);
+    let fail = |code: u32| {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, code as u64);
+        }
+        code
+    };
+    if size == 0 || (addr & 0xFFF) != 0 || (size & 0xFFF) != 0 || addr.checked_add(size).is_none() {
+        log::warn!(
+            "svcUnmapPhysicalMemory: bad args addr={:#x} size={:#x}",
+            addr,
+            size
+        );
+        return fail(KERNEL_INVALID_ADDRESS);
+    }
+    if let Some(region) = kernel
+        .address_space
+        .regions_in(addr, size)
+        .into_iter()
+        .find(|region| !region.name.starts_with("physmem"))
+    {
+        log::warn!(
+            "svcUnmapPhysicalMemory addr={:#x} size={:#x} overlaps {} at {:#x}+{:#x}",
+            addr,
+            size,
+            region.name,
+            region.base,
+            region.size
+        );
+        return fail(KERNEL_INVALID_CURRENT_MEMORY);
+    }
+    match kernel.address_space.unmap(addr, size) {
+        Ok(removed) => log::trace!(
+            "svcUnmapPhysicalMemory addr={:#x} size={:#x} removed={:#x}",
+            addr,
+            size,
+            removed
+        ),
+        Err(error) => {
+            log::warn!(
+                "svcUnmapPhysicalMemory addr={:#x} size={:#x} failed: {}",
+                addr,
+                size,
+                error
+            );
+            return fail(KERNEL_INVALID_CURRENT_MEMORY);
+        }
+    }
     if let Some(cpu) = cpu_mut() {
-        let _ = unsafe { cpu.unmap_host(addr, size) };
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
