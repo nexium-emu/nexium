@@ -492,7 +492,52 @@ const MAX_TRANSLATION_CACHE_ENTRIES: usize = 128;
 #[derive(Clone)]
 enum PendingComputeId {
     Ready(u64),
-    Deferred(crossbeam::channel::Receiver<Option<u64>>),
+    Deferred(Arc<DeferredComputeId>),
+}
+
+#[derive(Default)]
+struct DeferredComputeId {
+    value: Mutex<Option<Option<u64>>>,
+    ready: std::sync::Condvar,
+}
+
+impl DeferredComputeId {
+    fn publish(&self, id: Option<u64>) {
+        let mut value = self.value.lock().unwrap_or_else(|error| error.into_inner());
+        if value.is_none() {
+            *value = Some(id);
+            self.ready.notify_all();
+        }
+    }
+
+    fn wait(&self) -> Option<u64> {
+        let mut value = self.value.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(id) = *value {
+                return id;
+            }
+            value = self.ready.wait(value).unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+struct DeferredComputeIdSender(Option<Arc<DeferredComputeId>>);
+
+impl DeferredComputeIdSender {
+    fn send(mut self, id: Option<u64>) {
+        if let Some(deferred) = self.0.take() {
+            deferred.publish(id);
+        }
+    }
+}
+
+impl Drop for DeferredComputeIdSender {
+    fn drop(&mut self) {
+        if let Some(deferred) = self.0.take() {
+            log::error!("[compute-offload] dispatch dropped before completion ID");
+            deferred.publish(None);
+        }
+    }
 }
 
 impl PendingComputeId {
@@ -503,20 +548,33 @@ impl PendingComputeId {
         }
     }
 
-    fn wait(self) -> Option<u64> {
+    fn wait(&self) -> Option<u64> {
         match self {
-            PendingComputeId::Ready(id) => Some(id),
-            PendingComputeId::Deferred(rx) => {
-                match rx.recv() {
-                    Ok(id) => id,
-                    Err(_) => {
-                        log::error!("[compute-offload] dispatch channel disconnected before completion ID");
-                        None
-                    }
-                }
-            }
+            PendingComputeId::Ready(id) => Some(*id),
+            PendingComputeId::Deferred(deferred) => deferred.wait(),
         }
     }
+}
+
+fn pending_raw_storage_writers(keys: &[ComputeRawStorageKey]) -> Vec<PendingComputeId> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let pending = pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending
+        .iter()
+        .filter(|record| matches!(record.id, PendingComputeId::Deferred(_)))
+        .filter(|record| {
+            record.texel_targets.iter().any(|target| {
+                target
+                    .raw_storage_key
+                    .is_some_and(|key| keys.contains(&key))
+            })
+        })
+        .map(|record| record.id.clone())
+        .collect()
 }
 
 fn compute_alias_enabled() -> bool {
@@ -1646,6 +1704,22 @@ fn prepare_and_execute(
         .iter()
         .map(|key| key.and_then(|key| renderer.pin_compute_raw_storage(key)))
         .collect();
+    let unpinned_keys: Vec<ComputeRawStorageKey> = raw_storage_keys
+        .iter()
+        .zip(&raw_storage_leases)
+        .filter_map(|(key, lease)| if lease.is_none() { *key } else { None })
+        .collect();
+    let queued_writers = pending_raw_storage_writers(&unpinned_keys);
+    if !queued_writers.is_empty() {
+        for writer in &queued_writers {
+            writer.wait();
+        }
+        for (key, lease) in raw_storage_keys.iter().zip(&mut raw_storage_leases) {
+            if lease.is_none() {
+                *lease = key.and_then(|key| renderer.pin_compute_raw_storage(key));
+            }
+        }
+    }
     if has_pending_writebacks() {
         let image_overlap = resolved.iter().any(|resource| {
             let Ok(size) = resource_size(&resource.tic) else {
@@ -2342,7 +2416,8 @@ fn prepare_and_execute(
     crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::KC_DISPATCH, 1);
     if code_override.is_none() && lazy_compute_enabled() && compute_offload_enabled() {
         if let Some(rt) = crate::render_thread::maybe_render_thread() {
-            let (id_tx, id_rx) = crossbeam::channel::bounded(1);
+            let deferred_id = Arc::new(DeferredComputeId::default());
+            let id_tx = DeferredComputeIdSender(Some(Arc::clone(&deferred_id)));
             let job_renderer = std::sync::Arc::clone(renderer_arc);
             let program = qmd[0x08];
             rt.submit_named(
@@ -2366,11 +2441,11 @@ fn prepare_and_execute(
                         }
                     };
                     drop(raw_storage_leases);
-                    let _ = id_tx.send(sent);
+                    id_tx.send(sent);
                 }),
             );
             push_pending_writeback(PendingComputeWriteback {
-                    id: PendingComputeId::Deferred(id_rx),
+                    id: PendingComputeId::Deferred(deferred_id),
                     program_gpu_va: code_gpu,
                     serial,
                     output_targets,
