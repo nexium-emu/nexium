@@ -1293,7 +1293,7 @@ fn create_compute_raw_storage_buffer(
         Some(data),
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
         None,
-        false,
+        true,
         true,
     )
 }
@@ -1320,7 +1320,7 @@ pub(crate) fn create_compute_buffer(
         Some(data),
         usage,
         with_r32_uint_view.then_some(vk::Format::R32_UINT),
-        false,
+        true,
         false,
     )
 }
@@ -1339,7 +1339,7 @@ pub(crate) fn create_compute_texel_buffer(
         Some(data),
         usage,
         Some(format),
-        false,
+        true,
         false,
     )
 }
