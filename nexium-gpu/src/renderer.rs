@@ -2600,10 +2600,28 @@ impl CachedTexture {
     }
 }
 
-const DERIVED_TEXTURE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const DERIVED_TEXTURE_CACHE_TARGET_BYTES: u64 = 768 * 1024 * 1024;
-const DERIVED_TEXTURE_CACHE_MAX_ITEMS: usize = 4096;
-const DERIVED_TEXTURE_CACHE_TARGET_ITEMS: usize = 3072;
+const DERIVED_TEXTURE_CACHE_MIN_BYTES: u64 = 1024 * 1024 * 1024;
+const DERIVED_TEXTURE_CACHE_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DERIVED_TEXTURE_CACHE_PRESSURE_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
+const DERIVED_TEXTURE_CACHE_MAX_ITEMS: usize = 32768;
+const DERIVED_TEXTURE_CACHE_TARGET_ITEMS: usize = 24576;
+
+fn derived_texture_cache_max_bytes(vram_heap_bytes: u64) -> u64 {
+    (vram_heap_bytes / 2).clamp(DERIVED_TEXTURE_CACHE_MIN_BYTES, DERIVED_TEXTURE_CACHE_CEILING_BYTES)
+}
+
+fn derived_texture_cache_trim_bounds(
+    cached_bytes: u64,
+    vram_heap_bytes: u64,
+    vram_pressure: bool,
+) -> (u64, u64) {
+    if vram_pressure {
+        let reduced = (cached_bytes / 4 * 3).max(DERIVED_TEXTURE_CACHE_PRESSURE_FLOOR_BYTES);
+        return (reduced, reduced);
+    }
+    let max_bytes = derived_texture_cache_max_bytes(vram_heap_bytes);
+    (max_bytes, max_bytes / 4 * 3)
+}
 
 fn cache_uploaded_texture(
     cache: &mut nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
@@ -2628,7 +2646,12 @@ fn trim_derived_texture_cache(
     bytes: &mut u64,
     retired: &mut Vec<CachedTexture>,
 ) {
-    if *bytes <= DERIVED_TEXTURE_CACHE_MAX_BYTES && cache.len() <= DERIVED_TEXTURE_CACHE_MAX_ITEMS {
+    let (max_bytes, target_bytes) = derived_texture_cache_trim_bounds(
+        *bytes,
+        crate::gpu_health::vram_heap_bytes(),
+        crate::gpu_health::take_vram_pressure(monotonic_nanos()),
+    );
+    if *bytes <= max_bytes && cache.len() <= DERIVED_TEXTURE_CACHE_MAX_ITEMS {
         return;
     }
     let mut candidates: Vec<_> = cache.iter()
@@ -2636,7 +2659,7 @@ fn trim_derived_texture_cache(
         .collect();
     candidates.sort_unstable_by_key(|(key, generation)| (*generation, key.fingerprint));
     for (key, _) in candidates {
-        if *bytes <= DERIVED_TEXTURE_CACHE_TARGET_BYTES && cache.len() <= DERIVED_TEXTURE_CACHE_TARGET_ITEMS {
+        if *bytes <= target_bytes && cache.len() <= DERIVED_TEXTURE_CACHE_TARGET_ITEMS {
             break;
         }
         if let Some(texture) = cache.remove(&key) {
@@ -33653,11 +33676,11 @@ mod tests {
         let mut retired = Vec::new();
         super::cache_uploaded_texture(
             &mut cache, &mut ranges, &mut bytes, &mut retired,
-            key, derived_cache_test_texture(super::DERIVED_TEXTURE_CACHE_MAX_BYTES, 1),
+            key, derived_cache_test_texture(super::DERIVED_TEXTURE_CACHE_MIN_BYTES, 1),
         );
         super::trim_derived_texture_cache(&mut cache, &mut ranges, &mut bytes, &mut retired);
         assert_eq!(cache.len(), 1);
-        assert_eq!(bytes, super::DERIVED_TEXTURE_CACHE_MAX_BYTES);
+        assert_eq!(bytes, super::DERIVED_TEXTURE_CACHE_MIN_BYTES);
         assert!(ranges.overlapping(key.gpu_va, 1) == vec![key]);
         assert!(retired.is_empty());
     }
@@ -33716,7 +33739,7 @@ mod tests {
         let mut ranges = super::TextureRangeIndex::default();
         let mut bytes = 0;
         let mut retired = Vec::new();
-        let size = super::DERIVED_TEXTURE_CACHE_MAX_BYTES + 1;
+        let size = super::DERIVED_TEXTURE_CACHE_MIN_BYTES + 1;
         super::cache_uploaded_texture(
             &mut cache, &mut ranges, &mut bytes, &mut retired,
             key, derived_cache_test_texture(size, 1),
@@ -36209,6 +36232,20 @@ mod tests {
             resident: None,
             compute_alias: None,
         }
+    }
+
+    #[test]
+    fn texture_cache_budget_follows_vram_and_sheds_under_pressure() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(super::derived_texture_cache_trim_bounds(0, 16 * GIB, false), (8 * GIB, 6 * GIB));
+        assert_eq!(super::derived_texture_cache_trim_bounds(0, 6 * GIB, false), (3 * GIB, 3 * GIB / 4 * 3));
+        assert_eq!(super::derived_texture_cache_trim_bounds(0, GIB, false), (GIB, GIB / 4 * 3));
+        assert_eq!(super::derived_texture_cache_trim_bounds(0, 0, false), (GIB, GIB / 4 * 3));
+        assert_eq!(super::derived_texture_cache_trim_bounds(4 * GIB, 16 * GIB, true), (3 * GIB, 3 * GIB));
+        assert_eq!(
+            super::derived_texture_cache_trim_bounds(GIB / 2, 16 * GIB, true),
+            (GIB / 2, GIB / 2)
+        );
     }
 
     #[test]

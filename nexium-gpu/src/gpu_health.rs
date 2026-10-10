@@ -17,6 +17,9 @@ struct GpuHealth {
 static HEALTH: OnceLock<GpuHealth> = OnceLock::new();
 static DEVICE_LOST_REPORTED: AtomicBool = AtomicBool::new(false);
 static LAST_BUDGET_LOG_NS: AtomicU64 = AtomicU64::new(0);
+static VRAM_HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
+static LAST_PRESSURE_CHECK_NS: AtomicU64 = AtomicU64::new(0);
+const PRESSURE_CHECK_INTERVAL_NS: u64 = 500_000_000;
 
 pub(crate) fn install(
     instance: &ash::Instance,
@@ -35,6 +38,15 @@ pub(crate) fn install(
                 function,
             )
         });
+    let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let heap_count = (memory_properties.memory_heap_count as usize).min(vk::MAX_MEMORY_HEAPS);
+    let vram_bytes = memory_properties.memory_heaps[..heap_count]
+        .iter()
+        .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .map(|heap| heap.size)
+        .max()
+        .unwrap_or(0);
+    VRAM_HEAP_BYTES.store(vram_bytes, Ordering::Relaxed);
     let _ = HEALTH.set(GpuHealth {
         instance: instance.clone(),
         physical_device,
@@ -42,6 +54,27 @@ pub(crate) fn install(
         memory_budget,
         fault_info,
     });
+}
+
+pub(crate) fn vram_heap_bytes() -> u64 {
+    VRAM_HEAP_BYTES.load(Ordering::Relaxed)
+}
+
+pub(crate) fn take_vram_pressure(now_ns: u64) -> bool {
+    let last = LAST_PRESSURE_CHECK_NS.load(Ordering::Relaxed);
+    if last != 0 && now_ns.saturating_sub(last) < PRESSURE_CHECK_INTERVAL_NS {
+        return false;
+    }
+    if LAST_PRESSURE_CHECK_NS
+        .compare_exchange(last, now_ns.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    HEALTH
+        .get()
+        .and_then(query_budget)
+        .is_some_and(|heaps| heaps.iter().any(HeapBudget::under_pressure))
 }
 
 pub(crate) fn note_result(context: &str, result: vk::Result) {
