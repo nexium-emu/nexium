@@ -2039,6 +2039,23 @@ fn stream_prepared_draws_enabled() -> bool {
     })
 }
 
+fn idle_stream_prepared_draws_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_STREAM_PREPARED").ok().as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    })
+}
+
+fn stream_prepared_draws_now() -> bool {
+    stream_prepared_draws_enabled()
+        || (idle_stream_prepared_draws_enabled()
+            && crate::render_thread::maybe_render_thread()
+                .is_some_and(crate::render_thread::RenderThread::is_idle))
+}
+
 fn streamed_draw_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -6901,8 +6918,8 @@ pub(crate) fn enqueue_draws(
                     continue;
                     }
                 }
-                let stream_ready = stream_prepared_draws_enabled()
-                    && batch.len() >= streamed_draw_limit();
+                let stream_ready =
+                    batch.len() >= streamed_draw_limit() && stream_prepared_draws_now();
                 if batch.len() >= MAX_ACCUMULATED_DRAWS || stream_ready {
                     derived_state_cache.clear();
                     record_enqueue_flush_reason(
@@ -10706,9 +10723,7 @@ impl PreparedDrawPacketizer {
                 }
             }
         }
-        if stream_prepared_draws_enabled()
-            && !self.pending.is_empty()
-        {
+        if !self.pending.is_empty() && stream_prepared_draws_now() {
             let ready = self.pending.take();
             if !Self::submit(render_thread, ready) {
                 self.submit_failed = true;
