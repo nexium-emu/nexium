@@ -1291,7 +1291,9 @@ fn create_compute_raw_storage_buffer(
         mem_props,
         data.len().max(16) as u64,
         Some(data),
-        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::VERTEX_BUFFER,
         None,
         true,
         true,

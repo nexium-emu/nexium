@@ -14408,9 +14408,17 @@ impl Renderer {
                     fermi_exact_rt_snapshot_leases,
                     fermi_exact_rt_snapshot_ids,
                 )?;
+                let mut aliased_vertex_bindings: Vec<u32> = Vec::new();
                 if !call.resident_vertex.is_empty() {
                     let mut fallback_bindings = Vec::new();
                     for range in &call.resident_vertex {
+                        if let Some((buffer, offset)) =
+                            compute_alias_vertex_binding(compute_overlay_sources, range)
+                        {
+                            vertex_binds.push((range.binding, buffer, offset));
+                            aliased_vertex_bindings.push(range.binding);
+                            continue;
+                        }
                         if !range.has_exact_coverage() {
                             continue;
                         }
@@ -14517,6 +14525,7 @@ impl Renderer {
                     compute_overlay_sources,
                     &call.resident_vertex,
                     &vertex_binds,
+                    &aliased_vertex_bindings,
                 );
                 if !overlay_copies.is_empty() {
                     if pass_open {
@@ -17861,13 +17870,14 @@ fn collect_compute_overlay_copies(
     sources: &HashMap<u64, Vec<(u32, vk::Buffer)>>,
     ranges: &[crate::draw::ResidentVertexRange],
     vertex_binds: &[(u32, vk::Buffer, u64)],
+    aliased_bindings: &[u32],
 ) -> Vec<ComputeOverlayCopy> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COPIES: AtomicU64 = AtomicU64::new(0);
     static MISSES: AtomicU64 = AtomicU64::new(0);
     let mut copies = Vec::new();
     for range in ranges {
-        if range.compute_overlays.is_empty() {
+        if range.compute_overlays.is_empty() || aliased_bindings.contains(&range.binding) {
             continue;
         }
         let Some(&(_, dst, dst_base)) = vertex_binds
@@ -17919,6 +17929,29 @@ fn collect_compute_overlay_copies(
         }
     }
     copies
+}
+
+fn compute_alias_vertex_binding(
+    sources: &HashMap<u64, Vec<(u32, vk::Buffer)>>,
+    range: &crate::draw::ResidentVertexRange,
+) -> Option<(vk::Buffer, u64)> {
+    const VERTEX_ALIAS_ALIGNMENT: u64 = 16;
+    let [overlay] = range.compute_overlays.as_slice() else {
+        return None;
+    };
+    let len = u64::try_from(range.len).ok()?;
+    if overlay.dst_offset != 0
+        || overlay.len < len
+        || overlay.src_offset % VERTEX_ALIAS_ALIGNMENT != 0
+    {
+        return None;
+    }
+    let buffer = sources
+        .get(&overlay.serial)?
+        .iter()
+        .find(|(index, _)| *index == overlay.resource_index)
+        .map(|(_, buffer)| *buffer)?;
+    Some((buffer, overlay.src_offset))
 }
 
 fn compute_alias_storage_info(
