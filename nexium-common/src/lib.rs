@@ -1,3 +1,4 @@
+pub mod astc;
 pub mod async_compile;
 pub mod cache_affinity;
 pub mod constants;
