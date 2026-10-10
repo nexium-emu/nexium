@@ -43,6 +43,11 @@ pub struct GpuDrainGate {
 
 pub(crate) type PresentDeliveryLanes = Arc<Mutex<HashMap<u32, Arc<Mutex<()>>>>>;
 
+pub(crate) fn syncpt_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some())
+}
+
 pub(crate) fn present_delivery_lane(
     lanes: &PresentDeliveryLanes,
     binder_id: u32,
@@ -1162,7 +1167,7 @@ impl Kernel {
             self.record_fence_signal(handle);
             self.event_signals.insert(handle, true);
             self.threads.signal_handle(handle);
-            if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+            if crate::kernel::syncpt_debug_enabled() {
                 if let Some((syncpt_id, threshold)) = pending {
                     log::info!(
                         "[syncpt] scheduler drained gpu_fence_event handle={:#x} syncpt={} threshold={}",

@@ -12648,7 +12648,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 .map(|f| f.device == nexium_nvdrv::NvDevice::NvhostCtrl)
                 .unwrap_or(false);
             let h = kernel.handles.create_handle(HandleType::Event);
-            if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+            if crate::kernel::syncpt_debug_enabled() {
                 log::info!(
                     "[syncpt] query-event fd={} event_id={:#x} ctrl={}",
                     fd,
@@ -13508,6 +13508,11 @@ fn svc_reset_signal(kernel: &mut Kernel) -> u32 {
     result
 }
 
+fn arbiter_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_ARBITER_TRACE").is_some())
+}
+
 fn svc_wait_for_address(kernel: &mut Kernel) -> u32 {
     let (addr, arb_type, value, timeout_ns) = if let Some(cpu) = cpu_ref() {
         (
@@ -13541,7 +13546,7 @@ fn svc_wait_for_address(kernel: &mut Kernel) -> u32 {
         }
         break (true, current, should_wait);
     };
-    let trace_arbiter = std::env::var_os("NEXIUM_ARBITER_TRACE").is_some();
+    let trace_arbiter = arbiter_trace_enabled();
     if trace_arbiter {
         log::warn!(
             "[arb-wait] addr={:#x} type={} value={} timeout_ns={} read_ok={} current={} should_wait={}",
@@ -13606,7 +13611,7 @@ fn svc_signal_to_address(kernel: &mut Kernel) -> u32 {
     let mut buf = [0u8; 4];
     let _ = kernel.address_space.read(addr, &mut buf);
     let current = u32::from_le_bytes(buf);
-    let trace_arbiter = std::env::var_os("NEXIUM_ARBITER_TRACE").is_some();
+    let trace_arbiter = arbiter_trace_enabled();
     if trace_arbiter {
         let waiters = kernel
             .threads
