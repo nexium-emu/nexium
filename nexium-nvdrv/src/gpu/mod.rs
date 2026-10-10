@@ -2003,6 +2003,10 @@ pub fn configure_gpu_accuracy() {
     accuracy::configure_gpu_accuracy();
 }
 
+pub fn configure_retained_ssbos(title_default: bool) {
+    vk_dispatch::configure_retained_ssbos(title_default);
+}
+
 pub(crate) fn gpu_pipeline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {

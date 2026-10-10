@@ -14,6 +14,7 @@ pub static EMU_ALIVE: AtomicBool = AtomicBool::new(false);
 const METROID_DREAD_TITLE_ID: u64 = 0x0100_9380_1237_C000;
 const SWITCH_SPORTS_TITLE_ID: u64 = 0x0100_D2F0_0D5C_0000;
 const MINECRAFT_DUNGEONS_2_TITLE_ID: u64 = 0x0100_A7C0_1B79_2000;
+const TEARS_OF_THE_KINGDOM_TITLE_ID: u64 = 0x0100_F2C0_115B_6000;
 
 pub fn emu_alive() -> bool {
     EMU_ALIVE.load(Ordering::Acquire)
@@ -841,6 +842,9 @@ impl EmulationHandle {
                 let title_id = boot_ctx.kernel.lock().title_id;
                 nexium_nvdrv::gpu::configure_fast_gpu_time(title_id == SWITCH_SPORTS_TITLE_ID);
                 nexium_nvdrv::gpu::configure_gpu_accuracy();
+                nexium_nvdrv::gpu::configure_retained_ssbos(
+                    title_id == TEARS_OF_THE_KINGDOM_TITLE_ID,
+                );
                 nexium_core::services::am::set_title_nifm_offline(
                     title_id == MINECRAFT_DUNGEONS_2_TITLE_ID,
                 );

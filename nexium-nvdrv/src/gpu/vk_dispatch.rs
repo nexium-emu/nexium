@@ -563,9 +563,36 @@ fn cfg_ssbo_writes(cfg: &nexium_shader::Cfg) -> GraphicsSsboWrites {
     writes
 }
 
+static TITLE_RETAINED_SSBO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn configure_retained_ssbos(title_default: bool) {
+    TITLE_RETAINED_SSBO.store(title_default, std::sync::atomic::Ordering::Relaxed);
+    if retained_ssbo_enabled() {
+        log::info!("gpu: read-only storage buffers are retained across kicks");
+    }
+}
+
+fn retained_ssbo_override(value: Option<&str>) -> Option<bool> {
+    let value = value?.trim();
+    if explicit_env_switch_value_enabled(Some(value)) {
+        Some(true)
+    } else if value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("no")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn retained_ssbo_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| explicit_env_switch_value_enabled(std::env::var("NEXIUM_RETAINED_SSBO").ok().as_deref()))
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| retained_ssbo_override(std::env::var("NEXIUM_RETAINED_SSBO").ok().as_deref()))
+        .unwrap_or_else(|| TITLE_RETAINED_SSBO.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn graphics_ssbo_writeback_enabled() -> bool {
@@ -26874,6 +26901,19 @@ mod tests {
             classify_rt_signature_boundary(&prior, &independent, true),
             RtSignatureBoundaryProfile::SmallRt
         );
+    }
+
+    #[test]
+    fn retained_ssbo_env_overrides_the_title_default_both_ways() {
+        for value in ["1", "true", "ON", " yes "] {
+            assert_eq!(super::retained_ssbo_override(Some(value)), Some(true), "{value}");
+        }
+        for value in ["0", "false", "Off", "no"] {
+            assert_eq!(super::retained_ssbo_override(Some(value)), Some(false), "{value}");
+        }
+        for value in [None, Some(""), Some("auto"), Some("2")] {
+            assert_eq!(super::retained_ssbo_override(value), None, "{value:?}");
+        }
     }
 
     fn test_ssbo_cache_key(data_offset: usize, read_len: usize) -> SsboSnapshotCacheKey {
