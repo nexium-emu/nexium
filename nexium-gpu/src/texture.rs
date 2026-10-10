@@ -1695,6 +1695,57 @@ fn decode_bc3(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
 fn decode_astc(src: &[u8], width: u32, height: u32, bw: usize, bh: usize, out: &mut [u8]) {
     let w = width as usize;
     let h = height as usize;
+    if w == 0 || h == 0 || bw == 0 || bh == 0 {
+        return;
+    }
+    decode_astc_bands(src, w, h, bw, bh, out);
+}
+
+fn decode_astc_bands(src: &[u8], w: usize, h: usize, bw: usize, bh: usize, out: &mut [u8]) {
+    let blocks_x = w.div_ceil(bw);
+    let block_rows = h.div_ceil(bh);
+    let workers = astc_decode_workers(blocks_x * block_rows, block_rows);
+    if workers <= 1 {
+        decode_astc_rows(src, w, h, bw, bh, out);
+        return;
+    }
+    let rows_per_band = block_rows.div_ceil(workers);
+    let band_src_bytes = rows_per_band * blocks_x * 16;
+    let band_out_bytes = rows_per_band * bh * w * 4;
+    std::thread::scope(|scope| {
+        let mut bands = out.chunks_mut(band_out_bytes).enumerate();
+        let first = bands.next();
+        for (band, out_band) in bands {
+            let band_src = astc_band_source(src, band, band_src_bytes);
+            scope.spawn(move || {
+                decode_astc_rows(band_src, w, out_band.len() / (w * 4), bw, bh, out_band)
+            });
+        }
+        if let Some((band, out_band)) = first {
+            let band_src = astc_band_source(src, band, band_src_bytes);
+            decode_astc_rows(band_src, w, out_band.len() / (w * 4), bw, bh, out_band);
+        }
+    });
+}
+
+fn astc_band_source(src: &[u8], band: usize, band_src_bytes: usize) -> &[u8] {
+    let start = band.saturating_mul(band_src_bytes).min(src.len());
+    let end = start.saturating_add(band_src_bytes).min(src.len());
+    &src[start..end]
+}
+
+fn astc_decode_workers(blocks: usize, block_rows: usize) -> usize {
+    const MIN_BLOCKS_PER_WORKER: usize = 2048;
+    static MAX_WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let max_workers = *MAX_WORKERS.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).clamp(1, 16))
+    });
+    (blocks / MIN_BLOCKS_PER_WORKER)
+        .clamp(1, max_workers)
+        .min(block_rows)
+}
+
+fn decode_astc_rows(src: &[u8], w: usize, h: usize, bw: usize, bh: usize, out: &mut [u8]) {
     let mut buf = vec![0u32; w * h];
     if texture2ddecoder::decode_astc(src, w, h, bw, bh, &mut buf).is_err() {
         for px in out.chunks_exact_mut(4) {
@@ -2298,6 +2349,32 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
 
 #[cfg(test)]
 mod tests {
+    fn astc_void_extent_block(index: usize) -> [u8; 16] {
+        let mut block = [0u8; 16];
+        let header: u64 = 0x1fc | (0b11 << 10) | (((1u64 << 52) - 1) << 12);
+        block[..8].copy_from_slice(&header.to_le_bytes());
+        for (channel, value) in block[8..].chunks_exact_mut(2).enumerate() {
+            let shade = (index.wrapping_mul(2654435761).wrapping_add(channel * 977) & 0xffff) as u16;
+            value.copy_from_slice(&shade.to_le_bytes());
+        }
+        block
+    }
+
+    #[test]
+    fn banded_astc_decode_matches_a_single_pass() {
+        for (width, height, bw, bh) in [(512u32, 320u32, 4usize, 4usize), (510, 317, 4, 4), (1000, 999, 8, 6)] {
+            let blocks = (width as usize).div_ceil(bw) * (height as usize).div_ceil(bh);
+            let src: Vec<u8> = (0..blocks).flat_map(astc_void_extent_block).collect();
+            let size = width as usize * height as usize * 4;
+            let mut banded = vec![0u8; size];
+            let mut single = vec![0u8; size];
+            super::decode_astc(&src, width, height, bw, bh, &mut banded);
+            super::decode_astc_rows(&src, width as usize, height as usize, bw, bh, &mut single);
+            assert!(banded == single, "{width}x{height} {bw}x{bh}");
+            assert!(single.chunks_exact(4).any(|px| px != [0xff, 0x00, 0xff, 0xff]));
+        }
+    }
+
     #[test]
     fn reused_3d_swizzle_clears_padding_and_truncated_texels() {
         let mut reusable = vec![0xff; 131072];
