@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
 pub mod adapter;
+mod astc_async;
+mod astc_gpu;
+pub mod bcn_encode;
 pub mod bundle_cache;
 pub mod commands;
 pub mod compute;

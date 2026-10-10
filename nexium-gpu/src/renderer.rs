@@ -1491,6 +1491,9 @@ struct RendererInner {
         HashMap<crate::compute::ComputeRawStorageKey, CachedComputeRawStorage>,
     raw_storage_resident: Arc<Mutex<ComputeRawStorageResidency>>,
     compute_overlay_sources: HashMap<u64, Vec<(u32, vk::Buffer)>>,
+    astc_pipeline: Option<crate::astc_gpu::AstcDecodePipeline>,
+    astc_pipeline_failed: bool,
+    astc_async: AstcAsyncDecodes,
     parked_compute_buffers: Vec<ParkedComputeBuffer>,
     graphics_storage: HashMap<crate::compute::ComputeRawStorageKey, GraphicsStorageEntry>,
     retired_graphics_storage: Vec<(u64, crate::compute::ComputeBufferResource)>,
@@ -1730,6 +1733,7 @@ struct TextureMipCopy {
 struct TextureUploadData {
     bytes: Vec<u8>,
     copies: Vec<TextureMipCopy>,
+    astc: Option<crate::astc_gpu::AstcUploadPlan>,
 }
 
 impl TextureUploadData {
@@ -1742,8 +1746,309 @@ impl TextureUploadData {
                 width,
                 height,
             }],
+            astc: None,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum TextureUploadSource<'a> {
+    Bytes(&'a [u8]),
+    Buffer { buffer: vk::Buffer, base_offset: u64 },
+    Deferred,
+}
+
+impl TextureUploadSource<'_> {
+    fn stage(
+        self,
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        slot: Option<&mut FrameSlot>,
+    ) -> Result<TextureUploadLease, String> {
+        match self {
+            Self::Bytes(bytes) => allocate_texture_upload(device, mem_props, bytes, slot),
+            Self::Buffer { buffer, base_offset } => Ok(TextureUploadLease {
+                buffer,
+                base_offset,
+                dedicated: None,
+            }),
+            Self::Deferred => Err("deferred texture upload has no staged data".to_string()),
+        }
+    }
+}
+
+struct AstcAsyncJob {
+    ticket: u64,
+    key: TexCacheKey,
+    image: vk::Image,
+    raw: Vec<u8>,
+    tic: crate::texture::TicEntry,
+    pitch_size: usize,
+    force_pitch: bool,
+    format: vk::Format,
+}
+
+struct AstcAsyncResult {
+    ticket: u64,
+    key: TexCacheKey,
+    image: vk::Image,
+    format: vk::Format,
+    upload: Result<TextureUploadData, String>,
+}
+
+#[derive(Default)]
+struct AstcAsyncDecodes {
+    worker: Option<crate::astc_async::DecodeWorker<AstcAsyncJob, AstcAsyncResult>>,
+    worker_failed: bool,
+    pending: nexium_common::fast_hash::FastMap<TexCacheKey, u64>,
+    next_ticket: u64,
+}
+
+impl AstcAsyncDecodes {
+    fn available(&mut self) -> bool {
+        if self.worker.is_none() && !self.worker_failed {
+            match crate::astc_async::DecodeWorker::spawn("nexium-astc-decode", |job: AstcAsyncJob| {
+                AstcAsyncResult {
+                    ticket: job.ticket,
+                    key: job.key,
+                    image: job.image,
+                    format: job.format,
+                    upload: texture_upload_data(
+                        &job.raw,
+                        &job.tic,
+                        job.key.layers,
+                        job.pitch_size,
+                        job.force_pitch,
+                        job.format,
+                    ),
+                }
+            }) {
+                Ok(worker) => {
+                    log::info!("[astc] decoding ASTC textures on a background thread");
+                    self.worker = Some(worker);
+                }
+                Err(error) => {
+                    log::warn!("[astc] background decoder unavailable, decoding in place: {error}");
+                    self.worker_failed = true;
+                }
+            }
+        }
+        self.worker.is_some()
+    }
+
+    fn queue(
+        &mut self,
+        key: TexCacheKey,
+        image: vk::Image,
+        raw: &[u8],
+        tic: crate::texture::TicEntry,
+        pitch_size: usize,
+        force_pitch: bool,
+        format: vk::Format,
+    ) -> bool {
+        let Some(worker) = self.worker.as_mut() else {
+            return false;
+        };
+        self.next_ticket += 1;
+        let ticket = self.next_ticket;
+        let job = AstcAsyncJob {
+            ticket,
+            key,
+            image,
+            raw: raw.to_vec(),
+            tic,
+            pitch_size,
+            force_pitch,
+            format,
+        };
+        if !worker.submit(job) {
+            log::warn!("[astc] background decoder stopped, decoding in place");
+            self.worker = None;
+            self.worker_failed = true;
+            return false;
+        }
+        self.pending.insert(key, ticket);
+        true
+    }
+
+    fn take_completed(&mut self) -> Vec<AstcAsyncResult> {
+        let Some(worker) = self.worker.as_mut() else {
+            return Vec::new();
+        };
+        let mut ready = Vec::new();
+        for result in worker.completed() {
+            if self.pending.get(&result.key) == Some(&result.ticket) {
+                self.pending.remove(&result.key);
+                ready.push(result);
+            }
+        }
+        ready
+    }
+}
+
+fn apply_async_astc_uploads(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    decodes: &mut AstcAsyncDecodes,
+    tex_cache: &mut nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
+    slot: &mut FrameSlot,
+) {
+    for result in decodes.take_completed() {
+        let Some(texture) = tex_cache
+            .get_mut(&result.key)
+            .filter(|texture| texture.image == result.image)
+        else {
+            continue;
+        };
+        let upload = match result.upload {
+            Ok(upload) => upload,
+            Err(error) => {
+                log::warn!("[astc] background decode of {:#x} failed: {error}", result.key.gpu_va);
+                continue;
+            }
+        };
+        match update_texture_image(
+            device,
+            cmd,
+            mem_props,
+            texture.image,
+            texture.layout,
+            result.format,
+            result.key.layers,
+            result.key.volume,
+            result.key.mip_levels,
+            TextureUploadSource::Bytes(&upload.bytes),
+            &upload.copies,
+            &[],
+            slot,
+        ) {
+            Ok(stage) => {
+                if let Some(stage) = stage {
+                    slot.upload_buffers.push(stage);
+                }
+                texture.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            }
+            Err(error) => {
+                log::warn!("[astc] background upload of {:#x} failed: {error}", result.key.gpu_va);
+            }
+        }
+    }
+}
+
+fn gpu_astc_upload_plan(
+    raw: &[u8],
+    tic: &crate::texture::TicEntry,
+    layer_count: u32,
+    force_pitch: bool,
+    format: vk::Format,
+    allowed: bool,
+) -> Option<TextureUploadData> {
+    let crate::texture::TicFormat::Astc(block_width, block_height) = tic.format else {
+        return None;
+    };
+    if !allowed
+        || crate::astc_gpu::decode_mode() != nexium_common::astc::AstcDecodeMode::Gpu
+        || force_pitch
+        || tic_is_volume(tic)
+        || tic.is_sparse
+        || tic.sample_count() != Some(1)
+        || !effective_texture_block_linear(tic)
+        || !(matches!(format, vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB)
+            || crate::bcn_encode::BcTarget::for_format(format).is_some())
+        || (tic.mip_levels() > 1 && (tic.block_width_log2 != 0 || tic.block_depth_log2 != 0))
+    {
+        return None;
+    }
+    let layers = layer_count.max(1);
+    let layout = crate::texture::block_linear_mip_layout(tic)?;
+    if raw.len() < layout.guest_size_bytes(layers) {
+        return None;
+    }
+    let mut plan = crate::astc_gpu::AstcUploadPlan::new(crate::bcn_encode::BcTarget::for_format(format));
+    let mut copies = Vec::with_capacity(layout.levels.len());
+    for level in &layout.levels {
+        let level_layers: Vec<Vec<u8>> = (0..layers as usize)
+            .map(|layer| {
+                let start = layer
+                    .saturating_mul(layout.layer_stride)
+                    .saturating_add(level.guest_offset);
+                let end = start.saturating_add(level.guest_size);
+                crate::texture::unswizzle_block_linear_strided(
+                    &raw[start..end],
+                    level.storage_width,
+                    level.storage_height,
+                    tic.format.src_bpp(),
+                    level.block_height_log2,
+                    level.stride_alignment_log2,
+                )
+            })
+            .collect();
+        let buffer_offset = plan.push_level(
+            &level_layers,
+            level.width,
+            level.height,
+            u32::from(block_width),
+            u32::from(block_height),
+        );
+        copies.push(TextureMipCopy {
+            buffer_offset,
+            mip_level: level.level,
+            width: level.width,
+            height: level.height,
+        });
+    }
+    Some(TextureUploadData {
+        bytes: Vec::new(),
+        copies,
+        astc: Some(plan),
+    })
+}
+
+fn record_gpu_astc_decode(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    pipeline: &mut Option<crate::astc_gpu::AstcDecodePipeline>,
+    pipeline_failed: &mut bool,
+    slot: &mut FrameSlot,
+    plan: &crate::astc_gpu::AstcUploadPlan,
+) -> Option<TextureUploadSource<'static>> {
+    if pipeline.is_none() && !*pipeline_failed {
+        match crate::astc_gpu::AstcDecodePipeline::new(device) {
+            Ok(created) => {
+                log::info!("[astc] decoding ASTC textures on the GPU");
+                *pipeline = Some(created);
+            }
+            Err(error) => {
+                log::warn!("[astc] GPU decoder unavailable, decoding on the CPU: {error}");
+                *pipeline_failed = true;
+            }
+        }
+    }
+    let pipeline = pipeline.as_ref()?;
+    if slot.astc_arena.is_none() && !slot.astc_arena_unavailable {
+        match crate::astc_gpu::AstcDecodeArena::new(
+            device,
+            mem_props,
+            pipeline,
+            crate::astc_gpu::INPUT_ARENA_BYTES,
+            crate::astc_gpu::OUTPUT_ARENA_BYTES,
+        ) {
+            Ok(arena) => slot.astc_arena = Some(arena),
+            Err(error) => {
+                log::warn!("[astc] decode arena unavailable, decoding on the CPU: {error}");
+                slot.astc_arena_unavailable = true;
+            }
+        }
+    }
+    let arena = slot.astc_arena.as_mut()?;
+    let reservation = arena.reserve(device, mem_props, plan)?;
+    pipeline.record(device, cmd, arena, reservation, plan);
+    Some(TextureUploadSource::Buffer {
+        buffer: arena.output_buffer(),
+        base_offset: reservation.copy_offset,
+    })
 }
 
 const TEXTURE_IDENTITY_SWIZZLE: [crate::texture::SwizzleSource; 4] = [
@@ -3251,6 +3556,8 @@ struct FrameSlot {
     retired_views: Vec<vk::ImageView>,
     fermi_exact_rt_snapshot_leases: Vec<u64>,
     storage_readback_staging: Option<StorageReadbackStaging>,
+    astc_arena: Option<crate::astc_gpu::AstcDecodeArena>,
+    astc_arena_unavailable: bool,
 }
 
 const FERMI_EXACT_RT_SNAPSHOT_LEASE_CAPACITY: usize = 32;
@@ -3358,6 +3665,9 @@ fn destroy_retired_rt_images(device: &ash::Device, images: &mut Vec<GpuImage>) {
 fn recycle_slot_upload_buffers(device: &ash::Device, slot: &mut FrameSlot) {
     if let Some(arena) = slot.texture_upload_arena.as_mut() {
         arena.head = 0;
+    }
+    if let Some(arena) = slot.astc_arena.as_mut() {
+        arena.reset(device);
     }
     if slot.upload_buffers.is_empty() {
         return;
@@ -5635,7 +5945,7 @@ impl Renderer {
         if !depth_texture_images_enabled() {
             log::info!("Guest depth textures are sampled as colour images");
         }
-        let native_bc_formats = NATIVE_BC_FORMATS
+        let native_bc_formats: Vec<vk::Format> = NATIVE_BC_FORMATS
             .iter()
             .copied()
             .filter(|&format| {
@@ -5650,6 +5960,7 @@ impl Renderer {
                 )
             })
             .collect();
+        crate::astc_gpu::configure(&native_bc_formats);
         let shader_draw_parameters_supported =
             supported_features_11.shader_draw_parameters == vk::TRUE;
         let shader_output_layer_supported = supported_features_12.shader_output_layer == vk::TRUE;
@@ -6218,6 +6529,8 @@ impl Renderer {
                 retired_views: Vec::new(),
                 fermi_exact_rt_snapshot_leases: Vec::new(),
                 storage_readback_staging: None,
+                astc_arena: None,
+                astc_arena_unavailable: false,
             })
             .collect::<Vec<_>>();
         let utility_slot = FrameSlot {
@@ -6240,6 +6553,8 @@ impl Renderer {
             retired_views: Vec::new(),
             fermi_exact_rt_snapshot_leases: Vec::new(),
             storage_readback_staging: None,
+            astc_arena: None,
+            astc_arena_unavailable: false,
         };
 
         let clear_slot_count = clear_slot_count();
@@ -6401,6 +6716,9 @@ impl Renderer {
                 compute_raw_storage_cache: HashMap::new(),
                 raw_storage_resident,
                 compute_overlay_sources: HashMap::new(),
+                astc_pipeline: None,
+                astc_pipeline_failed: false,
+                astc_async: AstcAsyncDecodes::default(),
                 parked_compute_buffers: Vec::new(),
                 graphics_storage: HashMap::new(),
                 retired_graphics_storage: Vec::new(),
@@ -7177,6 +7495,144 @@ impl Renderer {
             clear_submit,
         );
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn decode_astc_gpu(
+        &self,
+        blocks: &[u8],
+        width: u32,
+        height: u32,
+        block_width: u32,
+        block_height: u32,
+        target: Option<crate::bcn_encode::BcTarget>,
+    ) -> Result<Vec<u8>, String> {
+        let mut decoded = self.decode_astc_gpu_batch(
+            &[(blocks, width, height, block_width, block_height)],
+            target,
+            (blocks.len() as u64).next_multiple_of(256).max(256),
+            u64::from(width) * u64::from(height) * 4
+                + u64::from(width.div_ceil(4)) * u64::from(height.div_ceil(4)) * 16
+                + 1024,
+        )?;
+        Ok(decoded.remove(0))
+    }
+
+    #[doc(hidden)]
+    pub fn decode_astc_gpu_batch(
+        &self,
+        textures: &[(&[u8], u32, u32, u32, u32)],
+        target: Option<crate::bcn_encode::BcTarget>,
+        input_chunk_bytes: u64,
+        output_bytes: u64,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut inner = self.inner.lock();
+        let RendererInner {
+            device,
+            queue,
+            cmd_pool,
+            mem_props,
+            submit_state,
+            submit_timeline,
+            astc_pipeline,
+            ..
+        } = &mut *inner;
+        if astc_pipeline.is_none() {
+            *astc_pipeline = Some(crate::astc_gpu::AstcDecodePipeline::new(device)?);
+        }
+        let pipeline = astc_pipeline.as_ref().unwrap();
+        let plans: Vec<_> = textures
+            .iter()
+            .map(|&(blocks, width, height, block_width, block_height)| {
+                let mut plan = crate::astc_gpu::AstcUploadPlan::new(target);
+                plan.push_level(&[blocks.to_vec()], width, height, block_width, block_height);
+                plan
+            })
+            .collect();
+        let sizes: Vec<u64> = plans
+            .iter()
+            .map(|plan| if target.is_some() { plan.encoded_bytes } else { plan.decoded_bytes })
+            .collect();
+        let readback_bytes = sizes.iter().sum::<u64>().max(4);
+        let mut arena = crate::astc_gpu::AstcDecodeArena::new(
+            device,
+            mem_props,
+            pipeline,
+            input_chunk_bytes,
+            output_bytes,
+        )?;
+        let decoded = (|| -> Result<Vec<Vec<u8>>, String> {
+            let (readback, readback_memory) = crate::astc_gpu::allocate_buffer(
+                device,
+                mem_props,
+                readback_bytes,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let copied = (|| -> Result<Vec<Vec<u8>>, String> {
+                let cmd = alloc_one_time_cmd(device, *cmd_pool)?;
+                begin_one_time(device, cmd)?;
+                let mut readback_offset = 0u64;
+                for (plan, &size) in plans.iter().zip(&sizes) {
+                    let reservation = arena
+                        .reserve(device, mem_props, plan)
+                        .ok_or_else(|| "astc decode reservation failed".to_string())?;
+                    pipeline.record(device, cmd, &arena, reservation, plan);
+                    let region = vk::BufferCopy {
+                        src_offset: reservation.copy_offset,
+                        dst_offset: readback_offset,
+                        size,
+                    };
+                    unsafe {
+                        device.cmd_copy_buffer(cmd, arena.output_buffer(), readback, &[region]);
+                    }
+                    readback_offset += size;
+                }
+                let barrier = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ);
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &[barrier],
+                        &[],
+                        &[],
+                    );
+                }
+                end_one_time(device, cmd)?;
+                let submitted = submit_and_wait(submit_state, *submit_timeline, device, *queue, cmd);
+                unsafe { device.free_command_buffers(*cmd_pool, &[cmd]) };
+                submitted?;
+                let mapped = unsafe {
+                    device.map_memory(readback_memory, 0, readback_bytes, vk::MemoryMapFlags::empty())
+                }
+                .map_err(|error| format!("astc readback map: {error:?}"))?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(mapped as *const u8, readback_bytes as usize)
+                };
+                let mut start = 0usize;
+                let outputs = sizes
+                    .iter()
+                    .map(|&size| {
+                        let output = bytes[start..start + size as usize].to_vec();
+                        start += size as usize;
+                        output
+                    })
+                    .collect();
+                unsafe { device.unmap_memory(readback_memory) };
+                Ok(outputs)
+            })();
+            unsafe {
+                device.destroy_buffer(readback, None);
+                device.free_memory(readback_memory, None);
+            }
+            copied
+        })();
+        arena.destroy(device);
+        decoded
     }
 
     pub fn upload_target_rgba(
@@ -12092,6 +12548,9 @@ impl Renderer {
             max_storage_buffer_range,
             max_texel_buffer_elements,
             compute_overlay_sources,
+            astc_pipeline,
+            astc_pipeline_failed,
+            astc_async,
             graphics_storage,
             retired_graphics_storage,
             graphics_storage_batch,
@@ -12405,6 +12864,14 @@ impl Renderer {
                 .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(batch): {:?}", e))?;
         }
+        apply_async_astc_uploads(
+            device,
+            cmd,
+            mem_props,
+            astc_async,
+            tex_cache,
+            &mut frame_slots[cur_idx],
+        );
         if group_preps
             .iter()
             .flat_map(|(_, preps)| preps.iter())
@@ -13921,7 +14388,18 @@ impl Renderer {
                                         continue;
                                     }
                                 };
-                                let upload = if volume_slices.is_some() {
+                                let deferred_astc = raw.is_some()
+                                    && volume_slices.is_none()
+                                    && !identity_volume
+                                    && rt_mips.is_empty()
+                                    && matches!(tic.format, crate::texture::TicFormat::Astc(..))
+                                    && crate::astc_gpu::decode_mode()
+                                        == nexium_common::astc::AstcDecodeMode::CpuAsynchronous
+                                    && !((texdump_stats_enabled() || texdump_image_enabled())
+                                        && texdump_target_enabled(tic.gpu_va))
+                                    && astc_async.available();
+                                let mut deferred_image = None;
+                                let upload = if volume_slices.is_some() || deferred_astc {
                                     Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
                                 } else if identity_volume {
                                     Ok(TextureUploadData::base(
@@ -13930,14 +14408,27 @@ impl Renderer {
                                         key.height,
                                     ))
                                 } else if let Some(raw) = raw {
-                                    texture_upload_data(
+                                    gpu_astc_upload_plan(
                                         raw,
                                         &tic,
                                         key.layers,
-                                        pitch_size,
                                         force_pitch,
                                         image_format,
+                                        !*astc_pipeline_failed
+                                            && !((texdump_stats_enabled() || texdump_image_enabled())
+                                                && texdump_target_enabled(tic.gpu_va)),
                                     )
+                                    .map(Ok)
+                                    .unwrap_or_else(|| {
+                                        texture_upload_data(
+                                            raw,
+                                            &tic,
+                                            key.layers,
+                                            pitch_size,
+                                            force_pitch,
+                                            image_format,
+                                        )
+                                    })
                                 } else {
                                     Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
                                 };
@@ -14123,6 +14614,41 @@ impl Renderer {
                                     pass_trace_calls.clear();
                                     color_sync_checked.clear();
                                 }
+                                let fallback_texels;
+                                let upload_source = if deferred_astc {
+                                    TextureUploadSource::Deferred
+                                } else {
+                                    match upload.astc.as_ref() {
+                                        Some(plan) => match record_gpu_astc_decode(
+                                            device,
+                                            cmd,
+                                            mem_props,
+                                            astc_pipeline,
+                                            astc_pipeline_failed,
+                                            &mut frame_slots[cur_idx],
+                                            plan,
+                                        ) {
+                                            Some(source) => source,
+                                            None => {
+                                                let Some(Ok(decoded)) = raw.map(|raw| {
+                                                    texture_upload_data(
+                                                        raw,
+                                                        &tic,
+                                                        key.layers,
+                                                        pitch_size,
+                                                        force_pitch,
+                                                        image_format,
+                                                    )
+                                                }) else {
+                                                    continue;
+                                                };
+                                                fallback_texels = decoded.bytes;
+                                                TextureUploadSource::Bytes(&fallback_texels)
+                                            }
+                                        },
+                                        None => TextureUploadSource::Bytes(texels),
+                                    }
+                                };
                                 let mut updated_in_place = false;
                                 if texture_update_in_place_enabled(
                                     key.volume,
@@ -14145,7 +14671,7 @@ impl Renderer {
                                             key.layers,
                                             key.volume,
                                             key.mip_levels,
-                                            texels,
+                                            upload_source,
                                             &upload.copies,
                                             &rt_mips,
                                             &mut frame_slots[cur_idx],
@@ -14168,6 +14694,7 @@ impl Renderer {
                                                         texture_rt_subresources(&rt_mips);
                                                 }
                                                 updated_in_place = true;
+                                                deferred_image = Some(image);
                                             }
                                             Err(error) => {
                                                 log::debug!(
@@ -14195,7 +14722,7 @@ impl Renderer {
                                         key.mip_levels,
                                         key.base_mip,
                                         key.view_mips,
-                                        texels,
+                                        upload_source,
                                         &upload.copies,
                                         volume_slices.as_deref(),
                                         &rt_mips,
@@ -14207,6 +14734,7 @@ impl Renderer {
                                         Some(&mut frame_slots[cur_idx]),
                                     ) {
                                         Ok((tex, stage)) => {
+                                            deferred_image = Some(tex.image);
                                             cache_uploaded_texture(
                                                 tex_cache, tex_cache_ranges, tex_cache_bytes,
                                                 &mut frame_slots[cur_idx].retired_textures, key, tex,
@@ -14229,6 +14757,21 @@ impl Renderer {
                                             hot_generic_texture_bindings.fill(None);
                                             group_texture_bindings.clear();
                                             binding_failure_reason = Some(error);
+                                        }
+                                    }
+                                }
+                                if let (true, Some(image), Some(raw)) = (deferred_astc, deferred_image, raw) {
+                                    if !astc_async.queue(
+                                        key,
+                                        image,
+                                        raw,
+                                        tic,
+                                        pitch_size,
+                                        force_pitch,
+                                        image_format,
+                                    ) {
+                                        if let Some(texture) = tex_cache.get_mut(&key) {
+                                            texture.invalidate_content();
                                         }
                                     }
                                 }
@@ -24692,7 +25235,7 @@ fn texture_upload_data_with_layout(
                 height: level.height,
             });
         }
-        return Ok(TextureUploadData { bytes, copies });
+        return Ok(TextureUploadData { bytes, copies, astc: None });
     }
 
     let linear = linear_texture_layers(
@@ -24734,6 +25277,25 @@ fn texture_level_upload(
             }).collect();
         }
         return crate::depth::unpack_texture_depth(linear, tic_format);
+    }
+    if let (crate::texture::TicFormat::Astc(..), Some(target)) =
+        (tic_format, crate::bcn_encode::BcTarget::for_format(format))
+    {
+        let decoded = texture_level_upload(
+            linear,
+            tic_format,
+            width,
+            height,
+            layers,
+            component_type,
+            vk::Format::R8G8B8A8_UNORM,
+        );
+        let layer_bytes = (width as usize * height as usize * 4).max(1);
+        return decoded
+            .chunks(layer_bytes)
+            .take(layers.max(1) as usize)
+            .flat_map(|layer| crate::bcn_encode::encode(layer, width, height, target))
+            .collect();
     }
     let native_layout = matches!(
         (tic_format, format),
@@ -26157,7 +26719,7 @@ where
         key.depth,
         key.is_3d,
         1,
-        &upload.bytes,
+        TextureUploadSource::Bytes(&upload.bytes),
         &upload.copies,
         &[],
         frame_slot,
@@ -28979,7 +29541,7 @@ fn upload_texture_oneshot(
         mip_levels,
         base_mip,
         view_mips,
-        rgba8,
+        TextureUploadSource::Bytes(rgba8),
         mip_copies,
         volume_slices,
         rt_mips,
@@ -29301,7 +29863,7 @@ fn create_texture_image(
     mip_levels: u32,
     base_mip: u32,
     view_mips: u32,
-    rgba8: &[u8],
+    source: TextureUploadSource<'_>,
     mip_copies: &[TextureMipCopy],
     volume_slices: Option<&[VolumeRtSlice]>,
     rt_mips: &[crate::texture_mips::TextureRtMip],
@@ -29417,13 +29979,8 @@ fn create_texture_image(
                 .map_err(|e| format!("bind_image_memory(tex): {:?}", e))?;
         }
 
-        stage = if volume_slices.is_none() {
-            Some(allocate_texture_upload(
-                device,
-                mem_props,
-                rgba8,
-                upload_slot,
-            )?)
+        stage = if volume_slices.is_none() && !matches!(source, TextureUploadSource::Deferred) {
+            Some(source.stage(device, mem_props, upload_slot)?)
         } else {
             None
         };
@@ -29629,6 +30186,26 @@ fn create_texture_image(
                 &copies,
             );
         }
+    } else if matches!(source, TextureUploadSource::Deferred)
+        && aspect == vk::ImageAspectFlags::COLOR
+        && crate::bcn_encode::BcTarget::for_format(format).is_none()
+    {
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: mip_levels,
+            base_array_layer: 0,
+            layer_count: if volume { 1 } else { layers },
+        };
+        unsafe {
+            device.cmd_clear_color_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: [0.0; 4] },
+                &[range],
+            );
+        }
     }
     copy_texture_rt_mips(device, cmd, image, mip_levels, rt_mips);
     transition_image_range(
@@ -29675,7 +30252,7 @@ fn update_texture_image(
     layers: u32,
     volume: bool,
     mip_levels: u32,
-    rgba8: &[u8],
+    source: TextureUploadSource<'_>,
     mip_copies: &[TextureMipCopy],
     rt_mips: &[crate::texture_mips::TextureRtMip],
     upload_slot: &mut FrameSlot,
@@ -29687,7 +30264,10 @@ fn update_texture_image(
     if mip_copies.is_empty() {
         return Err("texture update has no mip copy regions".to_string());
     }
-    let stage = allocate_texture_upload(device, mem_props, rgba8, Some(upload_slot))?;
+    if matches!(source, TextureUploadSource::Deferred) {
+        return Ok(None);
+    }
+    let stage = source.stage(device, mem_props, Some(upload_slot))?;
     let layer_count = if volume { 1 } else { layers.max(1) };
     transition_image_range(
         device,
@@ -29885,17 +30465,31 @@ fn native_bc_texture_format(
     })
 }
 
+fn astc_recompressed_texture_format(
+    tic: &crate::texture::TicEntry,
+    numeric_type: nexium_spirv::TextureNumericType,
+    srgb_enabled: bool,
+    target: Option<crate::bcn_encode::BcTarget>,
+) -> Option<vk::Format> {
+    let target = target?;
+    (matches!(tic.format, crate::texture::TicFormat::Astc(..))
+        && numeric_type == nexium_spirv::TextureNumericType::Float
+        && !tic_is_volume(tic)
+        && !tic.is_buffer())
+    .then(|| target.format(tic.is_srgb && srgb_enabled))
+}
+
 fn graphics_texture_image_format(
     tic: &crate::texture::TicEntry,
     numeric_type: nexium_spirv::TextureNumericType,
     native_bc_formats: &[vk::Format],
 ) -> Result<vk::Format, String> {
-    if let Some(format) = native_bc_texture_format(
-        tic,
-        numeric_type,
-        texture_environment_options().srgb,
-    )
-    .filter(|format| native_bc_formats.contains(format))
+    let srgb = texture_environment_options().srgb;
+    if let Some(format) = native_bc_texture_format(tic, numeric_type, srgb)
+        .or_else(|| {
+            astc_recompressed_texture_format(tic, numeric_type, srgb, crate::astc_gpu::bc_target())
+        })
+        .filter(|format| native_bc_formats.contains(format))
     {
         return Ok(format);
     }
@@ -32824,6 +33418,9 @@ impl Drop for RendererInner {
             if let Some(arena) = slot.texture_upload_arena.take() {
                 destroy_persistent_upload_buffer(&self.device, arena.buffer);
             }
+            if let Some(arena) = slot.astc_arena.take() {
+                arena.destroy(&self.device);
+            }
             destroy_retired_rt_images(&self.device, &mut slot.retired_rt_images);
             for t in slot.retired_rt_reinterprets.drain(..) {
                 unsafe {
@@ -32862,6 +33459,12 @@ impl Drop for RendererInner {
         }
         if let Some(arena) = self.utility_slot.texture_upload_arena.take() {
             destroy_persistent_upload_buffer(&self.device, arena.buffer);
+        }
+        if let Some(arena) = self.utility_slot.astc_arena.take() {
+            arena.destroy(&self.device);
+        }
+        if let Some(pipeline) = self.astc_pipeline.take() {
+            pipeline.destroy(&self.device);
         }
         destroy_retired_rt_images(&self.device, &mut self.utility_slot.retired_rt_images);
         for t in self.utility_slot.retired_rt_reinterprets.drain(..) {

@@ -8,6 +8,8 @@ fn main() {
     );
     compile("depth_pack", &[("main", naga::ShaderStage::Compute)]);
     compile("max_clocks", &[("main", naga::ShaderStage::Compute)]);
+    compile("astc_decode", &[("main", naga::ShaderStage::Compute)]);
+    compile("bc_encode", &[("main", naga::ShaderStage::Compute)]);
 }
 
 fn compile(shader: &str, entries: &[(&str, naga::ShaderStage)]) {
