@@ -849,7 +849,7 @@ struct CpuEnvMemo {
 }
 
 fn cpu_env_memo_enabled_value(value: Option<&str>) -> bool {
-    value == Some("1")
+    value != Some("0")
 }
 
 fn cpu_env_memo() -> Option<&'static CpuEnvMemo> {
@@ -1334,11 +1334,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn cpu_environment_memo_requires_exact_opt_in() {
-        for value in [None, Some(""), Some("0"), Some("true"), Some("false"), Some(" 1"), Some("1 ")] {
-            assert!(!cpu_env_memo_enabled_value(value), "{value:?}");
+    fn cpu_environment_memo_is_on_unless_disabled() {
+        for value in [None, Some(""), Some("1"), Some("true"), Some(" 0"), Some("0 ")] {
+            assert!(cpu_env_memo_enabled_value(value), "{value:?}");
         }
-        assert!(cpu_env_memo_enabled_value(Some("1")));
+        assert!(!cpu_env_memo_enabled_value(Some("0")));
     }
 
     #[test]

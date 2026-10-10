@@ -17212,7 +17212,7 @@ fn rt_pixel_limit(name: &str, default: u32, max: u32) -> u32 {
 fn render_env_present(name: &str, memo: &std::sync::OnceLock<bool>) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ENABLED.get_or_init(|| {
-        std::env::var("NEXIUM_RENDER_ENV_MEMO").is_ok_and(|value| value == "1")
+        !std::env::var("NEXIUM_RENDER_ENV_MEMO").is_ok_and(|value| value == "0")
     }) {
         *memo.get_or_init(|| std::env::var_os(name).is_some())
     } else {
