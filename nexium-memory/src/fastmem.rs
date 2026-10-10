@@ -478,7 +478,7 @@ fn soft_take_write_watch_observed(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CommittedRange {
     lo: u64,
     hi: u64,
@@ -601,7 +601,9 @@ pub fn committed_any(va: u64, len: usize) -> bool {
     let ranges = committed_ranges()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    ranges.iter().any(|range| range.lo < hi && lo < range.hi)
+    ranges
+        .get(ranges.partition_point(|range| range.hi <= lo))
+        .is_some_and(|range| range.lo < hi)
 }
 
 pub fn decommit(ptr: *mut u8, len: usize) {
@@ -896,75 +898,95 @@ fn committed_ranges() -> &'static Mutex<Vec<CommittedRange>> {
     COMMITTED_RANGES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn push_commit_segment(segments: &mut Vec<CommittedRange>, lo: u64, hi: u64, refs: u32) {
+    if hi <= lo || refs == 0 {
+        return;
+    }
+    if let Some(last) = segments.last_mut() {
+        if last.hi == lo && last.refs == refs {
+            last.hi = hi;
+            return;
+        }
+    }
+    segments.push(CommittedRange { lo, hi, refs });
+}
+
+fn note_released(released: &mut Vec<(u64, u64)>, lo: u64, hi: u64) {
+    if hi <= lo {
+        return;
+    }
+    if let Some((_, released_hi)) = released.last_mut() {
+        if *released_hi == lo {
+            *released_hi = hi;
+            return;
+        }
+    }
+    released.push((lo, hi));
+}
+
 fn update_commit_refs(
     ranges: &mut Vec<CommittedRange>,
     lo: u64,
     hi: u64,
     increment: bool,
 ) -> Vec<(u64, u64)> {
-    let mut boundaries = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(2));
-    boundaries.extend([lo, hi]);
-    for range in ranges.iter() {
-        boundaries.extend([range.lo, range.hi]);
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
-    let mut rebuilt: Vec<CommittedRange> = Vec::with_capacity(ranges.len().saturating_add(2));
     let mut released = Vec::new();
-    for segment in boundaries.windows(2) {
-        let segment_lo = segment[0];
-        let segment_hi = segment[1];
-        if segment_hi <= segment_lo {
-            continue;
-        }
-        let old_refs = ranges
-            .iter()
-            .find(|range| range.lo <= segment_lo && range.hi >= segment_hi)
-            .map_or(0, |range| range.refs);
-        let affected = segment_lo >= lo && segment_hi <= hi;
-        let new_refs = if affected {
-            if increment {
-                old_refs.saturating_add(1)
-            } else {
-                old_refs.saturating_sub(1)
-            }
-        } else {
-            old_refs
-        };
-        if old_refs != 0 && new_refs == 0 {
-            if let Some((_, released_hi)) = released.last_mut() {
-                if *released_hi == segment_lo {
-                    *released_hi = segment_hi;
-                } else {
-                    released.push((segment_lo, segment_hi));
-                }
-            } else {
-                released.push((segment_lo, segment_hi));
-            }
-        }
-        if new_refs == 0 {
-            continue;
-        }
-        if let Some(last) = rebuilt.last_mut() {
-            if last.hi == segment_lo && last.refs == new_refs {
-                last.hi = segment_hi;
-                continue;
-            }
-        }
-        rebuilt.push(CommittedRange {
-            lo: segment_lo,
-            hi: segment_hi,
-            refs: new_refs,
-        });
+    if hi <= lo {
+        return released;
     }
-    *ranges = rebuilt;
+    let adjust = |refs: u32| {
+        if increment {
+            refs.saturating_add(1)
+        } else {
+            refs.saturating_sub(1)
+        }
+    };
+    let start = ranges.partition_point(|range| range.hi <= lo);
+    let end = ranges.partition_point(|range| range.lo < hi);
+    let mut segments = Vec::with_capacity(end.saturating_sub(start).saturating_mul(2).saturating_add(3));
+    let mut cursor = lo;
+    for range in &ranges[start..end] {
+        if range.lo < lo {
+            push_commit_segment(&mut segments, range.lo, lo, range.refs);
+        }
+        let covered_lo = range.lo.max(lo);
+        let covered_hi = range.hi.min(hi);
+        push_commit_segment(&mut segments, cursor, covered_lo, adjust(0));
+        let refs = adjust(range.refs);
+        if refs == 0 {
+            note_released(&mut released, covered_lo, covered_hi);
+        }
+        push_commit_segment(&mut segments, covered_lo, covered_hi, refs);
+        if range.hi > hi {
+            push_commit_segment(&mut segments, hi, range.hi, range.refs);
+        }
+        cursor = covered_hi;
+    }
+    push_commit_segment(&mut segments, cursor, hi, adjust(0));
+    let mut splice_start = start;
+    let mut splice_end = end;
+    if let (Some(previous), Some(first)) = (
+        splice_start.checked_sub(1).map(|index| ranges[index]),
+        segments.first_mut(),
+    ) {
+        if previous.hi == first.lo && previous.refs == first.refs {
+            first.lo = previous.lo;
+            splice_start -= 1;
+        }
+    }
+    if let (Some(next), Some(last)) = (ranges.get(splice_end).copied(), segments.last_mut()) {
+        if last.hi == next.lo && last.refs == next.refs {
+            last.hi = next.hi;
+            splice_end += 1;
+        }
+    }
+    ranges.splice(splice_start..splice_end, segments);
     released
 }
 
 fn is_committed(ranges: &[CommittedRange], lo: u64, hi: u64) -> bool {
     let mut cursor = lo;
-    for range in ranges {
+    for range in &ranges[ranges.partition_point(|range| range.hi <= lo)..] {
         if range.hi <= cursor {
             continue;
         }
@@ -1098,6 +1120,96 @@ pub fn watch_write_through(addr: u64, size: usize, value: u64) -> bool {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    fn reference_update_commit_refs(
+        ranges: &mut Vec<CommittedRange>,
+        lo: u64,
+        hi: u64,
+        increment: bool,
+    ) -> Vec<(u64, u64)> {
+        let mut boundaries: Vec<u64> = ranges.iter().flat_map(|range| [range.lo, range.hi]).collect();
+        boundaries.extend([lo, hi]);
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut rebuilt: Vec<CommittedRange> = Vec::new();
+        let mut released = Vec::new();
+        for segment in boundaries.windows(2) {
+            let (segment_lo, segment_hi) = (segment[0], segment[1]);
+            let old_refs = ranges
+                .iter()
+                .find(|range| range.lo <= segment_lo && range.hi >= segment_hi)
+                .map_or(0, |range| range.refs);
+            let new_refs = if segment_lo >= lo && segment_hi <= hi {
+                if increment {
+                    old_refs.saturating_add(1)
+                } else {
+                    old_refs.saturating_sub(1)
+                }
+            } else {
+                old_refs
+            };
+            if old_refs != 0 && new_refs == 0 {
+                note_released(&mut released, segment_lo, segment_hi);
+            }
+            push_commit_segment(&mut rebuilt, segment_lo, segment_hi, new_refs);
+        }
+        *ranges = rebuilt;
+        released
+    }
+
+    fn reference_is_committed(ranges: &[CommittedRange], lo: u64, hi: u64) -> bool {
+        let mut cursor = lo;
+        for range in ranges {
+            if range.hi <= cursor {
+                continue;
+            }
+            if range.lo > cursor {
+                return false;
+            }
+            cursor = cursor.max(range.hi);
+            if cursor >= hi {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn commit_refs_match_the_reference_merge() {
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..40 {
+            let mut fast = Vec::new();
+            let mut reference = Vec::new();
+            for _ in 0..400 {
+                let lo = next() % 96;
+                let hi = lo + next() % 24;
+                let increment = next() % 3 != 0;
+                let fast_released = update_commit_refs(&mut fast, lo, hi, increment);
+                let reference_released = reference_update_commit_refs(&mut reference, lo, hi, increment);
+                assert_eq!(fast, reference, "lo={lo} hi={hi} increment={increment}");
+                assert_eq!(fast_released, reference_released, "lo={lo} hi={hi} increment={increment}");
+                let query_lo = next() % 100;
+                let query_hi = query_lo + next() % 16;
+                assert_eq!(
+                    is_committed(&fast, query_lo, query_hi),
+                    reference_is_committed(&reference, query_lo, query_hi),
+                    "query {query_lo}..{query_hi}"
+                );
+                assert_eq!(
+                    fast.get(fast.partition_point(|range| range.hi <= query_lo))
+                        .is_some_and(|range| range.lo < query_hi),
+                    reference.iter().any(|range| range.lo < query_hi && query_lo < range.hi),
+                    "any {query_lo}..{query_hi}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn write_watch_detects_direct_fastmem_stores_and_resets_atomically() {
