@@ -1840,6 +1840,16 @@ fn compute_overlay_enabled() -> bool {
     })
 }
 
+fn compute_storage_alias_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_COMPUTE_STORAGE_ALIAS").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
 fn compute_overlays_for_range(
     spans: &[super::engines::maxwell_compute::PendingComputeWritebackSpan],
     lo: u64,
@@ -5206,6 +5216,33 @@ impl SsboSnapshotCache {
             self.mirror.mark_dirty(base, size as usize);
         }
         (true, Vec::new())
+    }
+
+    fn compute_alias_for_range(
+        &self,
+        cpu_addr: u64,
+        len: u64,
+    ) -> Option<nexium_gpu::draw::ComputeOverlay> {
+        const MAX_STORAGE_OFFSET_ALIGNMENT: u64 = 256;
+        if self.compute_pending_cpu_ranges.is_empty()
+            || !compute_overlay_enabled()
+            || !compute_storage_alias_enabled()
+            || self.compute_pending_revision
+                != super::engines::maxwell_compute::pending_writeback_revision()
+        {
+            return None;
+        }
+        let end = cpu_addr.checked_add(len)?;
+        match compute_overlays_for_range(&self.compute_pending_spans, cpu_addr, end)?[..] {
+            [overlay]
+                if overlay.dst_offset == 0
+                    && overlay.len == len
+                    && overlay.src_offset % MAX_STORAGE_OFFSET_ALIGNMENT == 0 =>
+            {
+                Some(overlay)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn set_compute_pending(
@@ -16646,6 +16683,7 @@ fn execute_one_inner(
         let mut guest_addr = 0u64;
         let mut logical_size = 16usize;
         let mut data_offset = 0usize;
+        let mut compute_alias = None;
         let stage = if usize::from(d.cbuf_binding) < FRAGMENT_CBUF_BASE {
             vs_cbuf_group
         } else if usize::from(d.cbuf_binding) < GEOMETRY_CBUF_BASE {
@@ -16738,6 +16776,18 @@ fn execute_one_inner(
                     None => (None, 0),
                 },
             };
+            compute_alias = (!writeback_full_payload
+                && !ssbo_writes.unknown
+                && ssbo_writes.mask == 0
+                && d.indirect.is_none())
+            .then(|| mappings.cpu_range_for(aligned))
+            .flatten()
+            .filter(|&(_, available)| available >= logical_size as u64)
+            .and_then(|(cpu, _)| {
+                ssbo_snapshot_cache.compute_alias_for_range(cpu, logical_size as u64)
+            });
+            let _compute_alias_bypass =
+                compute_alias.is_some().then(super::prep::compute_barrier_bypass);
             if let Some(buf_cpu) = buf_cpu {
                 let read_size = window_size
                     .min(remaining as usize)
@@ -16879,6 +16929,7 @@ fn execute_one_inner(
             data_offset,
             readonly_noalias,
             data: bytes.unwrap_or_else(empty_storage_buffer_data),
+            compute_alias: compute_alias.filter(|_| resident.is_none()),
             resident,
         });
         ssbo_meta.push((dbg_base, dbg_slack, dbg_readok));

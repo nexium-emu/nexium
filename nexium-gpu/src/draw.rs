@@ -170,6 +170,7 @@ pub struct StorageBufferSnapshot {
     pub data: std::sync::Arc<Vec<u8>>,
     pub readonly_noalias: bool,
     pub resident: Option<GraphicsStorageResidentRef>,
+    pub compute_alias: Option<ComputeOverlay>,
 }
 
 #[derive(Clone, Debug)]
@@ -932,6 +933,7 @@ mod tests {
             data: std::sync::Arc::new(vec![1, 2, 3, 4]),
             readonly_noalias: false,
             resident: None,
+            compute_alias: None,
         };
         let cloned = snapshot.clone();
 

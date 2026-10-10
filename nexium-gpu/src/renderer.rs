@@ -14800,6 +14800,23 @@ impl Renderer {
                         continue;
                     }
                     let idx = snapshot.binding;
+                    if let Some(info) = call
+                        .storage_readback
+                        .is_none()
+                        .then(|| {
+                            compute_alias_storage_info(
+                                compute_overlay_sources,
+                                snapshot,
+                                cbuf_alignment,
+                            )
+                        })
+                        .flatten()
+                    {
+                        ssbo_infos.push(info);
+                        ssbo_bindings.push(idx);
+                        ssbo_provided[idx as usize] = true;
+                        continue;
+                    }
                     if let Some(resident) = snapshot
                         .resident
                         .as_ref()
@@ -17902,6 +17919,60 @@ fn collect_compute_overlay_copies(
         }
     }
     copies
+}
+
+fn compute_alias_storage_info(
+    sources: &HashMap<u64, Vec<(u32, vk::Buffer)>>,
+    snapshot: &crate::draw::StorageBufferSnapshot,
+    alignment: u64,
+) -> Option<vk::DescriptorBufferInfo> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BINDS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    let alias = snapshot.compute_alias?;
+    let range = snapshot.logical_size as u64;
+    let source = sources.get(&alias.serial).and_then(|entries| {
+        entries
+            .iter()
+            .find(|(index, _)| *index == alias.resource_index)
+            .map(|(_, buffer)| *buffer)
+    });
+    match source {
+        Some(buffer)
+            if alias.dst_offset == 0
+                && alias.len >= range
+                && alias.src_offset % alignment.max(1) == 0 =>
+        {
+            let binds = BINDS.fetch_add(1, Ordering::Relaxed) + 1;
+            if binds % 65536 == 1 {
+                log::info!(
+                    "[compute-alias] storage binds={} misses={}",
+                    binds,
+                    MISSES.load(Ordering::Relaxed)
+                );
+            }
+            Some(vk::DescriptorBufferInfo {
+                buffer,
+                offset: alias.src_offset,
+                range,
+            })
+        }
+        _ => {
+            let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+            if misses <= 8 || misses % 1024 == 0 {
+                log::warn!(
+                    "[compute-alias] storage source unusable serial={} resource={} binding={} offset={:#x} found={} misses={}",
+                    alias.serial,
+                    alias.resource_index,
+                    snapshot.binding,
+                    alias.src_offset,
+                    source.is_some(),
+                    misses
+                );
+            }
+            None
+        }
+    }
 }
 
 fn record_compute_overlay_copies(
@@ -21873,7 +21944,9 @@ fn execute_compute_dispatch(
             after_buffer_barriers.push(vk::BufferMemoryBarrier {
                 s_type: vk::StructureType::BUFFER_MEMORY_BARRIER,
                 src_access_mask: vk::AccessFlags::SHADER_WRITE,
-                dst_access_mask: vk::AccessFlags::HOST_READ,
+                dst_access_mask: vk::AccessFlags::HOST_READ
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 buffer: resource.buffer,
@@ -36084,6 +36157,7 @@ mod tests {
             data: std::sync::Arc::new(data.to_vec()),
             readonly_noalias: false,
             resident: None,
+            compute_alias: None,
         }
     }
 
@@ -36100,6 +36174,7 @@ mod tests {
             data,
             readonly_noalias: false,
             resident: None,
+            compute_alias: None,
         }
     }
 
