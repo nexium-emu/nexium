@@ -855,6 +855,21 @@ impl AddressSpace {
             .collect()
     }
 
+    pub fn regions_near(&self, va: u64) -> Vec<RegionInfo> {
+        let regs = self.regions.lock();
+        let next = regs.partition_point(|r| r.base <= va);
+        let info = |r: &Arc<Region>| RegionInfo {
+            base: r.base,
+            size: r.len as u64,
+            perm: r.perm(),
+            name: r.name.clone(),
+        };
+        match next.checked_sub(1).map(|index| &regs[index]) {
+            Some(region) if va < region.end() => vec![info(region)],
+            previous => previous.into_iter().chain(regs.get(next)).map(info).collect(),
+        }
+    }
+
     pub fn host_regions(&self) -> Vec<HostRegion> {
         let regs = self.regions.lock();
         regs.iter()
@@ -1461,6 +1476,22 @@ mod tests {
             err,
             AddressSpaceError::Unaligned { what: "len", .. }
         ));
+    }
+
+    #[test]
+    fn regions_near_returns_the_containing_region_or_the_gap_neighbours() {
+        let a = fresh();
+        let low = 0x6a00_0000;
+        let high = low + PAGE_SIZE * 8;
+        a.map(low, PAGE_SIZE * 2, Perm::RW, "heap").unwrap();
+        a.map(high, PAGE_SIZE, Perm::R, "codestatic").unwrap();
+        let bases = |va| a.regions_near(va).iter().map(|r| r.base).collect::<Vec<_>>();
+        assert_eq!(bases(low + PAGE_SIZE), vec![low]);
+        assert_eq!(bases(high), vec![high]);
+        assert_eq!(bases(low + PAGE_SIZE * 4), vec![low, high]);
+        assert_eq!(bases(low - 1), vec![low]);
+        assert_eq!(bases(high + PAGE_SIZE), vec![high]);
+        assert_eq!(a.regions_near(low)[0].name, "heap");
     }
 
     #[test]

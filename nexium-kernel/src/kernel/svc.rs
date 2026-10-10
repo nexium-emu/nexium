@@ -3586,7 +3586,11 @@ struct SynthMemInfo {
 }
 
 fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
-    let info = memory_info_for_regions(&kernel.address_space.regions(), address, kernel.address_space_end);
+    let info = memory_info_for_regions(
+        &kernel.address_space.regions_near(address),
+        address,
+        kernel.address_space_end,
+    );
     if !kernel.is_application {
         return info;
     }
