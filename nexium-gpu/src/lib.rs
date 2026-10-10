@@ -8,6 +8,7 @@ mod depth;
 pub mod descriptor;
 pub mod deswizzle;
 pub mod draw;
+pub mod gpu_health;
 mod max_clocks;
 pub mod pipeline;
 pub mod presentation;

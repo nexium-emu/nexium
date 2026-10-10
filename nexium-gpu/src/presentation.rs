@@ -1860,6 +1860,7 @@ pub(crate) fn barrier(
 }
 
 fn err(error: vk::Result) -> String {
+    crate::gpu_health::note_result("presentation", error);
     format!("Vulkan presentation: {error:?}")
 }
 

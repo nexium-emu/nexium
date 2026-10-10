@@ -5746,6 +5746,36 @@ impl Renderer {
 
         let mut enabled_ext_names: Vec<*const std::os::raw::c_char> = Vec::new();
         let mut present_features = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+        let mut fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default();
+        let device_extension_present = |name: &std::ffi::CStr| {
+            device_extensions.iter().any(|extension| unsafe {
+                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == name
+            })
+        };
+        let memory_budget_supported = device_extension_present(vk::EXT_MEMORY_BUDGET_NAME);
+        let mut device_fault_supported = device_extension_present(vk::EXT_DEVICE_FAULT_NAME);
+        if device_fault_supported {
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut fault_features);
+            unsafe {
+                instance.get_physical_device_features2(physical_device, &mut features);
+            }
+            device_fault_supported = fault_features.device_fault == vk::TRUE;
+        }
+        if memory_budget_supported {
+            enabled_ext_names.push(vk::EXT_MEMORY_BUDGET_NAME.as_ptr());
+        }
+        if device_fault_supported {
+            enabled_ext_names.push(vk::EXT_DEVICE_FAULT_NAME.as_ptr());
+            fault_features = vk::PhysicalDeviceFaultFeaturesEXT {
+                device_fault: vk::TRUE,
+                ..Default::default()
+            };
+        }
+        log::info!(
+            "[vulkan-init] memory budget reporting {} device fault reporting {}",
+            if memory_budget_supported { "enabled" } else { "unavailable" },
+            if device_fault_supported { "enabled" } else { "unavailable" }
+        );
         if presentation_target.is_some() {
             let has_extension = |name| {
                 device_extensions.iter().any(|extension| unsafe {
@@ -5814,6 +5844,10 @@ impl Renderer {
         if present_fences_supported {
             present_features.p_next = p_next_chain;
             p_next_chain = &mut present_features as *mut _ as *mut std::ffi::c_void;
+        }
+        if device_fault_supported {
+            fault_features.p_next = p_next_chain;
+            p_next_chain = &mut fault_features as *mut _ as *mut std::ffi::c_void;
         }
         let core_features = unsafe { instance.get_physical_device_features(physical_device) };
         let depth_clamp_supported = core_features.depth_clamp == vk::TRUE;
@@ -5923,6 +5957,13 @@ impl Renderer {
                 .create_device(physical_device, &dev_info, None)
                 .map_err(|e| format!("create_device: {:?}", e))?
         };
+        crate::gpu_health::install(
+            &instance,
+            physical_device,
+            &device,
+            memory_budget_supported,
+            device_fault_supported,
+        );
         init_stage("logical device created; obtaining queue");
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         init_stage("queue obtained; querying memory properties");
@@ -10048,6 +10089,7 @@ impl Renderer {
             rt_retirement
         };
         trace_gpu_memory(rt_cache, tex_cache.len(), *tex_cache_bytes, frame_slots, rt_retirement);
+        crate::gpu_health::log_memory_budget_periodically(monotonic_nanos());
         let texture_use_generation = submit_state.generation.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(cache) = aurora_resident_ssbos.as_mut() {
             cache.complete_frame_slot(cur_idx);
@@ -12139,6 +12181,7 @@ impl Renderer {
             rt_retirement
         };
         trace_gpu_memory(rt_cache, tex_cache.len(), *tex_cache_bytes, frame_slots, rt_retirement);
+        crate::gpu_health::log_memory_budget_periodically(monotonic_nanos());
         let texture_use_generation = submit_state.generation.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(cache) = aurora_resident_ssbos.as_mut() {
             cache.complete_frame_slot(cur_idx);
@@ -22597,7 +22640,10 @@ fn wait_fence_no_reset(device: &ash::Device, fence: vk::Fence) -> Result<(), Str
     unsafe {
         device
             .wait_for_fences(&[fence], true, 8_000_000_000)
-            .map_err(|e| format!("post-submit wait_for_fences: {:?}", e))
+            .map_err(|e| {
+                crate::gpu_health::note_result("wait_for_fences", e);
+                format!("post-submit wait_for_fences: {:?}", e)
+            })
     }
 }
 
@@ -31735,6 +31781,7 @@ fn queue_submit_tracked(
         _marker: std::marker::PhantomData,
     };
     if let Err(error) = unsafe { device.queue_submit(queue, &[submit], fence) } {
+        crate::gpu_health::note_result("queue_submit", error);
         return Err(format!("queue_submit(fence): {:?}", error));
     }
     crate::max_clocks::note_submission();
@@ -31804,9 +31851,15 @@ fn wait_fence(device: &ash::Device, fence: vk::Fence) -> Result<(), String> {
                 log::warn!("wait_fence: 2s timeout, extended wait");
                 device
                     .wait_for_fences(&[fence], true, 8_000_000_000)
-                    .map_err(|e| format!("wait_for_fences(hung 10s): {:?}", e))?;
+                    .map_err(|e| {
+                        crate::gpu_health::note_result("wait_for_fences", e);
+                        format!("wait_for_fences(hung 10s): {:?}", e)
+                    })?;
             }
-            Err(e) => return Err(format!("wait_for_fences: {:?}", e)),
+            Err(e) => {
+                crate::gpu_health::note_result("wait_for_fences", e);
+                return Err(format!("wait_for_fences: {:?}", e));
+            }
         }
         device
             .reset_fences(&[fence])
