@@ -359,6 +359,89 @@ impl FilterMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AstcDecodeMethod {
+    Gpu,
+    Cpu,
+    CpuAsynchronous,
+}
+
+impl Default for AstcDecodeMethod {
+    fn default() -> Self {
+        AstcDecodeMethod::Gpu
+    }
+}
+
+impl AstcDecodeMethod {
+    pub fn all() -> &'static [AstcDecodeMethod] {
+        &[
+            AstcDecodeMethod::Gpu,
+            AstcDecodeMethod::Cpu,
+            AstcDecodeMethod::CpuAsynchronous,
+        ]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            AstcDecodeMethod::Gpu => "GPU",
+            AstcDecodeMethod::Cpu => "CPU",
+            AstcDecodeMethod::CpuAsynchronous => "CPU Async",
+        }
+    }
+    pub fn mode(&self) -> nexium_common::astc::AstcDecodeMode {
+        use nexium_common::astc::AstcDecodeMode;
+        match self {
+            AstcDecodeMethod::Gpu => AstcDecodeMode::Gpu,
+            AstcDecodeMethod::Cpu => AstcDecodeMode::Cpu,
+            AstcDecodeMethod::CpuAsynchronous => AstcDecodeMode::CpuAsynchronous,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AstcRecompressionMethod {
+    Uncompressed,
+    Bc1,
+    Bc3,
+}
+
+impl Default for AstcRecompressionMethod {
+    fn default() -> Self {
+        AstcRecompressionMethod::Uncompressed
+    }
+}
+
+impl AstcRecompressionMethod {
+    pub fn all() -> &'static [AstcRecompressionMethod] {
+        &[
+            AstcRecompressionMethod::Uncompressed,
+            AstcRecompressionMethod::Bc1,
+            AstcRecompressionMethod::Bc3,
+        ]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            AstcRecompressionMethod::Uncompressed => "Uncompressed",
+            AstcRecompressionMethod::Bc1 => "BC1",
+            AstcRecompressionMethod::Bc3 => "BC3",
+        }
+    }
+    pub fn description(&self) -> &'static str {
+        match self {
+            AstcRecompressionMethod::Uncompressed => "Best quality, uses the most VRAM",
+            AstcRecompressionMethod::Bc1 => "Low quality, 1/8 of the VRAM, 1-bit alpha",
+            AstcRecompressionMethod::Bc3 => "Medium quality, 1/4 of the VRAM",
+        }
+    }
+    pub fn recompression(&self) -> nexium_common::astc::AstcRecompression {
+        use nexium_common::astc::AstcRecompression;
+        match self {
+            AstcRecompressionMethod::Uncompressed => AstcRecompression::Uncompressed,
+            AstcRecompressionMethod::Bc1 => AstcRecompression::Bc1,
+            AstcRecompressionMethod::Bc3 => AstcRecompression::Bc3,
+        }
+    }
+}
+
 fn default_output_scale() -> u8 {
     1
 }
@@ -570,6 +653,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub normal_gpu_accuracy: bool,
     #[serde(default)]
+    pub astc_decode: AstcDecodeMethod,
+    #[serde(default)]
+    pub astc_recompression: AstcRecompressionMethod,
+    #[serde(default = "default_sync_video_framerate")]
+    pub sync_video_framerate: bool,
+    #[serde(default)]
     pub library_folders: Vec<PathBuf>,
     #[serde(default)]
     pub view_mode: ViewMode,
@@ -644,6 +733,10 @@ fn default_emulated_device() -> bool {
 }
 
 fn default_fast_gpu_time() -> bool {
+    true
+}
+
+fn default_sync_video_framerate() -> bool {
     true
 }
 
@@ -874,6 +967,9 @@ impl Default for AppSettings {
             fast_gpu_time: default_fast_gpu_time(),
             force_max_clocks: false,
             normal_gpu_accuracy: false,
+            astc_decode: AstcDecodeMethod::default(),
+            astc_recompression: AstcRecompressionMethod::default(),
+            sync_video_framerate: default_sync_video_framerate(),
             library_folders: Vec::new(),
             view_mode: ViewMode::Carousel,
             carousel_theme: CarouselTheme::default(),
@@ -1084,6 +1180,52 @@ mod tests {
         assert!(!restored.fast_gpu_time);
         assert!(restored.force_max_clocks);
         assert!(restored.normal_gpu_accuracy);
+    }
+
+    #[test]
+    fn astc_settings_default_for_existing_configs_and_round_trip() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("astc_decode");
+        value.as_object_mut().unwrap().remove("astc_recompression");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.astc_decode, AstcDecodeMethod::Gpu);
+        assert_eq!(settings.astc_recompression, AstcRecompressionMethod::Uncompressed);
+        for decode in AstcDecodeMethod::all() {
+            for recompression in AstcRecompressionMethod::all() {
+                let settings = AppSettings {
+                    astc_decode: *decode,
+                    astc_recompression: *recompression,
+                    ..AppSettings::default()
+                };
+                let restored: AppSettings =
+                    serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+                assert_eq!(restored.astc_decode, *decode);
+                assert_eq!(restored.astc_recompression, *recompression);
+            }
+        }
+        let json = serde_json::to_value(AppSettings {
+            astc_decode: AstcDecodeMethod::CpuAsynchronous,
+            astc_recompression: AstcRecompressionMethod::Bc3,
+            ..AppSettings::default()
+        })
+        .unwrap();
+        assert_eq!(json["astc_decode"], "CpuAsynchronous");
+        assert_eq!(json["astc_recompression"], "Bc3");
+    }
+
+    #[test]
+    fn video_framerate_sync_defaults_on_for_existing_configs() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("sync_video_framerate");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(settings.sync_video_framerate);
+        let settings = AppSettings {
+            sync_video_framerate: false,
+            ..AppSettings::default()
+        };
+        let restored: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!restored.sync_video_framerate);
     }
 
     #[test]

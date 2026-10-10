@@ -1,5 +1,6 @@
 use crate::app_settings::{
-    AppSettings, AspectMode, CpuBackend, FilterMode, LogLevel, MotionRecenterButton,
+    AppSettings, AspectMode, AstcDecodeMethod, AstcRecompressionMethod, CpuBackend, FilterMode,
+    LogLevel, MotionRecenterButton,
 };
 use crate::audio::{
     current_stream_info, list_output_devices, push_test_tone, set_master_volume, AudioStreamInfo,
@@ -5324,7 +5325,7 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 12] = [
+            let rows: [(&str, String); 15] = [
                 ("GPU", self.app_settings.gpu_device_label()),
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
                 ("Output Scale", format!("{}x", scale)),
@@ -5343,6 +5344,12 @@ impl HorizonApp {
                     if self.app_settings.normal_gpu_accuracy { "Normal" } else { "High" }.to_string(),
                 ),
                 ("Depth Share", on(self.app_settings.depth_share)),
+                ("ASTC Decoding", self.app_settings.astc_decode.label().to_string()),
+                (
+                    "ASTC Recompression",
+                    self.app_settings.astc_recompression.label().to_string(),
+                ),
+                ("Sync Video Framerate", on(self.app_settings.sync_video_framerate)),
             ];
             let n = rows.len();
             if !self.prefs_focus {
@@ -5524,6 +5531,35 @@ impl HorizonApp {
                     11 => {
                         self.app_settings.depth_share = !self.app_settings.depth_share;
                         nexium_common::depth_share::set_enabled(self.app_settings.depth_share);
+                    }
+                    12 => {
+                        let all = crate::app_settings::AstcDecodeMethod::all();
+                        let idx = all
+                            .iter()
+                            .position(|x| *x == self.app_settings.astc_decode)
+                            .unwrap_or(0);
+                        self.app_settings.astc_decode =
+                            all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
+                        nexium_common::astc::set_decode_mode(self.app_settings.astc_decode.mode());
+                    }
+                    13 => {
+                        let all = crate::app_settings::AstcRecompressionMethod::all();
+                        let idx = all
+                            .iter()
+                            .position(|x| *x == self.app_settings.astc_recompression)
+                            .unwrap_or(0);
+                        self.app_settings.astc_recompression =
+                            all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
+                        nexium_common::astc::set_recompression(
+                            self.app_settings.astc_recompression.recompression(),
+                        );
+                    }
+                    14 => {
+                        self.app_settings.sync_video_framerate =
+                            !self.app_settings.sync_video_framerate;
+                        nexium_common::speed_limit::set_sync_to_video(
+                            self.app_settings.sync_video_framerate,
+                        );
                     }
                     _ => {}
                 }
@@ -12795,6 +12831,17 @@ fn graphics_settings_content(
         cfg.vsync = vsync;
         *save_needed = true;
     }
+    ui.add_space(6.0);
+    let mut sync_video_framerate = cfg.sync_video_framerate;
+    if ui
+        .checkbox(&mut sync_video_framerate, "Sync to framerate of video playback")
+        .changed()
+    {
+        cfg.sync_video_framerate = sync_video_framerate;
+        nexium_common::speed_limit::set_sync_to_video(sync_video_framerate);
+        *save_needed = true;
+    }
+    ui.label(egui::RichText::new("While the framerate is unlocked, cutscene videos still play at normal speed: the frame limiter comes back whenever the game is decoding video and lets go half a second after the video ends.").size(10.5).color(MUTED));
 
     ui.add_space(12.0);
     ui.label(
@@ -12825,6 +12872,42 @@ fn graphics_settings_content(
         *save_needed = true;
     }
     ui.label(egui::RichText::new("Copies the guest's main depth buffer with every frame and replays it into a depth attachment on the host device, so ReShade's Generic Depth and add-ons such as DLSS 5 Feed see real depth. Costs one extra readback per frame; leave off unless an overlay needs it.").size(10.5).color(MUTED));
+
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new("ASTC Textures (applies on next boot)")
+            .size(13.0)
+            .strong()
+            .color(TEXT),
+    );
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("Decoding method").size(11.0).color(TEXT));
+    ui.horizontal(|ui| {
+        for method in AstcDecodeMethod::all() {
+            if ui.radio(cfg.astc_decode == *method, method.label()).clicked() {
+                cfg.astc_decode = *method;
+                nexium_common::astc::set_decode_mode(method.mode());
+                *save_needed = true;
+            }
+        }
+    });
+    ui.label(egui::RichText::new("GPU decodes ASTC with a compute shader and is the fastest. CPU decodes on the render thread and can stutter when new textures load. CPU Async decodes on a background thread: no stutter, but textures can appear blank for a few frames while they load.").size(10.5).color(MUTED));
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("Recompression").size(11.0).color(TEXT));
+    ui.horizontal(|ui| {
+        for method in AstcRecompressionMethod::all() {
+            if ui
+                .radio(cfg.astc_recompression == *method, method.label())
+                .on_hover_text(method.description())
+                .clicked()
+            {
+                cfg.astc_recompression = *method;
+                nexium_common::astc::set_recompression(method.recompression());
+                *save_needed = true;
+            }
+        }
+    });
+    ui.label(egui::RichText::new(format!("{}. Re-encodes decoded ASTC textures as BC1 or BC3 so big games such as Tears of the Kingdom fit in less VRAM. BC1 keeps only on/off transparency; BC3 keeps full alpha.", cfg.astc_recompression.description())).size(10.5).color(MUTED));
 
     ui.add_space(12.0);
     ui.label(

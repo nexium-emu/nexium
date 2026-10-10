@@ -163,6 +163,9 @@ fn main() -> Result<(), eframe::Error> {
     nexium_common::fast_gpu_time::set_enabled(settings.fast_gpu_time);
     nexium_common::force_max_clocks::set_enabled(settings.force_max_clocks);
     nexium_common::gpu_accuracy::set_normal(settings.normal_gpu_accuracy);
+    nexium_common::astc::set_decode_mode(settings.astc_decode.mode());
+    nexium_common::astc::set_recompression(settings.astc_recompression.recompression());
+    nexium_common::speed_limit::set_sync_to_video(settings.sync_video_framerate);
     nexium_common::depth_share::set_enabled(
         std::env::var("NEXIUM_DEPTH_SHARE").map_or(settings.depth_share, |v| v != "0"),
     );
