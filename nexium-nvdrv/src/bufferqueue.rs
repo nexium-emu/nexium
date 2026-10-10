@@ -101,7 +101,7 @@ impl BufferQueue {
         now: std::time::Instant,
         swap_interval: i32,
     ) -> Option<std::time::Instant> {
-        self.schedule_swap_with_limit(now, swap_interval, nexium_common::speed_limit::enabled())
+        self.schedule_swap_with_limit(now, swap_interval, nexium_common::speed_limit::pacing())
     }
 
     fn schedule_swap_with_limit(

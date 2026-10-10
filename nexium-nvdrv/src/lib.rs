@@ -470,7 +470,7 @@ impl FrameQueueState {
             .front()
             .and_then(|frame| frame.present_at)
             .is_none_or(|deadline| deadline <= now);
-        let frame = (is_due || !nexium_common::speed_limit::enabled())
+        let frame = (is_due || !nexium_common::speed_limit::pacing())
             .then(|| frames.pending.pop_front()).flatten();
         let resumed = frame.is_some() && self.presenter_stalled.swap(false, Ordering::AcqRel);
         drop(frames);
@@ -494,7 +494,7 @@ impl FrameQueueState {
             };
             let now = std::time::Instant::now();
             if let Some(deadline) = front.present_at
-                .filter(|deadline| nexium_common::speed_limit::enabled() && *deadline > now)
+                .filter(|deadline| nexium_common::speed_limit::pacing() && *deadline > now)
             {
                 self.frame_available
                     .wait_for(&mut frames, (deadline - now).min(STOP_POLL));
@@ -2462,7 +2462,7 @@ impl Nvdrv {
     }
 
     pub fn pace_swap(&self, swap_interval: i32) {
-        if !nexium_common::speed_limit::enabled() || swap_interval <= 0 {
+        if !nexium_common::speed_limit::pacing() || swap_interval <= 0 {
             *self.last_swap_return.lock() = None;
             return;
         }
@@ -3206,6 +3206,7 @@ impl Nvdrv {
         const SURFACE_LUMA_BASE_METHOD: usize = 0x10c;
         const MAX_BITSTREAM_SIZE: usize = 32 * 1024 * 1024;
 
+        nexium_common::speed_limit::note_video_frame();
         match registers[CODEC_METHOD] {
             3 => {}
             9 => {
