@@ -1127,9 +1127,28 @@ fn configure_dynarmic_fast_paths() {
         let configured = std::env::var_os(DYNARMIC_FAST_PATHS_ENV);
         if let Some(value) = dynarmic_fast_paths_default(configured.as_deref()) {
             std::env::set_var(DYNARMIC_FAST_PATHS_ENV, value);
+            set_c_runtime_env(DYNARMIC_FAST_PATHS_ENV, value);
         }
     });
 }
+
+#[cfg(windows)]
+fn set_c_runtime_env(name: &str, value: &str) {
+    extern "C" {
+        fn _putenv_s(name: *const std::ffi::c_char, value: *const std::ffi::c_char) -> i32;
+    }
+    let (Ok(c_name), Ok(c_value)) = (std::ffi::CString::new(name), std::ffi::CString::new(value))
+    else {
+        return;
+    };
+    let status = unsafe { _putenv_s(c_name.as_ptr(), c_value.as_ptr()) };
+    if status != 0 {
+        log::warn!("dynarmic: could not set {} for the C runtime (status {})", name, status);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_c_runtime_env(_name: &str, _value: &str) {}
 
 fn dynarmic_fast_paths_default(value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
     value.is_none().then_some("1")
