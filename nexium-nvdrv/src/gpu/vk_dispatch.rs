@@ -2873,9 +2873,13 @@ impl SsboSnapshotCache {
         len: usize,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> Option<Arc<Vec<u8>>> {
-        let mut data = vec![0u8; len];
-        if !mem_read(cpu_addr, &mut data) {
+        let mut data = Vec::<u8>::with_capacity(len);
+        let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr(), len) };
+        if !mem_read(cpu_addr, bytes) {
             return None;
+        }
+        unsafe {
+            data.set_len(len);
         }
         self.bytes_read = self.bytes_read.saturating_add(data.len());
         Some(Arc::new(data))
