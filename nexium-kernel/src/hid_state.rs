@@ -249,34 +249,74 @@ fn selected_auxiliary_input(
     }
 }
 
+struct InjectedInputCache {
+    checked: std::time::Instant,
+    text: String,
+    input: Option<ControllerInput>,
+    status: &'static str,
+    hold: Option<(std::time::Instant, std::time::Duration)>,
+}
+
+fn injected_hold(text: &str) -> Option<std::time::Duration> {
+    text.split_whitespace()
+        .find_map(|token| token.strip_prefix("ms="))
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+}
+
+fn held_input(
+    input: Option<ControllerInput>,
+    hold: Option<(std::time::Instant, std::time::Duration)>,
+    now: std::time::Instant,
+) -> Option<ControllerInput> {
+    match hold {
+        Some((started, duration)) if now.saturating_duration_since(started) >= duration => None,
+        _ => input,
+    }
+}
+
 fn injected_input() -> Option<ControllerInput> {
     use std::sync::{Mutex, OnceLock};
-    static STATE: OnceLock<Option<(std::path::PathBuf, Mutex<(std::time::Instant, Option<ControllerInput>, &'static str)>)>> = OnceLock::new();
+    static STATE: OnceLock<Option<(std::path::PathBuf, Mutex<InjectedInputCache>)>> = OnceLock::new();
     let (path, cache) = STATE
         .get_or_init(|| {
             std::env::var_os("NEXIUM_HID_INJECT").map(|value| {
                 let stale = std::time::Instant::now() - std::time::Duration::from_secs(1);
-                (std::path::PathBuf::from(value), Mutex::new((stale, None, "unread")))
+                (
+                    std::path::PathBuf::from(value),
+                    Mutex::new(InjectedInputCache {
+                        checked: stale,
+                        text: String::new(),
+                        input: None,
+                        status: "unread",
+                        hold: None,
+                    }),
+                )
             })
         })
         .as_ref()?;
     let mut cache = cache.lock().ok()?;
-    if cache.0.elapsed() >= std::time::Duration::from_millis(25) {
-        cache.0 = std::time::Instant::now();
-        let (input, status) = match std::fs::read_to_string(path) {
-            Ok(text) => match parse_injected_input(&text) {
-                Some(input) => (Some(input), "active"),
-                None => (None, "neutral-or-invalid"),
-            },
-            Err(_) => (None, "unreadable"),
+    if cache.checked.elapsed() >= std::time::Duration::from_millis(25) {
+        cache.checked = std::time::Instant::now();
+        let (text, input, status) = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let input = parse_injected_input(&text);
+                let status = if input.is_some() { "active" } else { "neutral-or-invalid" };
+                (text, input, status)
+            }
+            Err(_) => (String::new(), None, "unreadable"),
         };
-        if hid_trace_enabled() && (cache.1 != input || cache.2 != status) {
+        if text != cache.text {
+            cache.hold = injected_hold(&text).map(|duration| (std::time::Instant::now(), duration));
+            cache.text = text;
+        }
+        if hid_trace_enabled() && (cache.input != input || cache.status != status) {
             log::info!("[hid-inject] status={} input={:?} exclusive={}", status, input, exclusive_input_enabled());
         }
-        cache.1 = input;
-        cache.2 = status;
+        cache.input = input;
+        cache.status = status;
     }
-    cache.1
+    held_input(cache.input, cache.hold, std::time::Instant::now())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1563,6 +1603,21 @@ mod tests {
             assert_eq!(selected_controller_input(host, input, true), ControllerInput::default());
             assert_eq!(selected_controller_input(host, input, false), host);
         }
+    }
+
+    #[test]
+    fn injected_holds_end_after_their_duration() {
+        let text = "lx=1 ms=250 seq=3";
+        let input = parse_injected_input(text);
+        assert!(input.is_some_and(|input| input.stick_l_x == 32767));
+        let duration = injected_hold(text).unwrap();
+        assert_eq!(duration, std::time::Duration::from_millis(250));
+        let started = std::time::Instant::now();
+        let hold = Some((started, duration));
+        assert_eq!(held_input(input, hold, started + duration / 2), input);
+        assert_eq!(held_input(input, hold, started + duration), None);
+        assert_eq!(held_input(input, None, started + duration * 4), input);
+        assert_eq!(injected_hold("lx=1"), None);
     }
 
     #[test]
