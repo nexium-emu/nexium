@@ -2912,7 +2912,10 @@ impl Nvdrv {
             && self.channel_map_reuses_addresses(req);
         let maps_unused_range =
             device == NvDevice::NvhostAsGpu && cmd == 0x4106 && self.map_buffer_targets_unused_range(req);
-        !reuses_video_mappings && !maps_unused_range
+        let fenced_unmap = device == NvDevice::NvhostAsGpu
+            && cmd == 0x4105
+            && gpu::accuracy::normal_accuracy();
+        !reuses_video_mappings && !maps_unused_range && !fenced_unmap
     }
 
     pub fn ioctl_needs_drain(&self, req: &IoctlRequest) -> bool {
