@@ -1,5 +1,7 @@
 pub mod address_space;
 pub mod fastmem;
+#[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+pub mod linux_watch;
 pub mod perm;
 pub mod region;
 #[cfg(any(target_vendor = "sony", windows))]

@@ -192,8 +192,31 @@ mod sys {
         if p == libc::MAP_FAILED {
             (std::ptr::null_mut(), false)
         } else {
-            (p as *mut u8, false)
+            (p as *mut u8, watch_reserved(p as usize, size))
         }
+    }
+
+    /// Registers the whole reservation for write tracking. Registration costs
+    /// nothing per page: only pages a query has reset take a (kernel-resolved)
+    /// fault on their next write.
+    #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+    fn watch_reserved(start: usize, size: usize) -> bool {
+        let Some(watch) = crate::linux_watch::global() else {
+            return false;
+        };
+        if watch.register(start, size) {
+            return true;
+        }
+        log::warn!(
+            "fastmem: write-watch registration of the arena failed ({}); disabled",
+            std::io::Error::last_os_error()
+        );
+        false
+    }
+
+    #[cfg(not(all(target_os = "linux", not(target_vendor = "sony"))))]
+    fn watch_reserved(_start: usize, _size: usize) -> bool {
+        false
     }
 
     pub fn commit(ptr: *mut u8, len: usize) -> bool {
@@ -216,6 +239,20 @@ mod sys {
                 -1,
                 0,
             );
+        }
+        // The replacement mapping is not write-tracked. Until this succeeds a
+        // query of the range fails its registration check and reads as dirty.
+        #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+        if super::ARENA_WRITE_WATCH.load(std::sync::atomic::Ordering::Acquire) {
+            let registered = crate::linux_watch::global()
+                .is_some_and(|watch| watch.register(ptr as usize, len));
+            if !registered {
+                log::warn!(
+                    "fastmem: write-watch re-registration failed at {:p}+{:#x}; range will always read dirty",
+                    ptr,
+                    len
+                );
+            }
         }
     }
 }
@@ -401,7 +438,7 @@ fn soft_write_watch_available() -> bool {
     false
 }
 
-#[cfg(any(target_vendor = "sony", windows))]
+#[cfg(any(target_vendor = "sony", windows, target_os = "linux"))]
 fn record_observed_write_vas(pages: &[u64]) {
     if pages.is_empty() {
         return;
@@ -674,16 +711,139 @@ pub fn write_watch_query_range(va: u64, len: usize) -> Option<(u64, usize)> {
     Some((lo, usize::try_from(hi - lo).ok()?))
 }
 
+/// Page-aligned query range for the Linux backend, which also accepts VAs in
+/// the direct-mode window. Kept separate from `write_watch_query_range`:
+/// callers use that one to decide whether a VA may be read as an arena
+/// offset, which must not start succeeding for direct-mode host addresses.
+#[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+fn linux_watch_query_range(va: u64, len: usize) -> Option<(u64, usize)> {
+    const PAGE_MASK: u64 = 0xfff;
+    if len == 0 {
+        return None;
+    }
+    let lo = va & !PAGE_MASK;
+    let end = va.checked_add(len as u64)?;
+    let hi = end.checked_add(PAGE_MASK)? & !PAGE_MASK;
+    let (window_lo, window_hi) = va_window();
+    if hi <= lo || lo < window_lo || hi > window_hi {
+        return None;
+    }
+    Some((lo, usize::try_from(hi - lo).ok()?))
+}
+
+/// Query-and-reset over the arena for Linux. Holds the commit lock for the
+/// whole operation so a concurrent decommit cannot swap the mapping mid-scan,
+/// and publishes the reset pages to the observed-write log before releasing
+/// it, exactly like the Windows path.
+#[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+fn linux_take_write_watch(
+    va: u64,
+    len: usize,
+    spans: Option<&mut Vec<(u64, usize)>>,
+    observe: bool,
+) -> WriteWatchObservation {
+    if !ARENA_WRITE_WATCH.load(Ordering::Acquire) {
+        return WriteWatchObservation::unavailable();
+    }
+    let Some(watch) = crate::linux_watch::global() else {
+        return WriteWatchObservation::unavailable();
+    };
+    let Some((lo, query_len)) = linux_watch_query_range(va, len) else {
+        return WriteWatchObservation::unavailable();
+    };
+    let base = arena();
+    let Some(offset) = va_offset(lo) else {
+        return WriteWatchObservation::unavailable();
+    };
+    let offset_hi = offset + query_len as u64;
+    if base.is_null() || offset_hi > arena_size() {
+        return WriteWatchObservation::unavailable();
+    }
+    thread_local! {
+        static DIRTY_PAGES: std::cell::RefCell<Vec<u64>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+    let ranges = committed_ranges()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !is_committed(&ranges, offset, offset_hi) {
+        return WriteWatchObservation::unavailable();
+    }
+    let generation_before = if observe {
+        observed_write_snapshot_range(lo, query_len).1
+    } else {
+        0
+    };
+    let host_lo = base as usize + offset as usize;
+    let result = DIRTY_PAGES.with(|pages| {
+        let mut pages = pages.borrow_mut();
+        pages.clear();
+        let scan = watch.take(host_lo, query_len, |run_lo, run_hi| {
+            let mut page = lo + (run_lo - host_lo) as u64;
+            let end = lo + (run_hi - host_lo) as u64;
+            while page < end {
+                pages.push(page);
+                page += 4096;
+            }
+        });
+        if let Err(errno) = scan {
+            // Some pages may already have been reset without being reported.
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "fastmem: write-watch scan failed (errno {errno}) at va={lo:#x} len={query_len:#x}; treating range as dirty"
+                );
+            }
+            pages.clear();
+            pages.extend((0..query_len as u64 >> 12).map(|index| lo + index * 4096));
+        }
+        if pages.is_empty() {
+            return WriteWatchResult::Clean;
+        }
+        record_observed_write_vas(&pages);
+        if let Some(spans) = spans {
+            for &page_va in pages.iter() {
+                match spans.last_mut() {
+                    Some((last_va, last_len)) if *last_va + *last_len as u64 == page_va => {
+                        *last_len += 4096;
+                    }
+                    _ => spans.push((page_va, 4096)),
+                }
+            }
+        }
+        WriteWatchResult::Dirty
+    });
+    let (serial_after, generation_after) = if observe {
+        observed_write_snapshot_range(lo, query_len)
+    } else {
+        (0, 0)
+    };
+    drop(ranges);
+    WriteWatchObservation {
+        result,
+        serial_after,
+        generation_before,
+        generation_after,
+    }
+}
+
 pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
     #[cfg(target_vendor = "sony")]
     {
         return soft_take_write_watch(va, len, None);
     }
 
-    #[cfg(not(any(windows, target_vendor = "sony")))]
+    #[cfg(not(any(windows, target_vendor = "sony", target_os = "linux")))]
     {
         let _ = (va, len);
         return WriteWatchResult::Unavailable;
+    }
+
+    #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+    {
+        return linux_take_write_watch(va, len, None, false).result;
     }
 
     #[cfg(windows)]
@@ -745,10 +905,15 @@ pub fn take_write_watch_spans(
         return soft_take_write_watch(va, len, Some(spans));
     }
 
-    #[cfg(not(any(windows, target_vendor = "sony")))]
+    #[cfg(not(any(windows, target_vendor = "sony", target_os = "linux")))]
     {
         let _ = (va, len, spans);
         return WriteWatchResult::Unavailable;
+    }
+
+    #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+    {
+        return linux_take_write_watch(va, len, Some(spans), false).result;
     }
 
     #[cfg(windows)]
@@ -821,10 +986,15 @@ pub fn take_write_watch_spans_observed(
         return soft_take_write_watch_observed(va, len, spans);
     }
 
-    #[cfg(not(any(windows, target_vendor = "sony")))]
+    #[cfg(not(any(windows, target_vendor = "sony", target_os = "linux")))]
     {
         let _ = (va, len, spans);
         return WriteWatchObservation::unavailable();
+    }
+
+    #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+    {
+        return linux_take_write_watch(va, len, Some(spans), true);
     }
 
     #[cfg(windows)]
@@ -1117,9 +1287,31 @@ pub fn watch_write_through(addr: u64, size: usize, value: u64) -> bool {
     true
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, all(target_os = "linux", not(target_vendor = "sony")))))]
 mod tests {
     use super::*;
+
+    /// True when the arena is write-watched. A host that cannot provide it
+    /// fails the test loudly unless the skip was requested explicitly.
+    fn require_watch() -> bool {
+        let _ = arena();
+        if write_watch_available() {
+            return true;
+        }
+        if std::env::var_os("NEXIUM_TEST_ALLOW_NO_WRITE_WATCH").is_some() {
+            eprintln!("SKIPPED: fastmem write-watch unavailable on this host");
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if crate::linux_watch::disabled_by_env() {
+            eprintln!("SKIPPED: fastmem write-watch disabled by NEXIUM_NO_WRITE_WATCH");
+            return false;
+        }
+        panic!(
+            "fastmem write-watch unavailable on this host (see the fastmem/write-watch log line). \
+             Set NEXIUM_TEST_ALLOW_NO_WRITE_WATCH=1 to skip the tests that need it."
+        );
+    }
 
     fn reference_update_commit_refs(
         ranges: &mut Vec<CommittedRange>,
@@ -1215,6 +1407,9 @@ mod tests {
     fn write_watch_detects_direct_fastmem_stores_and_resets_atomically() {
         const VA: u64 = 0xf0_0000_0000;
         const LEN: usize = 0x2000;
+        if !require_watch() {
+            return;
+        }
         let ptr = commit(VA, LEN).expect("write-watched fastmem allocation");
 
         let _ = take_write_watch(VA, LEN);
@@ -1238,6 +1433,9 @@ mod tests {
     fn observed_span_take_brackets_scoped_generation() {
         const VA: u64 = 0xf3_0000_0000;
         const LEN: usize = 0x1_0000;
+        if !require_watch() {
+            return;
+        }
         let ptr = commit(VA, LEN).expect("write-watched fastmem allocation");
         let _ = take_write_watch(VA, LEN);
         unsafe { ptr.add(0x100).write_volatile(0x31) };
@@ -1289,6 +1487,9 @@ mod tests {
     fn overlapping_fastmem_leases_do_not_decommit_each_other() {
         const VA: u64 = 0xf1_0000_0000;
         const LEN: usize = 0x1000;
+        if !require_watch() {
+            return;
+        }
         let first = commit(VA, LEN).expect("first fastmem lease");
         let second = commit(VA, LEN).expect("overlapping fastmem lease");
         assert_eq!(first, second);
@@ -1300,5 +1501,356 @@ mod tests {
 
         decommit(second, LEN);
         assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+
+        fn spans_of(va: u64, len: usize) -> (WriteWatchResult, Vec<(u64, usize)>) {
+            let mut spans = Vec::new();
+            let result = take_write_watch_spans(va, len, &mut spans);
+            (result, spans)
+        }
+
+        #[test]
+        fn probe_reports_available_and_untouched_range_reads_clean() {
+            const VA: u64 = 0xe3_0000_0000;
+            const LEN: usize = 0x8000;
+            if !require_watch() {
+                return;
+            }
+            let ptr = commit(VA, LEN).expect("fastmem commit");
+            // Fresh pages have no tracking state yet: dirty, never clean.
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Dirty);
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
+            // Reads do not dirty.
+            assert_eq!(unsafe { ptr.add(0x3000).read_volatile() }, 0);
+            assert_eq!(spans_of(VA, LEN), (WriteWatchResult::Clean, vec![]));
+            decommit(ptr, LEN);
+        }
+
+        #[test]
+        fn write_dirties_exactly_the_containing_pages_and_take_resets() {
+            const VA: u64 = 0xe3_1000_0000;
+            const LEN: usize = 0x10_000;
+            if !require_watch() {
+                return;
+            }
+            let ptr = commit(VA, LEN).expect("fastmem commit");
+            let _ = take_write_watch(VA, LEN);
+            unsafe {
+                ptr.add(0x2ffc).cast::<u64>().write_unaligned(u64::MAX);
+                ptr.add(0x9000).write_volatile(1);
+                ptr.add(0xffff).write_volatile(1);
+            }
+            assert_eq!(
+                spans_of(VA, LEN),
+                (
+                    WriteWatchResult::Dirty,
+                    vec![(VA + 0x2000, 0x2000), (VA + 0x9000, 0x1000), (VA + 0xf000, 0x1000)]
+                )
+            );
+            assert_eq!(spans_of(VA, LEN), (WriteWatchResult::Clean, vec![]));
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
+            unsafe { ptr.add(0x9001).write_volatile(2) };
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Dirty);
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
+            decommit(ptr, LEN);
+        }
+
+        #[test]
+        fn unaligned_sub_range_queries_reset_only_their_own_pages() {
+            const VA: u64 = 0xe3_2000_0000;
+            const LEN: usize = 0x8000;
+            if !require_watch() {
+                return;
+            }
+            let ptr = commit(VA, LEN).expect("fastmem commit");
+            let _ = take_write_watch(VA, LEN);
+            unsafe {
+                ptr.add(0x1010).write_volatile(1);
+                ptr.add(0x5010).write_volatile(1);
+            }
+            // [0x1800, 0x2800) covers pages 1 and 2 only.
+            assert_eq!(
+                spans_of(VA + 0x1800, 0x1000),
+                (WriteWatchResult::Dirty, vec![(VA + 0x1000, 0x1000)])
+            );
+            assert_eq!(take_write_watch(VA + 0x1800, 0x1000), WriteWatchResult::Clean);
+            assert_eq!(take_write_watch(VA + 0x6000, 0x2000), WriteWatchResult::Clean);
+            // Page 5 is still pending for whoever asks about it; spans append.
+            let mut spans = vec![(1, 2)];
+            assert_eq!(take_write_watch_spans(VA, LEN, &mut spans), WriteWatchResult::Dirty);
+            assert_eq!(spans, vec![(1, 2), (VA + 0x5000, 0x1000)]);
+            assert_eq!(take_write_watch(VA, 0), WriteWatchResult::Unavailable);
+            decommit(ptr, LEN);
+        }
+
+        #[test]
+        fn writes_from_other_threads_are_seen_and_never_lost_under_contention() {
+            const VA: u64 = 0xe3_3000_0000;
+            const PAGES: usize = 64;
+            const LEN: usize = PAGES * 0x1000;
+            const ROUNDS: usize = 200;
+            if !require_watch() {
+                return;
+            }
+            let ptr = commit(VA, LEN).expect("fastmem commit");
+            let _ = take_write_watch(VA, LEN);
+            let addr = ptr as usize;
+            std::thread::spawn(move || unsafe { ((addr + 0x7123) as *mut u8).write_volatile(9) })
+                .join()
+                .unwrap();
+            assert_eq!(
+                spans_of(VA, LEN),
+                (WriteWatchResult::Dirty, vec![(VA + 0x7000, 0x1000)])
+            );
+
+            // Several writers each bump a per-page counter while this thread
+            // keeps taking. Every write must be covered by a later take: after
+            // the writers stop, the sum of what takes reported is the truth.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writers: Vec<_> = (0..4usize)
+                .map(|writer| {
+                    std::thread::spawn(move || {
+                        for round in 0..ROUNDS {
+                            for page in (writer..PAGES).step_by(4) {
+                                let slot = (addr + page * 0x1000 + 8) as *mut u32;
+                                unsafe { slot.write_volatile(round as u32 + 1) };
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let mut snapshot = vec![0u32; PAGES];
+            let refresh = |snapshot: &mut Vec<u32>| {
+                let (result, spans) = spans_of(VA, LEN);
+                assert_ne!(result, WriteWatchResult::Unavailable);
+                for (span_va, span_len) in spans {
+                    let first = ((span_va - VA) >> 12) as usize;
+                    for page in first..first + (span_len >> 12) {
+                        let slot = (addr + page * 0x1000 + 8) as *const u32;
+                        snapshot[page] = unsafe { slot.read_volatile() };
+                    }
+                }
+            };
+            while !stop.load(Ordering::Relaxed) {
+                refresh(&mut snapshot);
+                if writers.iter().all(|writer| writer.is_finished()) {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            refresh(&mut snapshot);
+            assert_eq!(snapshot, vec![ROUNDS as u32; PAGES]);
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
+            decommit(ptr, LEN);
+        }
+
+        #[test]
+        fn decommit_and_recommit_never_read_clean_without_a_fresh_baseline() {
+            const VA: u64 = 0xe3_4000_0000;
+            const LEN: usize = 0x4000;
+            if !require_watch() {
+                return;
+            }
+            let ptr = commit(VA, LEN).expect("fastmem commit");
+            unsafe { ptr.add(0x1000).write_volatile(0x77) };
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Dirty);
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
+            let generation = commit_generation();
+            decommit(ptr, LEN);
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
+            assert_ne!(commit_generation(), generation);
+
+            // The contents changed (zeroed) without a guest write: the first
+            // query after recommit must say dirty for every page.
+            let again = commit(VA, LEN).expect("fastmem recommit");
+            assert_eq!(again, ptr);
+            assert_eq!(unsafe { again.add(0x1000).read_volatile() }, 0);
+            assert_eq!(spans_of(VA, LEN), (WriteWatchResult::Dirty, vec![(VA, LEN)]));
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
+            unsafe { again.add(0x3fff).write_volatile(1) };
+            assert_eq!(
+                spans_of(VA, LEN),
+                (WriteWatchResult::Dirty, vec![(VA + 0x3000, 0x1000)])
+            );
+            decommit(again, LEN);
+        }
+
+        #[test]
+        fn partial_decommit_keeps_tracking_the_live_part_and_regrowth_reads_dirty() {
+            const VA: u64 = 0xe3_5000_0000;
+            const LEN: usize = 0x6000;
+            if !require_watch() {
+                return;
+            }
+            let ptr = commit(VA, LEN).expect("fastmem commit");
+            let _ = take_write_watch(VA, LEN);
+            unsafe { ptr.add(0x1000).write_volatile(1) };
+            // Shrink: drop the top four pages (what resize_committed does).
+            decommit(unsafe { ptr.add(0x2000) }, 0x4000);
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
+            assert_eq!(
+                spans_of(VA, 0x2000),
+                (WriteWatchResult::Dirty, vec![(VA + 0x1000, 0x1000)])
+            );
+            assert_eq!(take_write_watch(VA, 0x2000), WriteWatchResult::Clean);
+            // Regrow: the new pages are dirty, the surviving ones stay clean.
+            commit(VA + 0x2000, 0x4000).expect("fastmem regrow");
+            assert_eq!(
+                spans_of(VA, LEN),
+                (WriteWatchResult::Dirty, vec![(VA + 0x2000, 0x4000)])
+            );
+            unsafe { ptr.add(0x5000).write_volatile(1) };
+            assert_eq!(
+                spans_of(VA, LEN),
+                (WriteWatchResult::Dirty, vec![(VA + 0x5000, 0x1000)])
+            );
+            decommit(ptr, LEN);
+        }
+
+        #[test]
+        fn uncommitted_and_out_of_arena_ranges_are_unavailable() {
+            if !require_watch() {
+                return;
+            }
+            assert_eq!(take_write_watch(0xe3_6000_0000, 0x1000), WriteWatchResult::Unavailable);
+            assert_eq!(take_write_watch(arena_size(), 0x1000), WriteWatchResult::Unavailable);
+            assert_eq!(take_write_watch(u64::MAX - 0x10, 0x1000), WriteWatchResult::Unavailable);
+            let mut spans = Vec::new();
+            let observation = take_write_watch_spans_observed(0xe3_6000_0000, 0x1000, &mut spans);
+            assert_eq!(observation.result, WriteWatchResult::Unavailable);
+            assert!(spans.is_empty());
+        }
+
+        /// Per-query cost on this host. Run with
+        /// `cargo test -p nexium-memory -- --ignored --nocapture query_cost`.
+        #[test]
+        #[ignore]
+        fn query_cost() {
+            const VA: u64 = 0xe3_8000_0000;
+            if !require_watch() {
+                return;
+            }
+            for len in [0x1000usize, 0x1_0000, 0x10_0000, 0x100_0000, 0x1000_0000] {
+                let ptr = commit(VA, len).expect("fastmem commit");
+                unsafe { std::ptr::write_bytes(ptr, 1, len) };
+                let _ = take_write_watch(VA, len);
+                let rounds = (0x4000_0000 / len).clamp(16, 20_000);
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    assert_eq!(take_write_watch(VA, len), WriteWatchResult::Clean);
+                }
+                let clean = start.elapsed() / rounds as u32;
+                let mut spans = Vec::new();
+                let start = std::time::Instant::now();
+                for round in 0..rounds {
+                    unsafe { ptr.add((round * 0x1000) % len).write_volatile(2) };
+                    spans.clear();
+                    assert_eq!(take_write_watch_spans(VA, len, &mut spans), WriteWatchResult::Dirty);
+                }
+                let one_dirty = start.elapsed() / rounds as u32;
+                let rounds = rounds.min(64);
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    unsafe { std::ptr::write_bytes(ptr, 3, len) };
+                }
+                let fill = start.elapsed() / rounds as u32;
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    unsafe { std::ptr::write_bytes(ptr, 3, len) };
+                    spans.clear();
+                    assert_eq!(take_write_watch_spans(VA, len, &mut spans), WriteWatchResult::Dirty);
+                }
+                let all_dirty = (start.elapsed() / rounds as u32).saturating_sub(fill);
+                eprintln!(
+                    "len {len:#10x}: clean {clean:?}, one page dirty {one_dirty:?}, \
+                     all dirty {all_dirty:?} (+ refault cost inside a {fill:?} fill)"
+                );
+                decommit(ptr, len);
+            }
+        }
+
+        fn run_self_in_child(test: &str, marker: &str, envs: &[(&str, &str)]) {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", test, "--nocapture", "--test-threads=1"]).env(marker, "1");
+            for (key, value) in envs {
+                command.env(key, value);
+            }
+            let output = command.output().expect("spawn test child");
+            assert!(
+                output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// The arena is process-global, so the disabled configuration runs in
+        /// a child process: it must behave exactly as Linux did before the
+        /// backend existed.
+        #[test]
+        fn fallback_without_backend_is_unavailable_everywhere() {
+            const MARKER: &str = "NEXIUM_TEST_FALLBACK_CHILD";
+            const VA: u64 = 0xe3_7000_0000;
+            const LEN: usize = 0x2000;
+            if std::env::var_os(MARKER).is_none() {
+                run_self_in_child(
+                    "fastmem::tests::linux::fallback_without_backend_is_unavailable_everywhere",
+                    MARKER,
+                    &[("NEXIUM_NO_WRITE_WATCH", "1")],
+                );
+                return;
+            }
+            let ptr = commit(VA, LEN).expect("fastmem commit without write-watch");
+            assert!(!write_watch_available());
+            unsafe { ptr.write_volatile(1) };
+            assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
+            let mut spans = Vec::new();
+            assert_eq!(take_write_watch_spans(VA, LEN, &mut spans), WriteWatchResult::Unavailable);
+            let observation = take_write_watch_spans_observed(VA, LEN, &mut spans);
+            assert_eq!(observation.result, WriteWatchResult::Unavailable);
+            assert!(spans.is_empty());
+            decommit(ptr, LEN);
+            let again = commit(VA, LEN).expect("recommit without write-watch");
+            assert_eq!(unsafe { again.read_volatile() }, 0);
+            decommit(again, LEN);
+        }
+
+        /// Direct (NCE) mode addresses the arena by host address. Runs in a
+        /// child because the mode is latched per process.
+        #[test]
+        fn direct_mode_queries_use_host_addresses() {
+            const MARKER: &str = "NEXIUM_TEST_DIRECT_CHILD";
+            const LEN: usize = 0x4000;
+            if std::env::var_os(MARKER).is_none() {
+                if !require_watch() {
+                    return;
+                }
+                run_self_in_child(
+                    "fastmem::tests::linux::direct_mode_queries_use_host_addresses",
+                    MARKER,
+                    &[("NEXIUM_NCE", "1")],
+                );
+                return;
+            }
+            let (window_lo, _) = direct_va_range().expect("direct mode");
+            let va = window_lo + 0x3_0000_0000;
+            let ptr = commit(va, LEN).expect("fastmem commit");
+            assert_eq!(ptr as u64, va);
+            assert!(write_watch_available());
+            assert_eq!(take_write_watch(va, LEN), WriteWatchResult::Dirty);
+            assert_eq!(take_write_watch(va, LEN), WriteWatchResult::Clean);
+            unsafe { ptr.add(0x2000).write_volatile(1) };
+            assert_eq!(spans_of(va, LEN), (WriteWatchResult::Dirty, vec![(va + 0x2000, 0x1000)]));
+            assert_eq!(observed_write_pages_changed_since(va, LEN, 0), 4);
+            assert_eq!(take_write_watch(0x3_0000_0000, LEN), WriteWatchResult::Unavailable);
+            decommit(ptr, LEN);
+            assert_eq!(take_write_watch(va, LEN), WriteWatchResult::Unavailable);
+        }
     }
 }
