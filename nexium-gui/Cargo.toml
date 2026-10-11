@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 build = "build.rs"
+default-run = "nexium"
 
 [build-dependencies]
 winresource = "0.1"
