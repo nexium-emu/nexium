@@ -5189,7 +5189,7 @@ fn take_timing_forensics_sample(
         return None;
     }
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < limit).then(|| count + 1)
         })
         .ok()
