@@ -15,6 +15,7 @@ use eframe::egui;
 use eframe::egui::{Color32, CornerRadius, FontId, Sense, Stroke, Vec2};
 use std::sync::Arc;
 
+mod dump_glue;
 mod nextendo_glue;
 
 const BG: Color32 = Color32::from_rgb(0x0F, 0x0F, 0x11);
@@ -926,6 +927,7 @@ pub struct HorizonApp {
     game_info_path: Option<std::path::PathBuf>,
     mod_manager: Option<crate::mods::ModManager>,
     content_manager: Option<crate::content_manager::ContentManager>,
+    dump_job: Option<crate::dump::DumpJob>,
     firmware_prompt: Option<crate::firmware_prompt::FirmwarePrompt>,
     firmware_status: Option<Result<Option<nexium_loader::firmware::InstalledFirmware>, String>>,
     nextendo: crate::nextendo::Nextendo,
@@ -1575,6 +1577,7 @@ impl HorizonApp {
             game_info_path: None,
             mod_manager: None,
             content_manager: None,
+            dump_job: None,
             firmware_prompt: None,
             firmware_status: None,
             nextendo,
@@ -2012,6 +2015,7 @@ impl HorizonApp {
         let mut favorite_request: Option<std::path::PathBuf> = None;
         let mut download_request: Option<std::path::PathBuf> = None;
         let mut reveal_request: Option<std::path::PathBuf> = None;
+        let mut dump_request: Option<std::path::PathBuf> = None;
         let mut add_folder = false;
         let info_open = self.game_info_path.is_some();
         egui::ScrollArea::vertical()
@@ -2045,6 +2049,7 @@ impl HorizonApp {
                                     .favorites
                                     .iter()
                                     .any(|path| *path == game_path);
+                                let dumpable = self.library.games[idx].format != "NRO";
                                 let resp =
                                     game_tile(ui, &self.library.games[idx], tex.as_ref(), selected);
                                 if resp.clicked() {
@@ -2086,6 +2091,10 @@ impl HorizonApp {
                                             menu.close();
                                         }
                                         menu.separator();
+                                        if dumpable && menu.button("Dump RomFS & ExeFS").clicked() {
+                                            dump_request = Some(game_path.clone());
+                                            menu.close();
+                                        }
                                         if menu.button("Open Containing Folder").clicked() {
                                             reveal_request = Some(game_path.clone());
                                             menu.close();
@@ -2129,6 +2138,8 @@ impl HorizonApp {
             self.toggle_favorite_path(path);
         } else if let Some(path) = download_request {
             self.open_icon_picker(path);
+        } else if let Some(path) = dump_request {
+            self.start_dump(path, ctx);
         } else if let Some(path) = reveal_request {
             reveal_in_file_manager(&path);
         }
@@ -11354,6 +11365,9 @@ impl eframe::App for HorizonApp {
                             crate::carousel::CarouselAction::ManageContent(path) => {
                                 self.open_content_manager(std::path::PathBuf::from(path), ctx);
                             }
+                            crate::carousel::CarouselAction::DumpFiles(path) => {
+                                self.start_dump(std::path::PathBuf::from(path), ctx);
+                            }
                             crate::carousel::CarouselAction::ViewGameInfo(path) => {
                                 crate::ui_audio::play(crate::ui_audio::Sfx::Open);
                                 self.game_info_path = Some(std::path::PathBuf::from(path));
@@ -11949,12 +11963,14 @@ impl eframe::App for HorizonApp {
         } else {
             36.0
         };
+        let toast_top = toast_top + self.drive_dump(ctx, toast_top);
         self.draw_nextendo_toasts(ctx, toast_top);
 
         let native_visible = self.native_game_visible(carousel_mode);
         if let Some(window) = &mut self.native_game {
             let mut holes: Vec<_> = self.native_overlay_rect.into_iter().chain(self.game_bar_tab_rect).collect();
             holes.extend(self.nextendo_toasts.shown().iter().copied());
+            holes.extend(dump_glue::card_rect(self.dump_job.as_ref()));
             if self.download_toast.is_some() {
                 let screen = ctx.viewport_rect();
                 holes.push(egui::Rect::from_min_size(egui::pos2(screen.center().x - 184.0, screen.min.y + 20.0), egui::vec2(368.0, 74.0)));

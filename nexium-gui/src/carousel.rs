@@ -143,6 +143,7 @@ pub enum CarouselAction {
     ViewGameInfo(String),
     ManageMods(String),
     ManageContent(String),
+    DumpFiles(String),
     OpenShop,
     OpenCarouselSettings,
     OpenUpdate,
@@ -2684,6 +2685,7 @@ pub fn carousel_view(
     let mut want_info: Option<String> = None;
     let mut want_mods = None;
     let mut want_content = None;
+    let mut want_dump: Option<String> = None;
     let mut want_launch: Option<String> = None;
     let mut want_close = false;
     let mut fav_first: Option<egui::Rect> = None;
@@ -2888,6 +2890,7 @@ pub fn carousel_view(
             let path_string = lib.games[gi].path.to_string_lossy().to_string();
             let favd = favorites.iter().any(|p| *p == lib.games[gi].path);
             let is_playing_card = playing == Some(gi);
+            let dumpable = lib.games[gi].format != "NRO";
             resp.context_menu(|ui| {
                 if !is_playing_card && ui.button("Launch").clicked() {
                     want_launch = Some(path_string.clone());
@@ -2920,6 +2923,10 @@ pub fn carousel_view(
                 }
                 if ui.button("Updates & DLC").clicked() {
                     want_content = Some(path_string.clone());
+                    ui.close();
+                }
+                if dumpable && ui.button("Dump RomFS & ExeFS…").clicked() {
+                    want_dump = Some(path_string.clone());
                     ui.close();
                 }
             });
@@ -3458,6 +3465,9 @@ pub fn carousel_view(
     }
     if let Some(p) = want_content {
         action = CarouselAction::ManageContent(p);
+    }
+    if let Some(p) = want_dump {
+        action = CarouselAction::DumpFiles(p);
     }
     if let Some(p) = want_launch {
         action = CarouselAction::Launch(p);
