@@ -23,6 +23,7 @@ mod homebrew;
 mod input;
 mod motion_input;
 mod library;
+mod log_viewer;
 mod native_game;
 mod nextendo;
 mod mods;
@@ -99,6 +100,13 @@ fn host_wgpu_setup(preferred: Option<&str>) -> eframe::egui_wgpu::WgpuSetupCreat
     setup
 }
 
+/// Whether `NEXIUM_X11` asks for the X11 backend on a session that offers
+/// both Wayland and an X server (XWayland).
+#[cfg(any(target_os = "linux", test))]
+fn prefer_x11_backend(nexium_x11: Option<&str>, display: Option<&str>) -> bool {
+    nexium_x11.is_some_and(|value| !value.is_empty() && value != "0") && display.is_some_and(|display| !display.is_empty())
+}
+
 fn main() -> Result<(), eframe::Error> {
     std::env::set_var("DISABLE_MANGOHUD", "1");
 
@@ -128,7 +136,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let settings = AppSettings::load();
 
-    let (logger, log_buffer) = FileLogger::new(500).unwrap_or_else(|e| {
+    let (logger, log_feed) = FileLogger::new(nexium_common::file_logger::DEFAULT_UI_QUEUE_LINES).unwrap_or_else(|e| {
         eprintln!("Failed to initialize logger: {}", e);
         panic!("Logger initialization failed");
     });
@@ -146,6 +154,17 @@ fn main() -> Result<(), eframe::Error> {
         .unwrap_or_else(|| settings.log_level.to_filter());
     if let Err(e) = logger.init(log_filter) {
         eprintln!("Failed to set logger: {}", e);
+    }
+    if settings.log_viewer.keep_target_levels {
+        let (saved, errors) = nexium_common::file_logger::parse_target_levels(&settings.log_viewer.target_levels);
+        for error in errors {
+            eprintln!("Ignoring saved log level rule: {}", error);
+        }
+        if !saved.is_empty() {
+            let mut rules = log_feed.filter().rules();
+            rules.extend(saved);
+            log_feed.filter().set_rules(rules);
+        }
     }
 
     log::info!("=== NeXium - Nintendo Switch Emulator ===");
@@ -234,14 +253,36 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
-    let log_buf_for_app = log_buffer.clone();
+    // winit prefers Wayland whenever WAYLAND_DISPLAY is set, and the native
+    // Vulkan game surface exists only for X11 (on Wayland the game goes
+    // through GUI frame delivery). NEXIUM_X11=1 opts into winit's X11 backend
+    // (XWayland on a Wayland session) so the native presenter can be used;
+    // the environment is left untouched for everything else.
+    #[cfg(target_os = "linux")]
+    let mut options = options;
+    #[cfg(target_os = "linux")]
+    {
+        let nexium_x11 = std::env::var("NEXIUM_X11").ok();
+        let display = std::env::var("DISPLAY").ok();
+        if prefer_x11_backend(nexium_x11.as_deref(), display.as_deref()) {
+            log::info!("NEXIUM_X11: using the X11 window backend");
+            options.event_loop_builder = Some(Box::new(|builder| {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                builder.with_x11();
+            }));
+        } else if nexium_x11.is_some_and(|value| !value.is_empty() && value != "0") {
+            log::warn!("NEXIUM_X11 is set but DISPLAY is not; keeping the default window backend");
+        }
+    }
+
+    let mut log_feed_for_app = Some(log_feed);
     let result = eframe::run_native(
         "NeXium",
         options,
         Box::new(move |cc| {
             Ok(Box::new(HorizonApp::new(
                 cc,
-                log_buf_for_app.clone(),
+                log_feed_for_app.take(),
                 settings.clone(),
                 nro_arg.clone(),
             )))
@@ -275,7 +316,17 @@ mod fast_exit {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_surface_config, host_vsync_enabled, host_wgpu_setup};
+    use super::{host_surface_config, host_vsync_enabled, host_wgpu_setup, prefer_x11_backend};
+
+    #[test]
+    fn x11_backend_is_only_forced_when_asked_and_an_x_server_exists() {
+        assert!(!prefer_x11_backend(None, Some(":0")));
+        assert!(!prefer_x11_backend(Some("0"), Some(":0")));
+        assert!(!prefer_x11_backend(Some("1"), None));
+        assert!(!prefer_x11_backend(Some("1"), Some("")));
+        assert!(prefer_x11_backend(Some("1"), Some(":0")));
+        assert!(!prefer_x11_backend(Some(""), Some(":1")));
+    }
 
     #[test]
     fn host_wgpu_setup_defaults_to_vulkan_only() {

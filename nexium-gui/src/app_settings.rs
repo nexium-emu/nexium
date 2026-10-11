@@ -518,6 +518,57 @@ impl NextendoSettings {
     }
 }
 
+/// Preferences of the in-app log viewer (Debug > Logs).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogViewerSettings {
+    /// Lines the viewer keeps in memory; older lines are only in the log file.
+    pub ring_lines: usize,
+    pub show_error: bool,
+    pub show_warn: bool,
+    pub show_info: bool,
+    pub show_debug: bool,
+    pub show_trace: bool,
+    pub wrap: bool,
+    pub collapse_repeats: bool,
+    pub search_regex: bool,
+    pub search_case_sensitive: bool,
+    pub only_matches: bool,
+    /// Comma separated target substrings; a leading `-` excludes.
+    pub target_filter: String,
+    pub copy_last_lines: usize,
+    /// Restore `target_levels` on the next launch.
+    pub keep_target_levels: bool,
+    /// Per-target levels as `target=level` pairs, saved only while
+    /// `keep_target_levels` is on.
+    pub target_levels: String,
+}
+
+pub const LOG_RING_MIN: usize = 1_000;
+pub const LOG_RING_MAX: usize = 1_000_000;
+
+impl Default for LogViewerSettings {
+    fn default() -> Self {
+        Self {
+            ring_lines: 50_000,
+            show_error: true,
+            show_warn: true,
+            show_info: true,
+            show_debug: true,
+            show_trace: true,
+            wrap: false,
+            collapse_repeats: false,
+            search_regex: false,
+            search_case_sensitive: false,
+            only_matches: false,
+            target_filter: String::new(),
+            copy_last_lines: 500,
+            keep_target_levels: false,
+            target_levels: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PerformanceDebugSettings {
@@ -726,6 +777,8 @@ pub struct AppSettings {
     pub performance_debug: PerformanceDebugSettings,
     #[serde(default)]
     pub nextendo: NextendoSettings,
+    #[serde(default)]
+    pub log_viewer: LogViewerSettings,
 }
 
 fn default_emulated_device() -> bool {
@@ -1004,6 +1057,7 @@ impl Default for AppSettings {
             vibration_strength: default_vibration_strength(),
             performance_debug: PerformanceDebugSettings::default(),
             nextendo: NextendoSettings::default(),
+            log_viewer: LogViewerSettings::default(),
         }
     }
 }
@@ -1050,6 +1104,7 @@ impl AppSettings {
         };
         cfg.fsr_sharpness = cfg.fsr_sharpness.min(100);
         cfg.vibration_strength = cfg.vibration_strength.clamp(10, 100);
+        cfg.log_viewer.ring_lines = cfg.log_viewer.ring_lines.clamp(LOG_RING_MIN, LOG_RING_MAX);
         if cfg.performance_debug.sanitize_unsafe_gpu_overrides() {
             let _ = cfg.save();
         }

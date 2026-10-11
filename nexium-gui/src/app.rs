@@ -241,6 +241,35 @@ fn take_next_game_frame(
     }
 }
 
+/// Takes the newest valid frame and reports how many older valid frames were
+/// discarded on the way. The emulator queues several frames; showing them one
+/// per paint would leave the picture that many frames behind whenever the
+/// queue has filled, so only the latest is displayed.
+///
+/// Back-pressure is not this function's job: the emulator is held to the
+/// paint rate only if the delivery channel (nexium-runner `boot.rs`) has room
+/// for a single frame, so that the delivery thread stops popping the nvdrv
+/// frame queue until a paint takes it. A UI-side "take one unless more than N
+/// are waiting" cannot restore that: the delivery thread refills a deeper
+/// channel between paints, so it is either always over N (no throttle) or the
+/// frames shown are N old.
+fn take_latest_game_frame(
+    frame_rx: &std::sync::mpsc::Receiver<crate::boot::Frame>,
+) -> Option<(crate::boot::Frame, u64)> {
+    let mut latest = take_next_game_frame(frame_rx)?;
+    let mut skipped = 0;
+    while let Some(mut newer) = take_next_game_frame(frame_rx) {
+        // The UI keeps showing the last depth it was given, so a skipped
+        // frame's depth still has to reach it.
+        if newer.depth.is_none() {
+            newer.depth = latest.depth.take();
+        }
+        latest = newer;
+        skipped += 1;
+    }
+    Some((latest, skipped))
+}
+
 fn game_display_rect(
     panel: egui::Rect,
     texture_size: Vec2,
@@ -330,7 +359,7 @@ mod game_display_tests {
 
 #[cfg(test)]
 mod frame_receive_tests {
-    use super::{request_game_frame_repaint, take_next_game_frame};
+    use super::{request_game_frame_repaint, take_latest_game_frame, take_next_game_frame};
     use crate::boot::Frame;
 
     #[test]
@@ -389,6 +418,27 @@ mod frame_receive_tests {
         assert_eq!(take_next_game_frame(&rx).unwrap().pixels[0], 2);
         assert_eq!(take_next_game_frame(&rx).unwrap().pixels[0], 3);
         assert!(take_next_game_frame(&rx).is_none());
+    }
+
+    #[test]
+    fn a_paint_shows_the_newest_queued_frame_and_counts_the_skipped_ones() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        assert!(take_latest_game_frame(&rx).is_none());
+        tx.send(frame(1)).unwrap();
+        let (only, skipped) = take_latest_game_frame(&rx).unwrap();
+        assert_eq!((only.pixels[0], skipped), (1, 0));
+
+        for marker in 2..=5 {
+            tx.send(frame(marker)).unwrap();
+        }
+        tx.send(Frame { width: 0, height: 1, pixels: vec![0; 4], depth: None }).unwrap();
+        let (latest, skipped) = take_latest_game_frame(&rx).unwrap();
+        assert_eq!((latest.pixels[0], skipped), (5, 3));
+        assert!(take_latest_game_frame(&rx).is_none());
+
+        // Frames sent after a drain are picked up by the next paint.
+        tx.send(frame(6)).unwrap();
+        assert_eq!(take_latest_game_frame(&rx).unwrap().0.pixels[0], 6);
     }
 
     #[test]
@@ -822,7 +872,7 @@ pub struct HorizonApp {
     last_input: InputSnapshot,
     debugger: DebuggerState,
     performance: PerformanceMonitor,
-    log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    log_viewer: crate::log_viewer::LogViewer,
     controller_config: ControllerConfig,
     rebinding: Option<SwitchButton>,
     rebinding_pad: Option<SwitchButton>,
@@ -1411,7 +1461,7 @@ pub enum VkTarget {
 impl HorizonApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        log_feed: Option<nexium_common::file_logger::LogFeed>,
         app_settings: AppSettings,
         nro_arg: Option<String>,
     ) -> Self {
@@ -1475,7 +1525,7 @@ impl HorizonApp {
             last_input: InputSnapshot::default(),
             debugger: DebuggerState::new(),
             performance: PerformanceMonitor::new(),
-            log_buffer,
+            log_viewer: crate::log_viewer::LogViewer::new(log_feed, &app_settings.log_viewer),
             controller_config: ControllerConfig::load(),
             rebinding: None,
             rebinding_pad: None,
@@ -2191,10 +2241,13 @@ impl HorizonApp {
             FilterMode::Nearest => egui::TextureOptions::NEAREST,
             _ => egui::TextureOptions::LINEAR,
         };
-        if let Some(mut frame) = take_next_game_frame(&handle.frame_rx) {
+        if let Some((mut frame, skipped)) = take_latest_game_frame(&handle.frame_rx) {
             if let Some(window) = &mut self.native_game { window.active = false; }
-            gui_rate_stats(1, 1);
-            self.performance.record_frame();
+            gui_rate_stats(1, 1 + skipped);
+            if skipped != 0 {
+                gui_rate_stats(2, skipped);
+            }
+            self.performance.record_frames(1 + skipped);
             self.last_frame_res = (frame.width, frame.height);
             log::trace!(
                 "frame in: {}x{} ({} bytes)",
@@ -7329,7 +7382,7 @@ impl HorizonApp {
                     .unwrap_or(0);
                 self.app_settings.log_level =
                     levels[((idx as i32 + dir).rem_euclid(levels.len() as i32)) as usize];
-                log::set_max_level(self.app_settings.log_level.to_filter());
+                nexium_common::file_logger::set_global_level(self.app_settings.log_level.to_filter());
                 let _ = self.app_settings.save();
                 crate::ui_audio::play_move();
             }
@@ -11336,7 +11389,7 @@ impl eframe::App for HorizonApp {
                                 self.show_settings = true;
                             }
                             crate::carousel::CarouselAction::OpenDebug => {
-                                self.debugger.toggle_logs();
+                                self.debugger.show_logs = true;
                             }
                             crate::carousel::CarouselAction::Quit => {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -11954,7 +12007,7 @@ impl eframe::App for HorizonApp {
             &mut self.debugger,
             snapshot.as_ref(),
             mem_req.as_deref(),
-            &self.log_buffer,
+            &mut self.log_viewer,
             &mut self.app_settings,
         );
 
@@ -13411,9 +13464,10 @@ fn debug_windows(
     dbg: &mut DebuggerState,
     snapshot: Option<&crate::boot::CpuSnapshot>,
     mem_request: Option<&dyn Fn(u64)>,
-    log_buffer: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    log_viewer: &mut crate::log_viewer::LogViewer,
     app_settings: &mut AppSettings,
 ) {
+    log_viewer.ingest();
     if dbg.show_memory {
         egui::Window::new("Memory")
             .open(&mut dbg.show_memory)
@@ -13751,37 +13805,11 @@ fn debug_windows(
 
     let mut open_performance_from_logs = false;
     if dbg.show_logs {
-        egui::Window::new("Logs")
-            .open(&mut dbg.show_logs)
-            .default_size([580.0, 300.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if pill_button(ui, "Clear", false).clicked() {
-                        if let Ok(mut buf) = log_buffer.lock() {
-                            buf.clear();
-                        }
-                    }
-                    if pill_button(ui, "Performance Tuning", false).clicked() {
-                        open_performance_from_logs = true;
-                    }
-                });
-                ui.add_space(4.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        if let Ok(buf) = log_buffer.lock() {
-                            for entry in buf.iter() {
-                                ui.label(
-                                    egui::RichText::new(entry)
-                                        .size(11.0)
-                                        .monospace()
-                                        .color(MUTED),
-                                );
-                            }
-                        }
-                    });
-            });
+        match log_viewer.show(ctx, &mut dbg.show_logs, app_settings) {
+            Some(crate::log_viewer::LogViewerAction::OpenPerformance) => open_performance_from_logs = true,
+            Some(crate::log_viewer::LogViewerAction::Reveal(path)) => reveal_in_file_manager(&path),
+            None => {}
+        }
     }
 
     if open_performance_from_logs {

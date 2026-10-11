@@ -41,9 +41,43 @@ impl Default for SurfaceState {
     }
 }
 
+/// Which native window system the game surface lives on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceKind {
+    Win32,
+    /// An X11 window reached through an xcb connection (VK_KHR_xcb_surface).
+    Xcb,
+}
+
+/// Instance extensions a native game surface of `kind` needs, or `None` when
+/// the instance does not offer all of them (the caller then keeps the GUI
+/// frame-delivery path).
+fn surface_instance_extensions(
+    kind: SurfaceKind,
+    available: &dyn Fn(&std::ffi::CStr) -> bool,
+) -> Option<Vec<&'static std::ffi::CStr>> {
+    let required = vec![
+        ash::khr::surface::NAME,
+        match kind {
+            SurfaceKind::Win32 => ash::khr::win32_surface::NAME,
+            SurfaceKind::Xcb => ash::khr::xcb_surface::NAME,
+        },
+    ];
+    required.iter().all(|name| available(name)).then_some(required)
+}
+
 pub struct PresentationTarget {
     pub(crate) hwnd: isize,
     pub(crate) hinstance: isize,
+    kind: SurfaceKind,
+    xcb_connection: usize,
+    xcb_window: u32,
+    /// Set once the instance creator has been handed (and therefore enabled)
+    /// this target's surface extensions; see `claim_instance_extensions`.
+    extensions_claimed: AtomicBool,
+    /// Keeps the native connection the surface was created on alive for as
+    /// long as any renderer may still hold the surface.
+    _keepalive: Option<Arc<dyn std::any::Any + Send + Sync>>,
     state: Mutex<SurfaceState>,
     stopped: AtomicBool,
     sequence: AtomicU64,
@@ -204,9 +238,43 @@ impl PresentationTarget {
         hinstance: isize,
         repaint: Arc<dyn Fn() + Send + Sync>,
     ) -> Arc<Self> {
+        Self::with_kind(SurfaceKind::Win32, hwnd, hinstance, 0, 0, None, repaint)
+    }
+
+    /// A target presenting to the X11 window `window` through the xcb
+    /// connection `connection` (an `xcb_connection_t*`).
+    ///
+    /// # Safety
+    /// `connection` must be a live xcb connection and `window` a window on
+    /// it; both must stay valid until every renderer created with this target
+    /// has been dropped. `keepalive` is held for the target's lifetime so the
+    /// owner of the connection can be tied to it.
+    pub unsafe fn xcb(
+        connection: *mut std::ffi::c_void,
+        window: u32,
+        keepalive: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        repaint: Arc<dyn Fn() + Send + Sync>,
+    ) -> Arc<Self> {
+        Self::with_kind(SurfaceKind::Xcb, 0, 0, connection as usize, window, keepalive, repaint)
+    }
+
+    fn with_kind(
+        kind: SurfaceKind,
+        hwnd: isize,
+        hinstance: isize,
+        xcb_connection: usize,
+        xcb_window: u32,
+        keepalive: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        repaint: Arc<dyn Fn() + Send + Sync>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             hwnd,
             hinstance,
+            kind,
+            xcb_connection,
+            xcb_window,
+            extensions_claimed: AtomicBool::new(false),
+            _keepalive: keepalive,
             state: Mutex::new(SurfaceState {
                 vsync: true,
                 ..Default::default()
@@ -221,6 +289,26 @@ impl PresentationTarget {
             error: Mutex::new(None),
             repaint,
         })
+    }
+
+    /// Returns the instance extensions this target's surface needs
+    /// (`VK_KHR_surface` plus the window-system one), or `None` if
+    /// `available` reports any of them missing.
+    ///
+    /// The instance creator must enable every returned extension on the
+    /// instance it later passes to the presenter. Calling this is what
+    /// tells the presenter the extensions are enabled: a non-Windows target
+    /// that was never claimed refuses to create its surface (and the renderer
+    /// falls back to GUI frame delivery) instead of calling into an extension
+    /// the instance does not have.
+    pub fn claim_instance_extensions(
+        &self,
+        available: &dyn Fn(&std::ffi::CStr) -> bool,
+    ) -> Option<Vec<&'static std::ffi::CStr>> {
+        let extensions = surface_instance_extensions(self.kind, available);
+        self.extensions_claimed
+            .store(extensions.is_some(), Ordering::Release);
+        extensions
     }
 
     pub fn configure(&self, state: SurfaceState) {
@@ -786,17 +874,35 @@ impl Worker {
             last_present_profile: None,
         };
         #[cfg(windows)]
-        unsafe {
-            let api = ash::khr::win32_surface::Instance::new(entry, instance);
-            worker.surface = api
-                .create_win32_surface(
-                    &vk::Win32SurfaceCreateInfoKHR::default()
-                        .hwnd(worker.target.hwnd)
-                        .hinstance(worker.target.hinstance),
-                    None,
-                )
-                .map_err(err)?;
-            renderdoc_hook::set_active_window(instance, worker.target.hwnd);
+        if worker.target.kind == SurfaceKind::Win32 {
+            unsafe {
+                let api = ash::khr::win32_surface::Instance::new(entry, instance);
+                worker.surface = api
+                    .create_win32_surface(
+                        &vk::Win32SurfaceCreateInfoKHR::default()
+                            .hwnd(worker.target.hwnd)
+                            .hinstance(worker.target.hinstance),
+                        None,
+                    )
+                    .map_err(err)?;
+                renderdoc_hook::set_active_window(instance, worker.target.hwnd);
+            }
+        }
+        if worker.target.kind == SurfaceKind::Xcb {
+            if !worker.target.extensions_claimed.load(Ordering::Acquire) {
+                return Err("VK_KHR_xcb_surface was not enabled on the instance".into());
+            }
+            let api = ash::khr::xcb_surface::Instance::new(entry, instance);
+            unsafe {
+                worker.surface = api
+                    .create_xcb_surface(
+                        &vk::XcbSurfaceCreateInfoKHR::default()
+                            .connection(worker.target.xcb_connection as *mut _)
+                            .window(worker.target.xcb_window),
+                        None,
+                    )
+                    .map_err(err)?;
+            }
         }
         if worker.surface == vk::SurfaceKHR::null() {
             return Err("unsupported native presentation surface".into());
@@ -1921,6 +2027,38 @@ mod tests {
             p.mapping(120, 80),
             ([0.0, 1.0, 0.0, -1.0, 1.0, 0.0], [80, 120])
         );
+    }
+
+    #[test]
+    fn surface_extensions_are_all_or_nothing_per_window_system() {
+        let all = |_: &std::ffi::CStr| true;
+        assert_eq!(
+            surface_instance_extensions(SurfaceKind::Xcb, &all).unwrap(),
+            [ash::khr::surface::NAME, ash::khr::xcb_surface::NAME]
+        );
+        assert_eq!(
+            surface_instance_extensions(SurfaceKind::Win32, &all).unwrap(),
+            [ash::khr::surface::NAME, ash::khr::win32_surface::NAME]
+        );
+        let no_xcb = |name: &std::ffi::CStr| name != ash::khr::xcb_surface::NAME;
+        assert!(surface_instance_extensions(SurfaceKind::Xcb, &no_xcb).is_none());
+        let no_surface = |name: &std::ffi::CStr| name != ash::khr::surface::NAME;
+        assert!(surface_instance_extensions(SurfaceKind::Xcb, &no_surface).is_none());
+    }
+
+    #[test]
+    fn xcb_target_only_counts_as_claimed_when_its_extensions_are_available() {
+        let target = unsafe {
+            PresentationTarget::xcb(std::ptr::null_mut(), 7, None, Arc::new(|| {}))
+        };
+        assert!(!target.extensions_claimed.load(Ordering::Acquire));
+        assert!(target.claim_instance_extensions(&|_| false).is_none());
+        assert!(!target.extensions_claimed.load(Ordering::Acquire));
+        let granted = target.claim_instance_extensions(&|_| true).unwrap();
+        assert!(granted.contains(&ash::khr::xcb_surface::NAME));
+        assert!(target.extensions_claimed.load(Ordering::Acquire));
+        assert!(target.claim_instance_extensions(&|_| false).is_none());
+        assert!(!target.extensions_claimed.load(Ordering::Acquire));
     }
 
     #[test]
