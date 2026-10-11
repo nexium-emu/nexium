@@ -4493,6 +4493,58 @@ impl Emitter {
         (img, samp)
     }
 
+    /// Returns the integer family a graphics TEX/TLD4 must sample `tex_id` through, or `None` when
+    /// the float path applies.
+    ///
+    /// Maxwell texture units return UINT/SINT texels as raw integers in the destination registers
+    /// no matter which instruction reads them, so a filtered sample of an integer TIC has to go
+    /// through an integer-typed image and be bitcast back to register bits. Depth-compare samples
+    /// stay on the float path because Vulkan only allows Dref sampling of float images.
+    fn graphics_integer_sample_type(
+        &self,
+        tex_id: u32,
+        depth_compare: bool,
+    ) -> Option<TextureNumericType> {
+        if depth_compare || self.stage == Stage::Compute {
+            return None;
+        }
+        match self.texture_numeric_type_at(tex_id) {
+            TextureNumericType::Float => None,
+            numeric_type => Some(numeric_type),
+        }
+    }
+
+    /// Loads the integer image for `tex_id` from its typed binding and pairs it with the slot's
+    /// sampler. Returns the loaded image and the sampled image.
+    fn graphics_integer_sampled_image(
+        &mut self,
+        tex_id: u32,
+        numeric_type: TextureNumericType,
+        kind: GraphicsImageKind,
+    ) -> (Word, Word) {
+        let (decl, image_pointer) = self.typed_image_at(tex_id, numeric_type, kind);
+        let image = self
+            .b
+            .load(decl.image_t, None, image_pointer, None, [])
+            .unwrap();
+        let sampler_array = self.ensure_sampler_only();
+        let slot = self.const_u32(self.texture_slot(tex_id));
+        let sampler_pointer = self
+            .b
+            .access_chain(self.ptr_sampler, None, sampler_array, [slot])
+            .unwrap();
+        let sampler = self
+            .b
+            .load(self.sampler_t, None, sampler_pointer, None, [])
+            .unwrap();
+        let sampled_image_t = self.b.type_sampled_image(decl.image_t);
+        let sampled_image = self
+            .b
+            .sampled_image(sampled_image_t, None, image, sampler)
+            .unwrap();
+        (image, sampled_image)
+    }
+
     fn const_f32(&mut self, bits: u32) -> Word {
         if let Some(&w) = self.const_cache_f32.get(&bits) {
             return w;
@@ -5023,8 +5075,36 @@ impl Emitter {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sample_image(
         &mut self,
+        sampled_image: Word,
+        coords: Word,
+        implicit_lod: bool,
+        lod_bias: Option<Word>,
+        explicit_lod: Option<Word>,
+        texel_offset: Option<Word>,
+        gradients: Option<(Word, Word)>,
+    ) -> Word {
+        let result_t = self.vec4_t;
+        self.sample_image_typed(
+            result_t,
+            sampled_image,
+            coords,
+            implicit_lod,
+            lod_bias,
+            explicit_lod,
+            texel_offset,
+            gradients,
+        )
+    }
+
+    /// Samples `sampled_image` returning a four-component vector of `result_t`, which must match
+    /// the sampled type of the image (vec4 for float images, uvec4/ivec4 for integer images).
+    #[allow(clippy::too_many_arguments)]
+    fn sample_image_typed(
+        &mut self,
+        result_t: Word,
         sampled_image: Word,
         coords: Word,
         implicit_lod: bool,
@@ -5039,7 +5119,7 @@ impl Emitter {
             return if let Some(offset) = texel_offset {
                 self.b
                     .image_sample_explicit_lod(
-                        self.vec4_t,
+                        result_t,
                         None,
                         sampled_image,
                         coords,
@@ -5054,7 +5134,7 @@ impl Emitter {
             } else {
                 self.b
                     .image_sample_explicit_lod(
-                        self.vec4_t,
+                        result_t,
                         None,
                         sampled_image,
                         coords,
@@ -5071,7 +5151,7 @@ impl Emitter {
                 return if let Some(offset) = texel_offset {
                     self.b
                         .image_sample_explicit_lod(
-                            self.vec4_t,
+                            result_t,
                             None,
                             sampled_image,
                             coords,
@@ -5082,7 +5162,7 @@ impl Emitter {
                 } else {
                     self.b
                         .image_sample_explicit_lod(
-                            self.vec4_t,
+                            result_t,
                             None,
                             sampled_image,
                             coords,
@@ -5099,7 +5179,7 @@ impl Emitter {
                 (Some(bias), Some(offset)) => self
                     .b
                     .image_sample_implicit_lod(
-                        self.vec4_t,
+                        result_t,
                         None,
                         sampled_image,
                         coords,
@@ -5110,7 +5190,7 @@ impl Emitter {
                 (Some(bias), None) => self
                     .b
                     .image_sample_implicit_lod(
-                        self.vec4_t,
+                        result_t,
                         None,
                         sampled_image,
                         coords,
@@ -5121,7 +5201,7 @@ impl Emitter {
                 (None, Some(offset)) => self
                     .b
                     .image_sample_implicit_lod(
-                        self.vec4_t,
+                        result_t,
                         None,
                         sampled_image,
                         coords,
@@ -5131,7 +5211,7 @@ impl Emitter {
                     .unwrap(),
                 (None, None) => self
                     .b
-                    .image_sample_implicit_lod(self.vec4_t, None, sampled_image, coords, None, [])
+                    .image_sample_implicit_lod(result_t, None, sampled_image, coords, None, [])
                     .unwrap(),
             };
         }
@@ -5140,7 +5220,7 @@ impl Emitter {
         if let Some(offset) = texel_offset {
             self.b
                 .image_sample_explicit_lod(
-                    self.vec4_t,
+                    result_t,
                     None,
                     sampled_image,
                     coords,
@@ -5151,7 +5231,7 @@ impl Emitter {
         } else {
             self.b
                 .image_sample_explicit_lod(
-                    self.vec4_t,
+                    result_t,
                     None,
                     sampled_image,
                     coords,
@@ -6571,7 +6651,28 @@ impl Emitter {
                     .as_ref()
                     .and_then(|site| self.texture_gradients.get(site))
                     .copied();
-                let texel_offset = texel_offset.as_ref().map(|(x, y, z)| {
+                let offset_is_immediate = |value: &IrValue| {
+                    matches!(value, IrValue::Zero | IrValue::ImmU32(_) | IrValue::ImmF32(_))
+                };
+                // A register AOFFI (only emitted by the translator for LZ 1D/2D/2D-array
+                // fragment samples) cannot be a ConstOffset and Vulkan rejects a runtime Offset
+                // outside gathers, so it is applied below as an exact base-level coordinate
+                // shift instead.
+                let dynamic_offset = texel_offset
+                    .as_ref()
+                    .filter(|(x, y, z)| {
+                        !(offset_is_immediate(x) && offset_is_immediate(y) && offset_is_immediate(z))
+                    })
+                    .map(|(x, y, _)| (*x, *y));
+                assert!(
+                    dynamic_offset.is_none()
+                        || (cube.is_none() && volume.is_none() && !*implicit_lod),
+                    "register sample offsets are only lowered for explicit-LOD 2D samples"
+                );
+                let texel_offset = texel_offset
+                    .as_ref()
+                    .filter(|_| dynamic_offset.is_none())
+                    .map(|(x, y, z)| {
                     let immediate_bits = |value: &IrValue| match value {
                         IrValue::Zero => Some(0),
                         IrValue::ImmU32(bits) => Some(*bits),
@@ -6658,15 +6759,25 @@ impl Emitter {
                     {
                         self.sample_debug_value = Some(debug_coords);
                     }
-                    let img = self.b.load(image_t, None, img_var, None, []).unwrap();
-                    let samp = self
-                        .b
-                        .load(self.sampler_t, None, samp_var, None, [])
-                        .unwrap();
-                    let sampled_img = self
-                        .b
-                        .sampled_image(sampled_image_t, None, img, samp)
-                        .unwrap();
+                    let integer_type = self.graphics_integer_sample_type(*tex_id, depth_compare);
+                    let sampled_img = if let Some(numeric_type) = integer_type {
+                        let kind = if array.is_some() {
+                            GraphicsImageKind::CubeArray
+                        } else {
+                            GraphicsImageKind::Cube
+                        };
+                        self.graphics_integer_sampled_image(*tex_id, numeric_type, kind)
+                            .1
+                    } else {
+                        let img = self.b.load(image_t, None, img_var, None, []).unwrap();
+                        let samp = self
+                            .b
+                            .load(self.sampler_t, None, samp_var, None, [])
+                            .unwrap();
+                        self.b
+                            .sampled_image(sampled_image_t, None, img, samp)
+                            .unwrap()
+                    };
                     let sampled = if let Some(dref) = dref {
                         self.sample_image_dref(
                             sampled_img,
@@ -6677,6 +6788,19 @@ impl Emitter {
                             explicit_lod,
                             texel_offset,
                         )
+                    } else if let Some(numeric_type) = integer_type {
+                        let result_t = self.graphics_numeric_vec4_type(numeric_type);
+                        let raw = self.sample_image_typed(
+                            result_t,
+                            sampled_img,
+                            coords,
+                            *implicit_lod,
+                            lod_bias,
+                            explicit_lod,
+                            texel_offset,
+                            gradients,
+                        );
+                        self.b.bitcast(self.vec4_t, None, raw).unwrap()
                     } else {
                         self.sample_image(
                             sampled_img,
@@ -6751,19 +6875,28 @@ impl Emitter {
                                 .unwrap(),
                         );
                     }
-                    let (img_var, samp_var) = self.sampler_3d_at(*tex_id);
-                    let img = self
-                        .b
-                        .load(self.image_3d_t, None, img_var, None, [])
-                        .unwrap();
-                    let samp = self
-                        .b
-                        .load(self.sampler_t, None, samp_var, None, [])
-                        .unwrap();
-                    let sampled_img = self
-                        .b
-                        .sampled_image(self.sampled_image_3d_t, None, img, samp)
-                        .unwrap();
+                    let integer_type = self.graphics_integer_sample_type(*tex_id, depth_compare);
+                    let sampled_img = if let Some(numeric_type) = integer_type {
+                        self.graphics_integer_sampled_image(
+                            *tex_id,
+                            numeric_type,
+                            GraphicsImageKind::D3,
+                        )
+                        .1
+                    } else {
+                        let (img_var, samp_var) = self.sampler_3d_at(*tex_id);
+                        let img = self
+                            .b
+                            .load(self.image_3d_t, None, img_var, None, [])
+                            .unwrap();
+                        let samp = self
+                            .b
+                            .load(self.sampler_t, None, samp_var, None, [])
+                            .unwrap();
+                        self.b
+                            .sampled_image(self.sampled_image_3d_t, None, img, samp)
+                            .unwrap()
+                    };
                     let sampled = if let Some(dref) = dref {
                         self.sample_image_dref(
                             sampled_img,
@@ -6774,6 +6907,19 @@ impl Emitter {
                             explicit_lod,
                             texel_offset,
                         )
+                    } else if let Some(numeric_type) = integer_type {
+                        let result_t = self.graphics_numeric_vec4_type(numeric_type);
+                        let raw = self.sample_image_typed(
+                            result_t,
+                            sampled_img,
+                            coords,
+                            *implicit_lod,
+                            lod_bias,
+                            explicit_lod,
+                            texel_offset,
+                            gradients,
+                        );
+                        self.b.bitcast(self.vec4_t, None, raw).unwrap()
                     } else {
                         self.sample_image(
                             sampled_img,
@@ -6848,7 +6994,37 @@ impl Emitter {
                 } else {
                     self.sampled_image_t
                 };
-                let img = self.b.load(image_t, None, img_var, None, []).unwrap();
+                let integer_type = self.graphics_integer_sample_type(*tex_id, depth_compare);
+                let integer_image = integer_type.map(|numeric_type| {
+                    let kind = if self.sampler_arrayed {
+                        GraphicsImageKind::D2Array
+                    } else {
+                        GraphicsImageKind::D2
+                    };
+                    self.graphics_integer_sampled_image(*tex_id, numeric_type, kind)
+                });
+                let img = match integer_image {
+                    Some((image, _)) => image,
+                    None => self.b.load(image_t, None, img_var, None, []).unwrap(),
+                };
+                if let Some((dx, dy)) = dynamic_offset {
+                    // Texel offsets are applied in base-level texel space before wrapping, so
+                    // for the LZ form shifting the coordinate by offset / base size selects
+                    // exactly the texels (and filter weights) the hardware AOFFI would.
+                    let mut texel_delta = |value: IrValue| {
+                        let value = self.lower_value(&value);
+                        let value = self.as_i32(value);
+                        self.b.convert_s_to_f(self.f32_t, None, value).unwrap()
+                    };
+                    let (mut dx, mut dy) = (texel_delta(dx), texel_delta(dy));
+                    if self.texture_uses_normalized_coords(*tex_id) {
+                        self.b.capability(Capability::ImageQuery);
+                        (dx, dy) =
+                            self.normalize_filtered_2d_coords(img, self.sampler_arrayed, dx, dy);
+                    }
+                    uv0 = self.b.f_add(self.f32_t, None, uv0, dx).unwrap();
+                    uv1 = self.b.f_add(self.f32_t, None, uv1, dy).unwrap();
+                }
                 if !self.texture_uses_normalized_coords(*tex_id) {
                     (uv0, uv1) =
                         self.normalize_filtered_2d_coords(img, self.sampler_arrayed, uv0, uv1);
@@ -6903,10 +7079,13 @@ impl Emitter {
                     .b
                     .load(self.sampler_t, None, samp_var, None, [])
                     .unwrap();
-                let sampled_img = self
-                    .b
-                    .sampled_image(sampled_image_t, None, img, samp)
-                    .unwrap();
+                let sampled_img = match integer_image {
+                    Some((_, sampled_img)) => sampled_img,
+                    None => self
+                        .b
+                        .sampled_image(sampled_image_t, None, img, samp)
+                        .unwrap(),
+                };
                 self.capture_fragment_lod_debug(
                     tex_slot,
                     img,
@@ -6927,6 +7106,19 @@ impl Emitter {
                         explicit_lod,
                         texel_offset,
                     )
+                } else if let Some(numeric_type) = integer_type {
+                    let result_t = self.graphics_numeric_vec4_type(numeric_type);
+                    let raw = self.sample_image_typed(
+                        result_t,
+                        sampled_img,
+                        coords,
+                        *implicit_lod,
+                        lod_bias,
+                        explicit_lod,
+                        texel_offset,
+                        gradients,
+                    );
+                    self.b.bitcast(self.vec4_t, None, raw).unwrap()
                 } else {
                     self.sample_image(
                         sampled_img,
@@ -6985,6 +7177,7 @@ impl Emitter {
                 array,
                 gather_component,
                 lane,
+                dref,
             } => {
                 if self.stage == Stage::Compute {
                     Some(self.lower_compute_gather(*tex_id, u, v, array.as_ref(), *gather_component, *lane))
@@ -7009,7 +7202,19 @@ impl Emitter {
                 } else {
                     self.sampled_image_t
                 };
-                let img = self.b.load(image_t, None, img_var, None, []).unwrap();
+                let integer_type = self.graphics_integer_sample_type(*tex_id, dref.is_some());
+                let integer_image = integer_type.map(|numeric_type| {
+                    let kind = if self.sampler_arrayed {
+                        GraphicsImageKind::D2Array
+                    } else {
+                        GraphicsImageKind::D2
+                    };
+                    self.graphics_integer_sampled_image(*tex_id, numeric_type, kind)
+                });
+                let img = match integer_image {
+                    Some((image, _)) => image,
+                    None => self.b.load(image_t, None, img_var, None, []).unwrap(),
+                };
                 if !self.texture_uses_normalized_coords(*tex_id) {
                     (uv0, uv1) =
                         self.normalize_filtered_2d_coords(img, self.sampler_arrayed, uv0, uv1);
@@ -7055,15 +7260,61 @@ impl Emitter {
                     .b
                     .load(self.sampler_t, None, samp_var, None, [])
                     .unwrap();
-                let sampled_img = self
-                    .b
-                    .sampled_image(sampled_image_t, None, img, samp)
-                    .unwrap();
+                let sampled_img = match integer_image {
+                    Some((_, sampled_img)) => sampled_img,
+                    None => self
+                        .b
+                        .sampled_image(sampled_image_t, None, img, samp)
+                        .unwrap(),
+                };
                 let component = self.const_u32((*gather_component).min(3) as u32);
-                let gathered = self
-                    .b
-                    .image_gather(self.vec4_t, None, sampled_img, coords, component, None, [])
-                    .unwrap();
+                let gathered = if let Some(dref) = dref {
+                    // Vulkan only allows Dref gathers of float images; integer_type is None for
+                    // depth-compare uses (see graphics_integer_sample_type).
+                    let dref = self.lower_value(dref);
+                    self.b
+                        .image_dref_gather(
+                            self.vec4_t,
+                            None,
+                            sampled_img,
+                            coords,
+                            dref,
+                            None,
+                            [],
+                        )
+                        .unwrap()
+                } else {
+                    match integer_type {
+                        Some(numeric_type) => {
+                            let result_t = self.graphics_numeric_vec4_type(numeric_type);
+                            let raw = self
+                                .b
+                                .image_gather(
+                                    result_t,
+                                    None,
+                                    sampled_img,
+                                    coords,
+                                    component,
+                                    None,
+                                    [],
+                                )
+                                .unwrap();
+                            self.b.bitcast(self.vec4_t, None, raw).unwrap()
+                        }
+                        None => self
+                            .b
+                            .image_gather(
+                                self.vec4_t,
+                                None,
+                                sampled_img,
+                                coords,
+                                component,
+                                None,
+                                [],
+                            )
+                            .unwrap(),
+                    }
+                };
                 if matches!(self.stage, Stage::Fragment)
                     && self.sample_debug_slot == Some(tex_slot)
                     && self.sample_debug_value.is_none()
@@ -9611,11 +9862,12 @@ impl Emitter {
                             image_2d[depth] = true;
                         }
                     }
-                    IrOp::GatherTex { .. } => {
+                    IrOp::GatherTex { dref, .. } => {
+                        let depth = usize::from(dref.is_some());
                         if has_arrayed_2d {
-                            image_2d_arrayed[0] = true;
+                            image_2d_arrayed[depth] = true;
                         } else {
-                            image_2d[0] = true;
+                            image_2d[depth] = true;
                         }
                     }
                     IrOp::TexelFetch { y, z, .. } if z.is_none() && y.is_some() => {
@@ -9679,6 +9931,7 @@ impl Emitter {
         let mut tex_ids = std::collections::BTreeSet::new();
         let mut texture_kinds = std::collections::BTreeMap::new();
         let mut filtered_tex_ids = std::collections::BTreeSet::new();
+        let mut depth_compare_tex_ids = std::collections::BTreeSet::new();
         let mut texel_fetches = Vec::new();
         let mut texture_query_ids = std::collections::BTreeSet::new();
         for block in &cfg.blocks {
@@ -9809,10 +10062,14 @@ impl Emitter {
                         array,
                         volume,
                         cube,
+                        dref,
                         ..
                     } => {
                         needs_image = true;
                         needs_sampler = true;
+                        if dref.is_some() {
+                            depth_compare_tex_ids.insert(*tex_id);
+                        }
                         needs_arrayed_sampler |= array.is_some() && cube.is_none();
                         needs_3d_image |= volume.is_some();
                         needs_cube_image |= cube.is_some() && array.is_none();
@@ -9880,9 +10137,17 @@ impl Emitter {
                                 z.is_some().then_some(GraphicsImageKind::D3)
                             }));
                     }
-                    IrOp::GatherTex { tex_id, array, .. } => {
+                    IrOp::GatherTex {
+                        tex_id,
+                        array,
+                        dref,
+                        ..
+                    } => {
                         needs_image = true;
                         needs_sampler = true;
+                        if dref.is_some() {
+                            depth_compare_tex_ids.insert(*tex_id);
+                        }
                         needs_arrayed_sampler |= array.is_some();
                         tex_ids.insert(*tex_id);
                         filtered_tex_ids.insert(*tex_id);
@@ -9957,11 +10222,24 @@ impl Emitter {
             for tex_id in filtered_tex_ids {
                 let slot = self.texture_slot(tex_id);
                 let numeric_type = self.texture_numeric_type_at(tex_id);
-                assert_eq!(
-                    numeric_type,
-                    TextureNumericType::Float,
-                    "graphics texture {tex_id:#x} at descriptor slot {slot} is used by Sample/Gather but was assigned the incompatible {numeric_type:?} descriptor family"
-                );
+                if numeric_type != TextureNumericType::Float {
+                    assert!(
+                        !depth_compare_tex_ids.contains(&tex_id),
+                        "graphics texture {tex_id:#x} at descriptor slot {slot} is used by a depth-compare Sample but was assigned the incompatible {numeric_type:?} descriptor family"
+                    );
+                    // Integer TICs are sampled through their typed binding and bitcast back to
+                    // register bits, matching the raw integers Maxwell's TEX/TLD4 return.
+                    let kind = match texture_kinds[&tex_id] {
+                        GraphicsImageKind::D2 | GraphicsImageKind::D2Array
+                            if self.sampler_arrayed =>
+                        {
+                            GraphicsImageKind::D2Array
+                        }
+                        GraphicsImageKind::D2 | GraphicsImageKind::D2Array => GraphicsImageKind::D2,
+                        kind => kind,
+                    };
+                    self.ensure_typed_image_array(numeric_type, kind);
+                }
                 if !self.texture_uses_normalized_coords(tex_id) {
                     let kind = texture_kinds[&tex_id];
                     assert!(
@@ -11812,7 +12090,10 @@ fn validate_compute_options(
                 IrOp::Unimplemented { .. } => {
                     return Err(ComputeEmitError::UnimplementedIr(1));
                 }
-                IrOp::GatherTex { tex_id, array, gather_component, lane, .. } => {
+                IrOp::GatherTex { tex_id, array, gather_component, lane, dref, .. } => {
+                    if dref.is_some() {
+                        return Err(ComputeEmitError::UnsupportedOperation("compute depth-compare gather has no compare sampler path".to_owned()));
+                    }
                     let handle = nexium_shader::texture_handle_for_id(*tex_id);
                     let resource = filtered_resource(handle).ok_or(ComputeEmitError::MissingResource {
                         handle, kind: ComputeResourceKind::CombinedSampledImage,
@@ -16449,6 +16730,224 @@ mod tests {
             .any(|inst| inst.class.opcode == rspirv::spirv::Op::Bitcast));
     }
 
+    fn integer_sample_test_module(
+        op: IrOp,
+        manifest: Vec<GraphicsTextureResource>,
+    ) -> rspirv::dr::Module {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(op, Some(0));
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, _, _, _, _) = emit_fragment_full_with_options(
+            &cfg,
+            [0; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                texture_numeric_manifest: manifest,
+                ..FragmentOptions::default()
+            },
+        );
+        assert!(validate_structured_cfg(&words).is_ok());
+        validates_with_spirv_val_if_available(&words);
+        rspirv::dr::load_words(&words).expect("valid SPIR-V")
+    }
+
+    fn integer_sample_test_instructions(
+        module: &rspirv::dr::Module,
+    ) -> Vec<&rspirv::dr::Instruction> {
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect()
+    }
+
+    /// Returns the signedness of the integer scalar of `vector_type`, or `None` for float vectors.
+    fn integer_sample_test_vector_signedness(
+        module: &rspirv::dr::Module,
+        vector_type: Word,
+    ) -> Option<u32> {
+        let vector = module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.result_id == Some(vector_type))
+            .expect("result vector type");
+        assert_eq!(vector.class.opcode, rspirv::spirv::Op::TypeVector);
+        assert_eq!(vector.operands[1], Operand::LiteralBit32(4));
+        let Operand::IdRef(scalar_type) = vector.operands[0] else {
+            panic!("vector component type");
+        };
+        let scalar = module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.result_id == Some(scalar_type))
+            .expect("vector scalar type");
+        match scalar.class.opcode {
+            rspirv::spirv::Op::TypeFloat => None,
+            rspirv::spirv::Op::TypeInt => match scalar.operands[1] {
+                Operand::LiteralBit32(signedness) => Some(signedness),
+                ref other => panic!("unexpected signedness operand {other:?}"),
+            },
+            other => panic!("unexpected scalar opcode {other:?}"),
+        }
+    }
+
+    /// Asserts that the single `opcode` texture instruction returns an integer vector of the given
+    /// signedness and that its result is bitcast straight back to a float vector of register bits.
+    fn assert_integer_texture_result_is_bitcast(
+        module: &rspirv::dr::Module,
+        opcode: rspirv::spirv::Op,
+        signedness: u32,
+    ) {
+        let instructions = integer_sample_test_instructions(module);
+        let sample = instructions
+            .iter()
+            .find(|inst| inst.class.opcode == opcode)
+            .unwrap_or_else(|| panic!("missing {opcode:?}"));
+        assert_eq!(
+            integer_sample_test_vector_signedness(module, sample.result_type.unwrap()),
+            Some(signedness)
+        );
+        let sample_id = sample.result_id.unwrap();
+        let bitcast = instructions
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == rspirv::spirv::Op::Bitcast
+                    && inst.operands.first() == Some(&Operand::IdRef(sample_id))
+            })
+            .expect("integer texture result is bitcast to register bits");
+        assert_eq!(
+            integer_sample_test_vector_signedness(module, bitcast.result_type.unwrap()),
+            None
+        );
+    }
+
+    fn integer_sample_test_op(volume: Option<IrValue>, cube: Option<IrValue>, dref: Option<IrValue>) -> IrOp {
+        IrOp::SampleTex {
+            sample_site: None,
+            tex_id: 0,
+            u: IrValue::ImmF32(0.25),
+            v: IrValue::ImmF32(0.75),
+            array: None,
+            volume,
+            cube,
+            dref,
+            implicit_lod: true,
+            lod_bias: None,
+            explicit_lod: None,
+            texel_offset: None,
+            component: 0,
+        }
+    }
+
+    #[test]
+    fn filtered_sample_of_uint_tic_uses_uint_binding_and_bitcasts_raw_bits() {
+        let module = integer_sample_test_module(
+            integer_sample_test_op(None, None, None),
+            vec![GraphicsTextureResource::new(0, 0, TextureNumericType::Uint)],
+        );
+        let image = image_type_for_binding(&module, GFX_BINDING_UINT_2D);
+        assert_eq!(image.operands[1], Operand::Dim(rspirv::spirv::Dim::Dim2D));
+        let scalar = image_scalar_type_for_binding(&module, GFX_BINDING_UINT_2D);
+        assert_eq!(scalar.class.opcode, rspirv::spirv::Op::TypeInt);
+        assert_eq!(scalar.operands[1], Operand::LiteralBit32(0));
+        assert_integer_texture_result_is_bitcast(
+            &module,
+            rspirv::spirv::Op::ImageSampleImplicitLod,
+            0,
+        );
+        // The raw bits must not go through a numeric conversion on the way to the register.
+        assert!(!integer_sample_test_instructions(&module).iter().any(|inst| {
+            matches!(
+                inst.class.opcode,
+                rspirv::spirv::Op::ConvertUToF | rspirv::spirv::Op::ConvertSToF
+            )
+        }));
+    }
+
+    #[test]
+    fn filtered_sample_of_sint_volume_and_uint_cube_use_typed_bindings() {
+        let volume = integer_sample_test_module(
+            integer_sample_test_op(Some(IrValue::ImmF32(0.5)), None, None),
+            vec![GraphicsTextureResource::new(0, 0, TextureNumericType::Sint)
+                .with_image_kind(GraphicsImageKind::D3)],
+        );
+        let image = image_type_for_binding(&volume, GFX_BINDING_SINT_3D);
+        assert_eq!(image.operands[1], Operand::Dim(rspirv::spirv::Dim::Dim3D));
+        assert_integer_texture_result_is_bitcast(
+            &volume,
+            rspirv::spirv::Op::ImageSampleImplicitLod,
+            1,
+        );
+
+        let cube = integer_sample_test_module(
+            integer_sample_test_op(None, Some(IrValue::ImmF32(0.5)), None),
+            vec![GraphicsTextureResource::new(0, 0, TextureNumericType::Uint)
+                .with_image_kind(GraphicsImageKind::Cube)],
+        );
+        let image = image_type_for_binding(&cube, GFX_BINDING_UINT_CUBE);
+        assert_eq!(image.operands[1], Operand::Dim(rspirv::spirv::Dim::DimCube));
+        assert_integer_texture_result_is_bitcast(
+            &cube,
+            rspirv::spirv::Op::ImageSampleImplicitLod,
+            0,
+        );
+    }
+
+    #[test]
+    fn gather_of_uint_tic_uses_uint_binding_and_bitcasts_raw_bits() {
+        let module = integer_sample_test_module(
+            IrOp::GatherTex {
+                tex_id: 0,
+                u: IrValue::ImmF32(0.25),
+                v: IrValue::ImmF32(0.75),
+                array: None,
+                gather_component: 0,
+                lane: 2,
+                dref: None,
+            },
+            vec![GraphicsTextureResource::new(0, 0, TextureNumericType::Uint)],
+        );
+        let scalar = image_scalar_type_for_binding(&module, GFX_BINDING_UINT_2D);
+        assert_eq!(scalar.class.opcode, rspirv::spirv::Op::TypeInt);
+        assert_integer_texture_result_is_bitcast(&module, rspirv::spirv::Op::ImageGather, 0);
+    }
+
+    #[test]
+    fn float_tic_sample_keeps_float_binding_without_bitcast() {
+        let module = integer_sample_test_module(
+            integer_sample_test_op(None, None, None),
+            vec![GraphicsTextureResource::new(0, 0, TextureNumericType::Float)],
+        );
+        let instructions = integer_sample_test_instructions(&module);
+        let sample = instructions
+            .iter()
+            .find(|inst| inst.class.opcode == rspirv::spirv::Op::ImageSampleImplicitLod)
+            .expect("float sample");
+        assert_eq!(
+            integer_sample_test_vector_signedness(&module, sample.result_type.unwrap()),
+            None
+        );
+        assert!(!module.annotations.iter().any(|inst| {
+            matches!(
+                inst.operands.as_slice(),
+                [
+                    Operand::IdRef(_),
+                    Operand::Decoration(Decoration::Binding),
+                    Operand::LiteralBit32(GFX_BINDING_UINT_2D)
+                ]
+            )
+        }));
+    }
+
     #[test]
     fn fragment_sint_tld_uses_sint_binding_and_restores_bit_container() {
         let bytes = build_test_program(&[
@@ -16489,8 +16988,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "used by Sample/Gather but was assigned the incompatible Uint")]
+    #[should_panic(expected = "used by a depth-compare Sample but was assigned the incompatible Uint")]
     fn filtered_sampling_rejects_integer_descriptor_family_before_emission() {
+        // Plain filtered samples of integer TICs are legal and go through the integer family
+        // (see filtered_sample_of_uint_tic_uses_uint_binding_and_bitcasts_raw_bits). Dref
+        // sampling only exists for float images, so that combination must still fail closed.
         let mut program = nexium_shader::IrProgram::new();
         program.emit(
             IrOp::SampleTex {
@@ -16501,7 +17003,7 @@ mod tests {
                 array: None,
                 volume: None,
                 cube: None,
-                dref: None,
+                dref: Some(IrValue::ImmF32(0.5)),
                 implicit_lod: true,
                 lod_bias: None,
                 explicit_lod: None,
@@ -16826,6 +17328,7 @@ mod tests {
                     array: Some(IrValue::ImmU32(0x1234_0002)),
                     gather_component: 0,
                     lane: 0,
+                    dref: None,
                 }
             } else {
                 IrOp::SampleTex {
@@ -16880,6 +17383,7 @@ mod tests {
                             array: None,
                             gather_component: 1,
                             lane: 2,
+                            dref: None,
                         },
                         Some(0),
                     );
@@ -19382,7 +19886,7 @@ mod tests {
             for lane in 0..4 {
                 program.emit(if gather {
                     IrOp::GatherTex { tex_id: 0x20, u: IrValue::ImmF32(0.25),
-                        v: IrValue::ImmF32(0.75), array: None, gather_component: 2, lane }
+                        v: IrValue::ImmF32(0.75), array: None, gather_component: 2, lane, dref: None }
                 } else {
                     IrOp::SampleTexHandle { sample_site: Some(7), handle,
                         dimension: ImageDimension::D2Array, u: IrValue::ImmF32(0.25),
@@ -21077,6 +21581,57 @@ mod tests {
     }
 
     #[test]
+    fn shf_funnel_modes_translate_through_compute_spirv() {
+        let bytes = build_test_program(&[
+            // SHF.R.W.U64 R1, R2, R0, R3 from Tears of the Kingdom.
+            0x5cfc_01c0_0007_0201,
+            // SHF.R.S64.HI R5, R2, R0, R3 (clamped).
+            0x5cf9_01e0_0007_0205,
+            // SHF.L.U64 R6, R2, R4, R3 (clamped).
+            0x5bf8_01c0_0047_0206,
+            // SHF.R.U32 R7, R2, R4, R3 (clamped).
+            0x5cf8_0180_0047_0207,
+            // SHF.R.S64 R8, R2, 0x28, R3.
+            0x38f8_01e0_0287_0208,
+            enc_exit(),
+        ]);
+        let cfg = nexium_shader::build_compute_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let emitted = emit_compute(
+            &cfg,
+            &ComputeOptions {
+                local_size: [32, 1, 1],
+                ..ComputeOptions::default()
+            },
+        )
+        .expect("SHF compute module");
+        validates_with_spirv_val_if_available(&emitted.words);
+        let module = rspirv::dr::load_words(&emitted.words).expect("valid SPIR-V");
+        let opcodes = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .map(|instruction| instruction.class.opcode)
+            .collect::<Vec<_>>();
+        for expected in [
+            rspirv::spirv::Op::ShiftLeftLogical,
+            rspirv::spirv::Op::ShiftRightLogical,
+            rspirv::spirv::Op::ShiftRightArithmetic,
+            rspirv::spirv::Op::UGreaterThanEqual,
+            rspirv::spirv::Op::ULessThan,
+        ] {
+            assert!(opcodes.contains(&expected), "missing {expected:?}");
+        }
+        assert!(!module.capabilities.iter().any(|capability| matches!(
+            capability.operands.first(),
+            Some(rspirv::dr::Operand::Capability(
+                rspirv::spirv::Capability::Int64
+            ))
+        )));
+    }
+
+    #[test]
     fn captured_shared_sass_translates_through_generic_compute_spirv() {
         let bytes = build_test_program(&[
             0xef5e_0000_0007_0d08,
@@ -21717,6 +22272,217 @@ mod tests {
         assert_eq!(
             emit_compute(&cfg, &reserved),
             Err(ComputeEmitError::ReservedImageBinding)
+        );
+    }
+
+    fn enc_mov32i(dest: u8, imm: u32) -> u64 {
+        0x0100_0000_0000_f000 | (u64::from(imm) << 20) | (7u64 << 16) | u64::from(dest)
+    }
+
+    /// Translates `words` as a fragment shader, requires that nothing failed to lower, emits
+    /// SPIR-V, runs spirv-val and returns the parsed module.
+    fn lm3_fragment_module(words: &[u64]) -> rspirv::dr::Module {
+        let mut program = words.to_vec();
+        program.push(enc_exit());
+        let bytes = build_test_program(&program);
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0, "words={words:#x?}");
+        let (spirv, _, _, _, _) = emit_fragment_full_with_options(
+            &cfg,
+            [0; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions::default(),
+        );
+        validates_with_spirv_val_if_available(&spirv);
+        rspirv::dr::load_words(&spirv).expect("valid SPIR-V")
+    }
+
+    fn lm3_module_instructions(module: &rspirv::dr::Module) -> Vec<&rspirv::dr::Instruction> {
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect()
+    }
+
+    fn lm3_has_capability(module: &rspirv::dr::Module, capability: Capability) -> bool {
+        module
+            .capabilities
+            .iter()
+            .any(|inst| inst.operands == [Operand::Capability(capability)])
+    }
+
+    /// Image operand masks of every instruction with opcode `op`.
+    fn lm3_image_operand_masks(
+        module: &rspirv::dr::Module,
+        op: rspirv::spirv::Op,
+    ) -> Vec<Option<rspirv::spirv::ImageOperands>> {
+        lm3_module_instructions(module)
+            .into_iter()
+            .filter(|inst| inst.class.opcode == op)
+            .map(|inst| {
+                inst.operands.iter().find_map(|operand| match operand {
+                    Operand::ImageOperands(mask) => Some(*mask),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lm3_tex_lz_aoffi_fragment_shaders_validate() {
+        use rspirv::spirv::{ImageOperands, Op};
+        // fs 0x40003a030, 0x40003f030, 0x400040030, 0x400041030 (register offsets).
+        for pair in [
+            [0xc0fa_0083_a047_0e04u64, 0xc0fa_0083_a007_0e00],
+            [0xc0fa_00a3_a047_0e04, 0xc0fa_00a3_a007_0e00],
+            [0xc0fa_0083_a007_0a00, 0xc0fa_0083_a047_0a00],
+            [0xc0fa_00a3_a007_0a00, 0xc0fa_00a3_a047_0a00],
+        ] {
+            let module = lm3_fragment_module(&pair);
+            let masks = lm3_image_operand_masks(&module, Op::ImageSampleExplicitLod);
+            assert!(!masks.is_empty());
+            assert!(masks.iter().all(|mask| *mask == Some(ImageOperands::LOD)));
+            assert!(lm3_has_capability(&module, Capability::ImageQuery));
+            assert!(lm3_module_instructions(&module)
+                .iter()
+                .any(|inst| inst.class.opcode == Op::ImageQuerySizeLod));
+
+            // The same instructions with MOV32I offsets keep a ConstOffset.
+            let module = lm3_fragment_module(&[
+                enc_mov32i(4, 0x1f),
+                enc_mov32i(0, 0xe2),
+                pair[0],
+                pair[1],
+            ]);
+            let masks = lm3_image_operand_masks(&module, Op::ImageSampleExplicitLod);
+            assert!(!masks.is_empty());
+            assert!(masks
+                .iter()
+                .all(|mask| *mask == Some(ImageOperands::LOD | ImageOperands::CONST_OFFSET)));
+        }
+    }
+
+    #[test]
+    fn lm3_tld4_ptp_fragment_shaders_validate_with_per_lane_gather_offsets() {
+        use rspirv::spirv::Op;
+        // fs 0x400049030 and fs 0x400950030 / 0x400953030. PTP offsets are lowered as
+        // base-level coordinate shifts, so the gathers carry no offset operands.
+        let assert_shifted_gathers = |module: &rspirv::dr::Module| {
+            let masks = lm3_image_operand_masks(module, Op::ImageGather);
+            assert!(!masks.is_empty());
+            assert!(masks.iter().all(Option::is_none));
+            assert!(lm3_has_capability(module, Capability::ImageQuery));
+            assert!(!lm3_has_capability(module, Capability::ImageGatherExtended));
+        };
+        for words in [
+            vec![0xc8ba_0087_a007_0a00u64, 0xc8ba_0087_2047_0a04],
+            vec![0xc8ba_0087_a047_0e04, 0xc8ba_0087_a007_0e00, 0xc8ba_0087_a087_0e08],
+        ] {
+            assert_shifted_gathers(&lm3_fragment_module(&words));
+        }
+
+        assert_shifted_gathers(&lm3_fragment_module(&[
+            enc_mov32i(0, 0x3e02_3f01),
+            enc_mov32i(1, 0x0500_1f20),
+            0xc8ba_0087_a007_0a00,
+        ]));
+    }
+
+    #[test]
+    fn lm3_tld4_and_tld4s_depth_compare_fragment_shaders_use_dref_gathers() {
+        use rspirv::spirv::Op;
+        // fs 0x401291030, 0x4012a2030, 0x4012a4030.
+        for words in [
+            [
+                0xdf86_0100_7027_0406u64,
+                0xc8be_0107_a007_0400,
+                0xdf86_0100_5027_0604,
+                0xc8be_0107_a007_0600,
+            ],
+            [
+                0xdf86_00e0_7027_0406,
+                0xc8be_00e7_a007_0400,
+                0xdf86_00e0_5027_0604,
+                0xc8be_00e7_a007_0600,
+            ],
+            [
+                0xdf86_00e0_c067_0807,
+                0xc8be_00e7_a047_0800,
+                0xdf86_00e0_a067_0807,
+                0xc8be_00e7_a047_0800,
+            ],
+        ] {
+            let module = lm3_fragment_module(&words);
+            let instructions = lm3_module_instructions(&module);
+            assert!(instructions
+                .iter()
+                .any(|inst| inst.class.opcode == Op::ImageDrefGather));
+            assert!(!instructions
+                .iter()
+                .any(|inst| inst.class.opcode == Op::ImageGather));
+        }
+    }
+
+    #[test]
+    fn lm3_bindless_array_depth_compare_fragment_shader_validates() {
+        use rspirv::spirv::{ImageOperands, Op};
+        // fs 0x40089b030: TEX.B array DC AOFFI plus two TLD4.B array DC gathers.
+        let module = lm3_fragment_module(&[
+            enc_static_ldc(16, 2, 0x1a0),
+            enc_mov32i(17, 0x3e),
+            0xdebe_0010_b107_0811,
+            enc_static_ldc(6, 2, 0x1a8),
+            0xdefe_0007_b067_0804,
+            enc_static_ldc(0, 2, 0x1b0),
+            0xdefe_0027_b007_0800,
+        ]);
+        let masks = lm3_image_operand_masks(&module, Op::ImageSampleDrefImplicitLod);
+        assert_eq!(masks, vec![Some(ImageOperands::CONST_OFFSET)]);
+        let gathers = lm3_image_operand_masks(&module, Op::ImageDrefGather);
+        assert_eq!(gathers.len(), 8);
+        assert!(gathers.iter().all(Option::is_none));
+        assert!(!lm3_has_capability(&module, Capability::ImageGatherExtended));
+    }
+
+    #[test]
+    fn integer_tic_gather_stays_on_the_integer_binding() {
+        let module = integer_sample_test_module(
+            IrOp::GatherTex {
+                tex_id: 0,
+                u: IrValue::ImmF32(0.25),
+                v: IrValue::ImmF32(0.75),
+                array: None,
+                gather_component: 1,
+                lane: 3,
+                dref: None,
+            },
+            vec![GraphicsTextureResource::new(0, 0, TextureNumericType::Sint)],
+        );
+        let scalar = image_scalar_type_for_binding(&module, GFX_BINDING_SINT_2D);
+        assert_eq!(scalar.class.opcode, rspirv::spirv::Op::TypeInt);
+        assert_integer_texture_result_is_bitcast(&module, rspirv::spirv::Op::ImageGather, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "used by a depth-compare Sample but was assigned the incompatible Uint")]
+    fn depth_compare_gather_rejects_integer_descriptor_family() {
+        let _ = integer_sample_test_module(
+            IrOp::GatherTex {
+                tex_id: 0,
+                u: IrValue::ImmF32(0.25),
+                v: IrValue::ImmF32(0.75),
+                array: None,
+                gather_component: 0,
+                lane: 0,
+                dref: Some(IrValue::ImmF32(0.5)),
+            },
+            vec![GraphicsTextureResource::new(0, 0, TextureNumericType::Uint)],
         );
     }
 }

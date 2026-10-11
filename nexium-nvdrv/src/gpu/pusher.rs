@@ -1003,7 +1003,7 @@ pub(crate) fn write_payload_fences(
     for &(gpu_va, payload) in writes {
         match write_gpu(gpu_va, &payload.to_le_bytes()) {
             Some((cpu, ok)) => {
-                if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                if crate::syncpt_debug_enabled() {
                     log::info!(
                         "[syncpt] async fence release gpu_va={:#x} cpu={:#x} payload={:#x} write_ok={}",
                         gpu_va,
@@ -4541,10 +4541,17 @@ mod tests {
         assert!(pusher.inline_prep().ssbo_snapshot_cache.is_empty());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn entry_boundary_retains_write_watched_full_aurora_snapshot() {
-        const CPU_VA: u64 = 0xea_0000_0000;
+        if !crate::gpu::vk_dispatch::write_watch_test_host_or_skip(
+            "entry_boundary_retains_write_watched_full_aurora_snapshot",
+        ) {
+            return;
+        }
+        // Distinct from every other fastmem test range in this crate: tests run
+        // concurrently in one process and share the arena.
+        const CPU_VA: u64 = 0xe7_0000_0000;
         const LEN: usize = 3 * 1024 * 1024;
 
         let ptr = nexium_memory::fastmem::commit(CPU_VA, LEN).expect("fastmem test arena");

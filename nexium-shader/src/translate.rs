@@ -35,6 +35,15 @@ use super::operand::{
 
 const PT: u8 = 7;
 
+/// Decoded SHF mode bits that shape the lowering.
+struct Shf {
+    bits: u32,
+    wrap: bool,
+    right: bool,
+    high_half: bool,
+    signed: bool,
+}
+
 #[derive(Clone)]
 struct ValueDef {
     op: Op,
@@ -574,6 +583,13 @@ pub(crate) fn resolve_cbuf_handle_origin(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImmediateResolution {
+    Constant(u32),
+    Cycle,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TextureSampleForm {
     tex_type: u8,
     mask: u8,
@@ -1002,6 +1018,7 @@ impl Translator {
         tex_id: u32,
         compute_handle: Option<(TextureHandleOrigin, ImageDimension)>,
         form: TextureSampleForm,
+        defs: Option<&ValueDefs>,
         pred: Option<Predicate>,
     ) -> Option<Vec<(usize, Value)>> {
         let coord = reg_a(raw);
@@ -1031,8 +1048,43 @@ impl Translator {
             )
         };
         let lod_bias = form.bias_reg.map(|bias_reg| self.read_reg(bias_reg));
-        let texel_offset = if let Some(offset_reg) = form.offset_reg {
-            let packed = self.immediate_u32(self.read_reg(offset_reg))?;
+        let packed_offset = form.offset_reg.map(|offset_reg| self.read_reg(offset_reg));
+        let constant_offset = match packed_offset {
+            Some(packed) => self.resolve_immediate_u32(packed, defs),
+            None => None,
+        };
+        let texel_offset = if let (Some(packed), None) = (packed_offset, constant_offset) {
+            // A register AOFFI that is not a translation-time constant. Vulkan only accepts a
+            // runtime Offset operand on gathers, so the SPIR-V backend lowers it as an exact
+            // coordinate shift. That is only exact when every filtered texel comes from one
+            // known mip level, which is the LZ form. Other LOD modes, other stages and other
+            // texture types stay fail-closed.
+            let lod_zero = !form.implicit_lod && form.lod_reg.is_none();
+            if self.stage != ShaderStage::Fragment
+                || compute_handle.is_some()
+                || !lod_zero
+                || !matches!(form.tex_type, 0 | 2 | 3)
+            {
+                return None;
+            }
+            let mut nibble = |shift: u32| {
+                Value::Inst(self.program.emit(
+                    Op::Bfe {
+                        a: packed,
+                        b: Value::ImmU32(shift | (4 << 8)),
+                        signed: true,
+                    },
+                    None,
+                ))
+            };
+            let x = nibble(0);
+            let y = if form.tex_type == 0 {
+                Value::ImmU32(0)
+            } else {
+                nibble(4)
+            };
+            Some((x, y, Value::ImmU32(0)))
+        } else if let Some(packed) = constant_offset {
             let signed_nibble = |shift: u32| {
                 let nibble = ((packed >> shift) & 0xf) as i32;
                 (if nibble & 0x8 != 0 {
@@ -1118,28 +1170,70 @@ impl Translator {
         Some(samples)
     }
 
-    fn immediate_u32(&self, mut value: Value) -> Option<u32> {
-        for _ in 0..16 {
-            match value {
-                Value::Zero => return Some(0),
-                Value::ImmU32(bits) => return Some(bits),
-                Value::ImmF32(value) => return Some(value.to_bits()),
-                Value::Inst(id) => {
-                    let op = self
-                        .program
-                        .instructions
-                        .iter()
-                        .find(|inst| inst.result == Some(id))
-                        .map(|inst| &inst.op)?;
-                    let Op::Mov(next) = op else {
-                        return None;
-                    };
-                    value = *next;
-                }
-                Value::GprIn(_) => return None,
-            }
+    /// Resolves `value` to a translation-time constant. Looks through MOVs in this block and in
+    /// already translated blocks (`defs`), through predicated selects whose arms agree, and
+    /// through phis whose incoming values all resolve to the same constant. A phi source that
+    /// cycles back into a phi being resolved adds no constraint. Anything else (including a
+    /// back edge whose block has not been translated yet) is not constant.
+    fn resolve_immediate_u32(&self, value: Value, defs: Option<&ValueDefs>) -> Option<u32> {
+        match self.resolve_immediate_u32_inner(value, defs, &mut HashSet::new(), 0) {
+            ImmediateResolution::Constant(bits) => Some(bits),
+            ImmediateResolution::Cycle | ImmediateResolution::Unknown => None,
         }
-        None
+    }
+
+    fn resolve_immediate_u32_inner(
+        &self,
+        value: Value,
+        defs: Option<&ValueDefs>,
+        visiting: &mut HashSet<ValueId>,
+        depth: u32,
+    ) -> ImmediateResolution {
+        if depth > 64 {
+            return ImmediateResolution::Unknown;
+        }
+        let id = match value {
+            Value::Zero => return ImmediateResolution::Constant(0),
+            Value::ImmU32(bits) => return ImmediateResolution::Constant(bits),
+            Value::ImmF32(value) => return ImmediateResolution::Constant(value.to_bits()),
+            Value::GprIn(_) => return ImmediateResolution::Unknown,
+            Value::Inst(id) => id,
+        };
+        if !visiting.insert(id) {
+            return ImmediateResolution::Cycle;
+        }
+        let merge = |sources: &mut dyn Iterator<Item = Value>,
+                     visiting: &mut HashSet<ValueId>|
+         -> ImmediateResolution {
+            let mut constant = None;
+            for source in sources {
+                match self.resolve_immediate_u32_inner(source, defs, visiting, depth + 1) {
+                    ImmediateResolution::Constant(bits) => {
+                        if constant.is_some_and(|known| known != bits) {
+                            return ImmediateResolution::Unknown;
+                        }
+                        constant = Some(bits);
+                    }
+                    ImmediateResolution::Cycle => {}
+                    ImmediateResolution::Unknown => return ImmediateResolution::Unknown,
+                }
+            }
+            constant.map_or(ImmediateResolution::Cycle, ImmediateResolution::Constant)
+        };
+        let resolution = match self.direct_value_op(value, defs) {
+            Some(Op::Mov(next)) => {
+                self.resolve_immediate_u32_inner(next, defs, visiting, depth + 1)
+            }
+            Some(Op::SelectPred {
+                if_true, if_false, ..
+            }) => merge(&mut [if_true, if_false].into_iter(), visiting),
+            Some(Op::Phi { sources }) => {
+                merge(&mut sources.into_iter().map(|(_, source)| source), visiting)
+            }
+            _ => ImmediateResolution::Unknown,
+        };
+        visiting.remove(&id);
+        resolution
     }
 
     fn load_cbuf(&mut self, raw: u64) -> ValueId {
@@ -1996,96 +2090,270 @@ impl Translator {
         })
     }
 
-    fn shf_common_supported(raw: u64) -> bool {
-        ((raw >> 37) & 3) == 0 && ((raw >> 47) & 1) == 0 && ((raw >> 48) & 3) == 0
-    }
-
-    fn shf_imm_shift(raw: u64) -> u32 {
-        let shift = imm20(raw) as u32;
-        if ((raw >> 50) & 1) != 0 {
-            shift & 31
-        } else {
-            shift.min(32)
-        }
-    }
-
-    fn emit_shf_l_imm(&mut self, raw: u64, pred: Option<Predicate>) -> bool {
-        if !Self::shf_common_supported(raw) {
+    /// Lowers every Maxwell SHF (funnel shift) form into 32-bit integer IR.
+    ///
+    /// Field layout (envydis gm107, Mesa NAK sm50): Rd 0..8, Ra (low word) 8..16, Rb or an
+    /// immediate 20..37 (sign at 56), max shift 37..39 (0 U32, 2 U64, 3 S64, 1 invalid),
+    /// Rc (high word) 39..47, .CC 47, .HI 48, .X 49, .W 50.
+    ///
+    /// Semantics follow NAK's `OpShf::fold` for SM50: the operand is the 64-bit funnel
+    /// `Rc:Ra`, the shift amount wraps modulo the data size with .W and clamps to the data size
+    /// without it, `.L` always returns the high word, `.R` returns the low word or, with .HI,
+    /// the high word, and only S64 right shifts are arithmetic. `.L.HI` is an illegal encoding
+    /// on SM50, and .CC / .X have no documented semantics anywhere, so those fail closed.
+    fn emit_shf(&mut self, raw: u64, opcode: Opcode, pred: Option<Predicate>) -> bool {
+        let right = matches!(opcode, Opcode::SHF_r_reg | Opcode::SHF_r_imm);
+        let max_shift = (raw >> 37) & 3;
+        let write_cc = ((raw >> 47) & 1) != 0;
+        let high_half = ((raw >> 48) & 1) != 0;
+        let extended = ((raw >> 49) & 1) != 0;
+        let wrap = ((raw >> 50) & 1) != 0;
+        if max_shift == 1 || write_cc || extended || (high_half && !right) {
             return false;
         }
 
-        let dest = reg_dest(raw);
-        let low_reg = reg_a(raw);
-        let high_reg = reg_c(raw);
-        let low = self.read_reg(low_reg);
-        let high = self.read_reg(high_reg);
-        let shift = Self::shf_imm_shift(raw);
-
-        let op = match shift {
-            0 => Op::Mov(high),
-            32 => Op::Mov(low),
-            shift if low_reg == RZ => Op::IShl {
-                a: high,
-                b: Value::ImmU32(shift),
-            },
-            shift if high_reg == RZ => Op::IShr {
-                a: low,
-                b: Value::ImmU32(32 - shift),
-                signed: false,
-            },
-            shift => {
-                let left = self.emit_ishl_imm_value(high, shift);
-                let right = self.emit_ishr_imm_value(low, 32 - shift);
-                Op::ILop {
-                    a: left,
-                    b: right,
-                    op: LogicOp::Or,
-                    not_a: false,
-                    not_b: false,
-                }
-            }
+        let shf = Shf {
+            bits: if max_shift == 0 { 32 } else { 64 },
+            wrap,
+            right,
+            high_half,
+            signed: right && max_shift == 3,
         };
-        self.write_reg(dest, op, pred);
-        true
-    }
-
-    fn emit_shf_l_reg(&mut self, raw: u64, pred: Option<Predicate>) -> bool {
-        if !Self::shf_common_supported(raw) || ((raw >> 50) & 1) == 0 || reg_a(raw) != RZ {
-            return false;
-        }
-
-        let shift = self.read_reg(reg_b(raw));
-        let masked_shift = self.emit_ilop_imm_value(shift, 31, LogicOp::And, false, false);
-        let high = self.read_reg(reg_c(raw));
-        self.write_reg(
-            reg_dest(raw),
-            Op::IShl {
-                a: high,
-                b: masked_shift,
-            },
-            pred,
-        );
-        true
-    }
-
-    fn emit_shf_r_imm(&mut self, raw: u64, pred: Option<Predicate>) -> bool {
-        if !Self::shf_common_supported(raw) || reg_c(raw) != RZ {
-            return false;
-        }
-
         let low = self.read_reg(reg_a(raw));
-        let shift = Self::shf_imm_shift(raw);
+        let high = self.read_reg(reg_c(raw));
+        let shift = match opcode {
+            // The 20-bit immediate shares bits 37..39 with the max shift field.
+            Opcode::SHF_l_imm | Opcode::SHF_r_imm => Value::ImmU32(imm20(raw & !(3 << 37)) as u32),
+            _ => self.read_reg(reg_b(raw)),
+        };
         let op = match shift {
-            0 => Op::Mov(low),
-            32 => Op::Mov(Value::Zero),
-            shift => Op::IShr {
-                a: low,
-                b: Value::ImmU32(shift),
-                signed: false,
-            },
+            Value::Zero => self.shf_const_op(&shf, low, high, 0),
+            Value::ImmU32(amount) => {
+                let amount = if shf.wrap {
+                    amount & (shf.bits - 1)
+                } else {
+                    amount.min(shf.bits)
+                };
+                self.shf_const_op(&shf, low, high, amount)
+            }
+            shift => self.shf_dynamic_op(&shf, low, high, shift),
         };
         self.write_reg(reg_dest(raw), op, pred);
         true
+    }
+
+    /// Funnel shift by an already wrapped or clamped constant amount in `0..=bits`.
+    fn shf_const_op(&mut self, shf: &Shf, low: Value, high: Value, amount: u32) -> Op {
+        if shf.right {
+            if shf.high_half {
+                return Self::shr_const_op(high, amount, shf.signed);
+            }
+            if amount >= 32 {
+                return Self::shr_const_op(high, amount - 32, shf.signed);
+            }
+            let low_part = Self::shr_const_op(low, amount, false);
+            let high_part = Self::shl_const_op(high, 32 - amount);
+            self.or_ops(low_part, high_part)
+        } else {
+            if amount >= 32 {
+                return Self::shl_const_op(low, amount - 32);
+            }
+            let high_part = Self::shl_const_op(high, amount);
+            let low_part = Self::shr_const_op(low, 32 - amount, false);
+            self.or_ops(high_part, low_part)
+        }
+    }
+
+    /// Funnel shift by a runtime amount. IR shifts only see the low five bits of the amount,
+    /// so the `< 32` and `>= 32` halves are computed separately and merged with compare masks.
+    fn shf_dynamic_op(&mut self, shf: &Shf, low: Value, high: Value, shift: Value) -> Op {
+        let amount = if shf.wrap {
+            self.emit_ilop_imm_value(shift, shf.bits - 1, LogicOp::And, false, false)
+        } else {
+            // An arithmetic 64-bit shift by 63 already yields all sign bits, so S64 right
+            // shifts clamp there and never need the separate "shifted everything out" case.
+            let limit = if shf.signed { 63 } else { shf.bits };
+            self.emit_value(Op::IMinMaxPred {
+                a: shift,
+                b: Value::ImmU32(limit),
+                signed: false,
+                pred: PT,
+                neg_pred: false,
+            })
+        };
+        let may_reach_32 = shf.bits == 64 || !shf.wrap;
+        let may_reach_64 = shf.bits == 64 && !shf.wrap && !shf.signed;
+
+        let below = if shf.right && shf.high_half {
+            Self::shr_dynamic_op(high, amount, shf.signed)
+        } else if shf.right {
+            let low_part = Self::shr_dynamic_op(low, amount, false);
+            let high_part = if matches!(high, Value::Zero) {
+                Op::Mov(Value::Zero)
+            } else {
+                let doubled = self.emit_ishl_imm_value(high, 1);
+                let inverse = self.emit_ilop_imm_value(amount, 31, LogicOp::Xor, false, false);
+                Self::shl_dynamic_op(doubled, inverse)
+            };
+            self.or_ops(low_part, high_part)
+        } else {
+            let high_part = Self::shl_dynamic_op(high, amount);
+            let low_part = if matches!(low, Value::Zero) {
+                Op::Mov(Value::Zero)
+            } else {
+                let halved = self.emit_ishr_imm_value(low, 1);
+                let inverse = self.emit_ilop_imm_value(amount, 31, LogicOp::Xor, false, false);
+                Self::shr_dynamic_op(halved, inverse, false)
+            };
+            self.or_ops(high_part, low_part)
+        };
+        if !may_reach_32 {
+            return below;
+        }
+
+        let above = if shf.right && shf.high_half {
+            Self::shr_const_op(high, 32, shf.signed)
+        } else if shf.right {
+            Self::shr_dynamic_op(high, amount, shf.signed)
+        } else {
+            Self::shl_dynamic_op(low, amount)
+        };
+        let at_least_32 = self.emit_value(Op::ISet {
+            cmp: ICmp::Ge,
+            signed: false,
+            a: amount,
+            b: Value::ImmU32(32),
+            bool_float: false,
+        });
+        let merged = self.select_ops(at_least_32, above, below);
+        if !may_reach_64 || matches!(merged, Op::Mov(Value::Zero)) {
+            return merged;
+        }
+        let below_64 = self.emit_value(Op::ISet {
+            cmp: ICmp::Lt,
+            signed: false,
+            a: amount,
+            b: Value::ImmU32(64),
+            bool_float: false,
+        });
+        let merged = self.materialize_op(merged);
+        Op::ILop {
+            a: merged,
+            b: below_64,
+            op: LogicOp::And,
+            not_a: false,
+            not_b: false,
+        }
+    }
+
+    fn shl_const_op(value: Value, amount: u32) -> Op {
+        match (value, amount) {
+            (Value::Zero, _) => Op::Mov(Value::Zero),
+            (_, 32..) => Op::Mov(Value::Zero),
+            (value, 0) => Op::Mov(value),
+            (value, amount) => Op::IShl {
+                a: value,
+                b: Value::ImmU32(amount),
+            },
+        }
+    }
+
+    fn shr_const_op(value: Value, amount: u32, signed: bool) -> Op {
+        match (value, amount) {
+            (Value::Zero, _) => Op::Mov(Value::Zero),
+            (value, 32..) if signed => Op::IShr {
+                a: value,
+                b: Value::ImmU32(31),
+                signed: true,
+            },
+            (_, 32..) => Op::Mov(Value::Zero),
+            (value, 0) => Op::Mov(value),
+            (value, amount) => Op::IShr {
+                a: value,
+                b: Value::ImmU32(amount),
+                signed,
+            },
+        }
+    }
+
+    fn shl_dynamic_op(value: Value, amount: Value) -> Op {
+        if matches!(value, Value::Zero) {
+            return Op::Mov(Value::Zero);
+        }
+        Op::IShl {
+            a: value,
+            b: amount,
+        }
+    }
+
+    fn shr_dynamic_op(value: Value, amount: Value, signed: bool) -> Op {
+        if matches!(value, Value::Zero) {
+            return Op::Mov(Value::Zero);
+        }
+        Op::IShr {
+            a: value,
+            b: amount,
+            signed,
+        }
+    }
+
+    fn materialize_op(&mut self, op: Op) -> Value {
+        match op {
+            Op::Mov(value) => value,
+            op => self.emit_value(op),
+        }
+    }
+
+    fn or_ops(&mut self, a: Op, b: Op) -> Op {
+        if matches!(a, Op::Mov(Value::Zero)) {
+            return b;
+        }
+        if matches!(b, Op::Mov(Value::Zero)) {
+            return a;
+        }
+        let a = self.materialize_op(a);
+        let b = self.materialize_op(b);
+        Op::ILop {
+            a,
+            b,
+            op: LogicOp::Or,
+            not_a: false,
+            not_b: false,
+        }
+    }
+
+    /// Picks `if_set` where `mask` is all ones and `if_clear` where it is zero.
+    fn select_ops(&mut self, mask: Value, if_set: Op, if_clear: Op) -> Op {
+        let set_zero = matches!(if_set, Op::Mov(Value::Zero));
+        let clear_zero = matches!(if_clear, Op::Mov(Value::Zero));
+        if set_zero && clear_zero {
+            return Op::Mov(Value::Zero);
+        }
+        let set_part = if set_zero {
+            Op::Mov(Value::Zero)
+        } else {
+            let value = self.materialize_op(if_set);
+            Op::ILop {
+                a: value,
+                b: mask,
+                op: LogicOp::And,
+                not_a: false,
+                not_b: false,
+            }
+        };
+        let clear_part = if clear_zero {
+            Op::Mov(Value::Zero)
+        } else {
+            let value = self.materialize_op(if_clear);
+            Op::ILop {
+                a: value,
+                b: mask,
+                op: LogicOp::And,
+                not_a: false,
+                not_b: true,
+            }
+        };
+        self.or_ops(set_part, clear_part)
     }
 
     fn emit_ilop_imm_value(
@@ -3739,7 +4007,7 @@ impl Translator {
                     None
                 };
                 if self
-                    .emit_texture_sample(raw, tex_id, compute_handle, form, pred)
+                    .emit_texture_sample(raw, tex_id, compute_handle, form, defs, pred)
                     .is_none()
                 {
                     log::debug!("TEX runtime AOFFI unsupported raw={:#018x}", raw);
@@ -3799,7 +4067,7 @@ impl Translator {
                     None
                 };
                 let Some(samples) =
-                    self.emit_texture_sample(raw, origin.texture_id(), compute_handle, form, pred)
+                    self.emit_texture_sample(raw, origin.texture_id(), compute_handle, form, defs, pred)
                 else {
                     log::debug!("TEX_b runtime AOFFI unsupported raw={:#018x}", raw);
                     self.program.emit_void(Op::Unimplemented {
@@ -4091,6 +4359,13 @@ impl Translator {
             }
 
             Opcode::TLD4S => {
+                // Scalar 2D gather (envydis gm107 df00: f16 55, component 52..54, AOFFI 51,
+                // DC 50, NODEP 49, texture index 36..49, dst_b 28..36, rb 20..28, ra 8..16,
+                // dst_a 0..8). Source packing (citron TLD4S, Ryujinx EmitTexs Tld4s): plain
+                // form reads u=ra, v=rb; with AOFFI or DC the coordinates are the aligned pair
+                // ra/ra+1 and rb carries the offset word, then the depth reference (rb, or rb+1
+                // when both are present). Results are four lanes split over dst_a and dst_b, as
+                // aligned f32 pairs or as two packed f16x2 words.
                 let dest_a = reg_dest(raw);
                 let dest_b = ((raw >> 28) & 0xFF) as u8;
                 let ra = reg_a(raw);
@@ -4100,19 +4375,24 @@ impl Translator {
                 let aoffi = ((raw >> 51) & 0x1) != 0;
                 let dc = ((raw >> 50) & 0x1) != 0;
                 let fp16 = ((raw >> 55) & 0x1) != 0;
-                if aoffi
-                    || dc
-                    || (!fp16
-                        && [dest_a, dest_b]
-                            .into_iter()
-                            .any(|dest| dest != RZ && dest & 1 != 0))
+                let aligned_pair = |reg: u8| reg != RZ && reg & 1 == 0;
+                if (!fp16
+                    && [dest_a, dest_b]
+                        .into_iter()
+                        .any(|dest| dest != RZ && dest & 1 != 0))
+                    || ((aoffi || dc) && !aligned_pair(ra))
+                    || (aoffi && dc && !aligned_pair(rb))
+                    || (dc && (gather_component != 0 || self.stage == ShaderStage::Compute))
                 {
                     log::debug!(
-                        "TLD4S unsupported form raw={:#018x} aoffi={} dc={} fp16={} dest_a={} dest_b={}",
+                        "TLD4S unsupported form raw={:#018x} aoffi={} dc={} fp16={} component={} ra={} rb={} dest_a={} dest_b={}",
                         raw,
                         aoffi,
                         dc,
                         fp16,
+                        gather_component,
+                        ra,
+                        rb,
                         dest_a,
                         dest_b,
                     );
@@ -4124,21 +4404,35 @@ impl Translator {
                     return false;
                 }
 
-                let u = self.read_reg(ra);
-                let v = self.read_reg(rb);
+                let (u, v) = if aoffi || dc {
+                    (self.read_reg(ra), self.read_reg(ra + 1))
+                } else {
+                    (self.read_reg(ra), self.read_reg(rb))
+                };
+                // The AOFFI word packs signed 6-bit x/y offsets in its low two bytes, applied
+                // as a base-level coordinate shift exactly like the TLD4 AOFFI form.
+                let (u, v) = if aoffi {
+                    let packed = self.read_reg(rb);
+                    (
+                        self.shift_gather_coord(tex_id, u, packed, 0, 0),
+                        self.shift_gather_coord(tex_id, v, packed, 8, 1),
+                    )
+                } else {
+                    (u, v)
+                };
+                let dref = dc.then(|| self.read_reg(if aoffi { rb + 1 } else { rb }));
+                let gather = |lane: u8| Op::GatherTex {
+                    tex_id,
+                    u,
+                    v,
+                    array: None,
+                    gather_component,
+                    lane,
+                    dref,
+                };
                 if fp16 {
                     let gathered: [Value; 4] = std::array::from_fn(|lane| {
-                        Value::Inst(self.program.emit(
-                            Op::GatherTex {
-                                tex_id,
-                                u,
-                                v,
-                                array: None,
-                                gather_component,
-                                lane: lane as u8,
-                            },
-                            None,
-                        ))
+                        Value::Inst(self.program.emit(gather(lane as u8), None))
                     });
                     self.write_reg(
                         dest_a,
@@ -4164,18 +4458,7 @@ impl Translator {
                         } else {
                             pair_dest + (lane & 1)
                         };
-                        self.write_reg(
-                            dst_reg,
-                            Op::GatherTex {
-                                tex_id,
-                                u,
-                                v,
-                                array: None,
-                                gather_component,
-                                lane,
-                            },
-                            pred,
-                        );
+                        self.write_reg(dst_reg, gather(lane), pred);
                     }
                 }
             }
@@ -4619,6 +4902,12 @@ impl Translator {
             }
 
             Opcode::TLD4 | Opcode::TLD4_b => {
+                // Field layout (envydis gm107 c838/def8, Mesa NAK sm50 OpTld4, citron TLD4):
+                // dst 0..8, coords 8..16, meta 20..28, type 28..31, mask 31..35, NDV 35,
+                // texture index 36..49 (bound only), NODEP 49, DC 50, sparse pred 51..54,
+                // offset mode 54..56 / 36..38 (none, AOFFI, PTP), component 56..58 / 38..40.
+                // NDV and NODEP only change derivative and scheduling behavior; a gather always
+                // reads the base level, so neither affects the lowered result.
                 let bindless = decoded.opcode == Opcode::TLD4_b;
                 let mask = ((raw >> 31) & 0xF) as u8;
                 let tex_type = ((raw >> 28) & 0x7) as u8;
@@ -4629,20 +4918,24 @@ impl Translator {
                 } else {
                     (((raw >> 54) & 0x3) as u8, ((raw >> 56) & 0x3) as u8)
                 };
+                // Offset mode 3 is undefined. A depth-compare gather returns the four compare
+                // results, so only the R component select is meaningful there, and compute
+                // gathers have no depth-compare sampler path.
                 if mask == 0
                     || !matches!(tex_type, 2 | 3)
-                    || dc
                     || sparse_pred != PT
                     || offset_type > 2
+                    || (dc && (gather_component != 0 || self.stage == ShaderStage::Compute))
                 {
                     log::debug!(
-                        "TLD4 unsupported form raw={:#018x} bindless={} stage={:?} type={} mask={:#x} dc={} sparse_pred={} offset={}",
+                        "TLD4 unsupported form raw={:#018x} bindless={} stage={:?} type={} mask={:#x} dc={} component={} sparse_pred={} offset={}",
                         raw,
                         bindless,
                         self.stage,
                         tex_type,
                         mask,
                         dc,
+                        gather_component,
                         sparse_pred,
                         offset_type,
                     );
@@ -4654,6 +4947,7 @@ impl Translator {
                     return false;
                 }
 
+                let mut deferred_handle = None;
                 let tex_id = if bindless {
                     let handle = self.read_reg(reg_b(raw));
                     let Some((origin, deferred)) =
@@ -4668,16 +4962,19 @@ impl Translator {
                         return false;
                     };
                     if deferred {
-                        log::debug!(
-                            "TLD4_b deferred handle origin is unsupported raw={:#018x}",
-                            raw,
-                        );
-                        self.program.emit_void(Op::Unimplemented {
-                            opcode: Opcode::TLD4_b,
-                            raw,
-                        });
-                        self.unimplemented_count += 1;
-                        return false;
+                        if self.stage == ShaderStage::Compute {
+                            log::debug!(
+                                "TLD4_b deferred compute handle origin is unsupported raw={:#018x}",
+                                raw,
+                            );
+                            self.program.emit_void(Op::Unimplemented {
+                                opcode: Opcode::TLD4_b,
+                                raw,
+                            });
+                            self.unimplemented_count += 1;
+                            return false;
+                        }
+                        deferred_handle = Some(handle);
                     }
                     if let Some(partner) = origin.cross_binding_partner_id() {
                         if self.stage == ShaderStage::Compute {
@@ -4700,11 +4997,16 @@ impl Translator {
                     texs_tex_id(raw)
                 };
 
+                // Coordinates: [layer,] u, v. Meta registers in order: [bindless handle,]
+                // AOFFI word or the two PTP words, then the depth reference.
                 let coord = reg_a(raw);
                 let arrayed = tex_type == 3;
                 let array = arrayed.then(|| self.read_reg(coord));
                 let u = self.read_reg(coord.wrapping_add(u8::from(arrayed)));
                 let v = self.read_reg(coord.wrapping_add(1 + u8::from(arrayed)));
+                // Offsets shift the coordinates and query the texture size, so with a deferred
+                // bindless handle those size queries are retargeted together with the gathers.
+                let first_lowered = self.program.instructions.len();
                 let offset_reg = reg_b(raw).wrapping_add(u8::from(bindless));
                 let lanes: [(Value, Value, u8); 4] = match offset_type {
                     1 => {
@@ -4733,11 +5035,27 @@ impl Translator {
                     }
                     _ => [(u, v, 0), (u, v, 1), (u, v, 2), (u, v, 3)],
                 };
+                let offset_words = match offset_type {
+                    0 => 0,
+                    1 => 1,
+                    _ => 2,
+                };
+                let dref = dc.then(|| {
+                    if reg_b(raw) == RZ {
+                        Value::Zero
+                    } else {
+                        self.read_reg(offset_reg.wrapping_add(offset_words))
+                    }
+                });
+
                 let mut dst = reg_dest(raw);
+                let mut samples = Vec::new();
                 for (index, (u, v, lane)) in lanes.into_iter().enumerate() {
                     if (mask >> index) & 1 == 0 {
                         continue;
                     }
+                    let old_value = self.read_reg(dst);
+                    let instruction_index = self.program.instructions.len();
                     self.write_reg(
                         dst,
                         Op::GatherTex {
@@ -4747,10 +5065,31 @@ impl Translator {
                             array,
                             gather_component,
                             lane,
+                            dref,
                         },
                         pred,
                     );
+                    samples.push((instruction_index, old_value));
                     dst = dst.wrapping_add(1);
+                }
+                if let Some(handle) = deferred_handle {
+                    let provisional = crate::texture_handle_for_id(tex_id);
+                    for index in first_lowered..self.program.instructions.len() {
+                        if matches!(
+                            self.program.instructions[index].op,
+                            Op::TextureQueryDimension { handle, .. } if handle == provisional
+                        ) {
+                            samples.push((index, Value::Zero));
+                        }
+                    }
+                    self.pending_bindless_origin_checks
+                        .push(PendingBindlessOriginCheck {
+                            opcode: Opcode::TLD4_b,
+                            raw,
+                            handle,
+                            consumer_pred: pred,
+                            samples,
+                        });
                 }
             }
 
@@ -5861,32 +6200,12 @@ impl Translator {
                 self.emit_iscadd(raw, Value::ImmU32(imm20(raw) as u32), pred);
             }
 
-            Opcode::SHF_l_imm => {
-                if !self.emit_shf_l_imm(raw, pred) {
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::SHF_l_imm,
-                        raw,
-                    });
-                    self.unimplemented_count += 1;
-                    return false;
-                }
-            }
-            Opcode::SHF_l_reg => {
-                if !self.emit_shf_l_reg(raw, pred) {
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::SHF_l_reg,
-                        raw,
-                    });
-                    self.unimplemented_count += 1;
-                    return false;
-                }
-            }
-            Opcode::SHF_r_imm => {
-                if !self.emit_shf_r_imm(raw, pred) {
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::SHF_r_imm,
-                        raw,
-                    });
+            shf @ (Opcode::SHF_l_imm
+            | Opcode::SHF_l_reg
+            | Opcode::SHF_r_imm
+            | Opcode::SHF_r_reg) => {
+                if !self.emit_shf(raw, shf, pred) {
+                    self.program.emit_void(Op::Unimplemented { opcode: shf, raw });
                     self.unimplemented_count += 1;
                     return false;
                 }
@@ -8286,12 +8605,21 @@ mod tests {
         let left_reg = 0x5bfc_0380_0027_ff07u64;
         let right_imm = 0x38f8_7f80_0017_0909u64;
         for raw in [
+            // .CC: no reference defines SHF's carry/overflow flags.
             left_imm | (1 << 47),
+            left_reg | (1 << 47),
+            right_imm | (1 << 47),
+            // .HI on a left shift is an illegal encoding on SM50.
             left_imm | (1 << 48),
-            left_imm | (2 << 37),
-            left_reg & !(1 << 50),
-            (left_reg & !(0xff << 8)) | (1 << 8),
-            (right_imm & !(0xff << 39)) | (1 << 39),
+            left_reg | (1 << 48),
+            // .X and .XHI: extended-precision input is undocumented.
+            left_imm | (2 << 48),
+            right_imm | (2 << 48),
+            right_imm | (3 << 48),
+            // Max shift field value 1 is undefined.
+            left_imm | (1 << 37),
+            left_reg | (1 << 37),
+            right_imm | (1 << 37),
         ] {
             let mut t = Translator::new();
             assert!(!t.translate(raw), "SHF raw={raw:#018x}");
@@ -8300,6 +8628,312 @@ mod tests {
                 t.program.instructions.last().map(|inst| &inst.op),
                 Some(Op::Unimplemented { raw: failed, .. }) if *failed == raw
             ));
+        }
+    }
+
+    #[test]
+    fn previously_rejected_shf_modes_now_lower() {
+        let left_imm = 0x36f8_0300_0107_0607u64;
+        let left_reg = 0x5bfc_0380_0027_ff07u64;
+        let right_imm = 0x38f8_7f80_0017_0909u64;
+        for raw in [
+            left_imm | (2 << 37),
+            left_imm | (3 << 37),
+            left_reg & !(1 << 50),
+            (left_reg & !(0xff << 8)) | (1 << 8),
+            (right_imm & !(0xff << 39)) | (1 << 39),
+            right_imm | (1 << 48),
+            0x5cfc_01c0_0007_0201,
+        ] {
+            let mut t = Translator::new();
+            assert!(t.translate(raw), "SHF raw={raw:#018x}");
+            assert_eq!(t.unimplemented_count, 0, "SHF raw={raw:#018x}");
+        }
+    }
+
+    /// Scalar SHF reference for SM50, mirroring Mesa NAK's `OpShf::fold`.
+    fn shf_reference(
+        right: bool,
+        wrap: bool,
+        max_shift: u64,
+        high_half: bool,
+        low: u32,
+        high: u32,
+        shift: u32,
+    ) -> u32 {
+        let bits = if max_shift == 0 { 32 } else { 64 };
+        let shift = if wrap {
+            shift & (bits - 1)
+        } else {
+            shift.min(bits)
+        };
+        let packed = u64::from(low) | (u64::from(high) << 32);
+        let shifted = if !right {
+            packed.checked_shl(shift).unwrap_or(0)
+        } else if max_shift == 3 {
+            let packed = packed as i64;
+            packed.checked_shr(shift).unwrap_or(packed >> 63) as u64
+        } else {
+            packed.checked_shr(shift).unwrap_or(0)
+        };
+        if !right || high_half {
+            (shifted >> 32) as u32
+        } else {
+            shifted as u32
+        }
+    }
+
+    /// Evaluates a straight-line integer program and returns the last value written to `dest`.
+    fn eval_int_program(program: &Program, regs: &HashMap<u8, u32>, dest: u8) -> u32 {
+        let mut values: HashMap<ValueId, u32> = HashMap::new();
+        let mut written = None;
+        for inst in &program.instructions {
+            let value = |v: &Value| -> u32 {
+                match v {
+                    Value::Zero => 0,
+                    Value::ImmU32(imm) => *imm,
+                    Value::GprIn(reg) => regs[reg],
+                    Value::Inst(id) => values[id],
+                    other => panic!("unexpected SHF operand {other:?}"),
+                }
+            };
+            assert!(inst.pred.is_none(), "unexpected predicate in {:?}", inst.op);
+            let result = match &inst.op {
+                Op::Mov(a) => value(a),
+                Op::IShl { a, b } => value(a) << (value(b) & 31),
+                Op::IShr { a, b, signed } => {
+                    let shift = value(b) & 31;
+                    if *signed {
+                        ((value(a) as i32) >> shift) as u32
+                    } else {
+                        value(a) >> shift
+                    }
+                }
+                Op::ILop {
+                    a,
+                    b,
+                    op,
+                    not_a,
+                    not_b,
+                } => {
+                    let a = if *not_a { !value(a) } else { value(a) };
+                    let b = if *not_b { !value(b) } else { value(b) };
+                    match op {
+                        LogicOp::And => a & b,
+                        LogicOp::Or => a | b,
+                        LogicOp::Xor => a ^ b,
+                        LogicOp::PassB => b,
+                    }
+                }
+                Op::ISet {
+                    cmp,
+                    signed: false,
+                    a,
+                    b,
+                    bool_float: false,
+                } => {
+                    let (a, b) = (value(a), value(b));
+                    let hit = match cmp {
+                        ICmp::F => false,
+                        ICmp::Lt => a < b,
+                        ICmp::Eq => a == b,
+                        ICmp::Le => a <= b,
+                        ICmp::Gt => a > b,
+                        ICmp::Ne => a != b,
+                        ICmp::Ge => a >= b,
+                        ICmp::T => true,
+                    };
+                    if hit {
+                        u32::MAX
+                    } else {
+                        0
+                    }
+                }
+                Op::IMinMaxPred {
+                    a,
+                    b,
+                    signed: false,
+                    pred: PT,
+                    neg_pred: false,
+                } => value(a).min(value(b)),
+                other => panic!("SHF lowering emitted unexpected op {other:?}"),
+            };
+            if let Some(id) = inst.result {
+                values.insert(id, result);
+            }
+            if inst.dest_reg == Some(dest) {
+                written = Some(result);
+            }
+        }
+        written.expect("SHF wrote its destination")
+    }
+
+    fn encode_shf(
+        right: bool,
+        immediate: Option<u32>,
+        wrap: bool,
+        max_shift: u64,
+        high_half: bool,
+        regs: (u8, u8, u8, u8),
+    ) -> u64 {
+        let (dest, a, b, c) = regs;
+        let opcode: u64 = match (right, immediate.is_some()) {
+            (false, false) => 0x5bf8,
+            (true, false) => 0x5cf8,
+            (false, true) => 0x36f8,
+            (true, true) => 0x38f8,
+        };
+        let shift_field = match immediate {
+            Some(imm) => (u64::from(imm & 0x1_ffff) << 20) | (u64::from((imm >> 19) & 1) << 56),
+            None => u64::from(b) << 20,
+        };
+        (opcode << 48)
+            | (u64::from(wrap) << 50)
+            | (u64::from(high_half) << 48)
+            | (u64::from(c) << 39)
+            | (max_shift << 37)
+            | shift_field
+            | (7 << 16)
+            | (u64::from(a) << 8)
+            | u64::from(dest)
+    }
+
+    #[test]
+    fn shf_lowering_matches_reference_for_every_mode() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 16) as u32
+        };
+        const EDGE_SHIFTS: [u32; 14] = [
+            0,
+            1,
+            2,
+            31,
+            32,
+            33,
+            47,
+            63,
+            64,
+            65,
+            100,
+            0x3ffff,
+            0x7ffff,
+            u32::MAX,
+        ];
+        let mut checked = 0;
+        for right in [false, true] {
+            for wrap in [false, true] {
+                for max_shift in [0u64, 2, 3] {
+                    for high_half in [false, true] {
+                        if high_half && !right {
+                            continue;
+                        }
+                        for (a, c) in [(2u8, 3u8), (RZ, 3), (2, RZ)] {
+                            let mut shifts: Vec<u32> = EDGE_SHIFTS.to_vec();
+                            shifts.extend((0..24).map(|_| next() & 0x7f));
+                            shifts.extend((0..8).map(|_| next()));
+                            for shift in shifts {
+                                for immediate in [false, true] {
+                                    // Immediates keep bits 20..37 plus the sign at bit 56; 37..39 is max shift.
+                                    let (imm, effective) = if immediate {
+                                        let imm = shift & 0x9_ffff;
+                                        let effective = if imm & 0x8_0000 != 0 {
+                                            imm | 0xfff0_0000
+                                        } else {
+                                            imm
+                                        };
+                                        (Some(imm), effective)
+                                    } else {
+                                        (None, shift)
+                                    };
+                                    let raw = encode_shf(
+                                        right,
+                                        imm,
+                                        wrap,
+                                        max_shift,
+                                        high_half,
+                                        (1, a, 4, c),
+                                    );
+                                    let mut t = Translator::new();
+                                    assert!(t.translate(raw), "SHF raw={raw:#018x}");
+                                    assert_eq!(t.unimplemented_count, 0);
+                                    for _ in 0..4 {
+                                        let low = next() ^ (next() << 16);
+                                        let high = next() ^ (next() << 16);
+                                        let regs = HashMap::from([
+                                            (2u8, low),
+                                            (3u8, high),
+                                            (4u8, effective),
+                                        ]);
+                                        let got = eval_int_program(&t.program, &regs, 1);
+                                        let expected = shf_reference(
+                                            right,
+                                            wrap,
+                                            max_shift,
+                                            high_half,
+                                            if a == RZ { 0 } else { low },
+                                            if c == RZ { 0 } else { high },
+                                            effective,
+                                        );
+                                        assert_eq!(
+                                            got, expected,
+                                            "SHF raw={raw:#018x} low={low:#x} high={high:#x} shift={effective:#x}\n{:?}",
+                                            t.program.instructions
+                                        );
+                                        checked += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "only {checked} SHF cases checked");
+    }
+
+    #[test]
+    fn shf_register_shift_by_rz_is_a_plain_funnel() {
+        // SHF.R.U64 R1, R2, RZ, R3 shifts by zero and must return R2 unchanged.
+        let raw = encode_shf(true, None, false, 2, false, (1, 2, RZ, 3));
+        let mut t = Translator::new();
+        assert!(t.translate(raw));
+        assert_eq!(t.program.instructions.len(), 1);
+        assert!(matches!(
+            t.program.instructions[0].op,
+            Op::Mov(Value::GprIn(2))
+        ));
+    }
+
+    #[test]
+    fn totk_shf_right_wrap_u64_register_lowers() {
+        // SHF.R.W.U64 R1, R2, R0, R3 from a Tears of the Kingdom compute shader:
+        // R1 = low word of (R3:R2) >> (R0 & 63).
+        let raw = 0x5cfc_01c0_0007_0201u64;
+        assert_eq!(raw, encode_shf(true, None, true, 2, false, (1, 2, 0, 3)));
+        let mut t = Translator::new_compute();
+        assert!(t.translate(raw), "SHF raw={raw:#018x}");
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::ILop {
+                a: Value::GprIn(0),
+                b: Value::ImmU32(63),
+                op: LogicOp::And,
+                ..
+            }
+        )));
+        for (low, high, shift, expected) in [
+            (0x8765_4321, 0x0fed_cba9, 0, 0x8765_4321),
+            (0x8765_4321, 0x0fed_cba9, 4, 0x9876_5432),
+            (0x8765_4321, 0x0fed_cba9, 36, 0x00fe_dcba),
+            (0x8765_4321, 0x0fed_cba9, 64 + 4, 0x9876_5432),
+        ] {
+            let regs = HashMap::from([(0u8, shift), (2u8, low), (3u8, high)]);
+            assert_eq!(eval_int_program(&t.program, &regs, 1), expected);
         }
     }
 
@@ -9177,6 +9811,7 @@ mod tests {
                     array: None,
                     gather_component: 2,
                     lane,
+                    dref: None,
                 } if lane == expected_lane
             ));
         }
@@ -9213,6 +9848,7 @@ mod tests {
                     array: None,
                     gather_component: 3,
                     lane: actual_lane,
+                    dref: None,
                 } if tex_id == expected_tex_id && actual_lane == lane as u8
             ));
         }
@@ -9259,8 +9895,15 @@ mod tests {
         assert_eq!(gathers.len(), 4);
         for (index, gather) in gathers.into_iter().enumerate() {
             assert_eq!(gather.dest_reg, Some(8 + index as u8));
-            let Op::GatherTex { tex_id: 0x24, u, v, array: None, gather_component: 1, lane: 3 } =
-                gather.op
+            let Op::GatherTex {
+                tex_id: 0x24,
+                u,
+                v,
+                array: None,
+                gather_component: 1,
+                lane: 3,
+                dref: None,
+            } = gather.op
             else {
                 panic!("unexpected gather {:?}", gather.op);
             };
@@ -9367,7 +10010,7 @@ mod tests {
         let direct_base = tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, PT);
         let unsupported = [
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 3, false, PT),
-            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, true, PT),
+            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 1, 0, true, PT),
             tld4_raw(false, 8, 4, 0x24, 4, 0xf, 0, 0, false, PT),
             tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, 6),
             tld4_raw(false, 8, 4, 0x24, 2, 0, 0, 0, false, PT),
@@ -9432,6 +10075,7 @@ mod tests {
                     array: None,
                     gather_component: 1,
                     lane,
+                    dref: None,
                 } if lane == expected_lane
             ));
         }
@@ -9467,7 +10111,8 @@ mod tests {
     #[test]
     fn tld4s_offset_depth_and_unaligned_f32_forms_fail_closed() {
         let cases = [
-            tld4s_raw(8, 12, 4, 6, 0x24, 1, false, true, false),
+            tld4s_raw(8, 12, 5, 6, 0x24, 1, false, true, false),
+            tld4s_raw(8, 12, 4, 7, 0x24, 0, false, true, true),
             tld4s_raw(8, 12, 4, 6, 0x24, 1, false, false, true),
             tld4s_raw(9, 12, 4, 6, 0x24, 1, false, false, false),
         ];
@@ -12281,5 +12926,533 @@ mod tests {
         let mut predicated = Translator::new_compute();
         assert!(!predicated.translate(MEMBAR & !(7 << 16)));
         assert_eq!(predicated.unimplemented_count, 1);
+    }
+
+    /// Luigi's Mansion 3 TEX.LZ.AOFFI.NODEP 2D encodings that used to reject whole fragment
+    /// shaders (fs 0x40003a030, 0x40003f030, 0x400040030, 0x400041030).
+    const LM3_TEX_LZ_AOFFI: [u64; 8] = [
+        0xc0fa_0083_a047_0e04,
+        0xc0fa_0083_a007_0e00,
+        0xc0fa_00a3_a047_0e04,
+        0xc0fa_00a3_a007_0e00,
+        0xc0fa_0083_a007_0a00,
+        0xc0fa_0083_a047_0a00,
+        0xc0fa_00a3_a007_0a00,
+        0xc0fa_00a3_a047_0a00,
+    ];
+
+    /// Luigi's Mansion 3 TLD4.PTP 2D gathers without depth compare (fs 0x400049030,
+    /// 0x400950030, 0x400953030).
+    const LM3_TLD4_PTP: [u64; 5] = [
+        0xc8ba_0087_a007_0a00,
+        0xc8ba_0087_2047_0a04,
+        0xc8ba_0087_a047_0e04,
+        0xc8ba_0087_a007_0e00,
+        0xc8ba_0087_a087_0e08,
+    ];
+
+    /// Luigi's Mansion 3 TLD4.PTP.DC 2D gathers (fs 0x401291030, 0x4012a2030, 0x4012a4030).
+    const LM3_TLD4_PTP_DC: [u64; 5] = [
+        0xc8be_0107_a007_0400,
+        0xc8be_0107_a007_0600,
+        0xc8be_00e7_a007_0400,
+        0xc8be_00e7_a007_0600,
+        0xc8be_00e7_a047_0800,
+    ];
+
+    /// Luigi's Mansion 3 TLD4S.F16.DC encodings (fs 0x401291030, 0x4012a2030, 0x4012a4030).
+    const LM3_TLD4S_F16_DC: [u64; 6] = [
+        0xdf86_0100_7027_0406,
+        0xdf86_0100_5027_0604,
+        0xdf86_00e0_7027_0406,
+        0xdf86_00e0_5027_0604,
+        0xdf86_00e0_c067_0807,
+        0xdf86_00e0_a067_0807,
+    ];
+
+    fn sext(bits: u32, width: u32) -> u32 {
+        (((bits << (32 - width)) as i32) >> (32 - width)) as u32
+    }
+
+    fn gathers(translator: &Translator) -> Vec<&Inst> {
+        translator
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::GatherTex { .. }))
+            .collect()
+    }
+
+    fn assert_bfe(translator: &Translator, value: Value, source: Value, position: u32, width: u32) {
+        let Value::Inst(id) = value else {
+            panic!("expected a BFE result, got {value:?}");
+        };
+        let inst = translator
+            .program
+            .instructions
+            .iter()
+            .find(|inst| inst.result == Some(id))
+            .expect("BFE definition");
+        assert!(
+            matches!(
+                inst.op,
+                Op::Bfe { a, b: Value::ImmU32(bits), signed: true }
+                    if a == source && bits == position | (width << 8)
+            ),
+            "unexpected offset op {:?}",
+            inst.op
+        );
+    }
+
+    #[test]
+    fn lm3_tex_lz_aoffi_decodes_and_lowers_register_offsets() {
+        for raw in LM3_TEX_LZ_AOFFI {
+            assert_eq!(decode_one(raw).map(|decoded| decoded.opcode), Some(Opcode::TEX));
+            let form = decode_texture_sample_form(raw, false).expect("TEX form");
+            assert_eq!(form.tex_type, 2, "{raw:#x}");
+            assert_eq!(form.mask, 0b0111, "{raw:#x}");
+            assert!(!form.implicit_lod && form.lod_reg.is_none() && form.bias_reg.is_none());
+            assert_eq!(form.offset_reg, Some(reg_b(raw)));
+            assert_eq!(form.dref_reg, None);
+            assert_eq!((raw >> 49) & 1, 1, "NODEP");
+            assert_eq!((raw >> 35) & 1, 0, "NDV");
+
+            let mut t = Translator::new_fragment();
+            assert!(t.translate(raw), "{raw:#x}");
+            assert_eq!(t.unimplemented_count, 0);
+            let samples: Vec<_> = t
+                .program
+                .instructions
+                .iter()
+                .filter(|inst| matches!(inst.op, Op::SampleTex { .. }))
+                .collect();
+            assert_eq!(samples.len(), 3);
+            let (coord, meta, dest) = (reg_a(raw), reg_b(raw), reg_dest(raw));
+            for (component, sample) in samples.into_iter().enumerate() {
+                assert_eq!(sample.dest_reg, Some(dest + component as u8));
+                let Op::SampleTex {
+                    tex_id,
+                    u,
+                    v,
+                    array: None,
+                    volume: None,
+                    cube: None,
+                    implicit_lod: false,
+                    lod_bias: None,
+                    explicit_lod: Some(Value::Zero),
+                    texel_offset: Some((x, y, Value::ImmU32(0))),
+                    dref: None,
+                    component: actual,
+                    ..
+                } = sample.op
+                else {
+                    panic!("unexpected sample {:?}", sample.op);
+                };
+                assert_eq!(tex_id, texs_tex_id(raw));
+                assert_eq!((u, v), (Value::GprIn(coord), Value::GprIn(coord + 1)));
+                assert_eq!(actual, component as u8);
+                assert_bfe(&t, x, Value::GprIn(meta), 0, 4);
+                assert_bfe(&t, y, Value::GprIn(meta), 4, 4);
+            }
+
+            let mut constant = Translator::new_fragment();
+            constant.write_reg(reg_b(raw), Op::Mov(Value::ImmU32(0xf9)), None);
+            assert!(constant.translate(raw));
+            assert_eq!(constant.unimplemented_count, 0);
+            assert!(constant.program.instructions.iter().any(|inst| matches!(
+                inst.op,
+                Op::SampleTex {
+                    texel_offset: Some((Value::ImmU32(x), Value::ImmU32(y), Value::ImmU32(0))),
+                    ..
+                } if x == sext(9, 4) && y == sext(0xf, 4)
+            )));
+
+            // Register AOFFI outside the fragment stage keeps failing closed.
+            let mut vertex = Translator::new();
+            assert!(!vertex.translate(raw));
+            assert_eq!(vertex.unimplemented_count, 1);
+        }
+    }
+
+    #[test]
+    fn tex_register_aoffi_resolves_constants_across_blocks_and_phis() {
+        let raw = LM3_TEX_LZ_AOFFI[0];
+        let mut defs = ValueDefs::new();
+        defs.insert(ValueId(1), Op::Mov(Value::ImmU32(0x21)));
+        defs.insert(ValueId(2), Op::Mov(Value::Inst(ValueId(1))));
+        defs.insert(
+            ValueId(3),
+            Op::Phi {
+                sources: vec![
+                    (1, Value::Inst(ValueId(2))),
+                    (2, Value::Inst(ValueId(3))),
+                    (3, Value::ImmU32(0x21)),
+                ],
+            },
+        );
+        defs.insert(ValueId(4), Op::Mov(Value::ImmU32(0x12)));
+        defs.insert(
+            ValueId(5),
+            Op::Phi {
+                sources: vec![(1, Value::Inst(ValueId(1))), (2, Value::Inst(ValueId(4)))],
+            },
+        );
+
+        let mut initial = HashMap::new();
+        initial.insert(reg_b(raw), Value::Inst(ValueId(3)));
+        let mut t = Translator::with_initial_stage(initial, HashMap::new(), 100, ShaderStage::Fragment);
+        assert!(t.translate_with_defs(raw, &defs));
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::SampleTex {
+                texel_offset: Some((Value::ImmU32(1), Value::ImmU32(2), Value::ImmU32(0))),
+                ..
+            }
+        )));
+        assert!(!t.program.instructions.iter().any(|inst| matches!(inst.op, Op::Bfe { .. })));
+
+        // Disagreeing phi inputs are a real runtime offset.
+        let mut initial = HashMap::new();
+        initial.insert(reg_b(raw), Value::Inst(ValueId(5)));
+        let mut t = Translator::with_initial_stage(initial, HashMap::new(), 100, ShaderStage::Fragment);
+        assert!(t.translate_with_defs(raw, &defs));
+        assert!(t.program.instructions.iter().any(|inst| matches!(inst.op, Op::Bfe { .. })));
+    }
+
+    #[test]
+    fn lm3_tex_b_array_dc_aoffi_uses_handle_offset_and_dref_registers() {
+        let raw = 0xdebe_0010_b107_0811u64;
+        assert_eq!(decode_one(raw).map(|decoded| decoded.opcode), Some(Opcode::TEX_b));
+        let form = decode_texture_sample_form(raw, true).expect("TEX_b form");
+        assert_eq!(
+            form,
+            TextureSampleForm {
+                tex_type: 3,
+                mask: 1,
+                implicit_lod: true,
+                bias_reg: None,
+                lod_reg: None,
+                offset_reg: Some(17),
+                dref_reg: Some(18),
+            }
+        );
+
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(static_ldc(16, 2, 0x1a0)));
+        t.write_reg(17, Op::Mov(Value::ImmU32(0x3e)), None);
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        let samples: Vec<_> = t
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::SampleTex { .. }))
+            .collect();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].dest_reg, Some(17));
+        assert!(matches!(
+            samples[0].op,
+            Op::SampleTex {
+                tex_id,
+                u: Value::GprIn(9),
+                v: Value::GprIn(10),
+                array: Some(Value::GprIn(8)),
+                implicit_lod: true,
+                lod_bias: None,
+                explicit_lod: None,
+                texel_offset: Some((Value::ImmU32(x), Value::ImmU32(3), Value::ImmU32(0))),
+                dref: Some(Value::GprIn(18)),
+                component: 0,
+                ..
+            } if tex_id == bindless_texture_id_pair(2, 0x1a0 / 4, None) && x == sext(0xe, 4)
+        ));
+
+        // Implicit LOD with a non-constant offset cannot be expressed exactly in Vulkan.
+        let mut dynamic = Translator::new_fragment();
+        assert!(dynamic.translate(static_ldc(16, 2, 0x1a0)));
+        assert!(!dynamic.translate(raw));
+        assert_eq!(dynamic.unimplemented_count, 1);
+    }
+
+    /// Asserts that `coordinate` is `base` shifted by the signed 6-bit offset field of `word` at
+    /// `position`, scaled by the reciprocal of the base-level size along `component`.
+    fn assert_gather_shift(
+        translator: &Translator,
+        coordinate: Value,
+        base: Value,
+        word: Value,
+        position: u32,
+        component: u8,
+    ) {
+        let def = |value: Value| match value {
+            Value::Inst(id) => translator
+                .program
+                .instructions
+                .iter()
+                .find(|inst| inst.result == Some(id))
+                .map(|inst| inst.op.clone()),
+            _ => None,
+        };
+        let Some(Op::FAdd { a, b: step, .. }) = def(coordinate) else {
+            panic!("coordinate {coordinate:?} is not offset");
+        };
+        assert_eq!(a, base);
+        let Some(Op::FMul { a: delta, b: texel, .. }) = def(step) else {
+            panic!("offset step is not scaled");
+        };
+        let Some(Op::MultiFunc { src: size, func: MufuFunc::Rcp, .. }) = def(texel) else {
+            panic!("offset step is not divided by the texture size");
+        };
+        let Some(Op::I2F { src: size, .. }) = def(size) else {
+            panic!("texture size is not converted");
+        };
+        assert!(
+            matches!(
+                def(size),
+                Some(Op::TextureQueryDimension { lod: Value::Zero, component: actual, .. })
+                    if actual == component
+            ),
+            "offset is not scaled by the base-level size {:?}",
+            def(size)
+        );
+        let Some(Op::I2F { src: bits, signed: true, .. }) = def(delta) else {
+            panic!("offset is not converted");
+        };
+        assert_bfe(translator, bits, word, position, 6);
+    }
+
+    fn assert_lm3_ptp_gathers(raw: u64, dc: bool) {
+        let opcode = decode_one(raw).map(|decoded| decoded.opcode);
+        assert_eq!(opcode, Some(Opcode::TLD4), "{raw:#x}");
+        assert_eq!((raw >> 54) & 3, 2, "PTP offset mode");
+        assert_eq!((raw >> 56) & 3, 0, "R component");
+        assert_eq!((raw >> 50) & 1, u64::from(dc), "DC");
+        assert_eq!((raw >> 28) & 7, 2, "2D");
+        let mask = ((raw >> 31) & 0xf) as u8;
+        let (coord, meta, dest) = (reg_a(raw), reg_b(raw), reg_dest(raw));
+
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(raw), "{raw:#x}");
+        assert_eq!(t.unimplemented_count, 0);
+        let lanes: Vec<u8> = (0..4).filter(|lane| (mask >> lane) & 1 != 0).collect();
+        let found = gathers(&t);
+        assert_eq!(found.len(), lanes.len());
+        for (index, (lane, gather)) in lanes.iter().zip(found).enumerate() {
+            assert_eq!(gather.dest_reg, Some(dest + index as u8));
+            let Op::GatherTex {
+                tex_id,
+                u,
+                v,
+                array: None,
+                gather_component: 0,
+                lane: 3,
+                dref,
+            } = gather.op
+            else {
+                panic!("unexpected gather {:?}", gather.op);
+            };
+            assert_eq!(tex_id, texs_tex_id(raw));
+            assert_eq!(dref, dc.then_some(Value::GprIn(meta + 2)));
+            // PTP words pack signed bytes x0 y0 x1 y1 | x2 y2 x3 y3.
+            let word = Value::GprIn(meta + lane / 2);
+            let shift = u32::from(lane % 2) * 16;
+            assert_gather_shift(&t, u, Value::GprIn(coord), word, shift, 0);
+            assert_gather_shift(&t, v, Value::GprIn(coord + 1), word, shift + 8, 1);
+        }
+    }
+
+    #[test]
+    fn lm3_tld4_ptp_encodings_lower_to_per_lane_offset_gathers() {
+        for raw in LM3_TLD4_PTP {
+            assert_lm3_ptp_gathers(raw, false);
+        }
+    }
+
+    #[test]
+    fn lm3_tld4_ptp_depth_compare_encodings_lower_to_dref_gathers() {
+        for raw in LM3_TLD4_PTP_DC {
+            assert_lm3_ptp_gathers(raw, true);
+        }
+        let mut compute = Translator::new_compute();
+        assert!(!compute.translate(LM3_TLD4_PTP_DC[0]));
+        assert_eq!(compute.unimplemented_count, 1);
+    }
+
+    #[test]
+    fn tld4_aoffi_shifts_every_lane_by_the_shared_offset() {
+        let raw = tld4_raw(false, 8, 4, 0x24, 2, 0xf, 1, 1, false, PT);
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        let found = gathers(&t);
+        assert_eq!(found.len(), 4);
+        for (lane, gather) in found.into_iter().enumerate() {
+            let Op::GatherTex {
+                u,
+                v,
+                gather_component: 1,
+                lane: actual,
+                dref: None,
+                ..
+            } = gather.op
+            else {
+                panic!("unexpected gather {:?}", gather.op);
+            };
+            assert_eq!(actual, lane as u8);
+            // Bound TLD4 built by tld4_raw leaves the meta register field at R0.
+            assert_gather_shift(&t, u, Value::GprIn(4), Value::GprIn(0), 0, 0);
+            assert_gather_shift(&t, v, Value::GprIn(5), Value::GprIn(0), 8, 1);
+        }
+    }
+
+    #[test]
+    fn lm3_tld4_b_array_depth_compare_gathers_use_handle_offsets_and_dref() {
+        let plain = 0xdefe_0007_b067_0804u64;
+        assert_eq!(decode_one(plain).map(|decoded| decoded.opcode), Some(Opcode::TLD4_b));
+        assert_eq!(((plain >> 36) & 3, (plain >> 38) & 3), (0, 0));
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(static_ldc(6, 2, 0x1a0)));
+        assert!(t.translate(plain));
+        assert_eq!(t.unimplemented_count, 0);
+        let expected_tex_id = bindless_texture_id_pair(2, 0x1a0 / 4, None);
+        let found = gathers(&t);
+        assert_eq!(found.len(), 4);
+        for (lane, gather) in found.into_iter().enumerate() {
+            assert_eq!(gather.dest_reg, Some(4 + lane as u8));
+            assert!(matches!(
+                gather.op,
+                Op::GatherTex {
+                    tex_id,
+                    u: Value::GprIn(9),
+                    v: Value::GprIn(10),
+                    array: Some(Value::GprIn(8)),
+                    gather_component: 0,
+                    lane: actual,
+                    dref: Some(Value::GprIn(7)),
+                } if tex_id == expected_tex_id && actual == lane as u8
+            ));
+        }
+
+        let ptp = 0xdefe_0027_b007_0800u64;
+        assert_eq!(((ptp >> 36) & 3, (ptp >> 38) & 3), (2, 0));
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(static_ldc(0, 2, 0x1a0)));
+        assert!(t.translate(ptp));
+        assert_eq!(t.unimplemented_count, 0);
+        let found = gathers(&t);
+        assert_eq!(found.len(), 4);
+        for (lane, gather) in found.into_iter().enumerate() {
+            assert_eq!(gather.dest_reg, Some(lane as u8));
+            let Op::GatherTex {
+                tex_id,
+                u,
+                v,
+                array: Some(Value::GprIn(8)),
+                lane: 3,
+                dref: Some(Value::GprIn(3)),
+                ..
+            } = gather.op
+            else {
+                panic!("unexpected gather {:?}", gather.op);
+            };
+            assert_eq!(tex_id, expected_tex_id);
+            let word = Value::GprIn(1 + lane as u8 / 2);
+            let shift = (lane as u32 % 2) * 16;
+            assert_gather_shift(&t, u, Value::GprIn(9), word, shift, 0);
+            assert_gather_shift(&t, v, Value::GprIn(10), word, shift + 8, 1);
+        }
+    }
+    #[test]
+    fn lm3_tld4s_f16_depth_compare_reads_coordinate_pair_and_dref() {
+        for raw in LM3_TLD4S_F16_DC {
+            assert_eq!(decode_one(raw).map(|decoded| decoded.opcode), Some(Opcode::TLD4S));
+            assert_eq!((raw >> 55) & 1, 1, "F16");
+            assert_eq!((raw >> 52) & 3, 0, "R component");
+            assert_eq!((raw >> 51) & 1, 0, "AOFFI");
+            assert_eq!((raw >> 50) & 1, 1, "DC");
+            let (dest_a, dest_b) = (reg_dest(raw), ((raw >> 28) & 0xff) as u8);
+            let (ra, rb) = (reg_a(raw), reg_b(raw));
+
+            let mut t = Translator::new_fragment();
+            assert!(t.translate(raw), "{raw:#x}");
+            assert_eq!(t.unimplemented_count, 0);
+            let found = gathers(&t);
+            assert_eq!(found.len(), 4);
+            for (lane, gather) in found.into_iter().enumerate() {
+                assert!(matches!(
+                    gather.op,
+                    Op::GatherTex {
+                        tex_id,
+                        u: Value::GprIn(u),
+                        v: Value::GprIn(v),
+                        array: None,
+                        gather_component: 0,
+                        lane: actual,
+                        dref: Some(Value::GprIn(reference)),
+                    } if tex_id == texs_tex_id(raw)
+                        && u == ra
+                        && v == ra + 1
+                        && reference == rb
+                        && actual == lane as u8
+                ));
+            }
+            let packs: Vec<_> = t
+                .program
+                .instructions
+                .iter()
+                .filter(|inst| matches!(inst.op, Op::PackHalf2 { .. }))
+                .collect();
+            assert_eq!(packs.len(), 2);
+            assert_eq!(packs[0].dest_reg, Some(dest_a));
+            assert_eq!(packs[1].dest_reg, Some(dest_b));
+        }
+    }
+
+    #[test]
+    fn tld4s_aoffi_and_depth_compare_share_the_rb_pair() {
+        let both = tld4s_raw(8, 12, 4, 6, 0x24, 0, false, true, true);
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(both));
+        assert_eq!(t.unimplemented_count, 0);
+        let found = gathers(&t);
+        assert_eq!(found.len(), 4);
+        for gather in &found {
+            let Op::GatherTex {
+                u,
+                v,
+                dref: Some(Value::GprIn(7)),
+                ..
+            } = gather.op
+            else {
+                panic!("unexpected gather {:?}", gather.op);
+            };
+            assert_gather_shift(&t, u, Value::GprIn(4), Value::GprIn(6), 0, 0);
+            assert_gather_shift(&t, v, Value::GprIn(5), Value::GprIn(6), 8, 1);
+        }
+        assert_eq!(
+            found.iter().map(|gather| gather.dest_reg).collect::<Vec<_>>(),
+            [Some(8), Some(9), Some(12), Some(13)]
+        );
+
+        let offset_only = tld4s_raw(8, 12, 4, 6, 0x24, 2, false, true, false);
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(offset_only));
+        assert_eq!(t.unimplemented_count, 0);
+        let found = gathers(&t);
+        assert_eq!(found.len(), 4);
+        for gather in found {
+            let Op::GatherTex {
+                u,
+                v,
+                gather_component: 2,
+                dref: None,
+                ..
+            } = gather.op
+            else {
+                panic!("unexpected gather {:?}", gather.op);
+            };
+            assert_gather_shift(&t, u, Value::GprIn(4), Value::GprIn(6), 0, 0);
+            assert_gather_shift(&t, v, Value::GprIn(5), Value::GprIn(6), 8, 1);
+        }
     }
 }

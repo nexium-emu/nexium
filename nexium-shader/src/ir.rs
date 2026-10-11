@@ -721,6 +721,8 @@ pub enum Op {
         array: Option<Value>,
         gather_component: u8,
         lane: u8,
+        /// Depth reference for a depth-compare gather (`OpImageDrefGather`).
+        dref: Option<Value>,
     },
 
     FSetPred {
@@ -1490,14 +1492,21 @@ impl Inst {
                 array,
                 gather_component,
                 lane,
-            } => write!(
-                f,
-                "TexGather t[{tex_id:#x}], ({u}, {v}) array={array:?}.{}[{lane}]",
-                ["r", "g", "b", "a"]
-                    .get(*gather_component as usize)
-                    .copied()
-                    .unwrap_or("?")
-            ),
+                dref,
+            } => {
+                write!(f, "TexGather")?;
+                if let Some(reference) = dref {
+                    write!(f, ".dref({reference})")?;
+                }
+                write!(
+                    f,
+                    " t[{tex_id:#x}], ({u}, {v}) array={array:?}.{}[{lane}]",
+                    ["r", "g", "b", "a"]
+                        .get(*gather_component as usize)
+                        .copied()
+                        .unwrap_or("?")
+                )
+            }
             Op::Phi { sources } => {
                 write!(f, "Phi   ")?;
                 for (i, (bid, v)) in sources.iter().enumerate() {

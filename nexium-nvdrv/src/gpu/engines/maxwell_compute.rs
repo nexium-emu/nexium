@@ -1038,7 +1038,7 @@ pub(crate) fn resolve_pending_writebacks_report(
         return spans;
     }
     let kp = crate::gpu::pusher::kickprof::start();
-    let trace = std::env::var_os("NEXIUM_KC_RESOLVE_TRACE").is_some();
+    let trace = crate::env_flag_set!("NEXIUM_KC_RESOLVE_TRACE");
     let caller = std::panic::Location::caller();
     let record_count = records.len();
     let retired_serials: Vec<u64> = records
@@ -1455,8 +1455,10 @@ fn prepare_and_execute(
         kp_snap,
         code.len(),
     );
-    if let Some(dir) = std::env::var_os("NEXIUM_DUMP_COMPUTE_SASS") {
-        let path = std::path::Path::new(&dir).join(format!("cs_{:x}.bin", qmd[0x08]));
+    static DUMP_SASS_DIR: std::sync::OnceLock<Option<std::ffi::OsString>> =
+        std::sync::OnceLock::new();
+    if let Some(dir) = DUMP_SASS_DIR.get_or_init(|| std::env::var_os("NEXIUM_DUMP_COMPUTE_SASS")) {
+        let path = std::path::Path::new(dir).join(format!("cs_{:x}.bin", qmd[0x08]));
         if !path.exists() {
             let _ = std::fs::write(path, &code);
         }

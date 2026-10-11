@@ -46,6 +46,23 @@ fn gpfifo_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_GPFIFO_TRACE").is_some())
 }
 
+/// `NEXIUM_SYNCPT_DEBUG`, read once: it is consulted on every syncpoint
+/// operation, where an environment lookup is a lock plus a linear scan.
+pub(crate) fn syncpt_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some())
+}
+
+/// Presence of an environment variable, read once per call site.
+macro_rules! env_flag_set {
+    ($name:literal) => {{
+        static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SET.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+pub(crate) use env_flag_set;
+
 fn video_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1182,7 +1199,47 @@ impl Drop for AsyncGpuPendingGuard {
         }
         self.pending
             .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        async_gpu_pending_signal().notify();
     }
+}
+
+/// Wakes threads blocked in [`AsyncGpuPendingSignal::wait_while_pending`] when an
+/// asynchronous GPU submission finishes. One process-wide signal serves every
+/// queue: a wake for another queue is only a spurious wake-up, and every waiter
+/// re-checks its own counter.
+struct AsyncGpuPendingSignal {
+    lock: Mutex<()>,
+    changed: Condvar,
+}
+
+impl AsyncGpuPendingSignal {
+    fn notify(&self) {
+        // Taking the lock orders this notification after any waiter's check of
+        // the counter, so a waiter cannot miss the decrement that precedes it.
+        let _guard = self.lock.lock();
+        self.changed.notify_all();
+    }
+
+    /// Blocks until a submission completes or `timeout` elapses, unless
+    /// `pending` is already zero. Callers loop and re-check.
+    fn wait_while_pending(
+        &self,
+        pending: &std::sync::atomic::AtomicUsize,
+        timeout: std::time::Duration,
+    ) {
+        let mut guard = self.lock.lock();
+        if pending.load(Ordering::Acquire) != 0 {
+            self.changed.wait_for(&mut guard, timeout);
+        }
+    }
+}
+
+fn async_gpu_pending_signal() -> &'static AsyncGpuPendingSignal {
+    static SIGNAL: AsyncGpuPendingSignal = AsyncGpuPendingSignal {
+        lock: Mutex::new(()),
+        changed: Condvar::new(),
+    };
+    &SIGNAL
 }
 
 struct AsyncGpuQueueProfile {
@@ -1796,6 +1853,29 @@ fn ioctl_requires_async_gpu_drain(device: NvDevice, cmd: u16) -> bool {
     }
 }
 
+/// Narrows [`ioctl_requires_async_gpu_drain`] for requests that provably cannot
+/// affect queued GPU work.
+///
+/// The drain exists because queued kicks, the prep thread and the render thread
+/// all translate through the live mapping table, and a mapping-table write also
+/// posts a texture/RT invalidation straight to the render thread, overtaking
+/// draws still in the asynchronous queue. Neither happens for a non-sparse
+/// AllocSpace: it only reserves VA in the allocator (touched solely by ioctl
+/// handlers on this thread) and records the reservation in per-fd state, so it
+/// neither writes the mapping table nor invalidates anything. Sparse AllocSpace
+/// writes the mapping table, so it keeps its drain; the other mapping requests
+/// are narrowed separately in `Nvdrv::drain_required`.
+fn ioctl_skips_async_gpu_drain(device: NvDevice, cmd: u16, in_data: &[u8]) -> bool {
+    match (device, cmd) {
+        (NvDevice::NvhostAsGpu, 0x4102) => {
+            // Mirrors the handler: flags default to 0 when the request is short.
+            let flags = read_u32(in_data, 8).unwrap_or(0);
+            flags & 0x2 == 0
+        }
+        _ => false,
+    }
+}
+
 fn log_unknown_ioctl(device: &str, cmd: u16) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -1897,7 +1977,11 @@ impl GpuDrainHandle {
                 }
                 self.poll();
                 report.waiting("renderer-backed completions");
-                std::thread::yield_now();
+                // Completions are released by the worker and render threads; block
+                // until one lands instead of spinning. The timeout only bounds how
+                // long an interruption or a completion event goes unnoticed.
+                async_gpu_pending_signal()
+                    .wait_while_pending(&queue.pending, std::time::Duration::from_millis(1));
             }
             if queue.failed.load(Ordering::Acquire) {
                 log::error!("[gpu-sync] asynchronous GPU queue failed");
@@ -2610,7 +2694,7 @@ impl Nvdrv {
         let min = channel.syncpt_min;
         drop(channels);
         self.ordered_submit_max.insert(syncpt_id, threshold);
-        if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+        if crate::syncpt_debug_enabled() {
             log::info!(
                 "[syncpt] reserve fd={} flags={:#x} incr_value={} incr={} id={} min={} max={}",
                 fd,
@@ -2822,7 +2906,7 @@ impl Nvdrv {
         let current = self.syncpoint_value(id);
         let ordered = self.ordered_submit_max.get(&id).copied();
         let disposition = classify_submit_fence_wait(current, ordered, threshold);
-        if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+        if crate::syncpt_debug_enabled() {
             log::info!(
                 "[syncpt] queue-fence id={} threshold={} current={} ordered_max={:?} max={} -> {:?}",
                 id,
@@ -2915,7 +2999,10 @@ impl Nvdrv {
         let fenced_remap = device == NvDevice::NvhostAsGpu
             && matches!(cmd, 0x4105 | 0x4106 | 0x4114)
             && gpu::accuracy::normal_accuracy();
-        !reuses_video_mappings && !maps_unused_range && !fenced_remap
+        !reuses_video_mappings
+            && !maps_unused_range
+            && !fenced_remap
+            && !ioctl_skips_async_gpu_drain(device, cmd, &req.in_data)
     }
 
     pub fn ioctl_needs_drain(&self, req: &IoctlRequest) -> bool {
@@ -5062,7 +5149,7 @@ impl Nvdrv {
                 }
             }
             0x4118 => {
-                if std::env::var_os("NEXIUM_SYNC_RO_MAP_FAKE_OK").is_some() {
+                if env_flag_set!("NEXIUM_SYNC_RO_MAP_FAKE_OK") {
                     log::warn!(
                         "nvhost-as-gpu:GetSyncPointRoMap → fake SUCCESS (base=0) [NEXIUM_SYNC_RO_MAP_FAKE_OK]"
                     );
@@ -5343,7 +5430,7 @@ impl Nvdrv {
                                 );
                             }
                         }
-                        if std::env::var_os("NEXIUM_ENTRY_MIRROR").is_some() && address != 0 {
+                        if env_flag_set!("NEXIUM_ENTRY_MIRROR") && address != 0 {
                             let mut mirror = vec![0u8; num_entries as usize * 8];
                             let read_ok = mem_read(address, &mut mirror);
                             let guest: Vec<gpu::CommandListHeader> = mirror
@@ -5796,7 +5883,7 @@ impl Nvdrv {
                         req.in_data[7],
                     ]);
                     let current_val = self.syncpoint_value(syncpt_id);
-                    if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                    if crate::syncpt_debug_enabled() {
                         log::info!(
                             "[syncpt] event-wait id={} threshold={} current={}",
                             syncpt_id,
@@ -5872,7 +5959,7 @@ impl Nvdrv {
                         req.in_data[15],
                     ]);
                     let current_val = self.syncpoint_value(syncpt_id);
-                    if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                    if crate::syncpt_debug_enabled() {
                         log::info!(
                             "[syncpt] event-wait-async event={:#x} id={} threshold={} current={}",
                             event_id,
@@ -6180,6 +6267,13 @@ impl Default for Nvdrv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialises tests that map at the first GPU VA, since texture
+    /// invalidation generations are process wide and keyed by that address.
+    fn first_gpu_va_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct CloseTestFrameQueue<'a>(&'a FrameQueueState);
 
@@ -6792,6 +6886,57 @@ mod tests {
             NvDevice::NvhostAsGpu,
             0x4109
         ));
+    }
+
+    #[test]
+    fn async_gpu_drain_is_skipped_only_for_non_sparse_alloc_space() {
+        let alloc_space = |flags: u32| {
+            let mut in_data = vec![0u8; 24];
+            in_data[0..4].copy_from_slice(&16u32.to_le_bytes());
+            in_data[4..8].copy_from_slice(&0x1_0000u32.to_le_bytes());
+            in_data[8..12].copy_from_slice(&flags.to_le_bytes());
+            in_data
+        };
+        // Plain and fixed reservations only touch the VA allocator.
+        assert!(ioctl_skips_async_gpu_drain(NvDevice::NvhostAsGpu, 0x4102, &alloc_space(0)));
+        assert!(ioctl_skips_async_gpu_drain(NvDevice::NvhostAsGpu, 0x4102, &alloc_space(1)));
+        // A short request parses as flags=0 in the handler too.
+        assert!(ioctl_skips_async_gpu_drain(NvDevice::NvhostAsGpu, 0x4102, &[0u8; 8]));
+        // Sparse reservations write the mapping table.
+        assert!(!ioctl_skips_async_gpu_drain(NvDevice::NvhostAsGpu, 0x4102, &alloc_space(2)));
+        assert!(!ioctl_skips_async_gpu_drain(NvDevice::NvhostAsGpu, 0x4102, &alloc_space(3)));
+        // Every mapping-table mutation keeps its drain.
+        for cmd in [0x4103, 0x4105, 0x4106, 0x4114] {
+            assert!(!ioctl_skips_async_gpu_drain(NvDevice::NvhostAsGpu, cmd, &alloc_space(0)));
+        }
+        assert!(!ioctl_skips_async_gpu_drain(NvDevice::Nvmap, 0x0105, &[0u8; 24]));
+        assert!(!ioctl_skips_async_gpu_drain(NvDevice::NvhostVic, 0x0009, &[0u8; 24]));
+    }
+
+    #[test]
+    fn async_gpu_pending_signal_wakes_waiter_on_completion() {
+        use std::sync::atomic::AtomicUsize;
+        let pending = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        let (guard, inflight) = AsyncGpuPendingGuard::reserve(pending.clone(), failed.clone());
+        assert_eq!(inflight, 1);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            guard.complete();
+        });
+        let started = std::time::Instant::now();
+        while pending.load(Ordering::Acquire) != 0 {
+            // A long timeout: the wake-up must come from the guard's notify.
+            async_gpu_pending_signal()
+                .wait_while_pending(&pending, std::time::Duration::from_secs(5));
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        }
+        releaser.join().unwrap();
+        assert!(!failed.load(Ordering::Acquire));
+        // Already idle: returns without blocking.
+        let idle_started = std::time::Instant::now();
+        async_gpu_pending_signal().wait_while_pending(&pending, std::time::Duration::from_secs(5));
+        assert!(idle_started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
@@ -7841,6 +7986,7 @@ mod tests {
 
     #[test]
     fn repeated_fixed_map_unmaps_to_a_hole_without_extra_va_ownership() {
+        let _first_gpu_va = first_gpu_va_lock();
         let mut nvdrv = Nvdrv::new();
         let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
         let base = 0x0400_0000u64;
@@ -8092,6 +8238,7 @@ mod tests {
 
     #[test]
     fn sparse_remap_holes_shadow_aliases_and_preserve_parent_va_reservation() {
+        let _first_gpu_va = first_gpu_va_lock();
         let mut nvdrv = Nvdrv::new();
         let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
         let base = 0x0400_0000u64;
@@ -8654,6 +8801,7 @@ mod tests {
 
     #[test]
     fn configured_big_pages_control_dynamic_mapping_alignment_and_close_cleanup() {
+        let _first_gpu_va = first_gpu_va_lock();
         let mut nvdrv = Nvdrv::new();
         let first_fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
         let second_fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
@@ -8758,6 +8906,7 @@ mod tests {
 
     #[test]
     fn video_channel_map_and_unmap_match_variable_wire_layout() {
+        let _first_gpu_va = first_gpu_va_lock();
         let mut nvdrv = Nvdrv::new();
         let fd = nvdrv.open("/dev/nvhost-nvdec").unwrap();
         let cpu_address = 0x4a07_f000_00u64;
@@ -8797,6 +8946,7 @@ mod tests {
 
     #[test]
     fn repeated_video_mapping_preserves_addresses_and_mapping_generation() {
+        let _first_gpu_va = first_gpu_va_lock();
         let mut nvdrv = Nvdrv::new();
         let fd = nvdrv.open("/dev/nvhost-nvdec").unwrap();
         nvdrv

@@ -1660,7 +1660,7 @@ impl Maxwell3D {
             0xb2 => {
                 self.regs.sync_info = arg;
                 let id = arg & 0xFFF;
-                if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                if crate::syncpt_debug_enabled() {
                     log::info!("[syncpt] engine incr id={}", id);
                 }
                 self.pending_syncpt_incrs.push(id);
@@ -1707,7 +1707,7 @@ impl Maxwell3D {
                     static N: AtomicU32 = AtomicU32::new(0);
                     if operation != 0
                         || N.fetch_add(1, Ordering::Relaxed) < 12
-                        || std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some()
+                        || crate::syncpt_debug_enabled()
                     {
                         log::info!(
                             "maxwell3d: REPORT_SEMAPHORE arg={:#x} op={} gpu_va={:#x} payload={:#x}",

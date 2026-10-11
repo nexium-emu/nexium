@@ -224,7 +224,7 @@ impl ComputeMemoryBarrier {
         else {
             return;
         };
-        if std::env::var_os("NEXIUM_KC_BARRIER_TRACE").is_some() {
+        if crate::env_flag_set!("NEXIUM_KC_BARRIER_TRACE") {
             use std::sync::atomic::{AtomicU64, Ordering};
             static TRIGGERS: AtomicU64 = AtomicU64::new(0);
             let trigger = TRIGGERS.fetch_add(1, Ordering::Relaxed);
@@ -1029,7 +1029,7 @@ impl PrepState {
                             } else {
                                 mem_write(cpu, &write.payload.to_le_bytes())
                             };
-                            if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                            if crate::syncpt_debug_enabled() {
                                 log::info!(
                                     "[syncpt] fence release gpu_va={:#x} cpu={:#x} payload={:#x} long={} write_ok={}",
                                     write.gpu_va,
@@ -1327,7 +1327,7 @@ impl PrepState {
                     }
                     let kp = kickprof::start();
                     if requires_hard_boundary {
-                        let spans = maxwell_dma.transfer_spans();
+                        let spans = maxwell_dma.transfer_spans(arg);
                         let (dst_gpu, dst_size) = spans[1];
                         self.ssbo_snapshot_cache
                             .invalidate_gpu_write(mappings, dst_gpu, dst_size);

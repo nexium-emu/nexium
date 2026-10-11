@@ -370,14 +370,77 @@ impl MaxwellDma {
         ((self.offset_in_upper as u64) << 32) | self.offset_in_lower as u64
     }
 
-    pub fn transfer_spans(&self) -> [(u64, usize); 2] {
+    /// Conservative `[source, destination]` GPU byte spans the LAUNCH_DMA
+    /// `flags` will read and write, for cache invalidation before the copy.
+    /// Remapped lines are `line_length_in` *elements* wide (component size
+    /// times component count bytes each), and a block-linear side is touched
+    /// anywhere in its tiled surface, as `launch_dma` sizes them. Over-covering
+    /// only costs extra invalidation; under-covering would leave stale caches.
+    pub fn transfer_spans(&self, flags: u32) -> [(u64, usize); 2] {
+        let remap_enable = (flags >> LAUNCH_REMAP_ENABLE_BIT) & 1 != 0;
+        // The pitch-to-pitch path copies source-sized lines without applying the
+        // remap, so either side may be touched at either element size.
+        let bytes_per_group = if remap_enable {
+            let component_size = ((self.remap_components >> 16) & 0x3) as usize + 1;
+            let num_src_components = ((self.remap_components >> 20) & 0x3) as usize + 1;
+            let num_dst_components = ((self.remap_components >> 24) & 0x3) as usize + 1;
+            component_size * num_src_components.max(num_dst_components)
+        } else {
+            1
+        };
         let lines = self.line_count.max(1) as usize;
-        let src_stride = self.line_length_in.max(self.pitch_in) as usize;
-        let dst_stride = self.line_length_in.max(self.pitch_out) as usize;
-        let dst_addr = ((self.offset_out_upper as u64) << 32) | self.offset_out_lower as u64;
+        let line_units = self.line_length_in as usize;
+        let span = |block_linear: bool,
+                    bytes_per_group: usize,
+                    pitch: u32,
+                    width: u32,
+                    height: u32,
+                    block_size: u32,
+                    origin_x: u32,
+                    origin_y: u32| {
+            let line_bytes = line_units.saturating_mul(bytes_per_group);
+            if !block_linear {
+                return line_bytes.max(pitch as usize).saturating_mul(lines);
+            }
+            let width_bytes = if width != 0 {
+                (width as usize).saturating_mul(bytes_per_group)
+            } else {
+                line_bytes
+            }
+            .max((origin_x as usize).saturating_mul(bytes_per_group).saturating_add(line_bytes));
+            let height = if height != 0 { height as usize } else { lines }
+                .max((origin_y as usize).saturating_add(lines));
+            tiled_size_bytes(width_bytes, height, (block_size >> 4) & 0xF)
+        };
+        let src_block_linear = (flags >> LAUNCH_SRC_LAYOUT_BIT) & 1 == LAYOUT_BLOCK_LINEAR;
+        let dst_block_linear = (flags >> LAUNCH_DST_LAYOUT_BIT) & 1 == LAYOUT_BLOCK_LINEAR;
         [
-            (self.src_addr(), src_stride.saturating_mul(lines)),
-            (dst_addr, dst_stride.saturating_mul(lines)),
+            (
+                self.src_addr(),
+                span(
+                    src_block_linear,
+                    bytes_per_group,
+                    self.pitch_in,
+                    self.src_width,
+                    self.src_height,
+                    self.src_block_size,
+                    self.src_origin_x,
+                    self.src_origin_y,
+                ),
+            ),
+            (
+                self.dst_addr(),
+                span(
+                    dst_block_linear,
+                    bytes_per_group,
+                    self.pitch_out,
+                    self.dst_width,
+                    self.dst_height,
+                    self.dst_block_size,
+                    self.dst_origin_x,
+                    self.dst_origin_y,
+                ),
+            ),
         ]
     }
 
@@ -1816,20 +1879,31 @@ impl MaxwellDma {
             );
         }
         let tiled_size = tiled_size_bytes(dst_width_bytes, dst_height, block_height_log2);
-        let mut tiled = vec![0u8; tiled_size];
         let n = tiled_size.min(dst_limit);
-        mem_read(dst_cpu, &mut tiled[..n]);
-        swizzle_block_linear_into(
-            &mut tiled,
-            &post_remap,
-            line_length_dst,
-            line_count,
-            post_remap_pitch,
+        let window = block_linear_row_window(
             dst_width_bytes,
             block_height_log2,
             (self.dst_origin_x as usize) * bytes_per_element.max(1),
+            line_length_dst,
             self.dst_origin_y as usize,
+            line_count,
+            n,
         );
+        let mut tiled = vec![0u8; window.end - window.start];
+        if !tiled.is_empty() {
+            mem_read(dst_cpu + window.start as u64, &mut tiled);
+            swizzle_block_linear_into(
+                &mut tiled,
+                &post_remap,
+                line_length_dst,
+                line_count,
+                post_remap_pitch,
+                dst_width_bytes,
+                block_height_log2,
+                (self.dst_origin_x as usize) * bytes_per_element.max(1),
+                window.origin_y,
+            );
+        }
         if tiled_size > dst_limit && self.clamp_log_count < 16 {
             self.clamp_log_count += 1;
             log::warn!(
@@ -1847,7 +1921,7 @@ impl MaxwellDma {
                 mappings.describe_around(dst_gpu),
             );
         }
-        if !mem_write(dst_cpu, &tiled[..n]) {
+        if !tiled.is_empty() && !mem_write(dst_cpu + window.start as u64, &tiled) {
             return 0;
         }
         self.last_tiled_dst_bh_log2 = block_height_log2;
@@ -1917,21 +1991,32 @@ impl MaxwellDma {
             line_count
         };
         let tiled_size = tiled_size_bytes(dst_width_bytes, dst_height, dst_bh);
-        let mut tiled = vec![0u8; tiled_size];
         let n = tiled_size.min(dst_limit);
-        mem_read(dst_cpu, &mut tiled[..n]);
-        swizzle_block_linear_into(
-            &mut tiled,
-            linear,
-            line_length_dst,
-            line_count,
-            inter_pitch,
+        let window = block_linear_row_window(
             dst_width_bytes,
             dst_bh,
             (self.dst_origin_x as usize) * dst_bytes_per_element.max(1),
+            line_length_dst,
             self.dst_origin_y as usize,
+            line_count,
+            n,
         );
-        mem_write(dst_cpu, &tiled[..n]);
+        if window.end > window.start {
+            let mut tiled = vec![0u8; window.end - window.start];
+            mem_read(dst_cpu + window.start as u64, &mut tiled);
+            swizzle_block_linear_into(
+                &mut tiled,
+                linear,
+                line_length_dst,
+                line_count,
+                inter_pitch,
+                dst_width_bytes,
+                dst_bh,
+                (self.dst_origin_x as usize) * dst_bytes_per_element.max(1),
+                window.origin_y,
+            );
+            mem_write(dst_cpu + window.start as u64, &tiled);
+        }
         nexium_gpu::pitch_oracle::clear_pitch_range(dst_gpu, n as u64);
         nexium_gpu::tex_invalidate::bump_region(dst_gpu, tiled_size as u64);
     }
@@ -2187,6 +2272,47 @@ fn copy_active_gobs(
         .all(|&(offset, len)| mem_copy(src_cpu + offset as u64, dst_cpu + offset as u64, len))
 }
 
+/// The byte window of a block-linear surface that rows
+/// `origin_y..origin_y + line_count` live in: whole block rows, clipped to
+/// `limit`. Block rows are laid out one after another, so every byte a swizzle
+/// of those rows touches lies inside, and `origin_y` is rebased to the window.
+/// Reading and rewriting only this window is equivalent to the full-surface
+/// read-modify-write: the bytes outside it were written back unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockLinearRowWindow {
+    start: usize,
+    end: usize,
+    origin_y: usize,
+}
+
+fn block_linear_row_window(
+    width_bytes: usize,
+    block_height_log2: u32,
+    origin_x_bytes: usize,
+    line_length_bytes: usize,
+    origin_y: usize,
+    line_count: usize,
+    limit: usize,
+) -> BlockLinearRowWindow {
+    let rows_per_block = (1usize << block_height_log2) * GOB_H;
+    let gobs_per_row = (width_bytes + GOB_W - 1) / GOB_W;
+    let block_row_stride = gobs_per_row * (1usize << block_height_log2) * GOB_SIZE;
+    if line_count == 0 || block_row_stride == 0 {
+        return BlockLinearRowWindow { start: 0, end: 0, origin_y: 0 };
+    }
+    // The swizzle does not clip X to the padded width: a copy that runs past
+    // it lands in the following block row, outside a row window. Rewrite the
+    // whole surface for those, as before.
+    if origin_x_bytes.saturating_add(line_length_bytes) > gobs_per_row * GOB_W {
+        return BlockLinearRowWindow { start: 0, end: limit, origin_y };
+    }
+    let first_block = origin_y / rows_per_block;
+    let last_block = (origin_y + line_count - 1) / rows_per_block;
+    let start = first_block.saturating_mul(block_row_stride).min(limit);
+    let end = (last_block + 1).saturating_mul(block_row_stride).min(limit);
+    BlockLinearRowWindow { start, end, origin_y: origin_y - first_block * rows_per_block }
+}
+
 pub(super) fn tiled_size_bytes(width_bytes: usize, height: usize, block_height_log2: u32) -> usize {
     let block_height = 1usize << block_height_log2;
     let rows_per_block = block_height * GOB_H;
@@ -2295,7 +2421,11 @@ fn unswizzle_block_linear_bytes(
         let y_in_gob = y_in_block - gob_row_in_block * GOB_H;
         let block_row_off = block_y * block_row_stride;
         let dst_row_off = y * dst_pitch;
-        for x in 0..copy_width_bytes {
+        // Within a GOB, each 16-byte-aligned run of a row is contiguous in the
+        // tiled layout (`in_gob_offset` keeps `x & 15`), so copy whole runs. A
+        // run is clipped exactly where the per-byte bounds checks would stop.
+        let mut x = 0usize;
+        while x < copy_width_bytes {
             let src_byte_x = origin_x + x;
             let gob_col = src_byte_x / GOB_W;
             let x_in_gob = src_byte_x - gob_col * GOB_W;
@@ -2303,9 +2433,15 @@ fn unswizzle_block_linear_bytes(
                 block_row_off + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
             let src_off = gob_offset + in_gob_offset(x_in_gob, y_in_gob);
             let dst_off = dst_row_off + x;
-            if src_off < src_tiled.len() && dst_off < dst.len() {
-                dst[dst_off] = src_tiled[src_off];
+            let span = (16 - (src_byte_x & 15)).min(copy_width_bytes - x);
+            let copy_len = span
+                .min(dst.len().saturating_sub(dst_off))
+                .min(src_tiled.len().saturating_sub(src_off));
+            if copy_len != 0 {
+                dst[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&src_tiled[src_off..src_off + copy_len]);
             }
+            x += span;
         }
     }
     dst
@@ -2314,6 +2450,7 @@ fn unswizzle_block_linear_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
+        block_linear_row_window,
         active_gob_copy_plan, active_gob_copy_ranges_valid, copy_active_gobs,
         exact_rt_copy_subresource_supported, in_gob_offset, method_requires_hard_boundary,
         swizzle_block_linear, swizzle_block_linear_into, tiled_size_bytes,
@@ -2330,6 +2467,132 @@ mod tests {
     const DST_GPU: u64 = 0x3000;
     const SRC_CPU: u64 = 0x1_0000;
     const DST_CPU: u64 = 0x1_1000;
+
+    fn unswizzle_block_linear_bytes_reference(
+        src_tiled: &[u8],
+        copy_width_bytes: usize,
+        copy_height: usize,
+        dst_pitch: usize,
+        src_width_bytes: usize,
+        block_height_log2: u32,
+        origin_x: usize,
+        origin_y: usize,
+    ) -> Vec<u8> {
+        let mut dst = vec![0u8; dst_pitch * copy_height];
+        let block_height = 1usize << block_height_log2;
+        let rows_per_block = block_height * GOB_H;
+        let gobs_per_row = (src_width_bytes + GOB_W - 1) / GOB_W;
+        let block_row_stride = gobs_per_row * block_height * GOB_SIZE;
+        for y in 0..copy_height {
+            let src_y = origin_y + y;
+            let block_y = src_y / rows_per_block;
+            let y_in_block = src_y - block_y * rows_per_block;
+            let gob_row_in_block = y_in_block / GOB_H;
+            let y_in_gob = y_in_block - gob_row_in_block * GOB_H;
+            for x in 0..copy_width_bytes {
+                let src_byte_x = origin_x + x;
+                let gob_col = src_byte_x / GOB_W;
+                let x_in_gob = src_byte_x - gob_col * GOB_W;
+                let src_off = block_y * block_row_stride
+                    + gob_col * block_height * GOB_SIZE
+                    + gob_row_in_block * GOB_SIZE
+                    + in_gob_offset(x_in_gob, y_in_gob);
+                let dst_off = y * dst_pitch + x;
+                if src_off < src_tiled.len() && dst_off < dst.len() {
+                    dst[dst_off] = src_tiled[src_off];
+                }
+            }
+        }
+        dst
+    }
+
+    #[test]
+    fn windowed_block_linear_write_matches_full_surface_rewrite() {
+        let width_bytes = 300usize;
+        let height = 70usize;
+        for block_height_log2 in [0u32, 1, 3] {
+            let full_size = tiled_size_bytes(width_bytes, height, block_height_log2);
+            let surface: Vec<u8> = (0..full_size).map(|i| (i * 13 + 5) as u8).collect();
+            for (origin_x, origin_y, copy_w, copy_h, limit) in [
+                (0usize, 0usize, width_bytes, height, full_size),
+                (7, 9, 90, 3, full_size),
+                (64, 15, 100, 17, full_size),
+                (5, 60, 40, 30, full_size),
+                (5, 20, 40, 30, full_size / 2),
+                (0, 69, 300, 1, full_size - 100),
+                (0, 40, 16, 8, 64),
+                // X extent past the padded width spills into the next block row.
+                (280, 3, 100, 5, full_size),
+                (310, 60, 64, 10, full_size),
+            ] {
+                let src: Vec<u8> = (0..copy_w * copy_h).map(|i| (i * 7 + 1) as u8).collect();
+                // Old behaviour: read `limit` bytes of the whole surface, swizzle,
+                // write the same `limit` bytes back.
+                let mut expected = surface.clone();
+                let mut full = vec![0u8; full_size];
+                full[..limit].copy_from_slice(&surface[..limit]);
+                swizzle_block_linear_into(
+                    &mut full, &src, copy_w, copy_h, copy_w, width_bytes, block_height_log2,
+                    origin_x, origin_y,
+                );
+                expected[..limit].copy_from_slice(&full[..limit]);
+                // New behaviour: only the covered block rows.
+                let mut actual = surface.clone();
+                let window =
+                    block_linear_row_window(
+                        width_bytes, block_height_log2, origin_x, copy_w, origin_y, copy_h, limit,
+                    );
+                assert!(window.start <= window.end && window.end <= limit);
+                let mut tiled = actual[window.start..window.end].to_vec();
+                if !tiled.is_empty() {
+                    swizzle_block_linear_into(
+                        &mut tiled, &src, copy_w, copy_h, copy_w, width_bytes, block_height_log2,
+                        origin_x, window.origin_y,
+                    );
+                    actual[window.start..window.end].copy_from_slice(&tiled);
+                }
+                assert_eq!(
+                    actual, expected,
+                    "bh={block_height_log2} origin=({origin_x},{origin_y}) h={copy_h} limit={limit}"
+                );
+            }
+        }
+        assert_eq!(
+            block_linear_row_window(64, 0, 0, 64, 3, 0, 1 << 20),
+            super::BlockLinearRowWindow { start: 0, end: 0, origin_y: 0 }
+        );
+    }
+
+    #[test]
+    fn unswizzle_spans_match_bytewise_reference_including_clipping() {
+        let width_bytes = 200usize;
+        let height = 40usize;
+        for block_height_log2 in [0u32, 1, 2, 4] {
+            let gobs_per_row = (width_bytes + GOB_W - 1) / GOB_W;
+            let rows_per_block = (1usize << block_height_log2) * GOB_H;
+            let blocks = (height + rows_per_block - 1) / rows_per_block;
+            let full = gobs_per_row * (1usize << block_height_log2) * GOB_SIZE * blocks;
+            let tiled: Vec<u8> = (0..full).map(|i| (i * 31 + 7) as u8).collect();
+            for (origin_x, origin_y, copy_w, copy_h, dst_pitch, tiled_len) in [
+                (0, 0, width_bytes, height, width_bytes, full),
+                (3, 5, 117, 21, 130, full),
+                (15, 1, 1, 9, 4, full),
+                (17, 7, 150, 30, 160, full / 2),
+                (60, 0, 140, 40, 141, full - 333),
+            ] {
+                let src = &tiled[..tiled_len];
+                let got = unswizzle_block_linear_bytes(
+                    src, copy_w, copy_h, dst_pitch, width_bytes, height, block_height_log2,
+                    origin_x, origin_y,
+                );
+                let want = unswizzle_block_linear_bytes_reference(
+                    src, copy_w, copy_h, dst_pitch, width_bytes, block_height_log2, origin_x,
+                    origin_y,
+                );
+                assert_eq!(got, want, "bh={block_height_log2} origin=({origin_x},{origin_y})");
+            }
+        }
+    }
 
     #[test]
     fn only_dma_launch_requires_hard_boundary() {
@@ -2414,6 +2677,104 @@ mod tests {
         );
 
         assert_eq!(remapped, expected);
+    }
+
+    #[test]
+    fn transfer_spans_cover_every_byte_the_launch_writes() {
+        // Invalidation before a LAUNCH_DMA (prep.rs) uses these spans; a write
+        // outside them would leave a stale snapshot/mirror until the next
+        // write-watch sweep.
+        const SRC_GPU_VA: u64 = 0x10_0000;
+        const DST_GPU_VA: u64 = 0x40_0000;
+        const SRC_CPU_VA: u64 = 0x100_0000;
+        const DST_CPU_VA: u64 = 0x400_0000;
+        const LEN: usize = 0x10_0000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(SRC_GPU_VA, LEN as u64, SRC_CPU_VA, 3);
+        mappings.add(DST_GPU_VA, LEN as u64, DST_CPU_VA, 4);
+        let pitch_pitch = (1 << LAUNCH_SRC_LAYOUT_BIT) | (1 << LAUNCH_DST_LAYOUT_BIT);
+        let multi = 1 << LAUNCH_MULTI_LINE_BIT;
+        let remap = 1 << LAUNCH_REMAP_ENABLE_BIT;
+        // (flags, line_length_in, line_count, pitch_in, pitch_out, remap
+        //  components, block size, width, height, dst origin)
+        let cases: [(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32); 6] = [
+            // Plain pitch copy.
+            (pitch_pitch | multi, 0x40, 4, 0x80, 0x100, 0, 0, 0, 0, 0),
+            // Remapped: 0x40 *elements* of 4x4-byte components per line.
+            (pitch_pitch | multi | remap, 0x40, 3, 0x400, 0x500, 0x0333_3210, 0, 0, 0, 0),
+            // Single-line remapped fill-style copy.
+            (pitch_pitch | remap, 0x100, 1, 0, 0, 0x0013_0000 | 0x4444, 0, 0, 0, 0),
+            // Pitch to block-linear (dst layout bit clear), with an origin.
+            ((1 << LAUNCH_SRC_LAYOUT_BIT) | multi, 0x50, 20, 0x50, 0, 0, 0x20, 0x100, 64, 3 << 16),
+            // Pitch to block-linear, remapped 4-byte elements.
+            ((1 << LAUNCH_SRC_LAYOUT_BIT) | multi | remap, 0x20, 16, 0x80, 0, 0x0300_3210, 0x10, 0x40, 16, 0),
+            // Block-linear to pitch.
+            ((1 << LAUNCH_DST_LAYOUT_BIT) | multi, 0x60, 9, 0, 0x80, 0, 0, 0, 0, 0),
+        ];
+        for (index, &(flags, line_length, lines, pitch_in, pitch_out, components, block, width, height, origin)) in
+            cases.iter().enumerate()
+        {
+            let mut dma = MaxwellDma::new();
+            let src_gpu = SRC_GPU_VA;
+            let dst_gpu = DST_GPU_VA;
+            dma.offset_in_upper = (src_gpu >> 32) as u32;
+            dma.offset_in_lower = src_gpu as u32;
+            dma.offset_out_upper = (dst_gpu >> 32) as u32;
+            dma.offset_out_lower = dst_gpu as u32;
+            dma.line_length_in = line_length;
+            dma.line_count = lines;
+            dma.pitch_in = pitch_in;
+            dma.pitch_out = pitch_out;
+            dma.remap_components = components;
+            dma.remap_const_a = 0x1122_3344;
+            dma.remap_const_b = 0x5566_7788;
+            dma.src_block_size = block;
+            dma.dst_block_size = block;
+            dma.src_width = width;
+            dma.src_height = height;
+            dma.dst_width = width;
+            dma.dst_height = height;
+            dma.src_depth = 1;
+            dma.dst_depth = 1;
+            dma.dst_origin_x = origin & 0xffff;
+            dma.dst_origin_y = origin >> 16;
+            let [(span_src, src_len), (span_dst, dst_len)] = dma.transfer_spans(flags);
+            assert_eq!((span_src, span_dst), (src_gpu, dst_gpu));
+            let written = std::cell::RefCell::new(Vec::<(u64, usize)>::new());
+            let read_ranges = std::cell::RefCell::new(Vec::<(u64, usize)>::new());
+            let mem_read = |address: u64, output: &mut [u8]| {
+                read_ranges.borrow_mut().push((address, output.len()));
+                output.fill(0x5a);
+                true
+            };
+            let mem_write = |address: u64, input: &[u8]| {
+                written.borrow_mut().push((address, input.len()));
+                true
+            };
+            let mem_copy = |src: u64, dst: u64, len: usize| {
+                read_ranges.borrow_mut().push((src, len));
+                written.borrow_mut().push((dst, len));
+                true
+            };
+            dma.launch_dma(flags, &mappings, &mem_read, &mem_write, &mem_copy);
+            let written = written.into_inner();
+            assert!(!written.is_empty(), "case {index}: launch wrote nothing");
+            for (address, len) in written {
+                assert!(
+                    address >= DST_CPU_VA
+                        && address + len as u64 <= DST_CPU_VA + dst_len as u64,
+                    "case {index}: write {address:#x}+{len:#x} outside dst span {dst_len:#x}"
+                );
+            }
+            for (address, len) in read_ranges.into_inner() {
+                if address >= SRC_CPU_VA && address < SRC_CPU_VA + LEN as u64 {
+                    assert!(
+                        address + len as u64 <= SRC_CPU_VA + src_len as u64,
+                        "case {index}: read {address:#x}+{len:#x} outside src span {src_len:#x}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

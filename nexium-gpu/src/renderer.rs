@@ -1498,6 +1498,7 @@ struct RendererInner {
     graphics_storage: HashMap<crate::compute::ComputeRawStorageKey, GraphicsStorageEntry>,
     retired_graphics_storage: Vec<(u64, crate::compute::ComputeBufferResource)>,
     graphics_storage_batch: u64,
+    upload_content_cache: UploadContentCache,
     frame_slots: Vec<FrameSlot>,
     frame_index: usize,
     utility_slot: FrameSlot,
@@ -1748,6 +1749,132 @@ impl TextureUploadData {
             }],
             astc: None,
         }
+    }
+}
+
+const UPLOAD_CONTENT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const UPLOAD_CONTENT_CACHE_TARGET_BYTES: usize = 192 * 1024 * 1024;
+
+/// Everything `texture_upload_data_with_layout` reads, apart from the raw
+/// bytes themselves (represented by their hash and length).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct UploadContentKey {
+    raw_hash: u64,
+    raw_len: usize,
+    tic: crate::texture::TicEntry,
+    layers: u32,
+    pitch_size: usize,
+    effective_block_linear: bool,
+    force_pitch: bool,
+    format: i32,
+}
+
+impl UploadContentKey {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        raw_hash: u64,
+        raw_len: usize,
+        tic: &crate::texture::TicEntry,
+        layers: u32,
+        pitch_size: usize,
+        effective_block_linear: bool,
+        force_pitch: bool,
+        format: vk::Format,
+    ) -> Self {
+        // View-only fields do not change the uploaded bytes; dropping them lets
+        // swizzle and mip-view variants of one texture share an entry.
+        let mut tic = *tic;
+        tic.swizzle = TEXTURE_IDENTITY_SWIZZLE;
+        tic.normalized_coords = false;
+        tic.is_srgb = false;
+        tic.res_min_mip_level = 0;
+        tic.res_max_mip_level = 0;
+        Self {
+            raw_hash,
+            raw_len,
+            tic,
+            layers,
+            pitch_size,
+            effective_block_linear,
+            force_pitch,
+            format: format.as_raw(),
+        }
+    }
+}
+
+/// Converted upload bytes keyed by guest content. A texture whose cache entry
+/// was evicted, removed by an invalidation that did not change its bytes, or
+/// that is bound through another view, swizzle or numeric variant reuses the
+/// earlier conversion instead of unswizzling and decoding again.
+/// `NEXIUM_UPLOAD_CONTENT_CACHE=0` turns it off.
+#[derive(Default)]
+struct UploadContentCache {
+    entries: HashMap<UploadContentKey, (Arc<TextureUploadData>, u64)>,
+    bytes: usize,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl UploadContentCache {
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            !matches!(
+                std::env::var("NEXIUM_UPLOAD_CONTENT_CACHE")
+                    .ok()
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Some("0" | "false" | "off" | "no")
+            )
+        })
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        key: UploadContentKey,
+        build: impl FnOnce() -> Result<TextureUploadData, String>,
+    ) -> Result<Arc<TextureUploadData>, String> {
+        self.tick += 1;
+        if let Some((data, last_use)) = self.entries.get_mut(&key) {
+            *last_use = self.tick;
+            self.hits += 1;
+            return Ok(Arc::clone(data));
+        }
+        self.misses += 1;
+        if self.misses % 4096 == 0 {
+            log::debug!(
+                "[upload-content-cache] hits={} misses={} entries={} bytes={}",
+                self.hits,
+                self.misses,
+                self.entries.len(),
+                self.bytes
+            );
+        }
+        let data = Arc::new(build()?);
+        let size = data.bytes.len();
+        if size == 0 || size > UPLOAD_CONTENT_CACHE_MAX_BYTES / 4 || data.astc.is_some() {
+            return Ok(data);
+        }
+        self.bytes += size;
+        self.entries.insert(key, (Arc::clone(&data), self.tick));
+        if self.bytes > UPLOAD_CONTENT_CACHE_MAX_BYTES {
+            let mut order: Vec<_> = self
+                .entries
+                .iter()
+                .map(|(key, (_, last_use))| (*last_use, *key))
+                .collect();
+            order.sort_unstable_by_key(|(last_use, _)| *last_use);
+            for (_, key) in order {
+                if self.bytes <= UPLOAD_CONTENT_CACHE_TARGET_BYTES {
+                    break;
+                }
+                if let Some((evicted, _)) = self.entries.remove(&key) {
+                    self.bytes -= evicted.bytes.len();
+                }
+            }
+        }
+        Ok(data)
     }
 }
 
@@ -3015,7 +3142,7 @@ fn trace_gpu_memory(
             .fold(retired_bytes, |total, texture| total.saturating_add(texture.allocation_size));
         retired_rt_count += slot.retired_rt_images.len();
         for buffer in slot.upload_buffers.iter().chain(&slot.free_upload_buffers)
-            .chain(slot.texture_upload_arena.iter().map(|arena| &arena.buffer))
+            .chain(slot.texture_upload_arenas.iter().map(|arena| &arena.buffer))
         {
             upload_count += 1;
             upload_bytes = upload_bytes.saturating_add(buffer.size);
@@ -3547,7 +3674,8 @@ struct FrameSlot {
     retired_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
     upload_buffers: Vec<PersistentUploadBuffer>,
     free_upload_buffers: Vec<PersistentUploadBuffer>,
-    texture_upload_arena: Option<TextureUploadArena>,
+    texture_upload_arenas: Vec<TextureUploadArena>,
+    texture_upload_arena_active: usize,
     texture_upload_arena_unavailable: bool,
     retired_textures: Vec<CachedTexture>,
     retired_texel_buffers: Vec<CachedTexelBuffer>,
@@ -3647,6 +3775,8 @@ fn release_fermi_exact_rt_snapshot_lease_refs(
 const FRAME_SLOT_UPLOAD_POOL_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const TEXTURE_UPLOAD_ARENA_BYTES: u64 = 64 * 1024 * 1024;
 const TEXTURE_UPLOAD_ARENA_ALIGNMENT: u64 = 256;
+/// Arena chunks a frame slot keeps between uses.
+const TEXTURE_UPLOAD_ARENA_RETAIN_BYTES: u64 = 128 * 1024 * 1024;
 
 fn destroy_persistent_upload_buffer(device: &ash::Device, buffer: PersistentUploadBuffer) {
     unsafe {
@@ -3663,9 +3793,21 @@ fn destroy_retired_rt_images(device: &ash::Device, images: &mut Vec<GpuImage>) {
 }
 
 fn recycle_slot_upload_buffers(device: &ash::Device, slot: &mut FrameSlot) {
-    if let Some(arena) = slot.texture_upload_arena.as_mut() {
-        arena.head = 0;
+    // Keep the first few arena chunks for the next use of this slot; any chunk
+    // past the budget was only needed for an unusually heavy frame.
+    let mut kept = 0u64;
+    let mut arenas = Vec::with_capacity(slot.texture_upload_arenas.len());
+    for mut arena in slot.texture_upload_arenas.drain(..) {
+        if kept.saturating_add(arena.buffer.size) <= TEXTURE_UPLOAD_ARENA_RETAIN_BYTES {
+            kept = kept.saturating_add(arena.buffer.size);
+            arena.head = 0;
+            arenas.push(arena);
+        } else {
+            destroy_persistent_upload_buffer(device, arena.buffer);
+        }
     }
+    slot.texture_upload_arenas = arenas;
+    slot.texture_upload_arena_active = 0;
     if let Some(arena) = slot.astc_arena.as_mut() {
         arena.reset(device);
     }
@@ -3691,9 +3833,12 @@ fn recycle_slot_upload_buffers(device: &ash::Device, slot: &mut FrameSlot) {
 fn texture_upload_arena_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NEXIUM_UPLOAD_ARENA").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
+        !matches!(
+            std::env::var("NEXIUM_UPLOAD_ARENA")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "false" | "off" | "no")
         )
     })
 }
@@ -4321,20 +4466,24 @@ fn materialize_completed_readback(
         if stage.size < map_len as u64 {
             return None;
         }
-        let mut raw = vec![0u8; total];
+        // Filled straight from the mapping: no zero-fill pass over a buffer
+        // that is overwritten in full immediately afterwards.
+        let mut raw: Vec<u8> = Vec::with_capacity(total);
         let mut depth = None;
         unsafe {
             let ptr = device
                 .map_memory(stage.memory, 0, map_len as u64, vk::MemoryMapFlags::empty())
                 .ok()?;
             std::ptr::copy_nonoverlapping(ptr as *const u8, raw.as_mut_ptr(), total);
+            raw.set_len(total);
             if let Some(d) = completed.depth.filter(|_| depth_len > 0) {
-                let mut bytes = vec![0u8; depth_len];
+                let mut bytes: Vec<u8> = Vec::with_capacity(depth_len);
                 std::ptr::copy_nonoverlapping(
                     (ptr as *const u8).add(d.offset as usize),
                     bytes.as_mut_ptr(),
                     depth_len,
                 );
+                bytes.set_len(depth_len);
                 depth = Some(PresentDepthRaw {
                     width: d.width,
                     height: d.height,
@@ -5065,6 +5214,61 @@ fn startup_pipeline_prewarm_mode(
     }
 }
 
+fn pipeline_build_under_lock_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| {
+        !matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// `NEXIUM_PIPELINE_BUILD_LOCKED=1` restores the old behaviour of compiling
+/// (and waiting for) draw-time pipelines while holding the renderer lock.
+fn pipeline_build_under_lock_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        pipeline_build_under_lock_value_enabled(
+            std::env::var_os("NEXIUM_PIPELINE_BUILD_LOCKED").as_deref(),
+        )
+    })
+}
+
+thread_local! {
+    static GS_SPIRV_HASH_MEMO: std::cell::RefCell<Vec<(Arc<Vec<u32>>, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hash of a geometry shader's SPIR-V, memoised by `Arc` identity so repeated
+/// draws with the same module do not rehash every word. The memo keeps the
+/// `Arc` alive, so a pointer match always refers to the same contents.
+fn gs_spirv_hash(gs_spirv: &Arc<Vec<u32>>) -> u64 {
+    if gs_spirv.is_empty() {
+        return 0;
+    }
+    GS_SPIRV_HASH_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if let Some(index) = memo.iter().position(|(spirv, _)| Arc::ptr_eq(spirv, gs_spirv)) {
+            let entry = memo.remove(index);
+            let hash = entry.1;
+            memo.insert(0, entry);
+            return hash;
+        }
+        let hash = hash_spirv(gs_spirv);
+        memo.truncate(7);
+        memo.insert(0, (gs_spirv.clone(), hash));
+        hash
+    })
+}
+
+/// Device and pipeline cache of the renderer state, for the pipeline helpers
+/// that release and retake the renderer lock.
+fn renderer_pipeline_cache(
+    inner: &mut RendererInner,
+) -> (&ash::Device, &mut crate::pipeline::PipelineCache) {
+    (&inner.device, &mut inner.pipeline_cache)
+}
+
 fn sync_pipeline_should_wait(_use_async_skip: bool, exact_in_flight: bool) -> bool {
     exact_in_flight
 }
@@ -5225,18 +5429,40 @@ impl Renderer {
         result
     }
 
+    /// Waits for every currently unsettled deferred compute dispatch to finish on
+    /// the GPU *without* holding the renderer lock, so a following
+    /// `settle_all_pending_computes` under the lock finds signalled fences and
+    /// does not stall present/readback threads behind the GPU. Purely a wait:
+    /// which dispatches get settled, and in which order, is unchanged.
+    /// `NEXIUM_COMPUTE_SETTLE_LOCKED_WAIT=1` restores waiting under the lock.
+    fn prewait_pending_computes_unlocked(&self) {
+        if compute_settle_locked_wait_enabled() || !self.timeline_sync_available() {
+            return;
+        }
+        let target = {
+            let inner = self.inner.lock();
+            unsettled_pending_compute_generation(&inner.pending_computes)
+        };
+        if let Some(target) = target {
+            let _ = self.wait_submit_generation(target, std::time::Duration::from_secs(2));
+        }
+    }
+
     pub fn settle_pending_computes(&self) {
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
     }
 
     pub fn settle_ready_pending_computes(&self) {
-        let mut inner = self.inner.lock();
         if compute_settle_ready_enabled() {
+            let mut inner = self.inner.lock();
             settle_ready_pending_computes(&mut inner);
-        } else {
-            settle_all_pending_computes(&mut inner);
+            return;
         }
+        self.prewait_pending_computes_unlocked();
+        let mut inner = self.inner.lock();
+        settle_all_pending_computes(&mut inner);
     }
 
     pub fn readback_compute_storage_seed(
@@ -5517,6 +5743,7 @@ impl Renderer {
     }
 
     pub fn clear_texture_cache(&self) {
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let drained: Vec<_> = inner.tex_cache.drain().map(|(_, t)| t).collect();
@@ -5694,35 +5921,33 @@ impl Renderer {
         let mut layer_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
         let mut ext_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
         let mut present_fences_supported = false;
-        if presentation_target.is_some() {
-            let required = [
-                ash::khr::surface::NAME,
-                #[cfg(windows)]
-                ash::khr::win32_surface::NAME,
-            ];
+        let mut surface_extensions: Vec<&'static std::ffi::CStr> = Vec::new();
+        if let Some(target) = presentation_target.clone() {
             let available =
                 unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
-            let has_extension = |name| {
+            let has_extension = |name: &std::ffi::CStr| {
                 available.iter().any(|extension| unsafe {
                     std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == name
                 })
             };
-            if !required.iter().copied().all(has_extension) {
-                log::warn!("[vulkan-present] native surface extensions unavailable; using GUI frame delivery");
-                presentation_target = None;
-            } else {
-                present_fences_supported = has_extension(ash::khr::get_surface_capabilities2::NAME)
-                    && has_extension(ash::ext::surface_maintenance1::NAME);
+            match target.claim_instance_extensions(&has_extension) {
+                Some(extensions) => {
+                    surface_extensions = extensions;
+                    present_fences_supported = has_extension(ash::khr::get_surface_capabilities2::NAME)
+                        && has_extension(ash::ext::surface_maintenance1::NAME);
+                }
+                None => {
+                    log::warn!("[vulkan-present] native surface extensions unavailable; using GUI frame delivery");
+                    presentation_target = None;
+                }
             }
         }
         if presentation_target.is_some() {
-            ext_ptrs.push(ash::khr::surface::NAME.as_ptr());
+            ext_ptrs.extend(surface_extensions.iter().map(|name| name.as_ptr()));
             if present_fences_supported {
                 ext_ptrs.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
                 ext_ptrs.push(ash::ext::surface_maintenance1::NAME.as_ptr());
             }
-            #[cfg(windows)]
-            ext_ptrs.push(ash::khr::win32_surface::NAME.as_ptr());
         }
         let want_syncval = std::env::var("NEXIUM_VK_SYNCVAL").ok().as_deref() == Some("1");
         if validation_available {
@@ -6437,6 +6662,10 @@ impl Renderer {
         } else {
             None
         };
+        let mut compute_backend = compute_backend;
+        if let Some(backend) = compute_backend.as_mut() {
+            backend.set_pipeline_cache(pipeline_cache.detached_builder());
+        }
         if compute_backend.is_none() {
             log::warn!(
                 "generic Vulkan compute unavailable: {}",
@@ -6520,7 +6749,8 @@ impl Renderer {
                 retired_buffers: Vec::new(),
                 upload_buffers: Vec::new(),
                 free_upload_buffers: Vec::new(),
-                texture_upload_arena: None,
+                texture_upload_arenas: Vec::new(),
+                texture_upload_arena_active: 0,
                 texture_upload_arena_unavailable: false,
                 retired_textures: Vec::new(),
                 retired_texel_buffers: Vec::new(),
@@ -6544,7 +6774,8 @@ impl Renderer {
             retired_buffers: Vec::new(),
             upload_buffers: Vec::new(),
             free_upload_buffers: Vec::new(),
-            texture_upload_arena: None,
+            texture_upload_arenas: Vec::new(),
+            texture_upload_arena_active: 0,
             texture_upload_arena_unavailable: false,
             retired_textures: Vec::new(),
             retired_texel_buffers: Vec::new(),
@@ -6723,6 +6954,7 @@ impl Renderer {
                 graphics_storage: HashMap::new(),
                 retired_graphics_storage: Vec::new(),
                 graphics_storage_batch: 0,
+                upload_content_cache: UploadContentCache::default(),
                 frame_slots,
                 frame_index: 0,
                 utility_slot,
@@ -6985,6 +7217,7 @@ impl Renderer {
         }
         let (width, height) = (key.width, key.height);
         let clear_settle_started = std::time::Instant::now();
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let clear_settle = clear_settle_started.elapsed();
@@ -7133,6 +7366,7 @@ impl Renderer {
         }
 
         let clear_settle_started = std::time::Instant::now();
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let clear_settle = clear_settle_started.elapsed();
@@ -7350,6 +7584,7 @@ impl Renderer {
             return self.clear_target_key_with_format(key, rgba, format);
         }
         let clear_settle_started = std::time::Instant::now();
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let clear_settle = clear_settle_started.elapsed();
@@ -7653,6 +7888,7 @@ impl Renderer {
                 expected
             ));
         }
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let RendererInner {
@@ -7857,6 +8093,7 @@ impl Renderer {
             return Ok(None);
         }
 
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let RendererInner {
@@ -8028,6 +8265,7 @@ impl Renderer {
         if !fermi_exact_rt_snapshot_token_matches_tic(token, tic) {
             return Ok(None);
         }
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let RendererInner {
@@ -8267,6 +8505,7 @@ impl Renderer {
         src_format: vk::Format,
         dst_format: vk::Format,
     ) -> Result<bool, String> {
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let RendererInner {
@@ -8495,6 +8734,7 @@ impl Renderer {
             ));
         }
         let clear_settle_started = std::time::Instant::now();
+        self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let clear_settle = clear_settle_started.elapsed();
@@ -9948,6 +10188,7 @@ impl Renderer {
         gs_spirv: &[u32],
         fs_spirv: &[u32],
         vs_hash: u64,
+        gs_hash: u64,
         fs_hash: u64,
         vs_cbuf_mask: u64,
         fs_cbuf_mask: u64,
@@ -10025,7 +10266,7 @@ impl Renderer {
         let (color_format, color_format_key, color_attachment_count) =
             crate::pipeline::color_format_key(color_formats);
         let key = crate::pipeline::PipelineKey {
-            gs_hash: if gs_spirv.is_empty() { 0 } else { hash_spirv(gs_spirv) },
+            gs_hash: if gs_spirv.is_empty() { 0 } else { gs_hash },
             vs_hash,
             fs_hash,
             topology: topology.as_raw() as u32,
@@ -10052,7 +10293,6 @@ impl Renderer {
         let vertex_attribute_divisor_supported = inner.vertex_attribute_divisor_supported;
         let RendererInner {
             device,
-            shader_compiler,
             pipeline_cache,
             ..
         } = &mut *inner;
@@ -10075,11 +10315,30 @@ impl Renderer {
 
         let use_async_skip = async_shaders_enabled() && has_depth;
         if sync_pipeline_should_wait(use_async_skip, pipeline_cache.has_in_flight(&key)) {
-            let pipeline = pipeline_cache.wait_for_in_flight(device, &key);
-            if let Some(pipeline) = pipeline {
-                return Ok(Some(pipeline));
+            if pipeline_build_under_lock_enabled() {
+                let pipeline = pipeline_cache.wait_for_in_flight(device, &key);
+                if let Some(pipeline) = pipeline {
+                    return Ok(Some(pipeline));
+                }
+            } else {
+                // A worker is already building this exact pipeline. Wait for it
+                // with the renderer lock released so present/readback threads
+                // are not stalled behind the driver's compile.
+                if let Some(pipeline) = crate::pipeline::wait_for_in_flight_unlocked(
+                    &mut inner,
+                    renderer_pipeline_cache,
+                    &key,
+                ) {
+                    return Ok(Some(pipeline));
+                }
             }
         }
+        let RendererInner {
+            device,
+            shader_compiler,
+            pipeline_cache,
+            ..
+        } = &mut *inner;
 
         let vs_label = format!("runtime-vs hash={:016x}", vs_hash);
         let fs_label = format!("runtime-fs hash={:016x}", fs_hash);
@@ -10241,12 +10500,29 @@ impl Renderer {
             return Ok(None);
         }
 
-        let pipeline = {
-            let _g = nexium_common::shader_progress::guard();
-            pipeline_cache.build(device, &req)?
-        };
-        pipeline_cache.insert(key, pipeline);
-        Ok(Some(pipeline))
+        if pipeline_build_under_lock_enabled() {
+            let pipeline = {
+                let _g = nexium_common::shader_progress::guard();
+                pipeline_cache.build(device, &req)?
+            };
+            pipeline_cache.insert(key, pipeline);
+            return Ok(Some(pipeline));
+        }
+        // Compile with the renderer lock released. The shader modules and
+        // pipeline layout are only read and are destroyed only when the
+        // renderer itself is torn down (not while `&self` is borrowed); the
+        // VkPipelineCache is internally synchronised and its teardown waits for
+        // in-flight builds; a racing build of the same key is adopted.
+        crate::pipeline::build_unlocked_and_insert(
+            &mut inner,
+            renderer_pipeline_cache,
+            key,
+            |builder| {
+                let _g = nexium_common::shader_progress::guard();
+                builder.build(&self.device, &req)
+            },
+        )
+        .map(Some)
     }
 
     fn compile_call_pipeline(
@@ -10262,6 +10538,7 @@ impl Renderer {
             &call.gs_spirv,
             &call.fs_spirv,
             call.vs_hash,
+            gs_spirv_hash(&call.gs_spirv),
             call.fs_hash,
             call.vs_cbuf_mask,
             call.fs_cbuf_mask,
@@ -10363,6 +10640,7 @@ impl Renderer {
             &call.gs_spirv,
             &call.fs_spirv,
             call.vs_hash,
+            gs_spirv_hash(&call.gs_spirv),
             call.fs_hash,
             call.vs_cbuf_mask,
             call.fs_cbuf_mask,
@@ -12554,6 +12832,7 @@ impl Renderer {
             graphics_storage,
             retired_graphics_storage,
             graphics_storage_batch,
+            upload_content_cache,
             ..
         } = &mut *inner;
 
@@ -14017,8 +14296,11 @@ impl Renderer {
                             mips
                         })
                         .unwrap_or_default();
+                    let cached_entry = tex_cache.get(&key);
+                    let cached_invalidated =
+                        cached_entry.is_some_and(|texture| texture.invalidated);
                     let mip_overlay_needs_validation =
-                        texture_mip_overlay_needs_validation(tex_cache.get(&key), &rt_mips);
+                        texture_mip_overlay_needs_validation(cached_entry, &rt_mips);
                     record_tex_sub_add(0, rp_sub_t0);
                     let rp_sub_t0 = record_detail_profile.then(std::time::Instant::now);
                     let identity_volume = key.volume && volume_identity_enabled();
@@ -14071,8 +14353,8 @@ impl Renderer {
                             slices,
                         );
                     }
-                    let force_refresh_early = force_refresh_texture(key.gpu_va)
-                        || tex_cache.get(&key).is_some_and(|texture| texture.invalidated);
+                    let force_refresh_early =
+                        force_refresh_texture(key.gpu_va) || cached_invalidated;
                     let group_route = group_texture_memo
                         .then(|| group_texture_route_key(call, slot))
                         .flatten();
@@ -14406,13 +14688,13 @@ impl Renderer {
                                     && astc_async.available();
                                 let mut deferred_image = None;
                                 let upload = if volume_slices.is_some() || deferred_astc {
-                                    Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
+                                    Ok(Arc::new(TextureUploadData::base(Vec::new(), key.width, key.height)))
                                 } else if identity_volume {
-                                    Ok(TextureUploadData::base(
+                                    Ok(Arc::new(TextureUploadData::base(
                                         identity_volume_rgba8(key.width, key.height, key.layers),
                                         key.width,
                                         key.height,
-                                    ))
+                                    )))
                                 } else if let Some(raw) = raw {
                                     gpu_astc_upload_plan(
                                         raw,
@@ -14424,10 +14706,12 @@ impl Renderer {
                                             && !((texdump_stats_enabled() || texdump_image_enabled())
                                                 && texdump_target_enabled(tic.gpu_va)),
                                     )
-                                    .map(Ok)
+                                    .map(|plan| Ok(Arc::new(plan)))
                                     .unwrap_or_else(|| {
-                                        texture_upload_data(
+                                        texture_upload_data_cached(
+                                            upload_content_cache,
                                             raw,
+                                            raw_hash,
                                             &tic,
                                             key.layers,
                                             pitch_size,
@@ -14436,7 +14720,7 @@ impl Renderer {
                                         )
                                     })
                                 } else {
-                                    Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
+                                    Ok(Arc::new(TextureUploadData::base(Vec::new(), key.width, key.height)))
                                 };
                                 let upload = match upload {
                                     Ok(upload) => upload,
@@ -20469,6 +20753,32 @@ fn compute_settle_ready_enabled() -> bool {
     })
 }
 
+fn compute_settle_locked_wait_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_COMPUTE_SETTLE_LOCKED_WAIT").is_ok_and(|value| value != "0")
+    })
+}
+
+/// Highest submit-timeline generation among deferred compute dispatches that
+/// have not been settled yet; waiting for it covers every one of them (and the
+/// later dispatches a settle may wait on for shared raw storage).
+fn unsettled_pending_compute_generation(pending: &[PendingCompute]) -> Option<u64> {
+    max_unsettled_generation(
+        pending
+            .iter()
+            .map(|pending| (pending.result.is_some(), pending.submission_generation)),
+    )
+}
+
+fn max_unsettled_generation(entries: impl IntoIterator<Item = (bool, u64)>) -> Option<u64> {
+    entries
+        .into_iter()
+        .filter(|(settled, _)| !settled)
+        .map(|(_, generation)| generation)
+        .max()
+}
+
 fn settle_ready_pending_computes(inner: &mut RendererInner) {
     let pending_count = inner.pending_computes.len();
     for index in 0..pending_count {
@@ -25114,6 +25424,49 @@ fn decode_texture_rgba8_layers(
     out
 }
 
+/// `texture_upload_data`, reusing an earlier conversion of identical guest
+/// content when `raw_hash` is known.
+#[allow(clippy::too_many_arguments)]
+fn texture_upload_data_cached(
+    cache: &mut UploadContentCache,
+    raw: &[u8],
+    raw_hash: Option<u64>,
+    tic: &crate::texture::TicEntry,
+    layer_count: u32,
+    pitch_size: usize,
+    force_pitch: bool,
+    format: vk::Format,
+) -> Result<Arc<TextureUploadData>, String> {
+    let effective_block_linear = effective_texture_block_linear(tic);
+    let build = || {
+        texture_upload_data_with_layout(
+            raw,
+            tic,
+            layer_count,
+            pitch_size,
+            effective_block_linear,
+            force_pitch,
+            format,
+        )
+    };
+    match raw_hash.filter(|_| UploadContentCache::enabled()) {
+        Some(hash) => cache.get_or_insert_with(
+            UploadContentKey::new(
+                hash,
+                raw.len(),
+                tic,
+                layer_count,
+                pitch_size,
+                effective_block_linear,
+                force_pitch,
+                format,
+            ),
+            build,
+        ),
+        None => build().map(Arc::new),
+    }
+}
+
 fn texture_upload_data(
     raw: &[u8],
     tic: &crate::texture::TicEntry,
@@ -25206,33 +25559,118 @@ fn texture_upload_data_with_layout(
                 required
             ));
         }
-        let mut bytes = Vec::new();
+        let level_source = |level: &crate::texture::BlockLinearMipLevel, layer: usize| {
+            let start = layer
+                .saturating_mul(layout.layer_stride)
+                .saturating_add(level.guest_offset);
+            &raw[start..start.saturating_add(level.guest_size)]
+        };
+        let unswizzle_into = |level: &crate::texture::BlockLinearMipLevel, layer: usize, dst: &mut [u8]| {
+            crate::texture::unswizzle_block_linear_strided_into(
+                level_source(level, layer),
+                level.storage_width,
+                level.storage_height,
+                tic.format.src_bpp(),
+                level.block_height_log2,
+                level.stride_alignment_log2,
+                dst,
+            );
+        };
+        // Exact host bytes for the conversion path each level takes (native BC
+        // blocks stay at their compressed size; decoded formats are 4 bytes
+        // per texel).
+        let level_lens: Vec<usize> = layout
+            .levels
+            .iter()
+            .map(|level| {
+                texture_level_upload_len(
+                    level.linear_size,
+                    tic.format,
+                    level.width,
+                    level.height,
+                    format,
+                )
+            })
+            .collect();
+        let reserve = level_lens.iter().fold(0usize, |total, len| {
+            total.saturating_add(len.saturating_mul(layers as usize))
+        });
+        let passthrough = texture_level_upload_is_passthrough(tic.format, format);
+        let astc_recompress = matches!(tic.format, crate::texture::TicFormat::Astc(..))
+            && crate::bcn_encode::BcTarget::for_format(format).is_some();
+        let rgba_decode = !passthrough
+            && !astc_recompress
+            && format != vk::Format::D32_SFLOAT
+            && tic.format != crate::texture::TicFormat::G24R8;
+        if passthrough || rgba_decode {
+            // Write every level straight into one buffer instead of building a
+            // vector per level and appending it.
+            let mut bytes = vec![0u8; reserve];
+            let mut copies = Vec::with_capacity(layout.levels.len());
+            let mut cursor = 0usize;
+            let mut linear = Vec::new();
+            for (level, &level_len) in layout.levels.iter().zip(&level_lens) {
+                let buffer_offset = cursor as u64;
+                for layer in 0..layers as usize {
+                    let dst = &mut bytes[cursor..cursor + level_len];
+                    if passthrough {
+                        unswizzle_into(level, layer, dst);
+                    } else {
+                        linear.clear();
+                        linear.resize(level.linear_size, 0);
+                        unswizzle_into(level, layer, &mut linear);
+                        let layer_size = tic.format.linear_size(level.width, level.height);
+                        let end = layer_size.min(linear.len());
+                        crate::texture::decode_to_rgba8_typed_into(
+                            &linear[..end],
+                            level.width,
+                            level.height,
+                            tic.format,
+                            tic.component_types[0],
+                            dst,
+                        );
+                    }
+                    cursor += level_len;
+                }
+                copies.push(TextureMipCopy {
+                    buffer_offset,
+                    mip_level: level.level,
+                    width: level.width,
+                    height: level.height,
+                });
+            }
+            return Ok(TextureUploadData {
+                bytes,
+                copies,
+                astc: None,
+            });
+        }
+        let single_image = layout.levels.len() == 1 && layers == 1;
+        let mut bytes = if single_image {
+            Vec::new()
+        } else {
+            Vec::with_capacity(reserve)
+        };
         let mut copies = Vec::with_capacity(layout.levels.len());
         for level in &layout.levels {
             let buffer_offset = bytes.len() as u64;
             for layer in 0..layers as usize {
-                let start = layer
-                    .saturating_mul(layout.layer_stride)
-                    .saturating_add(level.guest_offset);
-                let end = start.saturating_add(level.guest_size);
-                let mut linear = crate::texture::unswizzle_block_linear_strided(
-                    &raw[start..end],
-                    level.storage_width,
-                    level.storage_height,
-                    tic.format.src_bpp(),
-                    level.block_height_log2,
-                    level.stride_alignment_log2,
-                );
-                linear.resize(level.linear_size, 0);
-                bytes.extend(texture_level_upload(
-                    &linear,
+                let mut linear = vec![0u8; level.linear_size];
+                unswizzle_into(level, layer, &mut linear);
+                let level_bytes = texture_level_upload_owned(
+                    linear,
                     tic.format,
                     level.width,
                     level.height,
                     1,
                     tic.component_types[0],
                     format,
-                ));
+                );
+                if single_image {
+                    bytes = level_bytes;
+                } else {
+                    bytes.extend_from_slice(&level_bytes);
+                }
             }
             copies.push(TextureMipCopy {
                 buffer_offset,
@@ -25241,7 +25679,11 @@ fn texture_upload_data_with_layout(
                 height: level.height,
             });
         }
-        return Ok(TextureUploadData { bytes, copies, astc: None });
+        return Ok(TextureUploadData {
+            bytes,
+            copies,
+            astc: None,
+        });
     }
 
     let linear = linear_texture_layers(
@@ -25252,8 +25694,8 @@ fn texture_upload_data_with_layout(
         effective_block_linear,
         force_pitch,
     );
-    let bytes = texture_level_upload(
-        &linear,
+    let bytes = texture_level_upload_owned(
+        linear,
         tic.format,
         tic.width,
         tic.height,
@@ -25262,6 +25704,84 @@ fn texture_upload_data_with_layout(
         format,
     );
     Ok(TextureUploadData::base(bytes, tic.width, tic.height))
+}
+
+/// Length of `texture_level_upload(linear, ..., layers = 1, ...)` for a
+/// `linear_len`-byte input, without converting anything. Mirrors that
+/// function's branch order; `upload_len_matches_texture_level_upload` pins it.
+fn texture_level_upload_len(
+    linear_len: usize,
+    tic_format: crate::texture::TicFormat,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> usize {
+    use crate::texture::TicFormat;
+    if format == vk::Format::D32_SFLOAT {
+        return match tic_format {
+            TicFormat::R32 | TicFormat::Z32 => linear_len,
+            TicFormat::R16 | TicFormat::Z16 => linear_len / 2 * 4,
+            _ => linear_len / 4 * 4,
+        };
+    }
+    if let (TicFormat::Astc(..), Some(target)) =
+        (tic_format, crate::bcn_encode::BcTarget::for_format(format))
+    {
+        return target.encoded_size(width, height);
+    }
+    if texture_level_upload_is_passthrough(tic_format, format) {
+        linear_len
+    } else if tic_format == TicFormat::G24R8 {
+        linear_len / 4 * 4
+    } else {
+        (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4)
+    }
+}
+
+/// Like `texture_level_upload`, but takes ownership of the linear bytes so
+/// formats whose host layout equals the guest linear layout are handed back
+/// without another full copy.
+fn texture_level_upload_owned(
+    linear: Vec<u8>,
+    tic_format: crate::texture::TicFormat,
+    width: u32,
+    height: u32,
+    layers: u32,
+    component_type: crate::texture::ComponentType,
+    format: vk::Format,
+) -> Vec<u8> {
+    if texture_level_upload_is_passthrough(tic_format, format) {
+        return linear;
+    }
+    texture_level_upload(
+        &linear,
+        tic_format,
+        width,
+        height,
+        layers,
+        component_type,
+        format,
+    )
+}
+
+/// True when `texture_level_upload` returns its input bytes unchanged.
+fn texture_level_upload_is_passthrough(
+    tic_format: crate::texture::TicFormat,
+    format: vk::Format,
+) -> bool {
+    if format == vk::Format::D32_SFLOAT {
+        return tic_format == crate::texture::TicFormat::R32;
+    }
+    if texture_level_native_layout(tic_format, format)
+        || tic_format == crate::texture::TicFormat::R16G16B16A16
+        || (tic_format == crate::texture::TicFormat::R16 && format == vk::Format::R16_SFLOAT)
+    {
+        return true;
+    }
+    tic_format != crate::texture::TicFormat::G24R8
+        && format == vk::Format::B10G11R11_UFLOAT_PACK32
 }
 
 fn texture_level_upload(
@@ -25303,7 +25823,53 @@ fn texture_level_upload(
             .flat_map(|layer| crate::bcn_encode::encode(layer, width, height, target))
             .collect();
     }
-    let native_layout = matches!(
+    let native_layout = texture_level_native_layout(tic_format, format);
+    if native_layout
+        || tic_format == crate::texture::TicFormat::R16G16B16A16
+        || (tic_format == crate::texture::TicFormat::R16 && format == vk::Format::R16_SFLOAT)
+    {
+        linear.to_vec()
+    } else if tic_format == crate::texture::TicFormat::G24R8 {
+        let numeric_type = if format == vk::Format::R32_UINT {
+            nexium_spirv::TextureNumericType::Uint
+        } else if format == vk::Format::R32_SINT {
+            nexium_spirv::TextureNumericType::Sint
+        } else {
+            nexium_spirv::TextureNumericType::Float
+        };
+        g24r8_scalar_upload(linear, numeric_type)
+    } else if format == vk::Format::B10G11R11_UFLOAT_PACK32 {
+        linear.to_vec()
+    } else {
+        let layer_size = tic_format.linear_size(width, height);
+        let decoded_layer_size = width as usize * height as usize * 4;
+        let mut out = Vec::with_capacity(decoded_layer_size.saturating_mul(layers as usize));
+        for layer in 0..layers as usize {
+            let start = layer.saturating_mul(layer_size);
+            let end = start.saturating_add(layer_size).min(linear.len());
+            if start >= linear.len() {
+                out.resize(out.len().saturating_add(decoded_layer_size), 0);
+                continue;
+            }
+            let mut decoded = crate::texture::decode_to_rgba8_typed(
+                &linear[start..end],
+                width,
+                height,
+                tic_format,
+                component_type,
+            );
+            decoded.resize(decoded_layer_size, 0);
+            if layers == 1 {
+                return decoded;
+            }
+            out.extend_from_slice(&decoded);
+        }
+        out
+    }
+}
+
+fn texture_level_native_layout(tic_format: crate::texture::TicFormat, format: vk::Format) -> bool {
+    matches!(
         (tic_format, format),
         (
             crate::texture::TicFormat::R8,
@@ -25359,6 +25925,9 @@ fn texture_level_upload(
                 | vk::Format::R32G32B32A32_UINT
                 | vk::Format::R32G32B32A32_SINT
         ) | (
+            crate::texture::TicFormat::E5B9G9R9,
+            vk::Format::E5B9G9R9_UFLOAT_PACK32
+        ) | (
             crate::texture::TicFormat::BC1,
             vk::Format::BC1_RGBA_UNORM_BLOCK | vk::Format::BC1_RGBA_SRGB_BLOCK
         ) | (
@@ -25383,46 +25952,7 @@ fn texture_level_upload(
                 crate::texture::TicFormat::BC6U,
                 vk::Format::BC6H_UFLOAT_BLOCK,
             )
-    );
-    if native_layout
-        || tic_format == crate::texture::TicFormat::R16G16B16A16
-        || (tic_format == crate::texture::TicFormat::R16 && format == vk::Format::R16_SFLOAT)
-    {
-        linear.to_vec()
-    } else if tic_format == crate::texture::TicFormat::G24R8 {
-        let numeric_type = if format == vk::Format::R32_UINT {
-            nexium_spirv::TextureNumericType::Uint
-        } else if format == vk::Format::R32_SINT {
-            nexium_spirv::TextureNumericType::Sint
-        } else {
-            nexium_spirv::TextureNumericType::Float
-        };
-        g24r8_scalar_upload(linear, numeric_type)
-    } else if format == vk::Format::B10G11R11_UFLOAT_PACK32 {
-        linear.to_vec()
-    } else {
-        let layer_size = tic_format.linear_size(width, height);
-        let decoded_layer_size = width as usize * height as usize * 4;
-        let mut out = Vec::with_capacity(decoded_layer_size.saturating_mul(layers as usize));
-        for layer in 0..layers as usize {
-            let start = layer.saturating_mul(layer_size);
-            let end = start.saturating_add(layer_size).min(linear.len());
-            if start >= linear.len() {
-                out.resize(out.len().saturating_add(decoded_layer_size), 0);
-                continue;
-            }
-            let mut decoded = crate::texture::decode_to_rgba8_typed(
-                &linear[start..end],
-                width,
-                height,
-                tic_format,
-                component_type,
-            );
-            decoded.resize(decoded_layer_size, 0);
-            out.extend(decoded);
-        }
-        out
-    }
+    )
 }
 
 fn g24r8_scalar_upload(linear: &[u8], numeric_type: nexium_spirv::TextureNumericType) -> Vec<u8> {
@@ -28999,7 +29529,16 @@ fn create_persistent_upload_buffer_reusable(
         }
         return Ok(buffer);
     }
-    create_persistent_upload_buffer(device, mem_props, data, usage)
+    // Round the size up so later uploads of similar size can reuse the buffer
+    // instead of allocating device memory again.
+    let rounded = required.max(1024 * 1024).next_power_of_two();
+    let buffer = create_persistent_upload_buffer_sized(device, mem_props, rounded, usage)?;
+    if !data.is_empty() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.mapped, data.len());
+        }
+    }
+    Ok(buffer)
 }
 
 fn allocate_texture_upload(
@@ -29010,58 +29549,60 @@ fn allocate_texture_upload(
 ) -> Result<TextureUploadLease, String> {
     let required = data.len().max(16) as u64;
     if let Some(slot) = slot {
-        if texture_upload_arena_enabled() {
-            if slot.texture_upload_arena.is_none() && !slot.texture_upload_arena_unavailable {
-                match create_persistent_upload_buffer_sized(
-                    device,
-                    mem_props,
-                    TEXTURE_UPLOAD_ARENA_BYTES,
-                    vk::BufferUsageFlags::TRANSFER_SRC,
-                ) {
-                    Ok(buffer) => {
-                        log::info!(
-                            "created {} MiB texture upload arena for graphics frame slot",
-                            TEXTURE_UPLOAD_ARENA_BYTES / (1024 * 1024)
-                        );
-                        slot.texture_upload_arena = Some(TextureUploadArena { buffer, head: 0 });
-                    }
-                    Err(error) => {
-                        slot.texture_upload_arena_unavailable = true;
-                        log::warn!(
-                            "texture upload arena unavailable (using dedicated staging buffers): {}",
-                            error
-                        );
-                    }
-                }
-            }
-            if let Some(arena) = slot.texture_upload_arena.as_mut() {
-                let remainder = arena.head % TEXTURE_UPLOAD_ARENA_ALIGNMENT;
-                let padding = if remainder == 0 {
-                    0
-                } else {
-                    TEXTURE_UPLOAD_ARENA_ALIGNMENT - remainder
-                };
-                let base_offset = arena.head.checked_add(padding);
-                let end = base_offset.and_then(|offset| offset.checked_add(required));
-                if let Some((base_offset, end)) = base_offset.zip(end) {
-                    if end <= arena.buffer.size {
-                        if !data.is_empty() {
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    data.as_ptr(),
-                                    arena.buffer.mapped.add(base_offset as usize),
-                                    data.len(),
-                                );
-                            }
+        if texture_upload_arena_enabled()
+            && !slot.texture_upload_arena_unavailable
+            && required <= TEXTURE_UPLOAD_ARENA_BYTES
+        {
+            // Bump-allocate from the slot's arena chunks, adding a chunk when
+            // the current ones are full. Chunks are reset (not freed) when the
+            // slot is recycled, so steady-state uploads allocate no memory.
+            loop {
+                if slot.texture_upload_arena_active >= slot.texture_upload_arenas.len() {
+                    match create_persistent_upload_buffer_sized(
+                        device,
+                        mem_props,
+                        TEXTURE_UPLOAD_ARENA_BYTES,
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                    ) {
+                        Ok(buffer) => {
+                            log::debug!(
+                                "created {} MiB texture upload arena chunk {} for frame slot",
+                                TEXTURE_UPLOAD_ARENA_BYTES / (1024 * 1024),
+                                slot.texture_upload_arenas.len()
+                            );
+                            slot.texture_upload_arenas.push(TextureUploadArena { buffer, head: 0 });
                         }
-                        arena.head = end;
-                        return Ok(TextureUploadLease {
-                            buffer: arena.buffer.buffer,
-                            base_offset,
-                            dedicated: None,
-                        });
+                        Err(error) => {
+                            slot.texture_upload_arena_unavailable = true;
+                            log::warn!(
+                                "texture upload arena unavailable (using dedicated staging buffers): {}",
+                                error
+                            );
+                            break;
+                        }
                     }
                 }
+                let arena = &mut slot.texture_upload_arenas[slot.texture_upload_arena_active];
+                let base_offset = arena.head.next_multiple_of(TEXTURE_UPLOAD_ARENA_ALIGNMENT);
+                let end = base_offset.saturating_add(required);
+                if end <= arena.buffer.size {
+                    if !data.is_empty() {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                arena.buffer.mapped.add(base_offset as usize),
+                                data.len(),
+                            );
+                        }
+                    }
+                    arena.head = end;
+                    return Ok(TextureUploadLease {
+                        buffer: arena.buffer.buffer,
+                        base_offset,
+                        dedicated: None,
+                    });
+                }
+                slot.texture_upload_arena_active += 1;
             }
         }
         let dedicated = create_persistent_upload_buffer_reusable(
@@ -30720,6 +31261,18 @@ fn color_texture_image_format_for_tic(
             .all(|component| *component == crate::texture::ComponentType::Float)
     {
         return Ok(vk::Format::B10G11R11_UFLOAT_PACK32);
+    }
+    // Shared-exponent RGB9E5 is sample-only in Vulkan (never a render target or
+    // storage image), and its SAMPLED_IMAGE and FILTER_LINEAR support is mandatory.
+    if tic.format == crate::texture::TicFormat::E5B9G9R9
+        && !tic.is_srgb
+        && numeric_type == nexium_spirv::TextureNumericType::Float
+        && tic
+            .component_types
+            .iter()
+            .all(|component| *component == crate::texture::ComponentType::Float)
+    {
+        return Ok(vk::Format::E5B9G9R9_UFLOAT_PACK32);
     }
     if tic.format == crate::texture::TicFormat::R16
         && !tic.is_srgb
@@ -33422,7 +33975,7 @@ impl Drop for RendererInner {
             for buffer in slot.free_upload_buffers.drain(..) {
                 destroy_persistent_upload_buffer(&self.device, buffer);
             }
-            if let Some(arena) = slot.texture_upload_arena.take() {
+            for arena in slot.texture_upload_arenas.drain(..) {
                 destroy_persistent_upload_buffer(&self.device, arena.buffer);
             }
             if let Some(arena) = slot.astc_arena.take() {
@@ -33464,7 +34017,7 @@ impl Drop for RendererInner {
         for buffer in self.utility_slot.free_upload_buffers.drain(..) {
             destroy_persistent_upload_buffer(&self.device, buffer);
         }
-        if let Some(arena) = self.utility_slot.texture_upload_arena.take() {
+        for arena in self.utility_slot.texture_upload_arenas.drain(..) {
             destroy_persistent_upload_buffer(&self.device, arena.buffer);
         }
         if let Some(arena) = self.utility_slot.astc_arena.take() {
@@ -34181,6 +34734,41 @@ mod tests {
             super::startup_pipeline_prewarm_mode(true, false, false),
             Synchronous
         );
+    }
+
+    #[test]
+    fn compute_prewait_targets_newest_unsettled_dispatch() {
+        assert_eq!(super::max_unsettled_generation(Vec::new()), None);
+        assert_eq!(super::max_unsettled_generation(vec![(true, 9)]), None);
+        assert_eq!(
+            super::max_unsettled_generation(vec![(false, 3), (true, 12), (false, 7), (false, 5)]),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn pipeline_build_stays_off_the_renderer_lock_unless_requested() {
+        use std::ffi::OsStr;
+        assert!(!super::pipeline_build_under_lock_value_enabled(None));
+        assert!(!super::pipeline_build_under_lock_value_enabled(Some(OsStr::new("0"))));
+        assert!(!super::pipeline_build_under_lock_value_enabled(Some(OsStr::new("off"))));
+        assert!(super::pipeline_build_under_lock_value_enabled(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn geometry_shader_hash_memo_matches_full_hash() {
+        let empty = std::sync::Arc::new(Vec::new());
+        assert_eq!(super::gs_spirv_hash(&empty), 0);
+        let modules: Vec<_> = (0..12u32)
+            .map(|seed| std::sync::Arc::new(vec![0x0723_0203, seed, seed.wrapping_mul(977), 5]))
+            .collect();
+        for _ in 0..3 {
+            for module in &modules {
+                assert_eq!(super::gs_spirv_hash(module), super::hash_spirv(module));
+            }
+        }
+        let same_contents = std::sync::Arc::new(modules[0].as_ref().clone());
+        assert_eq!(super::gs_spirv_hash(&same_contents), super::hash_spirv(&modules[0]));
     }
 
     #[test]
@@ -38020,6 +38608,86 @@ mod tests {
     }
 
     #[test]
+    fn sampled_r32_uint_render_target_selects_integer_view_and_sampler() {
+        use crate::texture::{ComponentType, SwizzleSource, TicEntry, TicFormat};
+        use crate::texture_manifest::{
+            normalize_texture_numeric_manifest, texture_numeric_type_for_slot,
+            TextureNumericBinding,
+        };
+        use nexium_spirv::TextureNumericType::{Float, Uint};
+
+        // Shape of the TOTK TIC that used to be rejected: a 1652x929 R32 render target whose
+        // component types are all UINT, read by a filtered TEX in the fragment shader.
+        let tic = TicEntry {
+            format: TicFormat::R32,
+            component_types: [ComponentType::Uint; 4],
+            swizzle: [
+                SwizzleSource::R,
+                SwizzleSource::Zero,
+                SwizzleSource::Zero,
+                SwizzleSource::One,
+            ],
+            gpu_va: 0x5_a900_0000,
+            width: 1652,
+            height: 929,
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 0,
+            is_block_linear: true,
+            texture_type: 1,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
+            max_mip_level: 0,
+            res_min_mip_level: 0,
+            res_max_mip_level: 0,
+        };
+
+        // A Float-typed sample has no legal view of a UINT texel.
+        let error = texture_image_format_for_tic(&tic, Float).unwrap_err();
+        assert!(error.contains("cannot back"), "{error}");
+
+        // The sampled slot now carries the TIC's integer family.
+        let manifest =
+            normalize_texture_numeric_manifest(vec![TextureNumericBinding::new(0x10, 1, Uint)])
+                .unwrap();
+        let numeric_type = texture_numeric_type_for_slot(&manifest, 1);
+        assert_eq!(numeric_type, Uint);
+        assert_eq!(
+            texture_image_format_for_tic(&tic, numeric_type).unwrap(),
+            vk::Format::R32_UINT
+        );
+
+        // The RT cache path picks the same R32_UINT view, which a MUTABLE_FORMAT R32 colour
+        // target can expose whether it was created as R32_SFLOAT or R32_UINT.
+        let view_format = rt_alias_view_format(
+            crate::rt_cache::RtKey::new(1, 1652, 929, tic.gpu_va),
+            tic,
+            vk::Format::R32_SFLOAT,
+        );
+        assert_eq!(view_format, vk::Format::R32_UINT);
+        assert!(texture_numeric_type_matches_format(numeric_type, view_format));
+        assert!(!texture_numeric_type_matches_format(Float, view_format));
+        for base in [vk::Format::R32_SFLOAT, vk::Format::R32_UINT, vk::Format::R32_SINT] {
+            assert!(crate::rt_cache::rt_formats_compatible(base, view_format));
+        }
+
+        // Integer views can never be linearly filtered, so the slot must use the nearest-only
+        // integer sampler and must not demand SAMPLED_IMAGE_FILTER_LINEAR.
+        assert!(texture_requires_integer_sampler(numeric_type, false));
+        let mut tsc = crate::texture::TscEntry::parse(&[0; 32]).unwrap();
+        tsc.mag_filter = crate::texture::TexFilter::Linear;
+        tsc.min_filter = crate::texture::TexFilter::Linear;
+        assert!(!compute_guest_sampler_format_features(&tsc, true, false, true, true)
+            .contains(vk::FormatFeatureFlags2::SAMPLED_IMAGE_FILTER_LINEAR));
+    }
+
+    #[test]
     fn positional_rt_slots_do_not_shift_compressed_aliases() {
         let depth = crate::rt_cache::RtKey::new(317, 1600, 900, 0x5a0ab0000);
         let color = crate::rt_cache::RtKey::new(329, 1600, 900, 0x5a9390000);
@@ -38162,6 +38830,59 @@ mod tests {
             texture_view_swizzle(TicFormat::R8G8B8A8, Float, logical),
             logical
         );
+    }
+
+    #[test]
+    fn owned_texture_level_upload_matches_borrowed_upload() {
+        use crate::texture::{ComponentType, TicFormat};
+
+        let (width, height, layers) = (8u32, 4u32, 2u32);
+        let cases = [
+            (TicFormat::R8G8B8A8, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::R8G8B8A8, vk::Format::R8G8B8A8_SRGB),
+            (TicFormat::R16G16B16A16, vk::Format::R16G16B16A16_SFLOAT),
+            (TicFormat::R16, vk::Format::R16_SFLOAT),
+            (TicFormat::R32, vk::Format::D32_SFLOAT),
+            (TicFormat::R16, vk::Format::D32_SFLOAT),
+            (TicFormat::G24R8, vk::Format::R32_UINT),
+            (TicFormat::G24R8, vk::Format::D32_SFLOAT),
+            (TicFormat::B10G11R11, vk::Format::B10G11R11_UFLOAT_PACK32),
+            (TicFormat::E5B9G9R9, vk::Format::E5B9G9R9_UFLOAT_PACK32),
+            (TicFormat::E5B9G9R9, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::BC1, vk::Format::BC1_RGBA_UNORM_BLOCK),
+            (TicFormat::BC1, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::BC7, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::A8B8G8R8, vk::Format::R8G8B8A8_UNORM),
+        ];
+        for (tic_format, host) in cases {
+            for layer_count in [1, layers] {
+                let len = tic_format.linear_size(width, height) * layer_count as usize;
+                let linear: Vec<u8> = (0..len).map(|i| (i * 29 + 7) as u8).collect();
+                let borrowed = texture_level_upload(
+                    &linear,
+                    tic_format,
+                    width,
+                    height,
+                    layer_count,
+                    ComponentType::Unorm,
+                    host,
+                );
+                let passthrough = super::texture_level_upload_is_passthrough(tic_format, host);
+                if passthrough {
+                    assert_eq!(borrowed, linear, "{tic_format:?} {host:?}");
+                }
+                let owned = super::texture_level_upload_owned(
+                    linear,
+                    tic_format,
+                    width,
+                    height,
+                    layer_count,
+                    ComponentType::Unorm,
+                    host,
+                );
+                assert_eq!(owned, borrowed, "{tic_format:?} {host:?} layers={layer_count}");
+            }
+        }
     }
 
     #[test]
@@ -38846,6 +39567,45 @@ mod tests {
             packed
         );
 
+        tic.format = TicFormat::E5B9G9R9;
+        assert_eq!(
+            texture_image_format_for_tic(&tic, TextureNumericType::Float).unwrap(),
+            vk::Format::E5B9G9R9_UFLOAT_PACK32
+        );
+        assert_eq!(
+            super::compute_sample_image_format(&tic, TextureNumericType::Float, false).unwrap(),
+            vk::Format::E5B9G9R9_UFLOAT_PACK32
+        );
+        let shared_exp = 0x8040_0100u32.to_le_bytes();
+        assert!(super::texture_level_upload_is_passthrough(
+            TicFormat::E5B9G9R9,
+            vk::Format::E5B9G9R9_UFLOAT_PACK32
+        ));
+        assert_eq!(
+            texture_level_upload(
+                &shared_exp,
+                TicFormat::E5B9G9R9,
+                1,
+                1,
+                1,
+                ComponentType::Float,
+                vk::Format::E5B9G9R9_UFLOAT_PACK32,
+            ),
+            shared_exp
+        );
+        tic.is_srgb = true;
+        assert_ne!(
+            texture_image_format_for_tic(&tic, TextureNumericType::Float).ok(),
+            Some(vk::Format::E5B9G9R9_UFLOAT_PACK32)
+        );
+        tic.is_srgb = false;
+        tic.component_types = [ComponentType::Unorm; 4];
+        assert_ne!(
+            texture_image_format_for_tic(&tic, TextureNumericType::Float).ok(),
+            Some(vk::Format::E5B9G9R9_UFLOAT_PACK32)
+        );
+        tic.component_types = [ComponentType::Float; 4];
+
         tic.component_types = [ComponentType::Unorm; 4];
         tic.is_srgb = true;
         tic.format = TicFormat::R8;
@@ -39085,6 +39845,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(upload.bytes, expected, "{guest_format:?}");
+            // Native BC blocks stay compressed: the up-front reservation is the
+            // exact upload size, not a decoded-RGBA8 upper bound.
+            assert_eq!(upload.bytes.capacity(), upload.bytes.len(), "{guest_format:?}");
             assert_eq!(upload.copies.len(), 6);
             for ((copy, level), offset) in upload.copies.iter().zip(&layout.levels).zip(offsets) {
                 assert_eq!(copy.buffer_offset, offset);
@@ -39103,6 +39866,132 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn upload_len_matches_texture_level_upload() {
+        use crate::texture::{ComponentType, TicFormat};
+        let cases = [
+            (TicFormat::R8G8B8A8, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::R8, vk::Format::R8_UNORM),
+            (TicFormat::R16G16B16A16, vk::Format::R16G16B16A16_SFLOAT),
+            (TicFormat::R16, vk::Format::R16_SFLOAT),
+            (TicFormat::R32, vk::Format::D32_SFLOAT),
+            (TicFormat::R16, vk::Format::D32_SFLOAT),
+            (TicFormat::Z16, vk::Format::D32_SFLOAT),
+            (TicFormat::Z32, vk::Format::D32_SFLOAT),
+            (TicFormat::Z24S8, vk::Format::D32_SFLOAT),
+            (TicFormat::G24R8, vk::Format::D32_SFLOAT),
+            (TicFormat::G24R8, vk::Format::R32_UINT),
+            (TicFormat::G24R8, vk::Format::R32_SFLOAT),
+            (TicFormat::B10G11R11, vk::Format::B10G11R11_UFLOAT_PACK32),
+            (TicFormat::E5B9G9R9, vk::Format::E5B9G9R9_UFLOAT_PACK32),
+            (TicFormat::E5B9G9R9, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::BC1, vk::Format::BC1_RGBA_UNORM_BLOCK),
+            (TicFormat::BC2, vk::Format::BC2_UNORM_BLOCK),
+            (TicFormat::BC3, vk::Format::BC3_SRGB_BLOCK),
+            (TicFormat::BC4, vk::Format::BC4_UNORM_BLOCK),
+            (TicFormat::BC5, vk::Format::BC5_UNORM_BLOCK),
+            (TicFormat::BC7, vk::Format::BC7_SRGB_BLOCK),
+            (TicFormat::BC1, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::BC4, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::BC7, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::A8B8G8R8, vk::Format::R8G8B8A8_UNORM),
+            (TicFormat::A2B10G10R10, vk::Format::R8G8B8A8_UNORM),
+        ];
+        for (tic_format, host) in cases {
+            for (width, height) in [(1u32, 1u32), (8, 4), (37, 19), (5, 3)] {
+                let linear_len = tic_format.linear_size(width, height);
+                let linear: Vec<u8> = (0..linear_len).map(|i| (i * 13 + 5) as u8).collect();
+                let produced = texture_level_upload(
+                    &linear,
+                    tic_format,
+                    width,
+                    height,
+                    1,
+                    ComponentType::Unorm,
+                    host,
+                );
+                assert_eq!(
+                    super::texture_level_upload_len(linear_len, tic_format, width, height, host),
+                    produced.len(),
+                    "{tic_format:?} {host:?} {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_multi_level_upload_reserves_exact_rgba8_size() {
+        use crate::texture::{block_linear_mip_layout, TicFormat};
+        let mut tic = group_memo_test_tic(0x7fff_f300_0000);
+        tic.format = TicFormat::BC1;
+        tic.width = 37;
+        tic.height = 19;
+        tic.is_block_linear = true;
+        tic.block_height_log2 = 2;
+        tic.texture_type = 5;
+        tic.depth = 3;
+        tic.max_mip_level = 5;
+        tic.res_max_mip_level = 5;
+        let layers = 3;
+        let layout = block_linear_mip_layout(&tic).unwrap();
+        let guest = vec![0x5a; layout.guest_size_bytes(layers)];
+        let upload = texture_upload_data_with_layout(
+            &guest,
+            &tic,
+            layers,
+            layout.layer_stride,
+            true,
+            false,
+            vk::Format::R8G8B8A8_UNORM,
+        )
+        .unwrap();
+        let expected: usize = layout
+            .levels
+            .iter()
+            .map(|level| level.width as usize * level.height as usize * 4 * layers as usize)
+            .sum();
+        assert_eq!(upload.bytes.len(), expected);
+        assert_eq!(upload.bytes.capacity(), expected);
+    }
+
+    #[test]
+    fn upload_content_cache_reuses_and_evicts_by_content() {
+        let tic = group_memo_test_tic(0x7fff_f600_0000);
+        let mut cache = super::UploadContentCache::default();
+        let key = |hash: u64, tic: &crate::texture::TicEntry| {
+            super::UploadContentKey::new(
+                hash, 64, tic, 1, 64, true, false, vk::Format::R8G8B8A8_UNORM,
+            )
+        };
+        let first = cache
+            .get_or_insert_with(key(1, &tic), || Ok(super::TextureUploadData::base(vec![1; 64], 4, 4)))
+            .unwrap();
+        // A different swizzle or mip view of the same content shares the entry.
+        let mut variant = tic;
+        variant.swizzle = [crate::texture::SwizzleSource::One; 4];
+        variant.res_min_mip_level = 1;
+        let second = cache
+            .get_or_insert_with(key(1, &variant), || panic!("content should be cached"))
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        // Different content or a different host format does not.
+        let other = cache
+            .get_or_insert_with(key(2, &tic), || Ok(super::TextureUploadData::base(vec![2; 64], 4, 4)))
+            .unwrap();
+        assert_eq!(other.bytes[0], 2);
+        let big = super::UPLOAD_CONTENT_CACHE_MAX_BYTES / 4;
+        for hash in 10..16 {
+            cache
+                .get_or_insert_with(key(hash, &tic), || {
+                    Ok(super::TextureUploadData::base(vec![0; big], 4, 4))
+                })
+                .unwrap();
+        }
+        assert!(cache.bytes <= super::UPLOAD_CONTENT_CACHE_MAX_BYTES);
+        assert!(!cache.entries.contains_key(&key(1, &tic)));
+        assert!(cache.entries.contains_key(&key(15, &tic)));
     }
 
     #[test]

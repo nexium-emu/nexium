@@ -342,7 +342,10 @@ impl KeplerCompute {
         mappings: &GpuMappings,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     ) {
-        let Some(dir) = std::env::var_os("NEXIUM_COMPUTE_LAUNCH_DUMP") else {
+        static DUMP_DIR: std::sync::OnceLock<Option<std::ffi::OsString>> =
+            std::sync::OnceLock::new();
+        let Some(dir) = DUMP_DIR.get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_LAUNCH_DUMP"))
+        else {
             return;
         };
         let dir = std::path::PathBuf::from(dir);

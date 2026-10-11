@@ -694,6 +694,7 @@ impl ComputeProgram {
         spirv: &[u32],
         required_subgroup_size: Option<u32>,
         descriptors: &[ComputeDescriptorSpec],
+        pipeline_cache: Option<&crate::pipeline::DetachedPipelineBuilder>,
     ) -> Result<Self, String> {
         let bindings: Vec<_> = descriptors
             .iter()
@@ -816,8 +817,11 @@ impl ComputeProgram {
             base_pipeline_index: -1,
             ..Default::default()
         };
-        let created = unsafe {
-            device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        let created = match pipeline_cache {
+            Some(cache) => cache.create_compute_pipeline(device, &pipeline_info),
+            None => unsafe {
+                device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            },
         };
         unsafe { device.destroy_shader_module(module, None) };
         let pipeline = match created {
@@ -902,6 +906,7 @@ pub(crate) const COMPUTE_PROGRAM_SET_CAPACITY: u32 = 64;
 pub(crate) struct ComputeBackend {
     programs: HashMap<ComputePipelineKey, ComputeProgram>,
     resource_pool: ComputeResourcePool,
+    pipeline_cache: Option<crate::pipeline::DetachedPipelineBuilder>,
     pub min_subgroup_size: u32,
     pub max_subgroup_size: u32,
     pub required_subgroup_size_stages: vk::ShaderStageFlags,
@@ -937,6 +942,7 @@ impl ComputeBackend {
         Ok(Self {
             programs: HashMap::new(),
             resource_pool: ComputeResourcePool::new(),
+            pipeline_cache: None,
             min_subgroup_size,
             max_subgroup_size,
             required_subgroup_size_stages,
@@ -960,6 +966,12 @@ impl ComputeBackend {
             workgroup_explicit_layout_enabled,
             storage_image_extended_formats_enabled,
         })
+    }
+
+    /// Routes compute pipeline creation through the renderer's VkPipelineCache.
+    /// The cache must outlive every later `prepare_program` call.
+    pub fn set_pipeline_cache(&mut self, cache: crate::pipeline::DetachedPipelineBuilder) {
+        self.pipeline_cache = Some(cache);
     }
 
     pub fn prepare_program(
@@ -987,7 +999,13 @@ impl ComputeBackend {
         };
         if !self.programs.contains_key(&key) {
             let program =
-                ComputeProgram::new(device, spirv, required_subgroup_size, &key.descriptors)?;
+                ComputeProgram::new(
+                    device,
+                    spirv,
+                    required_subgroup_size,
+                    &key.descriptors,
+                    self.pipeline_cache.as_ref(),
+                )?;
             self.programs.insert(key.clone(), program);
         }
         let program = self.programs.get(&key).unwrap();

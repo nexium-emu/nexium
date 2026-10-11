@@ -372,11 +372,44 @@ fn spec_color_formats(spec: &PipelineSpec) -> Vec<vk::Format> {
     }
 }
 
+/// Shared-handle guard for a `PipelineCache`: builds hold it for reading for the
+/// whole `vkCreate*Pipelines` call; `get_pipeline_cache_data` and teardown take
+/// it for writing. The flag is false once the VkPipelineCache and pipeline
+/// layout have been retired, so a builder that outlives them fails cleanly
+/// instead of using destroyed handles.
+pub type PipelineCacheLock = std::sync::RwLock<bool>;
+
+const PIPELINE_CACHE_RETIRED: &str = "pipeline cache already torn down";
+
+/// Flags for the shared VkPipelineCache. It is used concurrently by the compile
+/// workers and by draw-time builds running outside the renderer lock, which is
+/// only legal because it is *not* created with
+/// `VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT` (Vulkan then
+/// synchronises access to it internally).
+fn shared_pipeline_cache_create_flags() -> vk::PipelineCacheCreateFlags {
+    vk::PipelineCacheCreateFlags::empty()
+}
+
 pub fn build_graphics_pipeline(
     device: &ash::Device,
     vk_cache: vk::PipelineCache,
     pipeline_layout: vk::PipelineLayout,
-    cache_lock: &std::sync::RwLock<()>,
+    cache_lock: &PipelineCacheLock,
+    req: &PipelineBuildRequest,
+) -> Result<vk::Pipeline, String> {
+    let alive = cache_lock.read().unwrap_or_else(|e| e.into_inner());
+    if !*alive {
+        return Err(PIPELINE_CACHE_RETIRED.to_string());
+    }
+    create_graphics_pipeline(device, vk_cache, pipeline_layout, req)
+}
+
+/// The `vkCreateGraphicsPipelines` call itself. Callers must hold the cache's
+/// `PipelineCacheLock` for reading and have checked it is still alive.
+fn create_graphics_pipeline(
+    device: &ash::Device,
+    vk_cache: vk::PipelineCache,
+    pipeline_layout: vk::PipelineLayout,
     req: &PipelineBuildRequest,
 ) -> Result<vk::Pipeline, String> {
     if known_driver_hostile_pipeline(req.key.vs_hash, req.key.fs_hash) {
@@ -669,7 +702,6 @@ pub fn build_graphics_pipeline(
     };
 
     let pipelines = {
-        let _guard = cache_lock.read().unwrap_or_else(|e| e.into_inner());
         let pipeline_debug = std::env::var_os("NEXIUM_PIPELINE_DBG").is_some();
         if pipeline_debug {
             log::warn!(
@@ -700,6 +732,165 @@ pub fn build_graphics_pipeline(
     Ok(pipelines[0])
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InFlightPoll {
+    Ready(vk::Pipeline),
+    Pending,
+    Gone,
+}
+
+/// What a `PipelineCache` needs from a device to dispose of pipelines; a seam
+/// so the cache's concurrency protocol can be tested without a GPU.
+pub trait PipelineDestroyer {
+    fn destroy_unused_pipeline(&self, pipeline: vk::Pipeline);
+}
+
+impl PipelineDestroyer for ash::Device {
+    fn destroy_unused_pipeline(&self, pipeline: vk::Pipeline) {
+        // Only ever called for a pipeline no command buffer has recorded: a
+        // duplicate that lost a build race.
+        unsafe { self.destroy_pipeline(pipeline, None) };
+    }
+}
+
+pub struct DetachedPipelineBuilder {
+    vk_cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    cache_lock: std::sync::Arc<PipelineCacheLock>,
+    external_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    active_builds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct ActiveBuildGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for ActiveBuildGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl DetachedPipelineBuilder {
+    /// Runs `create` with the shared VkPipelineCache and pipeline layout while
+    /// holding the cache lock for reading, so the handles cannot be retired
+    /// (or the cache data serialised) underneath it. Counted in
+    /// `active_builds` so `maybe_save` does not block on it. Fails if the cache
+    /// was already torn down.
+    fn with_live_handles<T>(
+        &self,
+        create: impl FnOnce(vk::PipelineCache, vk::PipelineLayout) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.active_builds
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _active = ActiveBuildGuard(&self.active_builds);
+        let alive = self.cache_lock.read().unwrap_or_else(|e| e.into_inner());
+        if !*alive {
+            return Err(PIPELINE_CACHE_RETIRED.to_string());
+        }
+        create(self.vk_cache, self.layout)
+    }
+
+    /// Builds a graphics pipeline against the shared VkPipelineCache. Safe to
+    /// call without the renderer lock: the VkPipelineCache is internally
+    /// synchronised (see `shared_pipeline_cache_create_flags`), the layout and
+    /// shader modules are only read, and the read guard keeps teardown and
+    /// `get_pipeline_cache_data` out meanwhile.
+    pub fn build(
+        &self,
+        device: &ash::Device,
+        req: &PipelineBuildRequest,
+    ) -> Result<vk::Pipeline, String> {
+        self.with_live_handles(|vk_cache, layout| {
+            create_graphics_pipeline(device, vk_cache, layout, req)
+        })
+    }
+
+    /// Creates a compute pipeline through the shared VkPipelineCache so it is
+    /// served from (and persisted to) the on-disk cache like graphics pipelines.
+    pub fn create_compute_pipeline(
+        &self,
+        device: &ash::Device,
+        info: &vk::ComputePipelineCreateInfo,
+    ) -> Result<Vec<vk::Pipeline>, (Vec<vk::Pipeline>, vk::Result)> {
+        let alive = self.cache_lock.read().unwrap_or_else(|e| e.into_inner());
+        if !*alive {
+            return Err((Vec::new(), vk::Result::ERROR_INITIALIZATION_FAILED));
+        }
+        let created = unsafe {
+            device.create_compute_pipelines(self.vk_cache, std::slice::from_ref(info), None)
+        };
+        drop(alive);
+        if created.is_ok() {
+            self.external_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        created
+    }
+}
+
+/// Waits, with the renderer lock released between polls, for a compile worker
+/// that is already building `key`. `None` when the build failed or the worker
+/// went away; the caller then builds it itself.
+pub(crate) fn wait_for_in_flight_unlocked<G, D>(
+    guard: &mut parking_lot::MutexGuard<'_, G>,
+    project: fn(&mut G) -> (&D, &mut PipelineCache),
+    key: &PipelineKey,
+) -> Option<vk::Pipeline>
+where
+    D: PipelineDestroyer + ?Sized,
+{
+    let started = std::time::Instant::now();
+    let mut spins = 0u32;
+    loop {
+        let poll = {
+            let (device, cache) = project(&mut **guard);
+            cache.poll_in_flight(device, key)
+        };
+        match poll {
+            InFlightPoll::Ready(pipeline) => {
+                let elapsed = started.elapsed();
+                if elapsed >= std::time::Duration::from_millis(10) {
+                    log::warn!(
+                        "[pipeline-sync-wait] vs_hash={:016x} fs_hash={:016x} wait_ms={:.3} outcome=ready unlocked=true",
+                        key.vs_hash,
+                        key.fs_hash,
+                        elapsed.as_secs_f64() * 1000.0,
+                    );
+                }
+                return Some(pipeline);
+            }
+            InFlightPoll::Gone => return None,
+            InFlightPoll::Pending => {}
+        }
+        spins = spins.saturating_add(1);
+        parking_lot::MutexGuard::unlocked(guard, || {
+            if spins < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        });
+    }
+}
+
+/// Builds `key` with the renderer lock released and publishes it. If another
+/// thread (a concurrent miss or a compile worker) published the same key in
+/// the meantime, that pipeline is adopted and this build's duplicate is
+/// destroyed, so exactly one pipeline object per key survives.
+pub(crate) fn build_unlocked_and_insert<G, D>(
+    guard: &mut parking_lot::MutexGuard<'_, G>,
+    project: fn(&mut G) -> (&D, &mut PipelineCache),
+    key: PipelineKey,
+    build: impl FnOnce(&DetachedPipelineBuilder) -> Result<vk::Pipeline, String>,
+) -> Result<vk::Pipeline, String>
+where
+    D: PipelineDestroyer + ?Sized,
+{
+    let builder = project(&mut **guard).1.detached_builder();
+    let built = parking_lot::MutexGuard::unlocked(guard, || build(&builder))?;
+    let (device, cache) = project(&mut **guard);
+    Ok(cache.insert_or_adopt(device, key, built))
+}
+
 struct CompileWorker {
     req_tx: std::sync::mpsc::Sender<PipelineBuildRequest>,
     res_rx: std::sync::mpsc::Receiver<(PipelineKey, vk::Pipeline)>,
@@ -718,7 +909,9 @@ pub struct PipelineCache {
     save_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     worker: Option<CompileWorker>,
     failed: HashSet<PipelineKey>,
-    cache_lock: std::sync::Arc<std::sync::RwLock<()>>,
+    cache_lock: std::sync::Arc<PipelineCacheLock>,
+    external_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    active_detached_builds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     specs: HashMap<PipelineKey, Arc<PipelineSpec>>,
     specs_dirty: bool,
     specs_saved_count: usize,
@@ -764,7 +957,7 @@ impl PipelineCache {
                 initial.as_ptr() as *const std::ffi::c_void
             },
             p_next: std::ptr::null(),
-            flags: Default::default(),
+            flags: shared_pipeline_cache_create_flags(),
             _marker: std::marker::PhantomData,
         };
         let vk_cache = unsafe {
@@ -851,7 +1044,7 @@ impl PipelineCache {
             })
             .ok();
 
-        let cache_lock = std::sync::Arc::new(std::sync::RwLock::new(()));
+        let cache_lock = std::sync::Arc::new(PipelineCacheLock::new(true));
         let worker = {
             let (req_tx, req_rx) = std::sync::mpsc::channel::<PipelineBuildRequest>();
             let (res_tx, res_rx) = std::sync::mpsc::channel::<(PipelineKey, vk::Pipeline)>();
@@ -928,6 +1121,8 @@ impl PipelineCache {
             worker,
             failed: HashSet::new(),
             cache_lock,
+            external_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_detached_builds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             specs,
             specs_dirty: false,
             specs_saved_count: specs_count,
@@ -982,7 +1177,12 @@ impl PipelineCache {
         }
     }
 
-    fn integrate_completed(&mut self, device: &ash::Device, key: PipelineKey, pipe: vk::Pipeline) {
+    fn integrate_completed<D: PipelineDestroyer + ?Sized>(
+        &mut self,
+        device: &D,
+        key: PipelineKey,
+        pipe: vk::Pipeline,
+    ) {
         let was_in_flight = self
             .worker
             .as_mut()
@@ -995,9 +1195,7 @@ impl PipelineCache {
             return;
         }
         if self.pipelines.contains_key(&key) {
-            unsafe {
-                device.destroy_pipeline(pipe, None);
-            }
+            device.destroy_unused_pipeline(pipe);
         } else {
             self.pipelines.insert(key, pipe);
             self.failed.remove(&key);
@@ -1006,7 +1204,7 @@ impl PipelineCache {
         }
     }
 
-    pub fn drain_completed(&mut self, device: &ash::Device) {
+    pub fn drain_completed<D: PipelineDestroyer + ?Sized>(&mut self, device: &D) {
         let mut done: Vec<(PipelineKey, vk::Pipeline)> = Vec::new();
         if let Some(w) = self.worker.as_ref() {
             while let Ok(r) = w.res_rx.try_recv() {
@@ -1030,9 +1228,9 @@ impl PipelineCache {
             .is_some_and(|w| !w.in_flight.is_empty())
     }
 
-    pub fn wait_for_in_flight(
+    pub fn wait_for_in_flight<D: PipelineDestroyer + ?Sized>(
         &mut self,
-        device: &ash::Device,
+        device: &D,
         target: &PipelineKey,
     ) -> Option<vk::Pipeline> {
         if !self.has_in_flight(target) {
@@ -1089,6 +1287,84 @@ impl PipelineCache {
         pipeline
     }
 
+    /// Non-blocking counterpart of `wait_for_in_flight`: integrates whatever the
+    /// workers have finished and reports whether `target` is ready, still being
+    /// built, or will never arrive. Lets the caller wait without holding the
+    /// renderer lock.
+    pub fn poll_in_flight<D: PipelineDestroyer + ?Sized>(
+        &mut self,
+        device: &D,
+        target: &PipelineKey,
+    ) -> InFlightPoll {
+        let mut disconnected = false;
+        let mut done: Vec<(PipelineKey, vk::Pipeline)> = Vec::new();
+        if let Some(w) = self.worker.as_ref() {
+            loop {
+                match w.res_rx.try_recv() {
+                    Ok(result) => done.push(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for (key, pipe) in done {
+            self.integrate_completed(device, key, pipe);
+        }
+        if disconnected {
+            let abandoned = self
+                .worker
+                .as_mut()
+                .map(|w| w.in_flight.drain().map(|(key, _)| key).collect::<Vec<_>>())
+                .unwrap_or_default();
+            for key in abandoned {
+                nexium_common::shader_progress::end();
+                self.failed.insert(key);
+            }
+        }
+        if let Some(pipeline) = self.get(target) {
+            return InFlightPoll::Ready(pipeline);
+        }
+        if self.has_in_flight(target) {
+            InFlightPoll::Pending
+        } else {
+            InFlightPoll::Gone
+        }
+    }
+
+    /// Everything needed to build a pipeline without borrowing the cache, so a
+    /// synchronous miss can compile outside the renderer lock.
+    pub fn detached_builder(&self) -> DetachedPipelineBuilder {
+        DetachedPipelineBuilder {
+            vk_cache: self.vk_cache,
+            layout: self.layout,
+            cache_lock: self.cache_lock.clone(),
+            external_dirty: self.external_dirty.clone(),
+            active_builds: self.active_detached_builds.clone(),
+        }
+    }
+
+    /// Inserts a pipeline built by a `DetachedPipelineBuilder`. If another
+    /// builder won the race the duplicate is destroyed and the cached handle is
+    /// returned.
+    pub fn insert_or_adopt<D: PipelineDestroyer + ?Sized>(
+        &mut self,
+        device: &D,
+        key: PipelineKey,
+        pipeline: vk::Pipeline,
+    ) -> vk::Pipeline {
+        if let Some(existing) = self.get(&key) {
+            if existing != pipeline {
+                device.destroy_unused_pipeline(pipeline);
+            }
+            return existing;
+        }
+        self.insert(key, pipeline);
+        pipeline
+    }
+
     pub fn try_async_skip(&mut self, req: PipelineBuildRequest) -> Option<PipelineBuildRequest> {
         let Some(w) = self.worker.as_mut() else {
             return Some(req);
@@ -1111,17 +1387,35 @@ impl PipelineCache {
     }
 
     pub fn maybe_save(&mut self, device: &ash::Device) {
+        if self
+            .external_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.dirty = true;
+            self.last_change = std::time::Instant::now();
+        }
+        // A build running outside the renderer lock holds the cache read guard;
+        // saving now would block the caller (under the renderer lock) on it.
         let builds_in_flight = self
             .worker
             .as_ref()
-            .is_some_and(|worker| !worker.in_flight.is_empty());
+            .is_some_and(|worker| !worker.in_flight.is_empty())
+            || self
+                .active_detached_builds
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0;
         if cache_save_due(
             self.dirty,
             self.specs_dirty,
             self.last_change.elapsed(),
             builds_in_flight,
         ) {
-            self.save(device);
+            // A detached build may have started since the check above; never
+            // wait for it here (the caller holds the renderer lock). Retry on
+            // a later call instead.
+            if !self.save_with(device, false) {
+                return;
+            }
             self.save_specs();
             self.dirty = false;
         } else if specs_save_due(self.specs_dirty, self.specs_saved_at.elapsed()) {
@@ -1130,26 +1424,41 @@ impl PipelineCache {
     }
 
     pub fn save(&mut self, device: &ash::Device) {
+        self.save_with(device, true);
+    }
+
+    /// Serialises the VkPipelineCache for the disk writer. With `block` false it
+    /// gives up (returning false) instead of waiting for in-flight builds.
+    fn save_with(&mut self, device: &ash::Device, block: bool) -> bool {
         if self.vk_cache == vk::PipelineCache::null() {
-            return;
+            return true;
         }
         let data = {
-            let _guard = self.cache_lock.write().unwrap_or_else(|e| e.into_inner());
+            let _guard = if block {
+                self.cache_lock.write().unwrap_or_else(|e| e.into_inner())
+            } else {
+                match self.cache_lock.try_write() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return false,
+                }
+            };
             match unsafe { device.get_pipeline_cache_data(self.vk_cache) } {
                 Ok(d) => d,
                 Err(e) => {
                     log::warn!("get_pipeline_cache_data failed: {:?}", e);
-                    return;
+                    return true;
                 }
             }
         };
         if data.len() == self.last_saved_len {
-            return;
+            return true;
         }
         self.last_saved_len = data.len();
         if let Some(tx) = &self.save_tx {
             let _ = tx.send(data);
         }
+        true
     }
 
     pub fn build(
@@ -1210,18 +1519,93 @@ impl PipelineCache {
                 device.destroy_pipeline(pipeline, None);
             }
         }
-        if self.vk_cache != vk::PipelineCache::null() {
+        let (vk_cache, layout) = self.retire_shared_handles();
+        if vk_cache != vk::PipelineCache::null() {
             unsafe {
-                device.destroy_pipeline_cache(self.vk_cache, None);
+                device.destroy_pipeline_cache(vk_cache, None);
             }
-            self.vk_cache = vk::PipelineCache::null();
         }
-        if self.layout != vk::PipelineLayout::null() {
+        if layout != vk::PipelineLayout::null() {
             unsafe {
-                device.destroy_pipeline_layout(self.layout, None);
+                device.destroy_pipeline_layout(layout, None);
             }
-            self.layout = vk::PipelineLayout::null();
         }
+    }
+
+    /// Detaches the VkPipelineCache and pipeline layout for destruction. Takes
+    /// the cache lock for writing, so it waits for every build still running
+    /// against them (compile workers, detached draw-time builds, compute
+    /// pipeline creation), and marks the lock retired so any builder that
+    /// starts afterwards fails instead of touching destroyed handles.
+    fn retire_shared_handles(&mut self) -> (vk::PipelineCache, vk::PipelineLayout) {
+        let mut alive = self.cache_lock.write().unwrap_or_else(|e| e.into_inner());
+        *alive = false;
+        drop(alive);
+        (
+            std::mem::replace(&mut self.vk_cache, vk::PipelineCache::null()),
+            std::mem::replace(&mut self.layout, vk::PipelineLayout::null()),
+        )
+    }
+}
+
+#[cfg(test)]
+impl PipelineCache {
+    /// A cache with no device behind it: fake handles, no disk I/O, and a
+    /// compile "worker" without threads whose results the test injects
+    /// through the returned sender.
+    fn for_tests(
+        vk_cache: vk::PipelineCache,
+        layout: vk::PipelineLayout,
+    ) -> (Self, std::sync::mpsc::Sender<(PipelineKey, vk::Pipeline)>) {
+        let (req_tx, _req_rx) = std::sync::mpsc::channel::<PipelineBuildRequest>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let cache = Self {
+            pipelines: HashMap::new(),
+            current_pipeline: CurrentPipeline::default(),
+            layout,
+            vk_cache,
+            dirty: false,
+            last_change: std::time::Instant::now(),
+            last_saved_len: 0,
+            save_tx: None,
+            worker: Some(CompileWorker {
+                req_tx,
+                res_rx,
+                in_flight: std::collections::HashMap::new(),
+                handles: Vec::new(),
+            }),
+            failed: HashSet::new(),
+            cache_lock: std::sync::Arc::new(PipelineCacheLock::new(true)),
+            external_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_detached_builds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            specs: HashMap::new(),
+            specs_dirty: false,
+            specs_saved_count: 0,
+            specs_saved_at: std::time::Instant::now(),
+            specs_tx: None,
+        };
+        (cache, res_tx)
+    }
+
+    /// What `queue_build` records after handing a request to a worker.
+    fn mark_queued_for_tests(&mut self, key: PipelineKey) {
+        self.worker.as_mut().unwrap().in_flight.insert(key, 0);
+        nexium_common::shader_progress::begin();
+    }
+
+    /// `clear` without a device: hands every cached pipeline to `destroyer`
+    /// and retires the shared handles.
+    fn teardown_for_tests<D: PipelineDestroyer + ?Sized>(&mut self, destroyer: &D) {
+        self.current_pipeline.clear();
+        if let Some(worker) = self.worker.take() {
+            for _ in worker.in_flight {
+                nexium_common::shader_progress::end();
+            }
+        }
+        for (_, pipeline) in self.pipelines.drain() {
+            destroyer.destroy_unused_pipeline(pipeline);
+        }
+        let _ = self.retire_shared_handles();
     }
 }
 
@@ -1242,6 +1626,367 @@ mod tests {
         cache_save_due, known_driver_hostile_pipeline, specs_save_due, CurrentPipeline,
         PipelineKey, CACHE_SAVE_IDLE_INTERVAL, SPECS_SAVE_INTERVAL,
     };
+
+    /// Records every pipeline the cache asks to destroy.
+    #[derive(Default)]
+    struct RecordingDestroyer {
+        destroyed: std::sync::Mutex<Vec<vk::Pipeline>>,
+    }
+
+    impl super::PipelineDestroyer for RecordingDestroyer {
+        fn destroy_unused_pipeline(&self, pipeline: vk::Pipeline) {
+            self.destroyed.lock().unwrap().push(pipeline);
+        }
+    }
+
+    impl RecordingDestroyer {
+        fn destroyed(&self) -> Vec<vk::Pipeline> {
+            self.destroyed.lock().unwrap().clone()
+        }
+    }
+
+    /// Stand-in for `RendererInner`: the state the renderer lock protects.
+    struct FakeRenderer {
+        destroyer: RecordingDestroyer,
+        cache: super::PipelineCache,
+    }
+
+    fn fake_renderer_parts(
+        inner: &mut FakeRenderer,
+    ) -> (&RecordingDestroyer, &mut super::PipelineCache) {
+        (&inner.destroyer, &mut inner.cache)
+    }
+
+    fn fake_renderer() -> (
+        std::sync::Arc<parking_lot::Mutex<FakeRenderer>>,
+        std::sync::mpsc::Sender<(PipelineKey, vk::Pipeline)>,
+    ) {
+        let (cache, completions) = super::PipelineCache::for_tests(
+            vk::PipelineCache::from_raw(0xcac4e),
+            vk::PipelineLayout::from_raw(0x1a70),
+        );
+        (
+            std::sync::Arc::new(parking_lot::Mutex::new(FakeRenderer {
+                destroyer: RecordingDestroyer::default(),
+                cache,
+            })),
+            completions,
+        )
+    }
+
+    fn next_fake_pipeline() -> vk::Pipeline {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x10_0000);
+        vk::Pipeline::from_raw(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The renderer's draw-time miss path (`Renderer::compile_pipeline` with the
+    /// lock released), with `build` standing in for `vkCreateGraphicsPipelines`.
+    fn resolve_miss(
+        renderer: &parking_lot::Mutex<FakeRenderer>,
+        key: PipelineKey,
+        build: impl FnOnce() -> vk::Pipeline,
+    ) -> Result<vk::Pipeline, String> {
+        let mut inner = renderer.lock();
+        {
+            let FakeRenderer { destroyer, cache } = &mut *inner;
+            cache.drain_completed(destroyer);
+            if let Some(pipeline) = cache.get(&key) {
+                return Ok(pipeline);
+            }
+        }
+        if inner.cache.has_in_flight(&key) {
+            if let Some(pipeline) =
+                super::wait_for_in_flight_unlocked(&mut inner, fake_renderer_parts, &key)
+            {
+                return Ok(pipeline);
+            }
+        }
+        super::build_unlocked_and_insert(&mut inner, fake_renderer_parts, key, |builder| {
+            builder.with_live_handles(|vk_cache, layout| {
+                assert_eq!(vk_cache, vk::PipelineCache::from_raw(0xcac4e));
+                assert_eq!(layout, vk::PipelineLayout::from_raw(0x1a70));
+                Ok(build())
+            })
+        })
+    }
+
+    /// Blocks until `count` threads have arrived, failing instead of hanging if
+    /// they never do (e.g. because a build were still serialised by the lock).
+    fn rendezvous(arrived: &std::sync::atomic::AtomicUsize, count: usize) {
+        arrived.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while arrived.load(std::sync::atomic::Ordering::Acquire) < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "builds did not overlap: the renderer lock is held while building"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn pipeline_cache_is_internally_synchronised() {
+        // Detached draw-time builds and the compile workers share it unlocked.
+        assert!(!super::shared_pipeline_cache_create_flags()
+            .contains(vk::PipelineCacheCreateFlags::EXTERNALLY_SYNCHRONIZED));
+    }
+
+    #[test]
+    fn concurrent_misses_on_one_key_keep_exactly_one_pipeline() {
+        let (renderer, _completions) = fake_renderer();
+        let key = PipelineKey { vs_hash: 0xabc, ..Default::default() };
+        let arrived = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let built = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let renderer = renderer.clone();
+                let arrived = arrived.clone();
+                let built = built.clone();
+                std::thread::spawn(move || {
+                    resolve_miss(&renderer, key, || {
+                        // Both builds are in progress at once: the lock is free.
+                        rendezvous(&arrived, 2);
+                        let pipeline = next_fake_pipeline();
+                        built.lock().unwrap().push(pipeline);
+                        pipeline
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        let built = built.lock().unwrap().clone();
+        assert_eq!(built.len(), 2);
+        assert_eq!(results[0], results[1], "both callers must use the same pipeline");
+        let survivor = results[0];
+        let loser = *built.iter().find(|&&pipeline| pipeline != survivor).unwrap();
+        let mut inner = renderer.lock();
+        assert_eq!(inner.destroyer.destroyed(), vec![loser], "loser destroyed exactly once");
+        assert_eq!(inner.cache.pipelines.len(), 1);
+        assert_eq!(inner.cache.get(&key), Some(survivor));
+        assert_eq!(
+            inner.cache.active_detached_builds.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        let FakeRenderer { destroyer, cache } = &mut *inner;
+        cache.teardown_for_tests(destroyer);
+    }
+
+    #[test]
+    fn miss_waits_unlocked_for_a_queued_prewarm_build() {
+        let (renderer, completions) = fake_renderer();
+        let key = PipelineKey { fs_hash: 0x51, ..Default::default() };
+        renderer.lock().cache.mark_queued_for_tests(key);
+        let waiter = {
+            let renderer = renderer.clone();
+            std::thread::spawn(move || {
+                resolve_miss(&renderer, key, || panic!("a queued build must be waited for"))
+            })
+        };
+        // The waiter polls with the lock released: this thread can take it.
+        for _ in 0..20 {
+            assert!(renderer.lock().cache.has_in_flight(&key));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let worker_pipeline = next_fake_pipeline();
+        completions.send((key, worker_pipeline)).unwrap();
+        assert_eq!(waiter.join().unwrap().unwrap(), worker_pipeline);
+        let mut inner = renderer.lock();
+        assert!(inner.destroyer.destroyed().is_empty());
+        assert!(!inner.cache.has_in_flight(&key));
+        let FakeRenderer { destroyer, cache } = &mut *inner;
+        cache.teardown_for_tests(destroyer);
+    }
+
+    #[test]
+    fn failed_prewarm_build_falls_back_to_a_detached_build() {
+        let (renderer, completions) = fake_renderer();
+        let key = PipelineKey { fs_hash: 0x52, ..Default::default() };
+        renderer.lock().cache.mark_queued_for_tests(key);
+        completions.send((key, vk::Pipeline::null())).unwrap();
+        let own = next_fake_pipeline();
+        assert_eq!(resolve_miss(&renderer, key, || own).unwrap(), own);
+        let mut inner = renderer.lock();
+        assert!(inner.destroyer.destroyed().is_empty());
+        assert_eq!(inner.cache.get(&key), Some(own));
+        let FakeRenderer { destroyer, cache } = &mut *inner;
+        cache.teardown_for_tests(destroyer);
+    }
+
+    #[test]
+    fn detached_build_racing_prewarm_completion_keeps_one_pipeline_either_order() {
+        for worker_lands_first in [true, false] {
+            let (renderer, completions) = fake_renderer();
+            let key = PipelineKey { vs_hash: 0x77, ..Default::default() };
+            let detached = next_fake_pipeline();
+            let worker = next_fake_pipeline();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let miss = {
+                let renderer = renderer.clone();
+                std::thread::spawn(move || {
+                    resolve_miss(&renderer, key, || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        detached
+                    })
+                    .unwrap()
+                })
+            };
+            entered_rx.recv().unwrap();
+            // Prewarm queued the same key and its worker finishes while the
+            // draw-time build is still running without the lock.
+            {
+                let mut inner = renderer.lock();
+                inner.cache.mark_queued_for_tests(key);
+                completions.send((key, worker)).unwrap();
+                if worker_lands_first {
+                    let FakeRenderer { destroyer, cache } = &mut *inner;
+                    cache.drain_completed(destroyer);
+                }
+            }
+            release_tx.send(()).unwrap();
+            let used = miss.join().unwrap();
+            let mut inner = renderer.lock();
+            {
+                let FakeRenderer { destroyer, cache } = &mut *inner;
+                cache.drain_completed(destroyer);
+            }
+            let (survivor, loser) =
+                if worker_lands_first { (worker, detached) } else { (detached, worker) };
+            assert_eq!(used, survivor, "worker_lands_first={worker_lands_first}");
+            assert_eq!(inner.cache.get(&key), Some(survivor));
+            assert_eq!(inner.destroyer.destroyed(), vec![loser]);
+            assert!(!inner.cache.has_in_flight(&key));
+            let FakeRenderer { destroyer, cache } = &mut *inner;
+            cache.teardown_for_tests(destroyer);
+        }
+    }
+
+    #[test]
+    fn concurrent_misses_and_completions_never_leak_or_double_destroy() {
+        let (renderer, completions) = fake_renderer();
+        let keys: Vec<_> = (0..24u64)
+            .map(|index| PipelineKey { vs_hash: index, ..Default::default() })
+            .collect();
+        for key in &keys[..3] {
+            renderer.lock().cache.mark_queued_for_tests(*key);
+        }
+        let created = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let workers = {
+            let created = created.clone();
+            let keys = keys.clone();
+            std::thread::spawn(move || {
+                for key in &keys[..3] {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let pipeline = next_fake_pipeline();
+                    created.lock().unwrap().push(pipeline);
+                    completions.send((*key, pipeline)).unwrap();
+                }
+            })
+        };
+        let threads: Vec<_> = (0..4)
+            .map(|thread_index| {
+                let renderer = renderer.clone();
+                let created = created.clone();
+                let keys = keys.clone();
+                std::thread::spawn(move || {
+                    let mut used = Vec::new();
+                    for round in 0..48 {
+                        let key = keys[(thread_index * 7 + round * 5) % keys.len()];
+                        let pipeline = resolve_miss(&renderer, key, || {
+                            std::thread::sleep(std::time::Duration::from_micros(300));
+                            let pipeline = next_fake_pipeline();
+                            created.lock().unwrap().push(pipeline);
+                            pipeline
+                        })
+                        .unwrap();
+                        used.push((key, pipeline));
+                    }
+                    used
+                })
+            })
+            .collect();
+        let used: Vec<_> = threads.into_iter().flat_map(|thread| thread.join().unwrap()).collect();
+        workers.join().unwrap();
+        let mut inner = renderer.lock();
+        {
+            let FakeRenderer { destroyer, cache } = &mut *inner;
+            cache.drain_completed(destroyer);
+        }
+        let destroyed = inner.destroyer.destroyed();
+        let created = created.lock().unwrap().clone();
+        let survivors: Vec<_> = keys.iter().filter_map(|key| inner.cache.get(key)).collect();
+        assert_eq!(survivors.len(), keys.len());
+        for (key, pipeline) in &used {
+            assert_eq!(inner.cache.get(key), Some(*pipeline), "caller used a non-surviving pipeline");
+        }
+        let mut accounted: Vec<_> = destroyed.iter().chain(&survivors).copied().collect();
+        accounted.sort_by_key(|pipeline| pipeline.as_raw());
+        let mut all_created = created.clone();
+        all_created.sort_by_key(|pipeline| pipeline.as_raw());
+        assert_eq!(accounted, all_created, "every pipeline is either cached or destroyed once");
+        let FakeRenderer { destroyer, cache } = &mut *inner;
+        cache.teardown_for_tests(destroyer);
+    }
+
+    #[test]
+    fn teardown_waits_for_an_in_flight_build_and_rejects_later_ones() {
+        let (cache, _completions) = super::PipelineCache::for_tests(
+            vk::PipelineCache::from_raw(0xcac4e),
+            vk::PipelineLayout::from_raw(0x1a70),
+        );
+        let builder = cache.detached_builder();
+        let cache = std::sync::Arc::new(std::sync::Mutex::new(cache));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let build = std::thread::spawn(move || {
+            let result = builder.with_live_handles(|vk_cache, layout| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok((vk_cache, layout))
+            });
+            (result, builder)
+        });
+        entered_rx.recv().unwrap();
+        let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let teardown = {
+            let cache = cache.clone();
+            let retired = retired.clone();
+            std::thread::spawn(move || {
+                let handles = cache.lock().unwrap().retire_shared_handles();
+                retired.store(true, std::sync::atomic::Ordering::Release);
+                handles
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !retired.load(std::sync::atomic::Ordering::Acquire),
+            "handles retired while a build was still using them"
+        );
+        release_tx.send(()).unwrap();
+        let (result, builder) = build.join().unwrap();
+        assert_eq!(
+            result.unwrap(),
+            (vk::PipelineCache::from_raw(0xcac4e), vk::PipelineLayout::from_raw(0x1a70))
+        );
+        assert_eq!(
+            teardown.join().unwrap(),
+            (vk::PipelineCache::from_raw(0xcac4e), vk::PipelineLayout::from_raw(0x1a70))
+        );
+        let late = builder.with_live_handles(|_, _| -> Result<(), String> {
+            panic!("a build after teardown must not see the retired handles")
+        });
+        assert!(late.is_err());
+        let mut cache = cache.lock().unwrap();
+        assert_eq!(cache.vk_cache, vk::PipelineCache::null());
+        assert_eq!(cache.layout, vk::PipelineLayout::null());
+        assert_eq!(
+            cache.active_detached_builds.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        cache.teardown_for_tests(&RecordingDestroyer::default());
+    }
 
     #[test]
     fn streamed_spec_snapshot_preserves_disk_format() {

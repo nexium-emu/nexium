@@ -25,6 +25,7 @@ pub enum TicFormat {
     X8Z24,
     S8Z24,
     B10G11R11,
+    E5B9G9R9,
     BC1,
     BC2,
     BC3,
@@ -113,6 +114,7 @@ impl TicFormat {
             0x1B => TicFormat::R16,
             0x18 => TicFormat::R8G8,
             0x1C | 0x1D => TicFormat::R8,
+            0x20 => TicFormat::E5B9G9R9,
             0x21 => TicFormat::B10G11R11,
             0x24 => TicFormat::BC1,
             0x25 => TicFormat::BC2,
@@ -168,7 +170,8 @@ impl TicFormat {
             | TicFormat::Z24S8
             | TicFormat::X8Z24
             | TicFormat::S8Z24
-            | TicFormat::B10G11R11 => 4,
+            | TicFormat::B10G11R11
+            | TicFormat::E5B9G9R9 => 4,
             TicFormat::R5G6B5
             | TicFormat::A1R5G5B5
             | TicFormat::A4R4G4B4
@@ -991,10 +994,33 @@ pub fn unswizzle_block_linear_strided(
     block_height_log2: u32,
     stride_alignment_log2: u32,
 ) -> Vec<u8> {
+    let mut dst = vec![0u8; width_px as usize * bpp * height_px as usize];
+    unswizzle_block_linear_strided_into(
+        src,
+        width_px,
+        height_px,
+        bpp,
+        block_height_log2,
+        stride_alignment_log2,
+        &mut dst,
+    );
+    dst
+}
+
+/// Like `unswizzle_block_linear_strided`, but writes into `dst`, which must be
+/// zeroed. Texels that do not fit in `dst` are skipped.
+pub fn unswizzle_block_linear_strided_into(
+    src: &[u8],
+    width_px: u32,
+    height_px: u32,
+    bpp: usize,
+    block_height_log2: u32,
+    stride_alignment_log2: u32,
+    dst: &mut [u8],
+) {
     let width = width_px as usize;
     let height = height_px as usize;
     let dst_stride = width * bpp;
-    let mut dst = vec![0u8; dst_stride * height];
 
     let block_height = 1usize << block_height_log2 as usize;
     let rows_per_block = block_height * GOB_H;
@@ -1013,7 +1039,7 @@ pub fn unswizzle_block_linear_strided(
             let tiled_row = block_row_offset + gob_row_in_block * GOB_SIZE
                 + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
             copy_block_linear_row::<false>(
-                src, &mut dst, y * dst_stride, tiled_row, dst_stride, 9 + block_height_log2 as usize, bpp,
+                src, dst, y * dst_stride, tiled_row, dst_stride, 9 + block_height_log2 as usize, bpp,
             );
             continue;
         }
@@ -1035,8 +1061,6 @@ pub fn unswizzle_block_linear_strided(
             }
         }
     }
-
-    dst
 }
 
 pub fn swizzle_block_linear_strided(
@@ -1839,6 +1863,29 @@ fn decode_b10g11r11(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     }
 }
 
+/// Decodes one E5B9G9R9 shared-exponent texel: three 9-bit mantissas with no
+/// implicit leading one, scaled by 2^(exponent - 15 - 9).
+fn decode_e5b9g9r9_texel(p: u32) -> [f32; 3] {
+    let scale = 2f32.powi(((p >> 27) & 0x1f) as i32 - 15 - 9);
+    [
+        (p & 0x1ff) as f32 * scale,
+        ((p >> 9) & 0x1ff) as f32 * scale,
+        ((p >> 18) & 0x1ff) as f32 * scale,
+    ]
+}
+
+fn decode_e5b9g9r9(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let pixels = width as usize * height as usize;
+    for i in 0..pixels.min(src.len() / 4) {
+        let p = u32::from_le_bytes([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]]);
+        let [r, g, b] = decode_e5b9g9r9_texel(p);
+        out[i * 4] = float_to_u8(r);
+        out[i * 4 + 1] = float_to_u8(g);
+        out[i * 4 + 2] = float_to_u8(b);
+        out[i * 4 + 3] = 0xff;
+    }
+}
+
 fn decode_bc4(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let (w, h) = (width as usize, height as usize);
     let mut buf = vec![0u32; w * h];
@@ -2002,8 +2049,23 @@ pub fn decode_to_rgba8_typed(
     format: TicFormat,
     component_type: ComponentType,
 ) -> Vec<u8> {
+    let mut out = vec![0u8; (width as usize) * (height as usize) * 4];
+    decode_to_rgba8_typed_into(src, width, height, format, component_type, &mut out);
+    out
+}
+
+/// Like `decode_to_rgba8_typed`, but decodes into `out`, which must be zeroed
+/// and exactly `width * height * 4` bytes long.
+pub fn decode_to_rgba8_typed_into(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    format: TicFormat,
+    component_type: ComponentType,
+    mut out: &mut [u8],
+) {
     let pixels = (width as usize) * (height as usize);
-    let mut out = vec![0u8; pixels * 4];
+    debug_assert_eq!(out.len(), pixels * 4);
 
     match format {
         TicFormat::A8B8G8R8 => {
@@ -2272,6 +2334,7 @@ pub fn decode_to_rgba8_typed(
             }
         }
         TicFormat::B10G11R11 => decode_b10g11r11(src, width, height, &mut out),
+        TicFormat::E5B9G9R9 => decode_e5b9g9r9(src, width, height, &mut out),
         TicFormat::BC1 => decode_bc1(src, width, height, &mut out),
         TicFormat::BC2 => decode_bc2(src, width, height, &mut out),
         TicFormat::BC3 => decode_bc3(src, width, height, &mut out),
@@ -2339,8 +2402,6 @@ pub fn decode_to_rgba8_typed(
             );
         }
     }
-
-    out
 }
 
 pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -> Vec<u8> {
@@ -2746,6 +2807,31 @@ mod tests {
             [0xff, 0, 0, 0xff]
         );
         assert_eq!(TicFormat::from_raw(0x2d), TicFormat::Unknown(0x2d));
+    }
+
+    #[test]
+    fn recognizes_e5b9g9r9_shared_exponent_format() {
+        use super::decode_e5b9g9r9_texel;
+
+        assert_eq!(TicFormat::from_raw(0x20), TicFormat::E5B9G9R9);
+        assert_eq!(TicFormat::E5B9G9R9.src_bpp(), 4);
+        assert_eq!(TicFormat::E5B9G9R9.block_extent(), (1, 1));
+        assert_eq!(TicFormat::E5B9G9R9.storage_extent(7, 5), (7, 5, 4));
+        assert_eq!(TicFormat::E5B9G9R9.linear_size(8, 4), 8 * 4 * 4);
+
+        let texel = |e: u32, b: u32, g: u32, r: u32| (e << 27) | (b << 18) | (g << 9) | r;
+        assert_eq!(decode_e5b9g9r9_texel(texel(16, 0, 128, 256)), [1.0, 0.5, 0.0]);
+        assert_eq!(decode_e5b9g9r9_texel(texel(15, 256, 0, 0)), [0.0, 0.0, 0.5]);
+        assert_eq!(decode_e5b9g9r9_texel(texel(0, 0, 0, 1))[0], 2f32.powi(-24));
+        assert_eq!(decode_e5b9g9r9_texel(texel(31, 0, 0, 511))[0], 65408.0);
+
+        let mut src = Vec::new();
+        src.extend_from_slice(&texel(16, 0, 128, 256).to_le_bytes());
+        src.extend_from_slice(&texel(17, 511, 0, 0).to_le_bytes());
+        assert_eq!(
+            decode_to_rgba8(&src, 2, 1, TicFormat::E5B9G9R9),
+            [0xff, 0x80, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff]
+        );
     }
 
     #[test]

@@ -1880,6 +1880,10 @@ fn finalize_bindless_origin_checks(
                     Opcode::TLD_b => {
                         matches!(inst.op, Op::TexelFetch { .. } | Op::TexelFetchHandle { .. })
                     }
+                    Opcode::TLD4_b => matches!(
+                        inst.op,
+                        Op::GatherTex { .. } | Op::TextureQueryDimension { .. }
+                    ),
                     Opcode::SUATOM => matches!(inst.op, Op::ImageAtomic { .. }),
                     Opcode::SUST => matches!(inst.op, Op::ImageWrite { .. }),
                     Opcode::SULD => matches!(inst.op, Op::ImageRead { .. }),
@@ -1919,6 +1923,13 @@ fn finalize_bindless_origin_checks(
                         *cbuf_binding = binding;
                         *cbuf_word_offset = word_offset;
                         *cbuf_secondary_word_offset = secondary_word_offset;
+                    }
+                    Op::GatherTex { tex_id, .. } if check.opcode == Opcode::TLD4_b => {
+                        *tex_id = origin.texture_id();
+                    }
+                    // Size queries feeding TLD4_b offset coordinate shifts.
+                    Op::TextureQueryDimension { handle, .. } if check.opcode == Opcode::TLD4_b => {
+                        *handle = crate::texture_handle_for_id(origin.texture_id());
                     }
                     Op::ImageAtomic { handle, .. } if check.opcode == Opcode::SUATOM => {
                         *handle = origin.as_texture_handle();
@@ -3091,6 +3102,65 @@ mod tests {
                 ))
             ));
         assert!(sample_tex_ids(&cfg).is_empty());
+    }
+
+    /// TLD4_b.AOFFI, 2D, all four lanes, R component, handle in `handle` and the offset word
+    /// in `handle + 1`.
+    fn tld4_b_aoffi(handle: u8, coord: u8, dest: u8) -> u64 {
+        (0b1101_1110_11u64 << 54)
+            | (1 << 36)
+            | (7 << 51)
+            | (0xf << 31)
+            | (2 << 28)
+            | (u64::from(handle) << 20)
+            | (7 << 16)
+            | (u64::from(coord) << 8)
+            | u64::from(dest)
+    }
+
+    #[test]
+    fn tld4_b_loop_carried_handle_retargets_gathers_and_offset_size_queries() {
+        // The PPS loop's TEX_b handle (R14) is a loop-carried phi, so its origin is only
+        // resolved after the whole CFG is translated.
+        let mut bytes = pps_loop_tex_b_program();
+        write_word(&mut bytes, 0xb8, tld4_b_aoffi(14, 4, 0));
+        let cfg = build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let expected = crate::bindless_texture_id_pair(2, 0x5a, Some(0x15a));
+        let instructions: Vec<_> = cfg
+            .blocks
+            .iter()
+            .flat_map(|block| &block.program.instructions)
+            .collect();
+        let gathers: Vec<u32> = instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::GatherTex { tex_id, .. } => Some(tex_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gathers, vec![expected; 4]);
+        let queries: Vec<_> = instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::TextureQueryDimension { handle, .. } => Some(handle),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queries, vec![crate::texture_handle_for_id(expected); 2]);
+    }
+
+    #[test]
+    fn tld4_b_differing_phi_origins_fail_closed() {
+        let mut bytes = tex_b_phi_program(0x4c98_0788_0697_0012);
+        write_word(&mut bytes, 0x68, tld4_b_aoffi(18, 16, 16));
+        let cfg = build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 1);
+        assert!(!cfg
+            .blocks
+            .iter()
+            .flat_map(|block| &block.program.instructions)
+            .any(|inst| matches!(inst.op, Op::GatherTex { .. })));
     }
 
     #[test]

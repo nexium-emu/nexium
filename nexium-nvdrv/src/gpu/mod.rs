@@ -108,7 +108,10 @@ enum PhysicalMappingIdentity {
     Sparse,
 }
 
-const MAPPING_LOOKUP_CACHE_SIZE: usize = 64;
+// Direct-mapped on 64 KiB pages; 256 slots cover 16 MiB of distinct pages per
+// thread (a 720p RGBA8 target alone spans ~57 pages). Wiped on every mapping
+// generation change, so the larger table only costs a 6 KiB clear per change.
+const MAPPING_LOOKUP_CACHE_SIZE: usize = 256;
 const MAPPING_LOOKUP_CACHE_SHIFT: u32 = 16;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1737,6 +1740,26 @@ impl GpuMappings {
         )
     }
 
+    /// `cpu_range_for`, `nvmap_id_for` and `mapping_epoch_for` for the same VA in
+    /// one GMMU lookup: `(cpu_addr, bytes_available, nvmap_id, mapping_epoch)`.
+    /// `None` exactly when `cpu_range_for` would be `None` (unmapped, sparse or
+    /// CPU-address overflow), in which case the other two are irrelevant to
+    /// every caller.
+    #[inline]
+    pub(crate) fn cpu_range_identity_for(&self, gpu_va: u64) -> Option<(u64, u64, u32, u64)> {
+        let cached = self.mapping_lookup_for(gpu_va)?;
+        let mapping = &self.mappings[cached.mapping_index];
+        if mapping.sparse {
+            return None;
+        }
+        Some((
+            mapping.cpu_addr.checked_add(gpu_va - mapping.gpu_va)?,
+            cached.gpu_hi - gpu_va,
+            mapping.nvmap_id,
+            mapping.epoch,
+        ))
+    }
+
     #[inline]
     pub fn nvmap_id_for(&self, gpu_va: u64) -> Option<u32> {
         let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
@@ -2751,7 +2774,7 @@ impl GpuContext {
                 }
             }
         }
-        let trace_entries = std::env::var_os("NEXIUM_ENTRY_TRACE").is_some();
+        let trace_entries = crate::env_flag_set!("NEXIUM_ENTRY_TRACE");
         for entry in entries {
             if trace_entries {
                 let va = entry.address();

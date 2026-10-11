@@ -1206,19 +1206,23 @@ impl Fermi2D {
                 rgba[out..out + 4].copy_from_slice(&pixel);
             }
         }
-        let rgb_nz = rgba
-            .chunks_exact(4)
-            .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
-            .count();
-        log::info!(
-            "Fermi2D::publish_frame dst_cpu={:#x} {}x{} pitch={} fmt={:#x} rgb_nz={}",
-            dst_cpu,
-            w,
-            h,
-            pitch,
-            self.dst.format,
-            rgb_nz
-        );
+        // The non-zero count exists only for this log line; skip the full
+        // pass over the frame when Info logging is off.
+        if log::log_enabled!(log::Level::Info) {
+            let rgb_nz = rgba
+                .chunks_exact(4)
+                .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+                .count();
+            log::info!(
+                "Fermi2D::publish_frame dst_cpu={:#x} {}x{} pitch={} fmt={:#x} rgb_nz={}",
+                dst_cpu,
+                w,
+                h,
+                pitch,
+                self.dst.format,
+                rgb_nz
+            );
+        }
         let mut q = self.captured_frames.lock().unwrap();
         if q.len() >= 2 {
             q.remove(0);
