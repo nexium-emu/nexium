@@ -229,6 +229,79 @@ pub fn sync_host_region_changes(
     Ok(count)
 }
 
+/// One line comparing the kernel's view of a faulting address with the
+/// faulting core's own mappings, so an "unmapped" guest fault on memory the
+/// kernel considers mapped (a core that missed or misapplied a host-map
+/// change) is told apart from a real guest bug.  Logged for the first
+/// unmapped-memory fault of each core.
+fn log_fault_kernel_view(
+    core_id: usize,
+    cpu: &nexium_core::cpu::Cpu,
+    address_space: &nexium_memory::AddressSpace,
+    last_generation: u64,
+    fault: Option<&nexium_core::cpu::FaultSnapshot>,
+) {
+    let Some(fault) = fault else {
+        log::warn!(
+            "[core{}] first data abort at pc={:#x}: no fault snapshot",
+            core_id,
+            cpu.get_pc()
+        );
+        return;
+    };
+    log::warn!("{}", fault_kernel_view(core_id, cpu, address_space, last_generation, fault));
+}
+
+fn fault_kernel_view(
+    core_id: usize,
+    cpu: &nexium_core::cpu::Cpu,
+    address_space: &nexium_memory::AddressSpace,
+    last_generation: u64,
+    fault: &nexium_core::cpu::FaultSnapshot,
+) -> String {
+    let addr = fault.addr;
+    let containing = address_space
+        .regions_near(addr)
+        .into_iter()
+        .find(|region| region.base <= addr && addr - region.base < region.size);
+    let mut probe = [0u8; 1];
+    let readable = address_space.read(addr, &mut probe).is_ok();
+    let kernel = match &containing {
+        Some(region) => format!(
+            "mapped '{}' {:#x}..{:#x} perm={}{}",
+            region.name,
+            region.base,
+            region.base + region.size,
+            region.perm,
+            if readable { "" } else { " (reserved, not committed)" }
+        ),
+        None => "unmapped".to_string(),
+    };
+    let core_view = cpu.mapping_view(addr);
+    let core = core_view
+        .as_ref()
+        .map(|view| view.to_string())
+        .unwrap_or_else(|| "n/a (backend keeps no per-core map)".to_string());
+    let diverges = readable && core_view.as_ref().is_some_and(|view| view.region.is_none());
+    format!(
+        "[core{}] first data abort: pc={:#x} addr={:#x} size={} write={} | kernel: {} | core: {} | map generation core={} kernel={}{}",
+        core_id,
+        fault.pc,
+        addr,
+        fault.size,
+        fault.is_write,
+        kernel,
+        core,
+        last_generation,
+        address_space.generation(),
+        if diverges {
+            " | CORE MAP DIVERGES FROM KERNEL (missed or misapplied host-map change)"
+        } else {
+            ""
+        }
+    )
+}
+
 struct CpuPollWatch {
     va: u64,
     len: usize,
@@ -821,7 +894,10 @@ impl EmulationHandle {
         let stop_flag_clone = Arc::clone(&stop_flag);
         let pause_flag = Arc::new(AtomicBool::new(false));
         let pause_flag_clone = Arc::clone(&pause_flag);
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(8);
+        // One slot: the UI takes the newest frame per paint, and a full slot
+        // makes the delivery thread hold its pending frame, so the frame
+        // queue backs up and paces the producer to the paint rate.
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(1);
         let cpu_snapshot = Arc::new(Mutex::new(CpuSnapshot::default()));
         let cpu_snapshot_clone = Arc::clone(&cpu_snapshot);
         let mem_request = Arc::new(Mutex::new(0u64));
@@ -985,6 +1061,7 @@ impl EmulationHandle {
                                 let mut aux_cycles = 0u64;
                                 let mut aux_svcs = 0u32;
                                 let mut aux_faults = 0u64;
+                                let mut aux_fault_view_logged = false;
                                 let mut aux_status = std::time::Instant::now();
                                 let spin_yield_n: u32 = std::env::var("NEXIUM_SPIN_YIELD")
                                     .ok()
@@ -1037,9 +1114,10 @@ impl EmulationHandle {
                                         }
                                     }
                                     let run = cpu_mut().unwrap().run_with_count(200_000);
+                                    let run_fault = cpu_ref().unwrap().take_fault();
                                     if aux_faults < 4 {
                                         let cpu = cpu_ref().unwrap();
-                                        if let Some(fault) = cpu.take_fault() {
+                                        if let Some(fault) = run_fault.as_ref() {
                                             let host = addr_aux.host_region_at(fault.addr);
                                             let mut bytes = [0u8; 16];
                                             let width = (fault.size as usize).min(bytes.len());
@@ -1107,6 +1185,17 @@ impl EmulationHandle {
                                     }
                                     if let nexium_core::cpu::CpuEvent::Exception(code) = event {
                                         aux_faults = aux_faults.saturating_add(1);
+                                        if code == 0x0E && !aux_fault_view_logged {
+                                            aux_fault_view_logged = true;
+                                            let cpu = cpu_ref().unwrap();
+                                            log_fault_kernel_view(
+                                                core_id,
+                                                cpu,
+                                                &addr_aux,
+                                                last_map_gen,
+                                                run_fault.as_ref(),
+                                            );
+                                        }
                                         if aux_faults <= 4 || aux_faults % 100_000 == 0 {
                                             let cpu = cpu_ref().unwrap();
                                             log::error!(
@@ -1179,24 +1268,25 @@ impl EmulationHandle {
                                                 _ => {}
                                             }
                                         }
-                                        drop(k);
-                                    }
-                                    if hos_timeslice {
-                                        let mut k = kernel_aux.lock();
-                                        if k.threads.hos_timeslice_expired(
-                                            std::time::Duration::from_millis(10),
-                                        ) {
-                                            k.try_yield_current_ready(cpu_ref().unwrap());
-                                        }
-                                    } else if spin_yield_n != 0 {
-                                        slice_iters = slice_iters.saturating_add(1);
-                                        if slice_iters >= spin_yield_n {
-                                            slice_iters = 0;
-                                            let mut k = kernel_aux.lock();
-                                            if k.threads.has_ready_for_core(core_id as i32) {
+                                        // Slice checks share this critical section instead of
+                                        // re-taking the kernel lock after dropping it; the
+                                        // checks and their order are unchanged.
+                                        if hos_timeslice {
+                                            if k.threads.hos_timeslice_expired(
+                                                std::time::Duration::from_millis(10),
+                                            ) {
                                                 k.try_yield_current_ready(cpu_ref().unwrap());
                                             }
+                                        } else if spin_yield_n != 0 {
+                                            slice_iters = slice_iters.saturating_add(1);
+                                            if slice_iters >= spin_yield_n {
+                                                slice_iters = 0;
+                                                if k.threads.has_ready_for_core(core_id as i32) {
+                                                    k.try_yield_current_ready(cpu_ref().unwrap());
+                                                }
+                                            }
                                         }
+                                        drop(k);
                                     }
                                 }
                                 log::info!("[core{}] stopped", core_id);
@@ -1673,8 +1763,11 @@ impl EmulationHandle {
                         let run = cpu.run_with_count(cpu_slice);
                         let event = run.event;
                         let pc_after = cpu.get_pc();
+                        // Taken once per slice: the [guest-fault] line and the exception
+                        // report below both use it.
+                        let run_fault = cpu.take_fault();
                         if skipped_fault_logs < 8 {
-                            if let Some(fault) = cpu.take_fault() {
+                            if let Some(fault) = run_fault.as_ref() {
                                 skipped_fault_logs += 1;
                                 let host = boot_ctx.address_space.host_region_at(fault.addr);
                                 let mut bytes = [0u8; 16];
@@ -2088,13 +2181,17 @@ impl EmulationHandle {
                             }
                         }
 
-                        if cycle_count % 1_000_000 == 0 {
+                        // Wall-clock gated. This used to be `cycle_count % 1_000_000 == 0`,
+                        // which is true on every exit because a slice retires a fixed
+                        // 1,000,000 instructions unless exact retirement counting is on,
+                        // so the stats mutex was taken on every SVC.
+                        if last_cpu_snapshot.elapsed() >= std::time::Duration::from_millis(16) {
                             let mut st = stats_clone.lock();
                             st.svc_count = svc_count as u64;
                             st.cycle_count = cycle_count;
                             drop(st);
 
-                            if last_cpu_snapshot.elapsed() >= std::time::Duration::from_millis(16) {
+                            {
                                 last_cpu_snapshot = std::time::Instant::now();
                                 let mut snap = cpu_snapshot_clone.lock();
                                 snap.pc = cpu.get_pc();
@@ -2296,7 +2393,16 @@ impl EmulationHandle {
                                     b+7, cpu.get_register(b+7),
                                 );
                                 }
-                                if let Some(f) = cpu.take_fault() {
+                                if let Some(f) = run_fault.as_ref() {
+                                    if code == 0x0E {
+                                        log_fault_kernel_view(
+                                            0,
+                                            cpu,
+                                            &guard.address_space,
+                                            last_map_gen0,
+                                            Some(f),
+                                        );
+                                    }
                                     log::error!(
                                     "  fault addr={:#x} size={} write={} value={:#x} (fault.pc={:#x})",
                                     f.addr, f.size, f.is_write, f.value, f.pc
@@ -2874,5 +2980,197 @@ mod tests {
             hos_timeslice_mode_for(METROID_DREAD_TITLE_ID, Some(false)),
             HosTimesliceMode::Disabled
         );
+    }
+}
+
+#[cfg(all(test, feature = "backend-rustarmic"))]
+mod host_region_sync_tests {
+    use super::{fault_kernel_view, sync_host_region_changes};
+    use nexium_core::cpu::{Cpu, FaultSnapshot};
+    use nexium_memory::{AddressSpace, Perm};
+
+    const PAGE: u64 = 0x1000;
+
+    struct Core {
+        cpu: Cpu,
+        cursor: u64,
+    }
+
+    fn cores(n: usize) -> Vec<Core> {
+        (0..n)
+            .map(|_| Core { cpu: Cpu::new_rustarmic().unwrap(), cursor: 0 })
+            .collect()
+    }
+
+    fn sync(core_id: usize, core: &mut Core, space: &AddressSpace) {
+        sync_host_region_changes(&mut core.cpu, space, &mut core.cursor, core_id).unwrap();
+    }
+
+    /// What an svc does on the calling core besides publishing the change:
+    /// map the new region on that core immediately.
+    fn map_on_caller(core: &mut Core, space: &AddressSpace, va: u64) {
+        let region = space.host_region_at(va).unwrap();
+        unsafe {
+            core.cpu
+                .map_host(region.base, region.size, region.perm, region.host_ptr)
+                .unwrap();
+        }
+    }
+
+    /// Every page of `[lo, hi)`: mapped on the core exactly when the kernel
+    /// maps it, with the kernel's permission, readable through the hooks
+    /// with the kernel's bytes, and given inline fastmem bits only when the
+    /// kernel region is arena-backed (then exactly R / W-without-X).
+    fn assert_matches(core_id: usize, core: &Core, space: &AddressSpace, lo: u64, hi: u64) {
+        let arena = nexium_memory::fastmem::base().map(|base| base as u64);
+        for page in (lo..hi).step_by(PAGE as usize) {
+            let view = core.cpu.mapping_view(page).unwrap();
+            let Some(region) = space.host_region_at(page) else {
+                assert_eq!(view.region, None, "core{core_id}: stale mapping at {page:#x}: {view}");
+                assert_eq!(view.page_direct.unwrap_or_default(), (false, false), "core{core_id}: {page:#x}");
+                continue;
+            };
+            let (base, end, perm) = view.region.unwrap_or_else(|| {
+                panic!("core{core_id}: {page:#x} mapped by the kernel ({:#x}+{:#x}) but not on the core: {view}",
+                    region.base, region.size)
+            });
+            assert!(base <= page && page + PAGE <= end, "core{core_id}: {page:#x}: {view}");
+            assert_eq!(perm, region.perm, "core{core_id}: {page:#x}");
+            let mut want = [0u8; 8];
+            if space.read(page + 8, &mut want).is_ok() {
+                let mut got = [0u8; 8];
+                core.cpu.read_bytes(page + 8, &mut got).unwrap();
+                assert_eq!(got, want, "core{core_id}: {page:#x}");
+            }
+            let arena_backed = arena.is_some_and(|a| region.host_ptr as u64 == a + region.base);
+            if let Some(direct) = view.page_direct {
+                let expect = if arena_backed {
+                    (perm.contains(Perm::R), perm.contains(Perm::W) && !perm.contains(Perm::X))
+                } else {
+                    (false, false)
+                };
+                assert_eq!(direct, expect, "core{core_id}: page bits at {page:#x}: {view}");
+            }
+        }
+    }
+
+    fn sync_all_and_check(cores: &mut [Core], space: &AddressSpace, lo: u64, hi: u64) {
+        for (id, core) in cores.iter_mut().enumerate() {
+            sync(id, core, space);
+            assert_matches(id, core, space, lo, hi);
+        }
+    }
+
+    /// Every change kind the address space publishes, replayed into three
+    /// cores that sync at different times (one after every change, one
+    /// every other change, one only at the end), with the svc paths' direct
+    /// `map_host` on the calling core in between.
+    #[test]
+    fn every_core_sees_every_mapped_byte_for_each_change_kind() {
+        const LO: u64 = 0x9_1000_0000;
+        const HI: u64 = LO + 0x40 * PAGE;
+        let space = AddressSpace::new();
+        let mut cores = cores(3);
+        let mut step = 0;
+        let mut after_change = |cores: &mut Vec<Core>, space: &AddressSpace| {
+            step += 1;
+            sync(0, &mut cores[0], space);
+            assert_matches(0, &cores[0], space, LO, HI);
+            if step % 2 == 0 {
+                sync(1, &mut cores[1], space);
+                assert_matches(1, &cores[1], space, LO, HI);
+            }
+        };
+
+        // map, adjacent regions (MapPhysicalMemory gap fills, svcMapMemory).
+        space.map(LO, 4 * PAGE, Perm::RW, "physmem").unwrap();
+        map_on_caller(&mut cores[1], &space, LO);
+        after_change(&mut cores, &space);
+        space.map(LO + 4 * PAGE, 2 * PAGE, Perm::RW, "physmem").unwrap();
+        map_on_caller(&mut cores[2], &space, LO + 4 * PAGE);
+        after_change(&mut cores, &space);
+        for (i, byte) in (0..6 * PAGE).step_by(PAGE as usize).enumerate() {
+            space.write(LO + byte + 8, &[i as u8 + 1; 8]).unwrap();
+        }
+
+        // Reserved heap, committed in steps (grow and shrink).
+        let heap = LO + 0x10 * PAGE;
+        space.map_reserved(heap, 8 * PAGE, Perm::RW, "heap").unwrap();
+        after_change(&mut cores, &space);
+        space.resize_committed(heap, 4 * PAGE).unwrap();
+        space.write(heap + 3 * PAGE + 8, &[0xAB; 8]).unwrap();
+        after_change(&mut cores, &space);
+        space.resize_committed(heap, 8 * PAGE).unwrap();
+        after_change(&mut cores, &space);
+        space.resize_committed(heap, 2 * PAGE).unwrap();
+        after_change(&mut cores, &space);
+
+        // Code: RX, then protect to RW and back (Upsert of the same base).
+        let code = LO + 0x20 * PAGE;
+        space.map(code, 2 * PAGE, Perm::RX, "code").unwrap();
+        after_change(&mut cores, &space);
+        space.protect(code, 2 * PAGE, Perm::RW).unwrap();
+        after_change(&mut cores, &space);
+        space.protect(code, 2 * PAGE, Perm::RX).unwrap();
+        after_change(&mut cores, &space);
+
+        // Alias spanning two source regions, then a partial unmap that
+        // leaves survivors at the old base with a different size.
+        let alias = LO + 0x30 * PAGE;
+        space.map_alias(alias, LO + 2 * PAGE, 4 * PAGE, Perm::RW, "alias").unwrap();
+        after_change(&mut cores, &space);
+        space.unmap_alias(alias + PAGE, LO + 3 * PAGE, PAGE).unwrap();
+        after_change(&mut cores, &space);
+        space.unmap_alias(alias, LO + 2 * PAGE, PAGE).unwrap();
+        after_change(&mut cores, &space);
+
+        sync_all_and_check(&mut cores, &space, LO, HI);
+        if nexium_memory::fastmem::base().is_some() {
+            // The page-table half of the check actually ran.
+            let view = cores[0].cpu.mapping_view(LO).unwrap();
+            assert_eq!(view.page_direct, Some((true, true)), "{view}");
+        }
+        // The alias shares the source's bytes on every core.
+        let mut got = [0u8; 8];
+        cores[2].cpu.read_bytes(alias + 2 * PAGE + 8, &mut got).unwrap();
+        assert_eq!(got, [5; 8]);
+    }
+
+    /// An `unmap_host` (a published Remove, or the svc retry path) takes
+    /// out exactly the range, not every region overlapping it.
+    #[test]
+    fn unmap_host_removes_only_the_requested_pages() {
+        const LO: u64 = 0x9_2000_0000;
+        let space = AddressSpace::new();
+        space.map(LO, 8 * PAGE, Perm::RW, "physmem").unwrap();
+        let mut cores = cores(1);
+        sync(0, &mut cores[0], &space);
+        unsafe { cores[0].cpu.unmap_host(LO + 3 * PAGE, 2 * PAGE).unwrap() };
+        for page in 0..8 {
+            let view = cores[0].cpu.mapping_view(LO + page * PAGE).unwrap();
+            assert_eq!(view.region.is_some(), !(3..5).contains(&page), "page {page}: {view}");
+        }
+        space.write(LO + 6 * PAGE, &[7; 8]).unwrap();
+        let mut got = [0u8; 8];
+        cores[0].cpu.read_bytes(LO + 6 * PAGE, &mut got).unwrap();
+        assert_eq!(got, [7; 8], "upper piece keeps its host offset");
+    }
+
+    #[test]
+    fn first_fault_line_reports_kernel_and_core_views() {
+        const LO: u64 = 0x9_3000_0000;
+        let space = AddressSpace::new();
+        space.map(LO, 2 * PAGE, Perm::RW, "physmem").unwrap();
+        let mut cores = cores(1);
+        sync(0, &mut cores[0], &space);
+        unsafe { cores[0].cpu.unmap_host(LO + PAGE, PAGE).unwrap() };
+        let fault = FaultSnapshot { pc: 0x1234, addr: LO + PAGE + 0xb0, size: 8, ..Default::default() };
+        let line = fault_kernel_view(1, &cores[0].cpu, &space, cores[0].cursor, &fault);
+        assert!(line.contains("kernel: mapped 'physmem'"), "{line}");
+        assert!(line.contains("core: unmapped"), "{line}");
+        assert!(line.contains("CORE MAP DIVERGES"), "{line}");
+        let fault = FaultSnapshot { addr: LO + 4 * PAGE, ..fault };
+        let line = fault_kernel_view(1, &cores[0].cpu, &space, cores[0].cursor, &fault);
+        assert!(line.contains("kernel: unmapped") && !line.contains("DIVERGES"), "{line}");
     }
 }

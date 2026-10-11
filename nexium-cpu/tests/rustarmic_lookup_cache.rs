@@ -220,7 +220,7 @@ fn cached_region_still_checks_exact_width_and_cross_region_copy() {
     let fault = fixture.cpu.take_fault().unwrap();
     assert_eq!(
         (fault.pc, fault.addr, fault.size, fault.is_write),
-        (CODE + 4, DATA + 4, 8, false)
+        (CODE + 4, DATA + 8, 8, false)
     );
     assert_eq!(first, 0x0807_0605_0403_0201);
     assert_eq!(second, 0x100f_0e0d_0c0b_0a09);

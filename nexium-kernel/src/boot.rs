@@ -206,6 +206,7 @@ impl BootContext {
 
         log::info!("Creating address space");
         let address_space = Arc::new(AddressSpace::new());
+        nexium_cpu::lockstep_register_address_space(&address_space);
 
         let nce = matches!(config.cpu_backend, nexium_cpu::CpuBackendKind::Nce);
         let direct_base = nexium_memory::fastmem::direct_va_base().unwrap_or(0);
@@ -415,6 +416,7 @@ impl BootContext {
         let application_romfs = nexium_loader::mods::build_mod_romfs(&app, &mods)?;
         let address_space = Arc::new(AddressSpace::new());
         let main_stack_size = application_main_stack_size(app.npdm.main_stack_size);
+        nexium_cpu::lockstep_register_address_space(&address_space);
 
         let a32 = !app.npdm.is_64bit;
         let bits: u32 = match app.npdm.address_space {

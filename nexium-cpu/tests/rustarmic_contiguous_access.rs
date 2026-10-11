@@ -361,7 +361,7 @@ fn cross_region_copies_and_permission_faults_keep_exact_fallback_byte_effects() 
                     svc(&mut fixture.cpu, CODE, 3);
                     fixture.check(&x, &v, CODE + 12);
                 } else {
-                    let fault = fixture.fault(CODE + 4, addr, bytes.min(8), !load);
+                    let fault = fixture.fault(CODE + 4, DATA + 8, bytes.min(8), !load);
                     let mut before_access = x;
                     before_access[0] = if load { gprs()[0] } else { x[0] };
                     assert_eq!(fault.regs, before_access);
@@ -603,7 +603,7 @@ fn live_pointer_size_and_permission_replacements_refresh_warmed_accesses() {
         }
         fixture.cpu.set_register(1, DATA + 32 - bytes as u64 + 1);
         let addr = DATA + 32 - bytes as u64 + 1;
-        let fault_addr = if bytes == 16 { addr + 8 } else { addr };
+        let fault_addr = DATA + 32;
         fixture.fault(CODE, fault_addr, bytes.min(8), false);
         let mut x = gprs();
         x[1] = addr;

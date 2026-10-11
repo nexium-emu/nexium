@@ -12,6 +12,8 @@ log.workspace = true
 parking_lot.workspace = true
 dynarmic-sys-mythrax = { workspace = true, optional = true }
 rustarmic = { path = "../rustarmic", optional = true }
+# Disassembly for lockstep divergence reports.
+disarm64 = { version = "0.1", default-features = false, features = ["full"], optional = true }
 
 [target.'cfg(all(target_arch = "aarch64", any(target_os = "android", target_os = "linux")))'.dependencies]
 libc = "0.2"
@@ -19,5 +21,12 @@ libc = "0.2"
 [features]
 default = ["backend-dynarmic", "backend-rustarmic"]
 backend-dynarmic = ["dep:dynarmic-sys-mythrax"]
-backend-rustarmic = ["dep:rustarmic"]
+backend-rustarmic = ["dep:rustarmic", "dep:disarm64"]
 backend-nce = []
+
+[dev-dependencies]
+# Lockstep tests: a deliberately miscompiling Rustarmic (test-only feature)
+# and the random program generator shared with rustarmic's own fuzz tests.
+rustarmic = { path = "../rustarmic", features = ["fault-injection"] }
+rand = "0.8"
+rand_chacha = "0.3"

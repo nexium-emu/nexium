@@ -15,6 +15,86 @@ unsafe impl Sync for SharedDynarmic {}
 
 const NULL_SKIP_MAX: u32 = 64;
 
+/// `dynarmic_version()` of the dynarmic-sys build whose `struct dynarmic`
+/// layout `DirectPageTable::discover` reads. Any other build keeps the
+/// per-page `mem_map_ptr` path.
+const DIRECT_PAGE_TABLE_VERSION: u32 = 20260209;
+const DYN_PAGE_SIZE: u64 = 0x1000;
+const DYN_PAGE_BITS: u32 = 12;
+
+/// Writer for a JIT's absolute-offset page table that skips dynarmic-sys's
+/// per-page khash.
+///
+/// `dynarmic_mem_map_ptr` inserts every 4 KiB page into a khash whose int64
+/// hash keeps only VA bits 33..44 in its low 12 bits, so all pages of one
+/// 8 GiB window share a few hundred home buckets and every insert probes past
+/// each earlier page with the same home. Mapping a 0xCC00_0000 heap that way
+/// takes 6-9 s per JIT. Every lookup the khash serves for a VA inside the page
+/// table (`get_memory_page`, the JIT's inline page-table walk, the slow-path
+/// callbacks) checks the page table first, so ranges it covers are written
+/// here directly and remembered so `unmap_host` can clear them.
+#[derive(Clone, Copy)]
+struct DirectPageTable {
+    entries: *mut *mut std::ffi::c_void,
+    len: u64,
+    shared: bool,
+}
+
+impl DirectPageTable {
+    /// Reads the page-table pointer out of the JIT's `struct dynarmic`
+    /// (`khash *memory; size_t num_page_table_entries; void **page_table`).
+    /// `Dynarmic` holds that handle and an `Arc` as its only two words; the
+    /// candidate whose second field equals the expected entry count is the
+    /// handle (the `Arc` allocation has its weak count, 1, there).
+    fn discover(emu: &dynarmic_sys::Dynarmic<'static, ()>, a32: bool) -> Option<Self> {
+        if env_flag("NEXIUM_DYNARMIC_KHASH_MAP")
+            || dynarmic_sys::dynarmic_version() != DIRECT_PAGE_TABLE_VERSION
+            || std::mem::size_of::<dynarmic_sys::Dynarmic<'static, ()>>()
+                != 2 * std::mem::size_of::<usize>()
+        {
+            return None;
+        }
+        let expected: usize = if a32 { 1 << (32 - 12) } else { 1 << (40 - 12) };
+        let words = unsafe {
+            std::ptr::read(
+                (emu as *const dynarmic_sys::Dynarmic<'static, ()>).cast::<[usize; 2]>(),
+            )
+        };
+        words.into_iter().find_map(|word| {
+            if word == 0 || word % std::mem::align_of::<usize>() != 0 {
+                return None;
+            }
+            let fields = word as *const usize;
+            let (memory, len, table) =
+                unsafe { (*fields, *fields.add(1), *fields.add(2)) };
+            (memory != 0 && len == expected && table != 0 && table % 8 == 0).then(|| Self {
+                entries: table as *mut *mut std::ffi::c_void,
+                len: len as u64,
+                shared: dynarmic_sys::shared_fastmem_page_table_enabled(),
+            })
+        })
+    }
+
+    /// Page count of `[va, va + len)` when the whole range is in the table.
+    fn pages_for(&self, va: u64, len: u64) -> Option<u64> {
+        if len == 0 || va & (DYN_PAGE_SIZE - 1) != 0 {
+            return None;
+        }
+        let pages = len.div_ceil(DYN_PAGE_SIZE);
+        let last = va.checked_add((pages - 1) * DYN_PAGE_SIZE)?;
+        ((last >> DYN_PAGE_BITS) < self.len).then_some(pages)
+    }
+
+    unsafe fn slots(&self, va: u64, pages: u64) -> &mut [*mut std::ffi::c_void] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.entries.add((va >> DYN_PAGE_BITS) as usize),
+                pages as usize,
+            )
+        }
+    }
+}
+
 pub struct DynarmicCpu {
     emu: Arc<SharedDynarmic>,
     isa: crate::GuestIsa,
@@ -28,6 +108,9 @@ pub struct DynarmicCpu {
     watch_protected: Rc<Cell<bool>>,
     cache_profile_enabled: bool,
     cache_profile_last: std::time::Instant,
+    page_table: Option<DirectPageTable>,
+    /// Ranges mapped through `page_table` rather than the khash, start to end.
+    direct_ranges: std::collections::BTreeMap<u64, u64>,
 }
 
 unsafe impl Send for DynarmicCpu {}
@@ -360,7 +443,14 @@ impl DynarmicCpu {
             true
         });
 
+        let page_table = DirectPageTable::discover(&emu, a32);
+        if page_table.is_none() {
+            log::info!("dynarmic: direct page-table mapping unavailable; using per-page mem_map_ptr");
+        }
+
         Ok(Self {
+            page_table,
+            direct_ranges: std::collections::BTreeMap::new(),
             emu: Arc::new(SharedDynarmic { emu }),
             isa,
             shadow: RefCell::new([0; 32]),
@@ -430,11 +520,25 @@ impl DynarmicCpu {
         perm: Perm,
         ptr: *mut u8,
     ) -> Result<(), String> {
-        let result = self
-            .emu
-            .emu
-            .mem_map_ptr(va, len as usize, perm_to_dyn(perm), ptr.cast())
-            .map_err(|e| format!("map_host failed: {:?}", e));
+        let direct = self.page_table.and_then(|table| {
+            // A zero offset (host pointer equal to the VA, as in direct-mapped
+            // arenas) reads as an empty slot, so those ranges stay on the khash.
+            let offset = (ptr as u64).wrapping_sub(va);
+            (offset != 0).then(|| table.pages_for(va, len).map(|pages| (table, pages)))?
+        });
+        let result = if let Some((table, pages)) = direct {
+            unsafe { self.map_direct(table, va, pages, ptr) }
+        } else if self.overlaps_direct(va, va.saturating_add(len)) {
+            Err(format!(
+                "map_host failed: {:#x}+{:#x} overlaps a direct page-table mapping",
+                va, len
+            ))
+        } else {
+            self.emu
+                .emu
+                .mem_map_ptr(va, len as usize, perm_to_dyn(perm), ptr.cast())
+                .map_err(|e| format!("map_host failed: {:?}", e))
+        };
         if result.is_ok() {
             self.emu.emu.invalidate_cache_range(va, len);
             if let Some((lo, hi)) = nexium_memory::fastmem::watch_range() {
@@ -448,15 +552,102 @@ impl DynarmicCpu {
     }
 
     pub unsafe fn unmap_host(&mut self, va: u64, len: u64) -> Result<(), String> {
-        let result = self
-            .emu
-            .emu
-            .mem_unmap(va, len as usize)
-            .map_err(|e| format!("unmap_host failed: {:?}", e));
-        if result.is_ok() {
+        let (cleared, gaps) = match self.page_table {
+            Some(table) if !self.direct_ranges.is_empty() && len != 0 => {
+                let end = va.saturating_add(len.div_ceil(DYN_PAGE_SIZE) * DYN_PAGE_SIZE);
+                unsafe { self.unmap_direct(table, va, end) }
+            }
+            _ => (false, vec![(va, len)]),
+        };
+        let mut result = Ok(());
+        for (base, size) in gaps {
+            result = self
+                .emu
+                .emu
+                .mem_unmap(base, size as usize)
+                .map_err(|e| format!("unmap_host failed: {:?}", e));
+            if result.is_err() {
+                break;
+            }
+        }
+        if result.is_ok() || cleared {
             self.emu.emu.invalidate_cache_range(va, len);
         }
         result
+    }
+
+    /// Fills the page-table slots for `[va, va + pages * 4 KiB)` with the
+    /// absolute offset `mem_map_ptr` would store, after the same
+    /// already-mapped check it makes against its khash.
+    unsafe fn map_direct(
+        &mut self,
+        table: DirectPageTable,
+        va: u64,
+        pages: u64,
+        ptr: *mut u8,
+    ) -> Result<(), String> {
+        let end = va + pages * DYN_PAGE_SIZE;
+        let slots = unsafe { table.slots(va, pages) };
+        // A process-shared table already holds other JITs' entries for the
+        // same ranges, so only this JIT's own direct ranges count as mapped.
+        if self.overlaps_direct(va, end)
+            || (!table.shared && slots.iter().any(|slot| !slot.is_null()))
+        {
+            return Err(format!(
+                "map_host failed: {:#x}+{:#x} is already mapped (code=4)",
+                va,
+                pages * DYN_PAGE_SIZE
+            ));
+        }
+        slots.fill((ptr as usize).wrapping_sub(va as usize) as *mut std::ffi::c_void);
+        self.direct_ranges.insert(va, end);
+        Ok(())
+    }
+
+    /// Clears this JIT's direct ranges inside `[va, end)` and returns whether
+    /// any were cleared plus the remaining sub-ranges, which belong to the
+    /// khash and go through `mem_unmap`.
+    unsafe fn unmap_direct(
+        &mut self,
+        table: DirectPageTable,
+        va: u64,
+        end: u64,
+    ) -> (bool, Vec<(u64, u64)>) {
+        let overlapping: Vec<(u64, u64)> = self
+            .direct_ranges
+            .range(..end)
+            .filter(|&(_, &range_end)| range_end > va)
+            .map(|(&start, &range_end)| (start, range_end))
+            .collect();
+        let mut gaps = Vec::new();
+        let mut cursor = va;
+        for &(start, range_end) in &overlapping {
+            self.direct_ranges.remove(&start);
+            let lo = start.max(va);
+            let hi = range_end.min(end);
+            unsafe { table.slots(lo, (hi - lo) / DYN_PAGE_SIZE) }.fill(std::ptr::null_mut());
+            if start < lo {
+                self.direct_ranges.insert(start, lo);
+            }
+            if hi < range_end {
+                self.direct_ranges.insert(hi, range_end);
+            }
+            if cursor < lo {
+                gaps.push((cursor, lo - cursor));
+            }
+            cursor = hi;
+        }
+        if cursor < end {
+            gaps.push((cursor, end - cursor));
+        }
+        (!overlapping.is_empty(), gaps)
+    }
+
+    fn overlaps_direct(&self, va: u64, end: u64) -> bool {
+        self.direct_ranges
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, &range_end)| range_end > va)
     }
 
     pub fn write_bytes(&self, va: u64, bytes: &[u8]) -> Result<(), String> {
@@ -848,10 +1039,61 @@ impl DynarmicCpu {
     }
 }
 
+/// Shadow JIT for lockstep differential execution (`crate::lockstep`).
+#[cfg(all(feature = "backend-rustarmic", target_os = "linux", target_arch = "x86_64"))]
+impl DynarmicCpu {
+    /// A64 JIT with no fastmem and no inline page-table walk, so every guest
+    /// store reaches dynarmic-sys's memory callbacks, which report it to the
+    /// unmapped-memory callback before performing it.  dynarmic-sys enables
+    /// that mode (and drops the inline page table) only when
+    /// `NEXIUM_WATCH_PAGE_PROTECT` is set while the JIT is constructed, so it
+    /// is set for the duration of `Dynarmic::new` and restored afterwards.
+    /// No callbacks are installed; the lockstep driver installs its own.
+    pub(crate) fn new_lockstep_shadow() -> Result<Self, String> {
+        const WATCH_ENV: &str = "NEXIUM_WATCH_PAGE_PROTECT";
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        configure_dynarmic_fast_paths();
+        let emu: dynarmic_sys::Dynarmic<'static, ()> = {
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os(WATCH_ENV);
+            std::env::set_var(WATCH_ENV, "1");
+            let emu = dynarmic_sys::Dynarmic::new();
+            match previous {
+                Some(value) => std::env::set_var(WATCH_ENV, value),
+                None => std::env::remove_var(WATCH_ENV),
+            }
+            emu
+        };
+        let page_table = DirectPageTable::discover(&emu, false);
+        Ok(Self {
+            page_table,
+            direct_ranges: std::collections::BTreeMap::new(),
+            emu: Arc::new(SharedDynarmic { emu }),
+            isa: crate::GuestIsa::AArch64,
+            shadow: RefCell::new([0; 32]),
+            shadow_active: Cell::new(false),
+            last_event: Rc::new(Cell::new(None)),
+            last_fault: Rc::new(RefCell::new(None)),
+            continue_on_null: Rc::new(Cell::new(false)),
+            null_skip_count: Rc::new(Cell::new(0)),
+            watch_applied: Rc::new(Cell::new(None)),
+            watch_protected: Rc::new(Cell::new(false)),
+            cache_profile_enabled: false,
+            cache_profile_last: std::time::Instant::now(),
+        })
+    }
+
+    /// The underlying dynarmic-sys handle.
+    pub(crate) fn raw(&self) -> &dynarmic_sys::Dynarmic<'static, ()> {
+        &self.emu.emu
+    }
+}
+
 struct CpuEnvMemo {
     watch_arm_delay_ms: Option<u64>,
     watch_page_protect: bool,
     pc_until_target: Option<(u64, String)>,
+    pc_until_max_hits: u64,
 }
 
 fn cpu_env_memo_enabled_value(value: Option<&str>) -> bool {
@@ -868,6 +1110,7 @@ fn cpu_env_memo() -> Option<&'static CpuEnvMemo> {
                         watch_arm_delay_ms: read_watch_arm_delay_ms(),
                         watch_page_protect: env_flag("NEXIUM_WATCH_PAGE_PROTECT"),
                         pc_until_target: read_pc_until_target(),
+                        pc_until_max_hits: read_pc_until_max_hits(),
                     };
                     log::info!("dynarmic: startup environment memo enabled");
                     settings
@@ -882,11 +1125,15 @@ fn watch_page_protect_enabled() -> bool {
         .unwrap_or_else(|| env_flag("NEXIUM_WATCH_PAGE_PROTECT"))
 }
 
-fn pc_until_target() -> Option<(u64, String)> {
+/// The memoized label is borrowed so the per-run check does not clone it.
+fn pc_until_target() -> Option<(u64, std::borrow::Cow<'static, str>)> {
     if let Some(settings) = cpu_env_memo() {
-        return settings.pc_until_target.clone();
+        return settings
+            .pc_until_target
+            .as_ref()
+            .map(|(target, label)| (*target, std::borrow::Cow::Borrowed(label.as_str())));
     }
-    read_pc_until_target()
+    read_pc_until_target().map(|(target, label)| (target, std::borrow::Cow::Owned(label)))
 }
 
 fn read_pc_until_target() -> Option<(u64, String)> {
@@ -912,6 +1159,12 @@ fn pc_until_hits() -> &'static std::sync::atomic::AtomicU64 {
 }
 
 fn pc_until_max_hits() -> u64 {
+    cpu_env_memo()
+        .map(|settings| settings.pc_until_max_hits)
+        .unwrap_or_else(read_pc_until_max_hits)
+}
+
+fn read_pc_until_max_hits() -> u64 {
     std::env::var("NEXIUM_PC_UNTIL_MAX")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1227,10 +1480,10 @@ fn delayed_cpu_watch() -> Option<(u64, u64)> {
 }
 
 fn watch_arm_delay_ms() -> Option<u64> {
-    if let Some(settings) = cpu_env_memo() {
-        return settings.watch_arm_delay_ms;
+    match cpu_env_memo() {
+        Some(settings) => settings.watch_arm_delay_ms,
+        None => read_watch_arm_delay_ms(),
     }
-    read_watch_arm_delay_ms()
 }
 
 fn read_watch_arm_delay_ms() -> Option<u64> {

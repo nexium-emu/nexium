@@ -1,5 +1,12 @@
 #[cfg(feature = "backend-dynarmic")]
 pub mod dynarmic;
+#[cfg(all(
+    feature = "backend-dynarmic",
+    feature = "backend-rustarmic",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub mod lockstep;
 #[cfg(feature = "backend-rustarmic")]
 pub mod rustarmic;
 #[cfg(nce_runtime)]
@@ -9,6 +16,27 @@ pub mod nce_patch;
 pub mod system;
 
 pub use system::{CpuCore, CpuSystem, CpuSystemConfig};
+
+/// Gives lockstep mode (`NEXIUM_LOCKSTEP=1`) the kernel's address space, so
+/// an "unmapped" fault on memory the kernel has mapped is reported as a
+/// core mapping-sync issue rather than a JIT divergence.  A no-op unless
+/// lockstep is compiled in; holds only a weak reference.
+pub fn lockstep_register_address_space(space: &std::sync::Arc<nexium_memory::AddressSpace>) {
+    #[cfg(all(
+        feature = "backend-dynarmic",
+        feature = "backend-rustarmic",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    lockstep::register_address_space(space);
+    #[cfg(not(all(
+        feature = "backend-dynarmic",
+        feature = "backend-rustarmic",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    let _ = space;
+}
 
 #[cfg(feature = "backend-dynarmic")]
 use dynarmic::DynarmicCpu;
@@ -89,6 +117,41 @@ impl HaltHandle {
     }
     pub fn peek_dump(&self) -> String {
         (self.peek_dump)()
+    }
+}
+
+/// One core's own view of a guest address, for fault diagnostics and for
+/// checking that a core's mappings match the kernel's address space.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MappingView {
+    /// The region the core's memory callbacks would use for `va`:
+    /// `(base, end, perm)`.
+    pub region: Option<(u64, u64, Perm)>,
+    /// The nearest mapped regions below and above `va` (`(base, end)`).
+    pub below: Option<(u64, u64)>,
+    pub above: Option<(u64, u64)>,
+    /// Inline fastmem permission of `va`'s page as `(read, write)`, when
+    /// the backend has a page table covering it.
+    pub page_direct: Option<(bool, bool)>,
+    pub region_count: usize,
+}
+
+impl std::fmt::Display for MappingView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.region {
+            Some((base, end, perm)) => write!(f, "mapped {base:#x}..{end:#x} perm={perm}")?,
+            None => f.write_str("unmapped")?,
+        }
+        if let Some((base, end)) = self.below {
+            write!(f, " below={base:#x}..{end:#x}")?;
+        }
+        if let Some((base, end)) = self.above {
+            write!(f, " above={base:#x}..{end:#x}")?;
+        }
+        if let Some((read, write)) = self.page_direct {
+            write!(f, " page_direct=r{}w{}", u8::from(read), u8::from(write))?;
+        }
+        write!(f, " regions={}", self.region_count)
     }
 }
 
@@ -607,6 +670,20 @@ impl Cpu {
             Cpu::Nce(cpu) => Some(cpu.stats()),
             #[allow(unreachable_patterns)]
             _ => None,
+        }
+    }
+
+    /// The core's own mapping of `va`, for backends that keep a per-core
+    /// region list (Rustarmic); `None` elsewhere.
+    pub fn mapping_view(&self, va: u64) -> Option<MappingView> {
+        match self {
+            #[cfg(feature = "backend-rustarmic")]
+            Cpu::Rustarmic(cpu) => Some(cpu.mapping_view(va)),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = va;
+                None
+            }
         }
     }
 }
