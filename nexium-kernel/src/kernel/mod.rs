@@ -20,6 +20,18 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 pub(crate) const MUTEX_HAS_LISTENERS: u32 = 0x4000_0000;
+
+/// The kernel's most recent write to one guest mutex word, kept so that an
+/// inconsistent word (for example a thread finding its own tag in a mutex it
+/// is trying to acquire) can be attributed to a kernel handoff or to guest code.
+#[derive(Clone, Copy, Debug)]
+pub struct MutexWordWrite {
+    pub word: u32,
+    /// Thread whose SVC performed the write.
+    pub by: u32,
+    pub reason: &'static str,
+    pub at: std::time::Instant,
+}
 const TLS_USER_DISABLE_COUNT_OFFSET: u64 = 0x100;
 const TLS_USER_INTERRUPT_FLAG_OFFSET: u64 = 0x102;
 
@@ -73,6 +85,8 @@ pub struct Kernel {
     pub event_signals: HashMap<u32, bool>,
     pub exited_thread_handles: HashMap<u32, ExitedThreadState>,
     pub pending_condvar_signals: HashMap<u64, u32>,
+    /// Last kernel write per guest mutex word (diagnostics, see `MutexWordWrite`).
+    pub mutex_word_writes: HashMap<u64, MutexWordWrite>,
     pub audio_render_condvar: Option<u64>,
     pub tls_buffer: [u8; 0x100],
     pub pending_frames: Vec<FrameOut>,
@@ -170,6 +184,18 @@ pub struct Kernel {
     pub last_ipc_cmd: u32,
     pub last_ipc_detail: u32,
     pub gpu_drain_gate: Option<GpuDrainGate>,
+    /// Blocking IGBP DequeueBuffer requests parked for re-issue through the
+    /// IPC retry path: guest thread -> (binder id, start of the first attempt),
+    /// so the 3 s timeout spans all attempts.
+    pub igbp_dequeue_wait_started: HashMap<u32, (u32, std::time::Instant)>,
+    /// The parked entry of the thread whose svcSendSyncRequest is being
+    /// handled: (thread, binder id, start). Moved out of
+    /// `igbp_dequeue_wait_started` when the request begins, so it can only
+    /// apply to that immediate re-issue, never to a later request.
+    pub igbp_dequeue_resumed: Option<(u32, u32, std::time::Instant)>,
+    /// NEXIUM_BQ_WAIT_PROFILE samples of parked DequeueBuffer requests, carried
+    /// across re-issues like `igbp_dequeue_wait_started`.
+    pub(crate) igbp_dequeue_wait_profiles: HashMap<u32, svc::BufferQueueWaitProfile>,
     pub preempt_after_svc: bool,
     pub present_pace_until: Option<std::time::Instant>,
     pub(crate) next_present_id: u64,
@@ -345,6 +371,7 @@ impl Kernel {
             event_signals: HashMap::new(),
             exited_thread_handles: HashMap::new(),
             pending_condvar_signals: HashMap::new(),
+            mutex_word_writes: HashMap::new(),
             audio_render_condvar: None,
             tls_buffer: [0u8; 0x100],
             pending_frames: Vec::new(),
@@ -434,6 +461,9 @@ impl Kernel {
             last_ipc_cmd: 0,
             last_ipc_detail: 0,
             gpu_drain_gate: None,
+            igbp_dequeue_wait_started: HashMap::new(),
+            igbp_dequeue_resumed: None,
+            igbp_dequeue_wait_profiles: HashMap::new(),
             preempt_after_svc: false,
             present_pace_until: None,
             next_present_id: 1,
@@ -1003,6 +1033,14 @@ impl Kernel {
         }
     }
 
+    /// Events of the started audio renderers, i.e. what a renderer tick signals.
+    fn audio_renderer_tick_events(&self) -> impl Iterator<Item = u32> + '_ {
+        self.audio_renderers
+            .iter()
+            .filter(|(_, st)| st.state == 0)
+            .filter_map(|(key, _)| self.audio_renderer_events.get(key).copied())
+    }
+
     pub fn tick_audio_renderers(&mut self) {
         self.tick_audio_renderers_at(
             std::time::Instant::now(),
@@ -1026,15 +1064,21 @@ impl Kernel {
             crate::services::audio_out::handlers::poll_audio_outs(self);
         }
 
-        let to_signal: Vec<u32> = self
-            .audio_renderers
-            .iter()
-            .filter(|(_, st)| st.state == 0)
-            .filter_map(|(key, _)| self.audio_renderer_events.get(key).copied())
-            .collect();
-        let event_already_pending = to_signal
-            .iter()
-            .any(|ev| self.event_signals.get(ev).copied().unwrap_or(false));
+        // Rate limit first: this runs on every guest SVC, and everything below
+        // (event bookkeeping, sink counters) only matters for a renderer tick.
+        if now.saturating_duration_since(self.audio_renderer_last_tick)
+            < std::time::Duration::from_millis(5)
+        {
+            return;
+        }
+
+        let mut signal_count = 0usize;
+        let mut event_already_pending = false;
+        for ev in self.audio_renderer_tick_events() {
+            signal_count += 1;
+            event_already_pending |= self.event_signals.get(&ev).copied().unwrap_or(false);
+        }
+        let nothing_to_signal = signal_count == 0;
         if let Some(sink) = sink {
             use std::sync::atomic::{AtomicU64, Ordering};
             use std::sync::{Mutex, OnceLock};
@@ -1044,7 +1088,7 @@ impl Kernel {
 
             UNDERRUN_ACCUM.fetch_add(sink.drain_underrun_frames(), Ordering::Relaxed);
             DROP_ACCUM.fetch_add(sink.drain_dropped_frames(), Ordering::Relaxed);
-            if !to_signal.is_empty() {
+            if !nothing_to_signal {
                 let last = LAST_REPORT.get_or_init(|| Mutex::new(std::time::Instant::now()));
                 let mut last = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if last.elapsed() >= std::time::Duration::from_secs(1) {
@@ -1072,22 +1116,16 @@ impl Kernel {
                     "[audren-tick] calls={} renderers={} to_signal={} pending={} sink={}",
                     calls,
                     self.audio_renderers.len(),
-                    to_signal.len(),
+                    signal_count,
                     event_already_pending,
                     sink.is_some()
                 );
             }
         }
 
-        if now.saturating_duration_since(self.audio_renderer_last_tick)
-            < std::time::Duration::from_millis(5)
-        {
-            return;
-        }
-
         let blocks = if let Some(sink) = sink {
             let mut n = sink.drain_pending_events();
-            if !to_signal.is_empty() && !event_already_pending {
+            if !nothing_to_signal && !event_already_pending {
                 let queued_blocks = (sink.queued_frames() as u64) / FRAMES_PER_AUDIO_FRAME;
                 if queued_blocks < TARGET_QUEUE_BLOCKS {
                     n = n.max(TARGET_QUEUE_BLOCKS - queued_blocks);
@@ -1113,7 +1151,7 @@ impl Kernel {
             return;
         }
 
-        if to_signal.is_empty() {
+        if nothing_to_signal {
             return;
         }
         if event_already_pending {
@@ -1125,6 +1163,7 @@ impl Kernel {
 
         self.audio_renderer_last_tick = now;
         self.audio_renderer_frame_counter = self.audio_renderer_frame_counter.wrapping_add(1);
+        let to_signal: Vec<u32> = self.audio_renderer_tick_events().collect();
         for ev in &to_signal {
             self.event_signals.insert(*ev, true);
             self.threads.signal_handle(*ev);
@@ -1234,6 +1273,12 @@ impl Kernel {
     pub fn wake_due_sleepers(&mut self, now: std::time::Instant) {
         self.refresh_bufferqueue_events();
         self.drain_gpu_fence_events();
+        // Cached lower bound on the earliest deadline: skip both thread-table
+        // scans (condvar timeouts here, the rest in `Threads`) when no timed
+        // wait can be due yet.
+        if !self.threads.timers_due(now) {
+            return;
+        }
         let timed_out: Vec<(u32, u64, u64, bool)> = self
             .threads
             .threads
@@ -1299,6 +1344,15 @@ impl Kernel {
         self.threads.wake_due_sleepers(now);
     }
 
+    /// Records a kernel write of `word` to the guest mutex at `mutex_addr`.
+    pub(crate) fn note_mutex_word_write(&mut self, mutex_addr: u64, word: u32, reason: &'static str) {
+        let by = self.threads.current_handle().unwrap_or(0);
+        self.mutex_word_writes.insert(
+            mutex_addr,
+            MutexWordWrite { word, by, reason, at: std::time::Instant::now() },
+        );
+    }
+
     pub fn reacquire_condvar_mutex(&mut self, handle: u32, mutex_addr: u64, tag: u32) -> bool {
         loop {
             let cur_word = match self.address_space.atomic_load_u32(mutex_addr) {
@@ -1318,6 +1372,7 @@ impl Kernel {
                     .atomic_cas_u32(mutex_addr, cur_word, new_word)
                 {
                     Ok(true) => {
+                        self.note_mutex_word_write(mutex_addr, new_word, "condvar timeout reacquire");
                         log::debug!(
                             "cond_reacquire: handle={:#x} mutex={:#x} word {:#x}->{:#x}",
                             handle,
@@ -2217,5 +2272,637 @@ mod audio_renderer_event_tests {
         assert_eq!(kernel.event_signals.get(&0x200), Some(&false));
         kernel.tick_audio_renderers_at(now + Duration::from_millis(5), None);
         assert_eq!(kernel.event_signals.get(&0x200), Some(&true));
+    }
+}
+
+/// `Kernel::wake_due_sleepers` now returns early unless `Threads::timers_due`.
+/// Random timed waits of every kind (including condvar timeouts, which only
+/// the kernel resolves) against a brute-force expectation: after a pass at
+/// time `now`, nothing with a deadline <= `now` may still be waiting and
+/// nothing later may have been woken, whatever ran in between (early wakes
+/// leaving a stale cached deadline, `Threads`-only passes, re-waits).
+#[cfg(test)]
+mod timed_wake_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn deadline(state: &threads::ThreadState) -> Option<Instant> {
+        match state {
+            threads::ThreadState::Sleeping { wake_at } => Some(*wake_at),
+            threads::ThreadState::WaitingHandle { wake_at, .. }
+            | threads::ThreadState::WaitingCondvar { wake_at, .. }
+            | threads::ThreadState::WaitingArbiter { wake_at, .. } => *wake_at,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn gated_kernel_wake_matches_full_scan() {
+        let address_space = Arc::new(AddressSpace::new());
+        let mut kernel = Kernel::new(
+            address_space, 0x80_0000, 0x1000, 0x90_0000, 0x1000, 0xa0_0000, 0x1000, 0x10_0000,
+            0x10_1000,
+        );
+        let base = Instant::now();
+        let mut now = base;
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut rand = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let handles: Vec<u32> = (0..12).map(|i| 0x7000 + i).collect();
+        for &h in &handles {
+            kernel.threads.add_thread(h, threads::ThreadCtx::zero(), 0, 0, 0);
+        }
+        let mut timeouts = 0;
+        for step in 0..20_000 {
+            let h = handles[rand(handles.len() as u64) as usize];
+            let at = now + Duration::from_micros(rand(3000));
+            let maybe = |r: u64| if r % 4 == 0 { None } else { Some(at) };
+            match rand(10) {
+                0 => kernel.threads.transition_state(h, threads::ThreadState::Sleeping { wake_at: at }),
+                1 => {
+                    let wake_at = maybe(rand(4));
+                    kernel.threads.transition_state(
+                        h,
+                        threads::ThreadState::WaitingHandle { handles: vec![0x9000], wake_at },
+                    )
+                }
+                2 | 3 => {
+                    let wake_at = maybe(rand(4));
+                    kernel.threads.transition_state(
+                        h,
+                        threads::ThreadState::WaitingCondvar {
+                            mutex_addr: 0,
+                            condvar_addr: 0x2000 + rand(2) * 4,
+                            wake_at,
+                            spurious_wake: false,
+                        },
+                    )
+                }
+                4 => {
+                    let wake_at = maybe(rand(4));
+                    kernel.threads.transition_state(
+                        h,
+                        threads::ThreadState::WaitingArbiter { addr: 0x3000, value: 0, wake_at },
+                    )
+                }
+                // Early wakes leave the cached deadline behind.
+                5 => kernel.threads.transition_state(h, threads::ThreadState::Ready),
+                6 => {
+                    kernel.threads.wake_all_on_condvar(0x2000);
+                }
+                7 => kernel.threads.signal_handle(0x9000),
+                8 => {
+                    // A `Threads`-only pass (core loops, ensure_thread_loaded).
+                    now += Duration::from_micros(rand(1500));
+                    kernel.threads.wake_due_sleepers(now);
+                }
+                _ => {
+                    now += Duration::from_micros(rand(1500));
+                    for &h in &handles {
+                        kernel.threads.threads.get_mut(&h).unwrap().ctx.x[0] = 0;
+                    }
+                    let before: Vec<(u32, Option<Instant>, bool)> = handles
+                        .iter()
+                        .map(|h| {
+                            let state = &kernel.threads.threads[h].state;
+                            (*h, deadline(state), matches!(state, threads::ThreadState::Sleeping { .. }))
+                        })
+                        .collect();
+                    kernel.wake_due_sleepers(now);
+                    for (h, d, was_sleeping) in before {
+                        let state = &kernel.threads.threads[&h].state;
+                        match d {
+                            Some(d) if d <= now => {
+                                timeouts += 1;
+                                assert!(
+                                    matches!(state, threads::ThreadState::Ready),
+                                    "step {step}: {h:#x} due at {:?} still {state:?}",
+                                    d - base
+                                );
+                                assert_eq!(
+                                    kernel.threads.threads[&h].ctx.x[0] as u32
+                                        == nexium_common::result::KERNEL_TIMEOUT,
+                                    !was_sleeping,
+                                    "step {step}: {h:#x} result register"
+                                );
+                            }
+                            Some(_) => assert!(
+                                deadline(state).is_some(),
+                                "step {step}: {h:#x} woken before its deadline"
+                            ),
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert!(timeouts > 1000, "only {timeouts} timeouts exercised");
+    }
+}
+
+/// Guest mutex / condition-variable simulation through the real SVCs.
+///
+/// Guest threads run the nn::os `InternalCriticalSection` (Enter / Leave) and
+/// `InternalConditionVariable` (Wait / TimedWait / Signal / Broadcast)
+/// userland algorithms as single atomic micro-steps on the guest mutex word,
+/// interleaved at random across four cores, each with its own CPU. Every
+/// kernel call goes through `Kernel::dispatch_svc`, scheduling through the
+/// real `Threads` (pick_next / schedule_to / yield), timeouts through
+/// `Kernel::wake_due_sleepers`. Invariants checked after every micro-step:
+///
+/// * mutual exclusion: at most one thread believes it owns a mutex;
+/// * a tag in a mutex word belongs to the thread that believes it owns the
+///   mutex, or to a thread blocked in (or returning from) the lock / condvar
+///   SVC for that mutex that will come back owning it. A tag owned by anyone
+///   else is a stale handoff: that thread's next Enter would call
+///   svcArbitrateLock on itself and deadlock (the reported hang);
+/// * nobody ever calls svcArbitrateLock naming itself as the owner.
+#[cfg(all(test, feature = "backend-rustarmic"))]
+mod guest_mutex_sim_tests {
+    use super::*;
+    use nexium_common::result::{KERNEL_CANCELLED, KERNEL_TIMEOUT, SUCCESS};
+    use std::time::{Duration, Instant};
+
+    // Outside the fastmem arena window: inside it, every AddressSpace of this
+    // test binary (tests run in parallel) would share the same host pages.
+    const SYNC_PAGE: u64 = 1 << 43;
+    const MUTEXES: [u64; 2] = [SYNC_PAGE, SYNC_PAGE + 0x40];
+    /// Condition variable `i` is always used with mutex `i`.
+    const CONDVARS: [u64; 2] = [SYNC_PAGE + 0x80, SYNC_PAGE + 0xc0];
+    const L: u32 = MUTEX_HAS_LISTENERS;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Prog {
+        /// Not holding anything; picks a new action.
+        Idle,
+        /// Holding mutex `m`; picks an action that needs it.
+        Holding(usize),
+        /// Enter(m): next micro-step is the atomic load/CAS loop body.
+        EnterTry(usize),
+        /// Enter(m): about to call svcArbitrateLock(owner, m, self).
+        EnterSvc(usize, u32),
+        /// Enter(m): back from svcArbitrateLock, re-reading the word.
+        EnterRecheck(usize),
+        /// Leave(m).
+        Leave(usize),
+        /// Leave(m): word had the waiters bit, about to svcArbitrateUnlock.
+        LeaveSvc(usize),
+        /// Back from svcWaitProcessWideKeyAtomic on condvar `m`.
+        CondWaitDone(usize),
+        Exited,
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    struct Sim {
+        kernel: Kernel,
+        cpus: Vec<Cpu>,
+        rng: Rng,
+        handles: Vec<u32>,
+        prog: HashMap<u32, Prog>,
+        believed_owner: [Option<u32>; 2],
+        clock: Duration,
+        trace: VecDeque<String>,
+        seed: u64,
+        step: usize,
+        stats: HashMap<&'static str, usize>,
+    }
+
+    impl Sim {
+        fn new(seed: u64, threads: usize) -> Self {
+            let space = Arc::new(AddressSpace::new());
+            space.map(SYNC_PAGE, 0x1000, nexium_memory::Perm::RW, "sync").unwrap();
+            let mut kernel = Kernel::new(
+                space, 0x80_0000, 0x1000, 0x90_0000, 0x1000, 0xa0_0000, 0x1000, 0x10_0000,
+                0x10_1000,
+            );
+            let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xC0FFEE);
+            let main = kernel.threads.current[0].unwrap();
+            let mut handles = vec![main];
+            for _ in 1..threads {
+                let h = kernel.handles.create_handle(handles::HandleType::Thread);
+                kernel.threads.add_thread(h, threads::ThreadCtx::zero(), 0, 0, 0);
+                handles.push(h);
+            }
+            for (i, &h) in handles.iter().enumerate() {
+                let t = kernel.threads.threads.get_mut(&h).unwrap();
+                t.priority = 0x2c - 2 + rng.below(5) as i32;
+                t.core = (i % threads::NUM_CORES) as i32;
+                t.affinity_mask = 0xf;
+                if h != main {
+                    kernel.threads.transition_state(h, threads::ThreadState::Ready);
+                }
+            }
+            Sim {
+                kernel,
+                cpus: (0..threads::NUM_CORES).map(|_| Cpu::new_rustarmic().unwrap()).collect(),
+                rng,
+                prog: handles.iter().map(|h| (*h, Prog::Idle)).collect(),
+                handles,
+                believed_owner: [None; 2],
+                clock: Duration::ZERO,
+                trace: VecDeque::new(),
+                seed,
+                step: 0,
+                stats: HashMap::new(),
+            }
+        }
+
+        fn now(&self) -> Instant {
+            // Virtual time runs ahead of the wall clock the SVCs use for
+            // deadlines, so timeouts fire as the simulation advances it.
+            Instant::now() + self.clock
+        }
+
+        fn note(&mut self, s: String) {
+            if self.trace.len() == 80 {
+                self.trace.pop_front();
+            }
+            self.trace.push_back(s);
+        }
+
+        fn fail(&self, what: String) -> ! {
+            panic!(
+                "seed {} step {}: {}\nrecent:\n  {}",
+                self.seed,
+                self.step,
+                what,
+                self.trace.iter().cloned().collect::<Vec<_>>().join("\n  ")
+            );
+        }
+
+        fn word(&self, m: usize) -> u32 {
+            self.kernel.address_space.atomic_load_u32(MUTEXES[m]).unwrap()
+        }
+
+        fn cas(&self, m: usize, cur: u32, new: u32) -> bool {
+            self.kernel.address_space.atomic_cas_u32(MUTEXES[m], cur, new).unwrap()
+        }
+
+        fn svc(&mut self, core: usize, imm: u16, args: &[u64]) {
+            let _guard = cpu_local::set_current_cpu(&mut self.cpus[core], core);
+            let cpu = cpu_local::cpu_mut().unwrap();
+            for (i, a) in args.iter().enumerate() {
+                cpu.set_register(i as u32, *a);
+            }
+            self.kernel.dispatch_svc(imm);
+            // What the core loops do after every SVC.
+            let ready_yield = std::mem::take(&mut self.kernel.yield_after_svc);
+            let preempt = std::mem::take(&mut self.kernel.preempt_after_svc);
+            if ready_yield && self.kernel.threads.current[core].is_some() {
+                let cpu = cpu_local::cpu_ref().unwrap();
+                if preempt {
+                    self.kernel.try_preempt_current_ready(cpu);
+                } else {
+                    self.kernel.try_yield_current_ready(cpu);
+                }
+            }
+        }
+
+        fn result_register(&self, core: usize) -> u32 {
+            self.cpus[core].get_register(0) as u32
+        }
+
+        fn own(&mut self, h: u32, m: usize, how: &str) {
+            if let Some(other) = self.believed_owner[m] {
+                self.fail(format!("{h:#x} acquired mutex {m} ({how}) while {other:#x} holds it"));
+            }
+            let holder = self.word(m) & !L;
+            if holder != h {
+                self.fail(format!("{h:#x} acquired mutex {m} ({how}) but the word names {holder:#x}"));
+            }
+            self.believed_owner[m] = Some(h);
+            self.prog.insert(h, Prog::Holding(m));
+        }
+
+        /// One micro-step of the thread running on `core`.
+        fn run_thread(&mut self, core: usize, h: u32) {
+            let prog = self.prog[&h];
+            match prog {
+                Prog::Idle => match self.rng.below(10) {
+                    0..=5 => {
+                        let m = self.rng.below(2) as usize;
+                        self.note(format!("{h:#x}@{core} Enter({m})"));
+                        self.prog.insert(h, Prog::EnterTry(m));
+                    }
+                    6 => {
+                        // Signal / broadcast without holding the mutex.
+                        let c = self.rng.below(2) as usize;
+                        let count = self.rng.below(3) as i64 - 1;
+                        self.note(format!("{h:#x}@{core} Signal({c}, {count}) unlocked"));
+                        self.svc(core, 0x1d, &[CONDVARS[c], count as u64]);
+                    }
+                    7 => {
+                        let target = self.handles[self.rng.below(self.handles.len() as u64) as usize];
+                        self.note(format!("{h:#x}@{core} CancelSynchronization({target:#x})"));
+                        self.svc(core, 0x19, &[target as u64]);
+                    }
+                    8 => {
+                        let ns = [0u64, 0, 1_000, 200_000][self.rng.below(4) as usize];
+                        self.note(format!("{h:#x}@{core} SleepThread({ns})"));
+                        self.svc(core, 0x0b, &[ns]);
+                    }
+                    _ => {
+                        let live = self.prog.values().filter(|p| **p != Prog::Exited).count();
+                        if live > 3 && self.rng.below(20) == 0 && h != self.handles[0] {
+                            self.note(format!("{h:#x}@{core} ExitThread"));
+                            self.prog.insert(h, Prog::Exited);
+                            self.svc(core, 0x0a, &[]);
+                            *self.stats.entry("exit").or_default() += 1;
+                        }
+                    }
+                },
+                Prog::Holding(m) => match self.rng.below(10) {
+                    0..=3 => {
+                        self.note(format!("{h:#x}@{core} Leave({m})"));
+                        self.prog.insert(h, Prog::Leave(m));
+                    }
+                    4..=6 => {
+                        let timeout: u64 = match self.rng.below(5) {
+                            0 => u64::MAX,
+                            1 => 0,
+                            2 => 1_000,
+                            3 => self.rng.below(20_000),
+                            _ => 50_000 + self.rng.below(400_000),
+                        };
+                        self.note(format!("{h:#x}@{core} CondWait({m}, timeout {timeout})"));
+                        self.believed_owner[m] = None;
+                        self.prog.insert(h, Prog::CondWaitDone(m));
+                        self.svc(core, 0x1c, &[MUTEXES[m], CONDVARS[m], h as u64, timeout]);
+                        *self.stats.entry("condwait").or_default() += 1;
+                    }
+                    7..=8 => {
+                        let count = self.rng.below(3) as i64 - 1;
+                        self.note(format!("{h:#x}@{core} Signal({m}, {count}) locked"));
+                        self.svc(core, 0x1d, &[CONDVARS[m], count as u64]);
+                    }
+                    _ => {
+                        self.note(format!("{h:#x}@{core} SleepThread(0) holding {m}"));
+                        self.svc(core, 0x0b, &[0]);
+                    }
+                },
+                Prog::EnterTry(m) => {
+                    let value = self.word(m);
+                    if value == 0 {
+                        if self.cas(m, 0, h) {
+                            self.own(h, m, "fast path");
+                        }
+                    } else if value & L == 0 {
+                        if self.cas(m, value, value | L) {
+                            self.prog.insert(h, Prog::EnterSvc(m, value));
+                        }
+                    } else {
+                        self.prog.insert(h, Prog::EnterSvc(m, value & !L));
+                    }
+                }
+                Prog::EnterSvc(m, owner) => {
+                    if owner == h {
+                        self.fail(format!(
+                            "{h:#x} calls svcArbitrateLock(owner={owner:#x}) on mutex {m} naming itself (word {:#x})",
+                            self.word(m)
+                        ));
+                    }
+                    self.note(format!("{h:#x}@{core} svcArbitrateLock({owner:#x}, {m})"));
+                    self.prog.insert(h, Prog::EnterRecheck(m));
+                    self.svc(core, 0x1a, &[owner as u64, MUTEXES[m], h as u64]);
+                    if self.kernel.threads.current[core].is_none() {
+                        *self.stats.entry("lock parked").or_default() += 1;
+                    }
+                }
+                Prog::EnterRecheck(m) => {
+                    if self.word(m) & !L == h {
+                        self.own(h, m, "after svcArbitrateLock");
+                    } else {
+                        self.prog.insert(h, Prog::EnterTry(m));
+                    }
+                }
+                Prog::Leave(m) => {
+                    if self.believed_owner[m] == Some(h) {
+                        self.believed_owner[m] = None;
+                    }
+                    let value = self.word(m);
+                    if value == h {
+                        if self.cas(m, h, 0) {
+                            self.prog.insert(h, Prog::Idle);
+                        }
+                    } else {
+                        if value & !L != h {
+                            self.fail(format!("{h:#x} leaves mutex {m} but the word is {value:#x}"));
+                        }
+                        self.prog.insert(h, Prog::LeaveSvc(m));
+                    }
+                }
+                Prog::LeaveSvc(m) => {
+                    self.note(format!("{h:#x}@{core} svcArbitrateUnlock({m})"));
+                    self.prog.insert(h, Prog::Idle);
+                    self.svc(core, 0x1b, &[MUTEXES[m]]);
+                }
+                Prog::CondWaitDone(m) => {
+                    let rc = self.result_register(core);
+                    self.note(format!("{h:#x}@{core} CondWait({m}) returned {rc:#x}"));
+                    if rc == SUCCESS {
+                        self.own(h, m, "condvar wait success");
+                    } else if rc == KERNEL_TIMEOUT || rc == KERNEL_CANCELLED {
+                        // nn::os: on timeout, re-enter the critical section.
+                        *self.stats.entry("condwait timeout").or_default() += 1;
+                        self.prog.insert(h, Prog::EnterTry(m));
+                    } else {
+                        self.fail(format!("{h:#x} CondWait returned {rc:#x}"));
+                    }
+                }
+                Prog::Exited => self.fail(format!("exited thread {h:#x} is running")),
+            }
+        }
+
+        /// Stale-tag invariant: see the module docs.
+        fn check(&self) {
+            for m in 0..2 {
+                let word = self.word(m);
+                let holder = word & !L;
+                if holder == 0 || self.believed_owner[m] == Some(holder) {
+                    continue;
+                }
+                let Some(prog) = self.prog.get(&holder) else {
+                    self.fail(format!("mutex {m} word {word:#x} names unknown thread"));
+                };
+                let pending_result = || -> Option<u32> {
+                    let core = (0..threads::NUM_CORES)
+                        .find(|c| self.kernel.threads.current[*c] == Some(holder));
+                    match core {
+                        Some(core) => Some(self.cpus[core].get_register(0) as u32),
+                        None => self.kernel.threads.threads.get(&holder).map(|t| t.ctx.x[0] as u32),
+                    }
+                };
+                let state = self.kernel.threads.threads.get(&holder).map(|t| format!("{:?}", t.state));
+                let fine = match *prog {
+                    // Comes back from the lock SVC and re-reads the word.
+                    Prog::EnterRecheck(pm) => pm == m,
+                    // Still releasing it.
+                    Prog::Leave(pm) | Prog::LeaveSvc(pm) => pm == m,
+                    // Comes back from the condvar wait: owns it iff SUCCESS,
+                    // and while still blocked it must be queued for the mutex
+                    // (or still on the condvar, which writes no tag).
+                    Prog::CondWaitDone(pm) if pm == m => {
+                        let blocked = state.as_deref().is_some_and(|s| s.starts_with("Waiting"));
+                        blocked || pending_result() == Some(SUCCESS)
+                    }
+                    _ => false,
+                };
+                if !fine {
+                    self.fail(format!(
+                        "mutex {m} word {word:#x} names {holder:#x}, which does not own it and is not acquiring it \
+                         (prog {prog:?}, kernel state {state:?}, pending x0 {:#x?}, believed owner {:x?})",
+                        pending_result(),
+                        self.believed_owner[m]
+                    ));
+                }
+            }
+        }
+
+        fn tick(&mut self) {
+            self.step += 1;
+            let core = self.rng.below(threads::NUM_CORES as u64) as usize;
+            if self.rng.below(12) == 0 {
+                self.clock += Duration::from_micros(self.rng.below(300));
+                let now = self.now();
+                self.kernel.wake_due_sleepers(now);
+                return;
+            }
+            match self.kernel.threads.current[core] {
+                Some(h) => {
+                    if self.rng.below(25) == 0 {
+                        // Involuntary preemption between two userland steps.
+                        let _guard = cpu_local::set_current_cpu(&mut self.cpus[core], core);
+                        let cpu = cpu_local::cpu_ref().unwrap();
+                        self.kernel.try_yield_current_ready(cpu);
+                    } else {
+                        self.run_thread(core, h);
+                    }
+                }
+                None if core == 0 && self.clock.is_zero() => {
+                    // Main core loop: the kernel's own load path.
+                    let _guard = cpu_local::set_current_cpu(&mut self.cpus[core], core);
+                    self.kernel.ensure_thread_loaded();
+                }
+                None => {
+                    let now = self.now();
+                    self.kernel.wake_due_sleepers(now);
+                    let _guard = cpu_local::set_current_cpu(&mut self.cpus[core], core);
+                    if let Some(next) = self.kernel.threads.pick_next() {
+                        let cpu = cpu_local::cpu_mut().unwrap();
+                        self.kernel.threads.schedule_to(next, cpu);
+                    }
+                }
+            }
+            self.check();
+        }
+    }
+
+    fn env_or(name: &str, default: u64) -> u64 {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    /// NEXIUM_MUTEX_SIM_SEEDS / NEXIUM_MUTEX_SIM_STEPS scale the run.
+    #[test]
+    fn guest_mutexes_and_condvars_never_leave_a_stale_owner_tag() {
+        let seeds = env_or("NEXIUM_MUTEX_SIM_SEEDS", 40);
+        let steps = env_or("NEXIUM_MUTEX_SIM_STEPS", 6000);
+        let first = env_or("NEXIUM_MUTEX_SIM_FIRST_SEED", 1);
+        let mut totals: HashMap<&'static str, usize> = HashMap::new();
+        for seed in first..first + seeds {
+            let mut sim = Sim::new(seed, 4 + (seed % 13) as usize);
+            for _ in 0..steps {
+                sim.tick();
+            }
+            for (k, v) in sim.stats {
+                *totals.entry(k).or_default() += v;
+            }
+        }
+        for key in ["lock parked", "condwait", "condwait timeout", "exit"] {
+            assert!(totals.get(key).copied().unwrap_or(0) > 0, "never exercised {key}: {totals:?}");
+        }
+    }
+
+    /// The reported hang: a thread enters a critical section whose word
+    /// already holds its own tag with the waiters bit, and another thread is
+    /// queued behind it. svcArbitrateLock(owner = self) used to park the
+    /// caller on itself forever (and with it every queued thread). It must
+    /// return at once so the caller's lock loop sees its own tag, and its next
+    /// unlock must hand the lock to the queued thread.
+    #[test]
+    fn arbitrate_lock_naming_the_caller_does_not_park_it_on_itself() {
+        let mut sim = Sim::new(7, 2);
+        let me = sim.handles[0];
+        let other = sim.handles[1];
+        let m = 0;
+        // `other` is queued on `me`, as after its own Enter.
+        sim.kernel.threads.transition_state(
+            other,
+            threads::ThreadState::WaitingMutex { mutex_addr: MUTEXES[m], owner_handle: me, tag: other },
+        );
+        sim.kernel
+            .address_space
+            .write(MUTEXES[m], &(me | L).to_le_bytes())
+            .unwrap();
+        // A kernel handoff that put `me` there is reported in the diagnostics.
+        {
+            let _guard = cpu_local::set_current_cpu(&mut sim.cpus[0], 0);
+            sim.kernel.note_mutex_word_write(MUTEXES[m], me | L, "unlock handoff");
+        }
+        assert_eq!(sim.kernel.threads.current[0], Some(me));
+
+        sim.svc(0, 0x1a, &[me as u64, MUTEXES[m], me as u64]);
+        assert_eq!(sim.result_register(0), SUCCESS);
+        assert_eq!(sim.kernel.threads.current[0], Some(me), "caller was parked on itself");
+        assert!(matches!(
+            sim.kernel.threads.threads[&me].state,
+            threads::ThreadState::Running
+        ));
+        // Enter's re-read now succeeds; Leave goes to the kernel (waiters bit)
+        // and hands the lock to the queued thread.
+        assert_eq!(sim.word(m) & !L, me);
+        sim.svc(0, 0x1b, &[MUTEXES[m]]);
+        assert_eq!(sim.word(m), other);
+        assert!(matches!(
+            sim.kernel.threads.threads[&other].state,
+            threads::ThreadState::Ready
+        ));
+        assert_eq!(sim.kernel.threads.threads[&other].ctx.x[0] as u32, SUCCESS);
+        let last = sim.kernel.mutex_word_writes[&MUTEXES[m]];
+        assert_eq!((last.word, last.by, last.reason), (other, me, "unlock handoff"));
+    }
+
+    /// A different owner still parks the caller (unchanged behaviour).
+    #[test]
+    fn arbitrate_lock_on_another_owner_still_parks() {
+        let mut sim = Sim::new(8, 2);
+        let me = sim.handles[0];
+        let other = sim.handles[1];
+        sim.kernel
+            .address_space
+            .write(MUTEXES[0], &(other | L).to_le_bytes())
+            .unwrap();
+        sim.svc(0, 0x1a, &[other as u64, MUTEXES[0], me as u64]);
+        assert_eq!(sim.kernel.threads.current[0], None);
+        assert!(matches!(
+            sim.kernel.threads.threads[&me].state,
+            threads::ThreadState::WaitingMutex { owner_handle, tag, .. } if owner_handle == other && tag == me
+        ));
     }
 }

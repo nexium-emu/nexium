@@ -670,27 +670,39 @@ impl AddressSpace {
         len: usize,
         visit: impl FnOnce(&Region, usize) -> R,
     ) -> Option<R> {
-        LAST_REGION.with(|slot| {
-            let slot = slot.borrow();
-            let cached = slot.as_ref()?;
-            if cached.space != self.id || cached.generation != generation {
-                return None;
-            }
-            let region = &cached.region;
-            let off = usize::try_from(va.checked_sub(region.base)?).ok()?;
-            if off.checked_add(len)? > region.committed_len() {
-                return None;
-            }
-            Some(visit(region, off))
+        RECENT_REGIONS.with(|slots| {
+            let slots = slots.borrow();
+            let (region, off) = slots.iter().flatten().find_map(|cached| {
+                if cached.space != self.id || cached.generation != generation {
+                    return None;
+                }
+                let region = cached.region.upgrade()?;
+                let off = usize::try_from(va.checked_sub(region.base)?).ok()?;
+                if off.checked_add(len)? > region.committed_len() {
+                    return None;
+                }
+                Some((region, off))
+            })?;
+            Some(visit(&region, off))
         })
     }
 
     fn remember_region(&self, generation: u64, region: &Arc<Region>) {
-        LAST_REGION.with(|slot| {
-            *slot.borrow_mut() = Some(CachedRegion {
+        // A cached alias would keep its source's `alias_users` count up after
+        // the alias is unmapped, making a later shrink of the source fail
+        // with `AliasInUse`; aliases always take the locked path instead.
+        if region.alias_backing.is_some() {
+            return;
+        }
+        RECENT_REGIONS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            // Most recent first; the oldest entry falls off the end. Entries of
+            // other spaces or stale generations simply never match again.
+            slots.rotate_right(1);
+            slots[0] = Some(CachedRegion {
                 space: self.id,
                 generation,
-                region: Arc::clone(region),
+                region: Arc::downgrade(region),
             });
         });
     }
@@ -790,11 +802,17 @@ impl AddressSpace {
             self.read(va, &mut b)?;
             return Ok(u32::from_le_bytes(b));
         }
-        let (region, off) = self.locate(va, 4)?;
-        unsafe {
+        let generation = self.generation();
+        let load = |region: &Region, off: usize| unsafe {
             let p = region.buf.as_ptr().add(off) as *const std::sync::atomic::AtomicU32;
-            Ok((*p).load(Ordering::SeqCst))
+            (*p).load(Ordering::SeqCst)
+        };
+        if let Some(value) = self.with_cached_region(generation, va, 4, load) {
+            return Ok(value);
         }
+        let (region, off) = self.locate(va, 4)?;
+        self.remember_region(generation, &region);
+        Ok(load(&region, off))
     }
 
     pub fn atomic_cas_u32(&self, va: u64, current: u32, new: u32) -> Result<bool> {
@@ -807,13 +825,18 @@ impl AddressSpace {
             self.write(va, &new.to_le_bytes())?;
             return Ok(true);
         }
-        let (region, off) = self.locate(va, 4)?;
-        unsafe {
+        let generation = self.generation();
+        let cas = |region: &Region, off: usize| unsafe {
             let p = region.buf.as_ptr().add(off) as *const std::sync::atomic::AtomicU32;
-            Ok((*p)
-                .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok())
+            (*p).compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        };
+        if let Some(swapped) = self.with_cached_region(generation, va, 4, cas) {
+            return Ok(swapped);
         }
+        let (region, off) = self.locate(va, 4)?;
+        self.remember_region(generation, &region);
+        Ok(cas(&region, off))
     }
 
     pub fn read_pod<T: Pod>(&self, va: u64) -> Result<T> {
@@ -1033,12 +1056,19 @@ static ADDRESS_SPACE_IDS: AtomicU64 = AtomicU64::new(1);
 struct CachedRegion {
     space: u64,
     generation: u64,
-    region: Arc<Region>,
+    // Weak, so a host thread that outlives an address space cannot keep its
+    // regions alive: dropping a region decommits arena memory, which must
+    // happen when the space goes away, not whenever this cache is evicted.
+    region: std::sync::Weak<Region>,
 }
 
+/// Regions remembered per host thread. A guest touches a handful of regions
+/// at once (code, stack, heap, TLS, shared memory), so a single entry thrashed.
+const REGION_CACHE_ENTRIES: usize = 4;
+
 thread_local! {
-    static LAST_REGION: std::cell::RefCell<Option<CachedRegion>> =
-        const { std::cell::RefCell::new(None) };
+    static RECENT_REGIONS: std::cell::RefCell<[Option<CachedRegion>; REGION_CACHE_ENTRIES]> =
+        const { std::cell::RefCell::new([None, None, None, None]) };
 }
 
 impl RangePlan {
@@ -1676,7 +1706,7 @@ mod tests {
         let lease = a.host_region_lease_at(dst).unwrap();
         let source = Arc::downgrade(&lease.backing.alias_backing.as_ref().unwrap().source);
         a.unmap_alias(dst, src, PAGE_SIZE).unwrap();
-        LAST_REGION.with(|slot| *slot.borrow_mut() = None);
+        RECENT_REGIONS.with(|slots| *slots.borrow_mut() = Default::default());
         drop(a);
         assert!(source.upgrade().is_some());
         assert_eq!(unsafe { *lease.backing.buf.as_ptr() }, 0x6d);
@@ -1905,6 +1935,79 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn region_cache_keeps_several_regions_and_serves_atomics() {
+        const BASE: u64 = 1 << 42;
+        let a = fresh();
+        for i in 0..6u64 {
+            a.map(BASE + i * 0x10_0000, PAGE_SIZE, Perm::RW, format!("r{i}"))
+                .unwrap();
+        }
+        // Interleave more regions than the cache holds; every access must
+        // still see its own region's data.
+        for round in 0..3u8 {
+            for i in 0..6u64 {
+                let va = BASE + i * 0x10_0000 + 0x40;
+                a.write(va, &[round, i as u8]).unwrap();
+            }
+            for i in 0..6u64 {
+                let va = BASE + i * 0x10_0000 + 0x40;
+                let mut got = [0u8; 2];
+                a.read(va, &mut got).unwrap();
+                assert_eq!(got, [round, i as u8]);
+            }
+        }
+        let word = BASE + 0x10_0000 + 0x80;
+        assert_eq!(a.atomic_load_u32(word).unwrap(), 0);
+        assert!(a.atomic_cas_u32(word, 0, 7).unwrap());
+        assert!(!a.atomic_cas_u32(word, 0, 9).unwrap());
+        assert_eq!(a.atomic_load_u32(word).unwrap(), 7);
+        let mut raw = [0u8; 4];
+        a.read(word, &mut raw).unwrap();
+        assert_eq!(u32::from_le_bytes(raw), 7);
+        // Atomics still fail on unmapped memory, cached or not.
+        assert!(matches!(
+            a.atomic_load_u32(BASE + 0x8_0000),
+            Err(AddressSpaceError::Unmapped { .. })
+        ));
+        assert!(matches!(
+            a.atomic_cas_u32(BASE + PAGE_SIZE, 0, 1),
+            Err(AddressSpaceError::Unmapped { .. })
+        ));
+    }
+
+    #[test]
+    fn region_cache_does_not_pin_unmapped_alias() {
+        let a = fresh();
+        let src = 0x6a00_0000;
+        let dst = 0x6a10_0000;
+        a.map_reserved(src, PAGE_SIZE * 2, Perm::RW, "source").unwrap();
+        a.resize_committed(src, PAGE_SIZE * 2).unwrap();
+        a.map_alias(dst, src, PAGE_SIZE * 2, Perm::RW, "alias").unwrap();
+        a.write(dst + 4, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(a.atomic_load_u32(dst + 4).unwrap(), 0x0403_0201);
+        a.unmap_alias(dst, src, PAGE_SIZE * 2).unwrap();
+        a.resize_committed(src, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn region_cache_atomics_follow_committed_length() {
+        let a = fresh();
+        let base = 0x7E_0200_0000;
+        a.map_reserved(base, PAGE_SIZE * 2, Perm::RW, "reserved").unwrap();
+        a.resize_committed(base, PAGE_SIZE * 2).unwrap();
+        let word = base + PAGE_SIZE + 0x10;
+        assert!(a.atomic_cas_u32(word, 0, 5).unwrap());
+        assert_eq!(a.atomic_load_u32(word).unwrap(), 5);
+        a.resize_committed(base, PAGE_SIZE).unwrap();
+        assert!(matches!(
+            a.atomic_load_u32(word),
+            Err(AddressSpaceError::Unmapped { .. })
+        ));
+        a.resize_committed(base, PAGE_SIZE * 2).unwrap();
+        assert_eq!(a.atomic_load_u32(word).unwrap(), 0);
     }
 
     #[test]

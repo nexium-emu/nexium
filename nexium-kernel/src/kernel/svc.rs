@@ -21,6 +21,16 @@ use nexium_ipc as ipc;
 
 const KERNEL_EVENT_INVALID_STATE: u32 = 1 | (125 << 9);
 
+/// Presence of an environment variable, read once per call site. These flags
+/// sit on per-SVC / per-frame paths where `std::env::var_os` (a libc env lock
+/// plus a linear scan and allocation) is measurable.
+macro_rules! env_present_once {
+    ($name:literal) => {{
+        static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *VALUE.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 const AUDIO_PCM_INT16: u8 = 2;
 const AUDIO_PCM_FLOAT: u8 = 5;
 const AUDIO_PCM_ADPCM: u8 = 6;
@@ -2710,7 +2720,7 @@ fn svc_guest_probe(kernel: &mut Kernel) -> u32 {
         );
         guest_probe_mem_dump(kernel, cpu, probe_pc);
     }
-    if action.log_hits && std::env::var_os("NEXIUM_GUEST_PROBE_DUMP").is_some() {
+    if action.log_hits && env_present_once!("NEXIUM_GUEST_PROBE_DUMP") {
         use std::sync::atomic::{AtomicU64, Ordering};
         static DUMPS: AtomicU64 = AtomicU64::new(0);
         let sequence = DUMPS.fetch_add(1, Ordering::Relaxed);
@@ -3798,6 +3808,49 @@ fn memory_info_for_regions(
     }
 }
 
+#[cfg(test)]
+mod query_memory_neighbourhood_tests {
+    use super::memory_info_for_regions;
+    use nexium_memory::{AddressSpace, Perm};
+
+    #[test]
+    fn neighbouring_regions_answer_like_the_full_list() {
+        const PAGE: u64 = 0x1000;
+        let space = AddressSpace::new();
+        let base = 0x0800_0000u64;
+        for (offset, pages, name) in [
+            (0u64, 2u64, "codestatic"),
+            (2, 1, "codemutable"),
+            (8, 4, "heap"),
+            (20, 1, "stack"),
+            (40, 3, "shared"),
+        ] {
+            space
+                .map(base + offset * PAGE, pages * PAGE, Perm::RW, name)
+                .unwrap();
+        }
+        let end = base + 64 * PAGE;
+        let all = space.regions();
+        let mut probes = vec![0, base - 1, end, end + PAGE, u64::MAX];
+        for page in 0..64 {
+            let va = base + page * PAGE;
+            probes.extend([va, va + 0x10, va + PAGE - 1]);
+        }
+        for address in probes {
+            assert_eq!(
+                memory_info_for_regions(&space.regions_near(address), address, end),
+                memory_info_for_regions(&all, address, end),
+                "address {address:#x}"
+            );
+        }
+        let empty = AddressSpace::new();
+        assert_eq!(
+            memory_info_for_regions(&empty.regions_near(base), base, end),
+            memory_info_for_regions(&[], base, end)
+        );
+    }
+}
+
 #[cfg(all(test, feature = "backend-rustarmic"))]
 mod process_alias_tests {
     use super::{process_memory_alias_validation, svc_process_memory_alias, Kernel, SUCCESS, KERNEL_INVALID_HANDLE};
@@ -4447,8 +4500,10 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
 
     let mut handles: Vec<u32> = Vec::with_capacity(count as usize);
     if count > 0 && handles_addr != 0 {
-        let mut buf = vec![0u8; count as usize * 4];
-        if kernel.address_space.read(handles_addr, &mut buf).is_ok() {
+        // `count` is clamped to 0x40 above, so the raw words fit on the stack.
+        let mut raw = [0u8; 0x40 * 4];
+        let buf = &mut raw[..count as usize * 4];
+        if kernel.address_space.read(handles_addr, buf).is_ok() {
             for i in 0..count as usize {
                 let h = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
                 handles.push(h);
@@ -4553,10 +4608,7 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         };
         kernel.threads.yield_with_state(
             cpu,
-            crate::kernel::threads::ThreadState::WaitingHandle {
-                handles: handles.clone(),
-                wake_at,
-            },
+            crate::kernel::threads::ThreadState::WaitingHandle { handles, wake_at },
         );
         kernel.yield_after_svc = true;
     }
@@ -4643,6 +4695,41 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
     }
 
     let cur = kernel.threads.current_handle().unwrap_or(0);
+    if owner_handle == self_handle && owner_handle == cur {
+        // The word already names the caller, so by the word the caller holds
+        // the lock. Parking it as a waiter on itself can never end: the only
+        // thread that could hand the lock over is the one being parked. The
+        // guest's lock loop re-reads the word after this SVC, finds its own
+        // tag and proceeds as the owner; threads queued on it are handed the
+        // lock by its next unlock. (Horizon would hang here too, but its
+        // kernel never leaves a thread's tag in a word it does not know it
+        // owns; this state means something upstream went wrong, so say so.)
+        let last_write = kernel.mutex_word_writes.get(&mutex_addr).copied();
+        log::error!(
+            "svcArbitrateLock: thread {:#x} found its own tag in mutex {:#x} (word {:#x}); \
+             treating it as the owner instead of parking it on itself. \
+             state={:?} waiters={} last kernel write to this word: {}",
+            cur,
+            mutex_addr,
+            cur_word,
+            kernel.threads.threads.get(&cur).map(|t| &t.state),
+            kernel.threads.has_mutex_waiters(mutex_addr),
+            match last_write {
+                Some(w) => format!(
+                    "{:#x} by {:#x} ({}) {:?} ago",
+                    w.word,
+                    w.by,
+                    w.reason,
+                    w.at.elapsed()
+                ),
+                None => "none recorded (only guest code has written it)".to_string(),
+            }
+        );
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, SUCCESS as u64);
+        }
+        return SUCCESS;
+    }
     if owner_handle == self_handle || cur != self_handle {
         log::warn!(
             "svcArbitrateLock SELF/MISMATCH park: mutex={:#x} owner={:#x} self={:#x} current={:#x}",
@@ -4689,7 +4776,14 @@ fn release_mutex_word(kernel: &mut Kernel, mutex_addr: u64, caller: u32) -> (u32
                     cur,
                     cur | MUTEX_HAS_LISTENERS,
                 ) {
-                    Ok(true) => return (cur, cur | MUTEX_HAS_LISTENERS, 0),
+                    Ok(true) => {
+                        kernel.note_mutex_word_write(
+                            mutex_addr,
+                            cur | MUTEX_HAS_LISTENERS,
+                            "unlock by non-holder marks waiters",
+                        );
+                        return (cur, cur | MUTEX_HAS_LISTENERS, 0);
+                    }
                     Ok(false) => continue,
                     Err(_) => return (cur, cur, 0),
                 }
@@ -4712,6 +4806,11 @@ fn release_mutex_word(kernel: &mut Kernel, mutex_addr: u64, caller: u32) -> (u32
             .atomic_cas_u32(mutex_addr, cur, new_word)
         {
             Ok(true) => {
+                kernel.note_mutex_word_write(
+                    mutex_addr,
+                    new_word,
+                    if peek.is_some() { "unlock handoff" } else { "unlock release" },
+                );
                 if let Some((h, _, _)) = peek {
                     kernel.threads.commit_wake_mutex_waiter(mutex_addr, h);
                 }
@@ -5042,6 +5141,7 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                     }
                     Err(_) => break 'outer,
                 }
+                kernel.note_mutex_word_write(mutex_addr, new_word, "condvar signal handoff");
                 kernel.threads.wake_condvar_to_ready(handle);
                 nudge_preempt_for_wake(kernel, handle);
                 log::trace!(
@@ -5059,7 +5159,9 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                         .address_space
                         .atomic_cas_u32(mutex_addr, cur_word, new_word)
                     {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            kernel.note_mutex_word_write(mutex_addr, new_word, "condvar signal requeue");
+                        }
                         Ok(false) => continue,
                         Err(_) if diagnostics => {
                             log::warn!(
@@ -5434,6 +5536,7 @@ fn release_hwopus_session_state(kernel: &mut Kernel, session_handle: u32) {
 }
 
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
+    begin_sync_request(kernel);
     let (tls_addr, session_handle) = if let Some(cpu) = cpu_ref() {
         let x0 = cpu.get_register(0) as u32;
         log::trace!("SendSyncRequest: X0={:#x}", x0);
@@ -5517,7 +5620,8 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         .get(&session_handle)
         .map(|s| s.is_domain)
         .unwrap_or(false);
-    let ipc_parse_result = ipc::IpcCtx::parse(tls_buf.clone(), is_domain);
+    // `tls_buf` is not read after this point, so hand it over instead of cloning.
+    let ipc_parse_result = ipc::IpcCtx::parse(tls_buf, is_domain);
     let mut ctx = match ipc_parse_result {
         Ok(c) => c,
         Err(e) => {
@@ -5686,7 +5790,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         }
     }
 
-    let mut response_buf = vec![0u8; 0x100];
+    let mut response_buf = [0u8; 0x100];
     let copy_len = response.len().min(response_buf.len());
     response_buf[..copy_len].copy_from_slice(&response[..copy_len]);
 
@@ -6323,6 +6427,38 @@ fn dispatch_nextendo_account(
 }
 
 fn rewind_svc_for_retry(kernel: &mut Kernel) -> bool {
+    rewind_svc_for_retry_after(kernel, IPC_RETRY_INTERVAL)
+}
+
+/// Per-request bookkeeping at the start of every svcSendSyncRequest: a parked
+/// IGBP DequeueBuffer of the calling thread is handed to this request (its
+/// re-issue) and dropped from the parked set either way, so if the re-issue
+/// never reaches DequeueBuffer again (session closed meanwhile, ...) its start
+/// time cannot leak into a later, unrelated dequeue and time it out early.
+fn begin_sync_request(kernel: &mut Kernel) {
+    kernel.igbp_dequeue_resumed = kernel.threads.current_handle().and_then(|thread| {
+        kernel
+            .igbp_dequeue_wait_started
+            .remove(&thread)
+            .map(|(binder, started)| (thread, binder, started))
+    });
+}
+
+/// Rewinds the current thread onto its `svcSendSyncRequest` and parks it for
+/// `interval`, so the request is re-issued with the kernel lock released in
+/// between. False when the request cannot be re-issued (no current thread, or
+/// it did not come from `svcSendSyncRequest`); the caller must then answer.
+fn rewind_svc_for_retry_after(kernel: &mut Kernel, interval: std::time::Duration) -> bool {
+    rewind_svc_for_retry_inner(kernel, interval, true)
+}
+
+/// Same as `rewind_svc_for_retry_after`, but `warn_on_fail` = false keeps a
+/// caller that has its own fallback (it does not reply immediately) silent.
+fn rewind_svc_for_retry_inner(
+    kernel: &mut Kernel,
+    interval: std::time::Duration,
+    warn_on_fail: bool,
+) -> bool {
     if kernel.threads.current_handle().is_none() {
         return false;
     }
@@ -6340,14 +6476,16 @@ fn rewind_svc_for_retry(kernel: &mut Kernel) -> bool {
     } else if read_insn(pc) == Some(SVC_SEND_SYNC_REQUEST_INSN) {
         pc
     } else {
-        log::warn!(
-            "ipc retry: no svcSendSyncRequest instruction around pc={:#x}, replying immediately",
-            pc
-        );
+        if warn_on_fail {
+            log::warn!(
+                "ipc retry: no svcSendSyncRequest instruction around pc={:#x}, replying immediately",
+                pc
+            );
+        }
         return false;
     };
     cpu.set_pc(target);
-    let wake_at = std::time::Instant::now() + IPC_RETRY_INTERVAL;
+    let wake_at = std::time::Instant::now() + interval;
     kernel
         .threads
         .yield_with_state(
@@ -6372,7 +6510,7 @@ fn dispatch_service_v2(
     }
     let cmd_id = ctx.cmif_in.cmd_id;
     let _guard = if crate::kernel::profile::enabled() {
-        let key = if std::env::var_os("NEXIUM_PROFILE_IPC_CMD").is_some() {
+        let key = if env_present_once!("NEXIUM_PROFILE_IPC_CMD") {
             format!("{port_name}.cmd{cmd_id}")
         } else {
             port_name.to_string()
@@ -8940,7 +9078,10 @@ fn dispatch_service_v2(
                     let _ = kernel.address_space.write(pb.addr, &zero);
                 }
 
-                if std::env::var("NEXIUM_AUDIO_TEST_TONE").ok().as_deref() == Some("1") {
+                static AUDIO_TEST_TONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *AUDIO_TEST_TONE.get_or_init(|| {
+                    std::env::var("NEXIUM_AUDIO_TEST_TONE").ok().as_deref() == Some("1")
+                }) {
                     let base_phase = (frame as f32) * (TARGET_FRAMES as f32);
                     let phase_inc = std::f32::consts::TAU * 440.0 / TARGET_SR;
                     let total_frames = big_out.len() / 2;
@@ -9572,7 +9713,7 @@ fn reserve_bq_wait_profile_sample(
     )
 }
 
-struct BufferQueueWaitProfile {
+pub(crate) struct BufferQueueWaitProfile {
     first_counts: [usize; 4],
     thread: u32,
     pc: u64,
@@ -9687,6 +9828,17 @@ mod bq_wait_profile_tests {
     }
 }
 
+/// Poll interval of a blocking IGBP DequeueBuffer (both the parked re-issue
+/// and the legacy in-SVC loop).
+const IGBP_DEQUEUE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_micros(100);
+
+fn igbp_dequeue_blocking_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("NEXIUM_IGBP_DEQUEUE_BLOCKING").ok().as_deref() == Some("1")
+    })
+}
+
 fn handle_binder_transact(
     kernel: &mut Kernel,
     ctx: &mut ipc::IpcCtx,
@@ -9730,6 +9882,10 @@ fn handle_binder_transact(
     }
 
     let reply = igbp_handle_transact(kernel, binder_id, code, &in_parcel);
+    if kernel.ipc_retry_pending {
+        // Re-issued later; nothing may be written back for this attempt.
+        return Vec::new();
+    }
 
     log::trace!(
         "IHOSBinderDriver.TransactParcel{} binder={} code={} in_size={} reply_size={}",
@@ -9911,19 +10067,45 @@ fn igbp_handle_transact(
             p.finish()
         }
         IGBP_DEQUEUE_BUFFER => {
-            kernel
-                .nvdrv
-                .stats
-                .dequeue_buffer_calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let async_dequeue = reader.read_i32().unwrap_or(0) != 0;
             let _w = reader.read_u32();
             let _h = reader.read_u32();
             let _fmt = reader.read_i32();
             let _usage = reader.read_u32();
-            let started = std::time::Instant::now();
+            // A blocking dequeue with no free slot parks the calling guest
+            // thread and re-issues the request (see `rewind_svc_for_retry`)
+            // instead of sleeping inside the SVC with the kernel lock held,
+            // which stalled every core. The reply, the 3 s timeout and the
+            // async path are unchanged. NEXIUM_IGBP_DEQUEUE_BLOCKING=1 restores
+            // the in-SVC polling loop.
+            let waiter = kernel.threads.current_handle();
+            let resumed_started = match kernel.igbp_dequeue_resumed.take() {
+                Some((thread, binder, started))
+                    if Some(thread) == waiter && binder == binder_id =>
+                {
+                    Some(started)
+                }
+                _ => None,
+            };
+            if resumed_started.is_none() {
+                kernel
+                    .nvdrv
+                    .stats
+                    .dequeue_buffer_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let started = resumed_started.unwrap_or_else(std::time::Instant::now);
+            // Re-issue is only possible for an AArch64 `svc #0x21`; decided at
+            // most once per request so the fallback below is the old silent
+            // in-SVC poll (no per-iteration instruction probes or warnings).
+            let mut can_rewind = waiter.is_some()
+                && !igbp_dequeue_blocking_enabled()
+                && matches!(kernel.guest_isa, nexium_cpu::GuestIsa::AArch64);
             let profile_waits = bq_wait_profile_tracking_enabled() && !async_dequeue;
-            let mut wait_profile: Option<BufferQueueWaitProfile> = None;
+            let carried_profile =
+                waiter.and_then(|thread| kernel.igbp_dequeue_wait_profiles.remove(&thread));
+            let mut wait_profile: Option<BufferQueueWaitProfile> =
+                resumed_started.and(carried_profile);
             let (slot, free, deq, queued) = loop {
                 let state = kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
                     (
@@ -9967,7 +10149,26 @@ fn igbp_handle_transact(
                     );
                     break (None, free, deq, queued);
                 }
-                std::thread::sleep(std::time::Duration::from_micros(100));
+                if can_rewind {
+                    if let Some(waiter) = waiter {
+                        if rewind_svc_for_retry_inner(kernel, IGBP_DEQUEUE_RETRY_INTERVAL, false) {
+                            kernel
+                                .igbp_dequeue_wait_started
+                                .insert(waiter, (binder_id, started));
+                            if let Some(profile) = wait_profile.take() {
+                                kernel.igbp_dequeue_wait_profiles.insert(waiter, profile);
+                            }
+                            kernel.ipc_retry_pending = true;
+                            return Vec::new();
+                        }
+                    }
+                    log::debug!(
+                        "IGBP::DequeueBuffer binder={}: request cannot be re-issued, polling in-SVC",
+                        binder_id
+                    );
+                    can_rewind = false;
+                }
+                std::thread::sleep(IGBP_DEQUEUE_RETRY_INTERVAL);
             };
             if let Some(wait) = wait_profile {
                 if let Some(sample) = reserve_bq_wait_profile_sample(
@@ -10081,7 +10282,7 @@ fn igbp_handle_transact(
                 p.write_u32((-22i32) as u32);
                 return p.finish();
             }
-            if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() && !acquire_fences.is_empty() {
+            if env_present_once!("NEXIUM_PRESENT_KEYS") && !acquire_fences.is_empty() {
                 log::info!(
                     "IGBP::QueueBuffer acquire fences binder={} slot={} fences={:?}",
                     binder_id,
@@ -10100,7 +10301,7 @@ fn igbp_handle_transact(
                     nexium_nvdrv::FenceWaitDisposition::Reached => {}
                     nexium_nvdrv::FenceWaitDisposition::OrderedPredecessor => {
                         elided_ordered_fences.push((syncpt_id, threshold));
-                        if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                        if env_present_once!("NEXIUM_PRESENT_KEYS") {
                             log::trace!(
                                 "IGBP::QueueBuffer elided ordered acquire fence binder={} slot={} syncpt={} threshold={}",
                                 binder_id,
@@ -10243,7 +10444,7 @@ fn igbp_handle_transact(
                 has_buf,
                 gb_opt.is_some()
             );
-            if transform != 0 && std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+            if transform != 0 && env_present_once!("NEXIUM_PRESENT_KEYS") {
                 log::warn!(
                     "IGBP::QueueBuffer transform binder={} slot={} transform={:#x}",
                     binder_id,
@@ -10254,7 +10455,7 @@ fn igbp_handle_transact(
 
             if let Some(gb) = gb_opt {
                 if async_present_pipeline_enabled()
-                    && std::env::var_os("NEXIUM_PRESENT_CPU_ONLY").is_none()
+                    && !env_present_once!("NEXIUM_PRESENT_CPU_ONLY")
                 {
                     let ordered_present_identity = (|| {
                         let linear_size = (gb.stride as usize)
@@ -10462,7 +10663,7 @@ fn igbp_handle_transact(
                                 );
                                 return;
                             }
-                            if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                            if env_present_once!("NEXIUM_PRESENT_KEYS") {
                                 use std::sync::atomic::{AtomicU64, Ordering};
                                 static ORDERED_KEYS: AtomicU64 = AtomicU64::new(0);
                                 let sequence = ORDERED_KEYS.fetch_add(1, Ordering::Relaxed);
@@ -10668,10 +10869,14 @@ fn igbp_handle_transact(
                 };
                 kernel.nvdrv.wait_gpu_idle();
                 let renderer_for_present = kernel.nvdrv.renderer().cloned();
+                static PRESENT_PROBE_NVMAP: std::sync::OnceLock<Option<u32>> =
+                    std::sync::OnceLock::new();
                 if let (Some(probe), Some(renderer)) = (
-                    std::env::var("NEXIUM_PRESENT_PROBE_NVMAP")
-                        .ok()
-                        .and_then(|v| v.parse::<u32>().ok()),
+                    *PRESENT_PROBE_NVMAP.get_or_init(|| {
+                        std::env::var("NEXIUM_PRESENT_PROBE_NVMAP")
+                            .ok()
+                            .and_then(|v| v.parse::<u32>().ok())
+                    }),
                     renderer_for_present.as_ref(),
                 ) {
                     use std::sync::atomic::{AtomicBool, Ordering as ProbeOrdering};
@@ -10764,7 +10969,7 @@ fn igbp_handle_transact(
                     || gpu_stats.fermi_2d_blits != 0
                     || gpu_stats.maxwell_dma_blits != 0;
                 let has_gpu_present_target = renderer_for_present.is_some() && has_gpu_activity;
-                let cpu_present_only = std::env::var_os("NEXIUM_PRESENT_CPU_ONLY").is_some();
+                let cpu_present_only = env_present_once!("NEXIUM_PRESENT_CPU_ONLY");
                 let present_cpu_addr = resolved.map(|(addr, _)| addr).unwrap_or(0);
                 let present_is_tiled = resolved.map(|(_, is_tiled)| is_tiled).unwrap_or(false);
                 let present_surface_size = if present_is_tiled {
@@ -10856,7 +11061,7 @@ fn igbp_handle_transact(
                     let maxwell_dma_for_present =
                         std::sync::Arc::clone(&kernel.nvdrv.gpu.maxwell_dma);
                     qba.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let present_profile = std::env::var_os("NEXIUM_NVDRV_PROFILE").is_some();
+                    let present_profile = env_present_once!("NEXIUM_NVDRV_PROFILE");
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static PRESENT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
                     static PRESENT_ENQUEUED: AtomicU64 = AtomicU64::new(0);
@@ -10927,14 +11132,14 @@ fn igbp_handle_transact(
                             &mapped_present_vas,
                         );
                         if diagnostics_enabled()
-                            || std::env::var_os("NEXIUM_PRESENT_KEYS").is_some()
+                            || env_present_once!("NEXIUM_PRESENT_KEYS")
                         {
                             use std::sync::atomic::{AtomicU64, Ordering as O2};
                             static QP: AtomicU64 = AtomicU64::new(0);
                             let n = QP.fetch_add(1, O2::Relaxed);
                             if n < 3
                                 || n % 300 == 0
-                                || (std::env::var_os("NEXIUM_PRESENT_KEYS").is_some()
+                                || (env_present_once!("NEXIUM_PRESENT_KEYS")
                                     && n % 20 == 0)
                             {
                                 let (present_gpu_va, alias_mode, stamp) = exact_present_source
@@ -11483,7 +11688,7 @@ fn igbp_handle_transact(
                 p.write_u32((-22i32) as u32);
                 return p.finish();
             }
-            if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() && !cancel_fences.is_empty() {
+            if env_present_once!("NEXIUM_PRESENT_KEYS") && !cancel_fences.is_empty() {
                 log::info!(
                     "IGBP::CancelBuffer binder={} slot={} fences={:?}",
                     binder_id,
@@ -11995,7 +12200,7 @@ fn submit_present_frame(
         _ => (present_w, present_h, bytes, depth),
     };
     dump_present_frame(&bytes, present_w, present_h);
-    if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
+    if env_present_once!("NEXIUM_FRAME_PRESENT_CACHE") {
         nexium_common::frame_present::set_last_presented(present_w, present_h, bytes.clone());
     }
     nexium_nvdrv::enqueue_bounded_frame(
@@ -12407,7 +12612,7 @@ fn present_subwindow_has_content(
 }
 
 fn maybe_crop_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> (u32, u32, Vec<u8>) {
-    if std::env::var_os("NEXIUM_PRESENT_SUBWINDOW_CROP").is_none() {
+    if !env_present_once!("NEXIUM_PRESENT_SUBWINDOW_CROP") {
         if let Ok(mut slot) = present_crop_slot().lock() {
             *slot = None;
         }
@@ -12533,10 +12738,12 @@ mod present_crop_tests {
 }
 
 fn dump_present_frame(bytes: &[u8], width: u32, height: u32) {
-    if std::env::var("NEXIUM_PRESENT_DUMP")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    static PRESENT_DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PRESENT_DUMP.get_or_init(|| {
+        std::env::var("NEXIUM_PRESENT_DUMP")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -12957,7 +13164,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             let addr_space_w = kernel.address_space.clone();
             let addr_space_c = kernel.address_space.clone();
             let ioctl_profile = if crate::kernel::profile::enabled()
-                && std::env::var_os("NEXIUM_PROFILE_IOCTL").is_some()
+                && env_present_once!("NEXIUM_PROFILE_IOCTL")
             {
                 let device = kernel
                     .nvdrv
@@ -14406,18 +14613,7 @@ fn svc_signal_to_address(kernel: &mut Kernel) -> u32 {
     let current = u32::from_le_bytes(buf);
     let trace_arbiter = arbiter_trace_enabled();
     if trace_arbiter {
-        let waiters = kernel
-            .threads
-            .threads
-            .values()
-            .filter(|thread| {
-                matches!(
-                    &thread.state,
-                    crate::kernel::threads::ThreadState::WaitingArbiter { addr: a, .. }
-                        if *a == addr
-                )
-            })
-            .count();
+        let waiters = kernel.threads.arbiter_waiter_count(addr);
         log::warn!(
             "[arb-signal] addr={:#x} type={} value={} count={} current={} waiters={}",
             addr,
@@ -14448,18 +14644,7 @@ fn svc_signal_to_address(kernel: &mut Kernel) -> u32 {
             }
         }
         2 => {
-            let waiters = kernel
-                .threads
-                .threads
-                .values()
-                .filter(|thread| {
-                    matches!(
-                        &thread.state,
-                        crate::kernel::threads::ThreadState::WaitingArbiter { addr: a, .. }
-                            if *a == addr
-                    )
-                })
-                .count() as i32;
+            let waiters = kernel.threads.arbiter_waiter_count(addr) as i32;
             let new_value = if waiters == 0 {
                 value.wrapping_add(1)
             } else if count <= 0 {
@@ -14674,6 +14859,27 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+/// Application memory in use, excluding the system resource (GetInfo 22).
+/// Horizon counts the npdm main thread stack (the size boot maps as the stack),
+/// and games compare this against their own budgets (Super Mario Bros.
+/// Wonder aborts at boot when it is too high).
+fn used_non_system_memory(kernel: &Kernel) -> u64 {
+    kernel.code_size + kernel.stack_size + kernel.heap_committed
+}
+
+/// Total memory reported to the application (GetInfo 6). A 32-bit process can
+/// only grow its heap to the heap region, and games size the heap as total
+/// minus used, so report no more than the non-heap usage plus that region.
+fn reported_total_memory(kernel: &Kernel) -> u64 {
+    if matches!(kernel.guest_isa, nexium_cpu::GuestIsa::AArch32) {
+        let non_heap =
+            kernel.code_size + kernel.stack_size + kernel.system_resource_size;
+        kernel.total_memory.min(non_heap + kernel.heap_size)
+    } else {
+        kernel.total_memory
+    }
+}
+
 fn svc_get_info(kernel: &mut Kernel) -> u32 {
     let (info_type, handle, sub) = if let Some(cpu) = cpu_ref() {
         (
@@ -14710,15 +14916,14 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         5 => kernel.heap_size,
         6 => {
             if kernel.is_application {
-                kernel.total_memory
+                reported_total_memory(kernel)
             } else {
                 0x80_000_000
             }
         }
         7 => {
             if kernel.is_application {
-                kernel.code_size + kernel.stack_size + kernel.heap_committed
-                    + kernel.system_resource_size
+                used_non_system_memory(kernel) + kernel.system_resource_size
             } else {
                 0x40_000_000
             }
@@ -14758,8 +14963,9 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         18 => 0,
         19 => 0,
         20 => kernel.tls_base + 0x200,
-        21 => kernel.total_memory.saturating_sub(kernel.system_resource_size),
-        22 => kernel.code_size + kernel.stack_size + kernel.heap_committed,
+        21 => reported_total_memory(kernel).saturating_sub(kernel.system_resource_size),
+        22 => used_non_system_memory(kernel)
+            .min(reported_total_memory(kernel).saturating_sub(kernel.system_resource_size)),
 
         23 => u64::from(kernel.is_application),
         24 | 25 | 26 | 27 => 0,
@@ -15028,6 +15234,120 @@ fn svc_unmap_physical_memory(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+#[cfg(all(test, feature = "backend-rustarmic"))]
+mod physical_memory_tests {
+    use super::{svc_map_physical_memory, svc_unmap_physical_memory, Kernel, SUCCESS};
+    use crate::kernel::cpu_local::set_current_cpu;
+    use nexium_cpu::Cpu;
+    use nexium_memory::{AddressSpace, HostRegionChange, Perm};
+    use std::sync::Arc;
+
+    const PAGE: u64 = 0x1000;
+    const HEAP: u64 = 0x4400_0000;
+    const ALIAS: u64 = 0x4800_0000;
+
+    fn test_kernel() -> Kernel {
+        let address_space = Arc::new(AddressSpace::new());
+        address_space.map_reserved(HEAP, 0x20_0000, Perm::RW, "test_heap").unwrap();
+        Kernel::new(
+            address_space, 0x80_0000, 0x1000, HEAP, 0x20_0000, 0xa0_0000, 0x1000, 0xb0_0000, 0xb0_1000,
+        )
+    }
+
+    /// The runner's per-core replay of the address-space change log.
+    fn sync(cpu: &mut Cpu, address_space: &AddressSpace, cursor: &mut u64) {
+        let updates = address_space.host_region_changes_since(*cursor);
+        for change in updates.changes {
+            match change {
+                HostRegionChange::Upsert(region) => unsafe {
+                    let _ = cpu.unmap_host(region.base, region.size);
+                    cpu.map_host(region.base, region.size, region.perm, region.host_ptr).unwrap();
+                },
+                HostRegionChange::Remove { base, size } => unsafe {
+                    let _ = cpu.unmap_host(base, size);
+                },
+                HostRegionChange::Invalidate { base, size } => cpu.invalidate_range(base, size),
+            }
+        }
+        *cursor = updates.generation;
+    }
+
+    fn call(kernel: &mut Kernel, cpu: &mut Cpu, core: usize, svc: fn(&mut Kernel) -> u32, addr: u64, size: u64) {
+        cpu.set_register(0, addr);
+        cpu.set_register(1, size);
+        let _guard = set_current_cpu(cpu, core);
+        assert_eq!(svc(kernel), SUCCESS);
+    }
+
+    /// Every page in `lo..hi` is mapped on the core exactly when the kernel
+    /// maps it, with the kernel's permission, and reads through the core see
+    /// the kernel's bytes.
+    fn assert_core_matches_kernel(kernel: &Kernel, cpu: &Cpu, core: usize, lo: u64, hi: u64) {
+        for page in (lo..hi).step_by(PAGE as usize) {
+            let view = cpu.mapping_view(page).unwrap();
+            let Some(region) = kernel.address_space.host_region_at(page) else {
+                assert!(
+                    view.region.is_none(),
+                    "core{core}: {page:#x} mapped on the core but unmapped by the kernel ({view})"
+                );
+                continue;
+            };
+            let (base, end, perm) = view.region.unwrap_or_else(|| {
+                panic!("core{core}: {page:#x} unmapped on the core but mapped by the kernel ({view})")
+            });
+            assert!(base <= page && page + PAGE <= end, "core{core}: {page:#x} -> {view}");
+            assert_eq!(perm, region.perm, "core{core}: {page:#x}");
+            let mut want = [0u8; 8];
+            kernel.address_space.read(page + PAGE - 8, &mut want).unwrap();
+            let mut got = [0u8; 8];
+            cpu.read_bytes(page + PAGE - 8, &mut got).unwrap();
+            assert_eq!(got, want, "core{core}: {page:#x}");
+        }
+    }
+
+    /// The VAMM pattern (system_resource_size != 0): map physical memory on
+    /// one core, free part of it and map it again on another. Every core
+    /// must follow the kernel through the unmap and the re-map. The unmap
+    /// used to drop the overlapping region on the calling core only, which
+    /// then faulted on memory every other core (and the kernel) still had
+    /// mapped.
+    #[test]
+    fn unmap_and_remap_physical_memory_keeps_every_core_in_step() {
+        let mut kernel = test_kernel();
+        let mut cores = [Cpu::new_rustarmic().unwrap(), Cpu::new_rustarmic().unwrap()];
+        let mut cursors = [0u64; 2];
+        let space = Arc::clone(&kernel.address_space);
+        for (core, cpu) in cores.iter_mut().enumerate() {
+            sync(cpu, &space, &mut cursors[core]);
+        }
+
+        call(&mut kernel, &mut cores[0], 0, svc_map_physical_memory, ALIAS, 8 * PAGE);
+        // A second, adjacent and overlapping request only maps the gap.
+        call(&mut kernel, &mut cores[0], 0, svc_map_physical_memory, ALIAS + 6 * PAGE, 6 * PAGE);
+        for (core, cpu) in cores.iter_mut().enumerate() {
+            sync(cpu, &space, &mut cursors[core]);
+        }
+        kernel.address_space.write(ALIAS + 0xff8, &0x1122_3344_5566_7788u64.to_le_bytes()).unwrap();
+
+        call(&mut kernel, &mut cores[1], 1, svc_unmap_physical_memory, ALIAS + 2 * PAGE, PAGE);
+        assert!(kernel.address_space.host_region_at(ALIAS + 2 * PAGE).is_none());
+        for (core, cpu) in cores.iter_mut().enumerate() {
+            sync(cpu, &space, &mut cursors[core]);
+            assert_core_matches_kernel(&kernel, cpu, core, ALIAS, ALIAS + 12 * PAGE);
+        }
+
+        call(&mut kernel, &mut cores[1], 1, svc_map_physical_memory, ALIAS + 2 * PAGE, PAGE);
+        for (core, cpu) in cores.iter_mut().enumerate() {
+            sync(cpu, &space, &mut cursors[core]);
+            assert_core_matches_kernel(&kernel, cpu, core, ALIAS, ALIAS + 12 * PAGE);
+            assert!(cpu.mapping_view(ALIAS + 12 * PAGE).unwrap().region.is_none());
+        }
+        let mut got = [0u8; 8];
+        cores[1].read_bytes(ALIAS + 0xff8, &mut got).unwrap();
+        assert_eq!(u64::from_le_bytes(got), 0x1122_3344_5566_7788);
+    }
+}
+
 fn svc_create_event(kernel: &mut Kernel) -> u32 {
     log::debug!("svcCreateEvent");
     let writable = kernel.handles.create_handle(HandleType::Event);
@@ -15143,6 +15463,10 @@ fn svc_close_handle(kernel: &mut Kernel) -> u32 {
 }
 
 fn active_core_count() -> i32 {
+    // Deliberately NOT cached: frontends (Android multicore toggle) change
+    // NEXIUM_SINGLECORE between boots in the same process, and boot.rs reads
+    // it fresh to decide how many core threads to start. Only called from
+    // CreateThread / SetThreadCoreMask, so the env read is cold.
     if std::env::var("NEXIUM_SINGLECORE").is_ok() {
         1
     } else {
@@ -15290,6 +15614,8 @@ fn svc_exit_thread(kernel: &mut Kernel) -> u32 {
                 priority: 0x2C,
             });
         kernel.exited_thread_handles.insert(handle, state);
+        kernel.igbp_dequeue_wait_started.remove(&handle);
+        kernel.igbp_dequeue_wait_profiles.remove(&handle);
         kernel.threads.signal_handle(handle);
     }
     if let Some(cpu) = cpu_ref() {
@@ -16834,4 +17160,309 @@ fn cmif_dispatch_set(
         .services
         .set
         .dispatch_cmif(ctx.cmif_in.cmd_id, &mut cmif_ctx)
+}
+
+/// Blocking IGBP DequeueBuffer: with no free slot the calling guest thread is
+/// parked and its `svcSendSyncRequest` re-issued instead of sleeping in the
+/// SVC. These pin down what the guest can observe across re-issues: no reply
+/// is written while parked, the thread resumes on the same `svc` with its
+/// registers intact, the final reply is byte-identical to the in-SVC loop's,
+/// and the 3 s timeout runs from the first attempt.
+#[cfg(all(test, feature = "backend-rustarmic"))]
+mod igbp_dequeue_retry_tests {
+    use super::{
+        begin_sync_request, igbp_handle_transact, Kernel, ParcelBuilder, IGBP_DEQUEUE_BUFFER,
+        IGBP_DEQUEUE_RETRY_INTERVAL, SVC_SEND_SYNC_REQUEST_INSN,
+    };
+    use crate::kernel::cpu_local::set_current_cpu;
+    use crate::kernel::threads::ThreadState;
+    use nexium_cpu::Cpu;
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const CODE: u64 = 0x4000_0000;
+    const BINDER: u32 = 7;
+    const SESSION: u64 = 0xabcd;
+
+    fn setup() -> (Kernel, Cpu, u32) {
+        let space = Arc::new(AddressSpace::new());
+        space.map(CODE, 0x1000, Perm::RX, "code").unwrap();
+        space
+            .write(CODE, &SVC_SEND_SYNC_REQUEST_INSN.to_le_bytes())
+            .unwrap();
+        let kernel = Kernel::new(
+            space, 0x80_0000, 0x1000, 0x90_0000, 0x1000, 0xa0_0000, 0x1000, 0xb0_0000, 0xb0_1000,
+        );
+        // One slot, already dequeued: a blocking dequeue has to wait.
+        kernel.nvdrv.with_bufferqueue(BINDER, |queue| {
+            queue.set_preallocated(0, nexium_nvdrv::GraphicBuffer::default());
+            assert_eq!(queue.try_dequeue(), Some(0));
+        });
+        let main = kernel.threads.current[0].unwrap();
+        (kernel, Cpu::new_rustarmic().unwrap(), main)
+    }
+
+    fn dequeue_parcel(async_dequeue: bool) -> Vec<u8> {
+        let mut p = ParcelBuilder::new();
+        p.write_u32(0); // strict mode policy
+        p.write_u32(0); // empty interface token
+        p.write_u32(async_dequeue as u32);
+        p.write_u32(1280);
+        p.write_u32(720);
+        p.write_u32(1);
+        p.write_u32(0xb00);
+        p.finish()
+    }
+
+    /// The reply the original in-SVC loop produced.
+    fn expected_reply(slot: Option<u32>) -> Vec<u8> {
+        let mut p = ParcelBuilder::new();
+        p.write_u32(slot.unwrap_or(u32::MAX));
+        p.write_u32(1);
+        p.write_flattened_zero_fence();
+        p.write_u32(if slot.is_some() { 0 } else { (-11i32) as u32 });
+        p.finish()
+    }
+
+    /// One svcSendSyncRequest carrying DequeueBuffer, as the guest issues it
+    /// (pc just past the `svc`, x0 = session handle).
+    fn attempt(kernel: &mut Kernel, cpu: &mut Cpu, binder: u32, async_dequeue: bool) -> Vec<u8> {
+        cpu.set_pc(CODE + 4);
+        cpu.set_register(0, SESSION);
+        let _guard = set_current_cpu(cpu, 0);
+        begin_sync_request(kernel);
+        igbp_handle_transact(kernel, binder, IGBP_DEQUEUE_BUFFER, &dequeue_parcel(async_dequeue))
+    }
+
+    fn calls(kernel: &Kernel) -> u64 {
+        kernel.nvdrv.stats.dequeue_buffer_calls.load(Ordering::Relaxed)
+    }
+
+    /// Asserts the thread is parked for a re-issue and runs it again the way
+    /// the scheduler does once the retry interval has passed.
+    fn assert_parked_then_resume(kernel: &mut Kernel, cpu: &mut Cpu, main: u32) {
+        assert!(std::mem::take(&mut kernel.ipc_retry_pending));
+        assert_eq!(kernel.threads.current[0], None);
+        let thread = &kernel.threads.threads[&main];
+        match thread.state {
+            ThreadState::Sleeping { wake_at } => {
+                assert!(wake_at <= Instant::now() + IGBP_DEQUEUE_RETRY_INTERVAL);
+            }
+            ref other => panic!("not parked: {other:?}"),
+        }
+        // Rewound onto the svc, request registers intact.
+        assert_eq!(thread.ctx.pc, CODE);
+        assert_eq!(thread.ctx.x[0], SESSION);
+        let _guard = set_current_cpu(cpu, 0);
+        kernel
+            .threads
+            .wake_due_sleepers(Instant::now() + IGBP_DEQUEUE_RETRY_INTERVAL);
+        assert_eq!(kernel.threads.pick_next(), Some(main));
+        kernel.threads.schedule_to(main, cpu);
+        assert_eq!(cpu.get_pc(), CODE);
+    }
+
+    #[test]
+    fn blocking_dequeue_parks_and_reissues_until_a_slot_frees() {
+        let (mut kernel, mut cpu, main) = setup();
+        let before = calls(&kernel);
+        for _ in 0..3 {
+            let reply = attempt(&mut kernel, &mut cpu, BINDER, false);
+            assert!(reply.is_empty(), "nothing is written back while parked");
+            assert_parked_then_resume(&mut kernel, &mut cpu, main);
+        }
+        let started = kernel.igbp_dequeue_wait_started.get(&main).map(|(_, t)| *t);
+        assert!(started.is_some());
+        // Re-issues are one guest request: counted once, start time kept.
+        assert_eq!(calls(&kernel), before + 1);
+        let reply = attempt(&mut kernel, &mut cpu, BINDER, false);
+        assert!(reply.is_empty());
+        assert_eq!(
+            kernel.igbp_dequeue_wait_started.get(&main).map(|(_, t)| *t),
+            started
+        );
+        assert_parked_then_resume(&mut kernel, &mut cpu, main);
+
+        kernel
+            .nvdrv
+            .with_bufferqueue(BINDER, |queue| assert!(queue.cancel(0)));
+        let reply = attempt(&mut kernel, &mut cpu, BINDER, false);
+        assert_eq!(reply, expected_reply(Some(0)));
+        assert!(!kernel.ipc_retry_pending);
+        assert!(kernel.igbp_dequeue_wait_started.is_empty());
+        assert!(kernel.igbp_dequeue_resumed.is_none());
+        assert_eq!(kernel.threads.current[0], Some(main));
+        assert_eq!(calls(&kernel), before + 1);
+    }
+
+    #[test]
+    fn timeout_counts_from_the_first_attempt_across_reissues() {
+        let (mut kernel, mut cpu, main) = setup();
+        assert!(attempt(&mut kernel, &mut cpu, BINDER, false).is_empty());
+        assert_parked_then_resume(&mut kernel, &mut cpu, main);
+        // Pretend the first attempt was 3 s ago.
+        let entry = kernel.igbp_dequeue_wait_started.get_mut(&main).unwrap();
+        entry.1 -= Duration::from_secs(3);
+        let reply = attempt(&mut kernel, &mut cpu, BINDER, false);
+        assert_eq!(reply, expected_reply(None));
+        assert!(!kernel.ipc_retry_pending);
+        assert!(kernel.igbp_dequeue_wait_started.is_empty());
+        assert_eq!(kernel.threads.current[0], Some(main));
+    }
+
+    #[test]
+    fn async_dequeue_never_parks() {
+        let (mut kernel, mut cpu, main) = setup();
+        let reply = attempt(&mut kernel, &mut cpu, BINDER, true);
+        assert_eq!(reply, expected_reply(None));
+        assert!(!kernel.ipc_retry_pending);
+        assert!(kernel.igbp_dequeue_wait_started.is_empty());
+        assert_eq!(kernel.threads.current[0], Some(main));
+    }
+
+    #[test]
+    fn a_reissue_that_never_reaches_dequeue_does_not_age_the_next_request() {
+        let (mut kernel, mut cpu, main) = setup();
+        assert!(attempt(&mut kernel, &mut cpu, BINDER, false).is_empty());
+        assert_parked_then_resume(&mut kernel, &mut cpu, main);
+        kernel.igbp_dequeue_wait_started.get_mut(&main).unwrap().1 -= Duration::from_secs(3);
+        // The re-issued svcSendSyncRequest fails before reaching the binder
+        // (say the session was closed while the thread was parked).
+        {
+            let _guard = set_current_cpu(&mut cpu, 0);
+            begin_sync_request(&mut kernel);
+        }
+        assert!(kernel.igbp_dequeue_wait_started.is_empty());
+        // A later, fresh DequeueBuffer waits normally instead of inheriting the
+        // stale start and timing out at once.
+        assert!(attempt(&mut kernel, &mut cpu, BINDER, false).is_empty());
+        assert_parked_then_resume(&mut kernel, &mut cpu, main);
+        // So does a re-issue whose request now targets another binder.
+        kernel.igbp_dequeue_wait_started.get_mut(&main).unwrap().1 -= Duration::from_secs(3);
+        kernel
+            .nvdrv
+            .with_bufferqueue(BINDER + 1, |queue| {
+                queue.set_preallocated(0, nexium_nvdrv::GraphicBuffer::default());
+                assert_eq!(queue.try_dequeue(), Some(0));
+            });
+        assert!(attempt(&mut kernel, &mut cpu, BINDER + 1, false).is_empty());
+        assert_parked_then_resume(&mut kernel, &mut cpu, main);
+    }
+
+    #[test]
+    fn cancel_synchronization_while_parked_is_deferred_like_a_running_thread() {
+        let (mut kernel, mut cpu, main) = setup();
+        assert!(attempt(&mut kernel, &mut cpu, BINDER, false).is_empty());
+        // Not a handle wait: the cancel is recorded for the next wait, the
+        // dequeue itself carries on, as when it polled inside the SVC.
+        assert_eq!(kernel.threads.cancel_synchronization(main), Some(false));
+        assert!(matches!(
+            kernel.threads.threads[&main].state,
+            ThreadState::Sleeping { .. }
+        ));
+        assert_parked_then_resume(&mut kernel, &mut cpu, main);
+        kernel
+            .nvdrv
+            .with_bufferqueue(BINDER, |queue| assert!(queue.cancel(0)));
+        assert_eq!(
+            attempt(&mut kernel, &mut cpu, BINDER, false),
+            expected_reply(Some(0))
+        );
+        assert!(kernel.threads.take_wait_cancelled(main));
+    }
+
+    #[test]
+    fn binder_queue_replaced_while_parked_answers_from_the_new_queue() {
+        let (mut kernel, mut cpu, main) = setup();
+        assert!(attempt(&mut kernel, &mut cpu, BINDER, false).is_empty());
+        assert_parked_then_resume(&mut kernel, &mut cpu, main);
+        // The queue is torn down and recreated with a free slot while the
+        // thread is parked; the re-issue looks the binder up afresh.
+        kernel.nvdrv.bufferqueues.lock().remove(&BINDER);
+        kernel.nvdrv.with_bufferqueue(BINDER, |queue| {
+            queue.set_preallocated(3, nexium_nvdrv::GraphicBuffer::default());
+        });
+        assert_eq!(
+            attempt(&mut kernel, &mut cpu, BINDER, false),
+            expected_reply(Some(3))
+        );
+        assert!(kernel.igbp_dequeue_wait_started.is_empty());
+    }
+}
+
+/// GetInfo memory accounting (types 6, 7, 21, 22): only the npdm main thread
+/// stack counts as application usage (Super Mario Bros. Wonder aborts when
+/// used >= 0x5500000 with 0x444D000 of code), and a 32-bit process must be
+/// told exactly its heap region as free memory.
+#[cfg(all(test, feature = "backend-rustarmic"))]
+mod get_info_memory_tests {
+    use super::{svc_get_info, Kernel};
+    use crate::kernel::cpu_local::set_current_cpu;
+    use nexium_cpu::Cpu;
+    use nexium_memory::AddressSpace;
+    use std::sync::Arc;
+
+    fn kernel(isa: nexium_cpu::GuestIsa) -> Kernel {
+        let mut kernel = Kernel::new(
+            Arc::new(AddressSpace::new()),
+            0x80_0000,
+            0x1000,
+            0x90_0000,
+            0x1000,
+            0xa0_0000,
+            0x100_0000,
+            0xb0_0000,
+            0xb0_1000,
+        );
+        kernel.guest_isa = isa;
+        kernel.is_application = true;
+        kernel
+    }
+
+    fn get_info(kernel: &mut Kernel, cpu: &mut Cpu, info_type: u32) -> u64 {
+        cpu.set_register(1, info_type as u64);
+        cpu.set_register(2, 0xFFFF_8001);
+        cpu.set_register(3, 0);
+        let _guard = set_current_cpu(cpu, 0);
+        assert_eq!(svc_get_info(kernel), 0);
+        cpu.get_register(1)
+    }
+
+    #[test]
+    fn aarch64_usage_is_code_plus_main_stack_plus_heap() {
+        let mut kernel = kernel(nexium_cpu::GuestIsa::AArch64);
+        kernel.code_size = 0x444_D000;
+        kernel.stack_size = 0x10_0000;
+        kernel.system_resource_size = 0x100_0000;
+        kernel.heap_committed = 0;
+        let total = kernel.total_memory;
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        let used = get_info(&mut kernel, &mut cpu, 22);
+        assert_eq!(used, 0x454_D000);
+        assert!(used < 0x550_0000);
+        let total_non_system = get_info(&mut kernel, &mut cpu, 21);
+        assert_eq!(total_non_system - used, total - 0x100_0000 - 0x454_D000);
+        assert_eq!(get_info(&mut kernel, &mut cpu, 6), total);
+        assert_eq!(get_info(&mut kernel, &mut cpu, 7), 0x454_D000 + 0x100_0000);
+    }
+
+    #[test]
+    fn aarch32_free_memory_is_exactly_the_unused_heap_region() {
+        let mut kernel = kernel(nexium_cpu::GuestIsa::AArch32);
+        kernel.code_size = 0x80_0000;
+        kernel.stack_size = 0x8_0000;
+        kernel.system_resource_size = 0x10_0000;
+        kernel.heap_size = 0x8000_0000;
+        kernel.total_memory = kernel.total_memory.max(0x1_0000_0000);
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        for committed in [0u64, 0x20_0000, 0x1000_0000] {
+            kernel.heap_committed = committed;
+            let total = get_info(&mut kernel, &mut cpu, 6);
+            let used = get_info(&mut kernel, &mut cpu, 7);
+            assert_eq!(total - used, 0x8000_0000 - committed, "heap committed {committed:#x}");
+            assert!(get_info(&mut kernel, &mut cpu, 22) <= get_info(&mut kernel, &mut cpu, 21));
+        }
+    }
 }
