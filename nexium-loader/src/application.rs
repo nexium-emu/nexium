@@ -354,6 +354,7 @@ pub struct Application {
     pub application_control: Option<Vec<u8>>,
     pub patch_romfs: Option<LazyRomfs>,
     pub add_on_content: std::collections::BTreeMap<u64, Option<LazyRomfs>>,
+    pub exefs_files: Vec<crate::dump::ExefsFile>,
 }
 
 pub(crate) const MODULE_ORDER: &[&str] = &[
@@ -634,6 +635,7 @@ impl Application {
         allow_missing_code: bool,
     ) -> Result<Self, String> {
         log::info!("selected program NCA base={:#x}", program.nca_base);
+        let exefs_files = crate::dump::exefs_files(&mmap, program);
         let (npdm, modules, total_code_size) = match Self::load_code(&mmap, program) {
             Ok(code) => code,
             Err(error) if allow_missing_code => {
@@ -679,6 +681,7 @@ impl Application {
             application_control: None,
             patch_romfs: None,
             add_on_content: Default::default(),
+            exefs_files,
         })
     }
 

@@ -272,6 +272,7 @@ mod tests {
             application_control: None,
             patch_romfs: None,
             add_on_content: Default::default(),
+            exefs_files: Vec::new(),
             title_id: 0x0100_0000_0000_00ab,
         }
     }

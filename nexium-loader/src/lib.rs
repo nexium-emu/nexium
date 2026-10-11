@@ -5,6 +5,7 @@ pub mod cnmt;
 pub mod container;
 pub mod control;
 pub mod content;
+pub mod dump;
 pub mod env;
 pub mod firmware;
 pub mod layered;
