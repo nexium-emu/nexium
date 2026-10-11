@@ -423,3 +423,170 @@ fn application_metadata_and_file_reads_include_layered_mods() {
     drop(kernel);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+mod off_lock_reads {
+    use super::*;
+    use crate::kernel::cpu_local::set_current_cpu;
+    use crate::kernel::threads::ThreadState;
+    use nexium_cpu::Cpu;
+    use std::time::{Duration, Instant};
+
+    const CODE: u64 = 0x4000_0000;
+    const BIG: u64 = BASE + 0x40_0000;
+    const SIZE: usize = 3 << 20;
+
+    fn setup() -> (Kernel, Cpu, u32, Vec<u8>) {
+        let kernel = kernel();
+        kernel.address_space.map(CODE, 0x1000, Perm::RX, "code").unwrap();
+        kernel
+            .address_space
+            .write(CODE, &super::super::super::SVC_SEND_SYNC_REQUEST_INSN.to_le_bytes())
+            .unwrap();
+        kernel.address_space.map(BIG, SIZE as u64 + 0x10000, Perm::RW, "big").unwrap();
+        let data: Vec<u8> = (0..SIZE + 0x8000)
+            .map(|i| (i as u32).wrapping_mul(0x9e37_79b9).rotate_left(i as u32 % 13) as u8)
+            .collect();
+        let main = kernel.threads.current[0].unwrap();
+        (kernel, Cpu::new_rustarmic().unwrap(), main, data)
+    }
+
+    fn storage_read(offset: u64, size: usize) -> IpcCtx {
+        let mut payload = vec![0; 16];
+        payload[..8].copy_from_slice(&offset.to_le_bytes());
+        payload[8..].copy_from_slice(&(size as u64).to_le_bytes());
+        let mut ctx = request(0, &payload);
+        ctx.recv_buffers.push(IpcBuffer { addr: BIG, size: size as u64, mode: 0 });
+        ctx
+    }
+
+    fn file_read(offset: u64, size: usize) -> IpcCtx {
+        let mut payload = vec![0; 24];
+        payload[8..16].copy_from_slice(&offset.to_le_bytes());
+        payload[16..].copy_from_slice(&(size as u64).to_le_bytes());
+        let mut ctx = request(0, &payload);
+        ctx.recv_buffers.push(IpcBuffer { addr: BIG, size: size as u64, mode: 0 });
+        ctx
+    }
+
+    /// One svcSendSyncRequest as the guest issues it (pc just past the svc).
+    fn attempt(kernel: &mut Kernel, cpu: &mut Cpu, issue: &dyn Fn(&mut Kernel) -> Vec<u8>) -> Vec<u8> {
+        cpu.set_pc(CODE + 4);
+        let _guard = set_current_cpu(cpu, 0);
+        issue(kernel)
+    }
+
+    /// Asserts the thread is parked on its svc and resumes it the way the
+    /// scheduler does once the retry interval has passed.
+    fn resume(kernel: &mut Kernel, cpu: &mut Cpu, main: u32) {
+        assert!(std::mem::take(&mut kernel.ipc_retry_pending));
+        assert_eq!(kernel.threads.current[0], None);
+        let thread = &kernel.threads.threads[&main];
+        assert!(matches!(thread.state, ThreadState::Sleeping { .. }), "{:?}", thread.state);
+        assert_eq!(thread.ctx.pc, CODE);
+        let _guard = set_current_cpu(cpu, 0);
+        kernel.threads.wake_due_sleepers(Instant::now() + Duration::from_millis(5));
+        assert_eq!(kernel.threads.pick_next(), Some(main));
+        kernel.threads.schedule_to(main, cpu);
+        assert_eq!(cpu.get_pc(), CODE);
+    }
+
+    /// Re-issues a parked request until it is answered; returns the reply
+    /// and how many times the thread was parked.
+    fn complete(
+        kernel: &mut Kernel,
+        cpu: &mut Cpu,
+        main: u32,
+        issue: &dyn Fn(&mut Kernel) -> Vec<u8>,
+    ) -> (Vec<u8>, usize) {
+        let mut parked = 0;
+        loop {
+            let reply = attempt(kernel, cpu, issue);
+            if !reply.is_empty() {
+                assert!(!kernel.ipc_retry_pending);
+                assert_eq!(kernel.threads.current[0], Some(main));
+                return (reply, parked);
+            }
+            parked += 1;
+            assert!(parked < 5000, "the off-lock read never finished");
+            resume(kernel, cpu, main);
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    fn guest(kernel: &Kernel, size: usize) -> Vec<u8> {
+        let mut bytes = vec![0; size];
+        kernel.address_space.read(BIG, &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn large_storage_reads_park_the_thread_and_reply_exactly_like_inline_reads() {
+        let (mut kernel, mut cpu, main, data) = setup();
+        kernel.application_romfs = Some(AppRomfs::Plain(storage(&data)));
+        let (offset, size) = (0x1235u64, SIZE - 0x77);
+        let issue = |kernel: &mut Kernel| {
+            dispatch_storage(kernel, &mut storage_read(offset, size), "IFsStorage", 0).unwrap()
+        };
+        let (reply, parked) = complete(&mut kernel, &mut cpu, main, &issue);
+        assert!(parked >= 1, "a {size:#x}-byte read must leave the kernel lock");
+        assert_eq!(result(&reply), 0);
+        assert_eq!(guest(&kernel, size), &data[offset as usize..offset as usize + size]);
+
+        kernel.address_space.write(BIG, &vec![0; size]).unwrap();
+        let inline = issue(&mut kernel);
+        assert!(!kernel.ipc_retry_pending, "without a guest CPU the read runs inline");
+        assert_eq!(inline, reply);
+        assert_eq!(guest(&kernel, size), &data[offset as usize..offset as usize + size]);
+    }
+
+    #[test]
+    fn small_reads_stay_under_the_lock_and_a_changed_request_drops_the_stale_one() {
+        let (mut kernel, mut cpu, main, data) = setup();
+        kernel.application_romfs = Some(AppRomfs::Plain(storage(&data)));
+        let small = |kernel: &mut Kernel| {
+            dispatch_storage(kernel, &mut storage_read(0x10, 0x4000), "IFsStorage", 0).unwrap()
+        };
+        let reply = attempt(&mut kernel, &mut cpu, &small);
+        assert_eq!(result(&reply), 0);
+        assert!(!kernel.ipc_retry_pending);
+        assert_eq!(guest(&kernel, 0x4000), &data[0x10..0x4010]);
+
+        let first = |kernel: &mut Kernel| {
+            dispatch_storage(kernel, &mut storage_read(0, SIZE), "IFsStorage", 0).unwrap()
+        };
+        assert!(attempt(&mut kernel, &mut cpu, &first).is_empty());
+        resume(&mut kernel, &mut cpu, main);
+        let second = |kernel: &mut Kernel| {
+            dispatch_storage(kernel, &mut storage_read(0x2000, SIZE), "IFsStorage", 0).unwrap()
+        };
+        let (reply, _) = complete(&mut kernel, &mut cpu, main, &second);
+        assert_eq!(result(&reply), 0);
+        assert_eq!(guest(&kernel, SIZE), &data[0x2000..0x2000 + SIZE]);
+    }
+
+    #[test]
+    fn large_file_and_data_archive_reads_also_leave_the_lock() {
+        let (mut kernel, mut cpu, main, data) = setup();
+        kernel.application_romfs = Some(AppRomfs::Plain(storage(&data)));
+        let (base, length) = (0x300u64, (SIZE + 0x100) as u64);
+        let port = format!("IFileApplication:{base:x}:{length:x}");
+        let file = |kernel: &mut Kernel| {
+            dispatch_file_system(kernel, &mut file_read(0x40, SIZE), 0, &port, 0).unwrap()
+        };
+        let (reply, parked) = complete(&mut kernel, &mut cpu, main, &file);
+        assert!(parked >= 1);
+        assert_eq!(result(&reply), 0);
+        assert_eq!(&output(&reply)[..8], &(SIZE as u64).to_le_bytes());
+        assert_eq!(guest(&kernel, SIZE), &data[0x340..0x340 + SIZE]);
+
+        kernel.add_on_content.insert(TITLE + 0x1001, Some(storage(&data[0x5000..])));
+        let port = format!("IFsStorageData:{:016x}", TITLE + 0x1001);
+        let archive = |kernel: &mut Kernel| {
+            dispatch_storage(kernel, &mut storage_read(7, SIZE), &port, 0).unwrap()
+        };
+        let (reply, parked) = complete(&mut kernel, &mut cpu, main, &archive);
+        assert!(parked >= 1);
+        assert_eq!(result(&reply), 0);
+        assert_eq!(guest(&kernel, SIZE), &data[0x5007..0x5007 + SIZE]);
+    }
+}

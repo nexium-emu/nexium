@@ -66,10 +66,13 @@ pub struct LazyRomfs {
     patched: Option<Arc<crate::bktr::PatchedRomfs>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct CompressedRomfs {
-    entries: Vec<CompressionEntry>,
+    entries: Arc<[CompressionEntry]>,
     virtual_size: u64,
+    /// Identifies this storage's blocks in `cache`.
+    id: u64,
+    cache: Arc<crate::block_cache::BlockCache>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -106,14 +109,25 @@ impl LazyRomfs {
 
     pub fn read(&self, offset: u64, size: usize) -> Result<Vec<u8>, String> {
         let available = self.len().saturating_sub(offset).min(size as u64) as usize;
+        let mut output = vec![0; available];
+        self.read_into(offset, &mut output)?;
+        Ok(output)
+    }
+
+    /// Reads up to `out.len()` bytes at `offset` straight into `out` and
+    /// returns how many bytes the storage had there (fewer near its end).
+    /// Bytes of `out` past that count are left untouched.
+    pub fn read_into(&self, offset: u64, out: &mut [u8]) -> Result<usize, String> {
+        let available = self.len().saturating_sub(offset).min(out.len() as u64) as usize;
+        let output = &mut out[..available];
         if available == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
         let Some(storage) = &self.compressed else {
-            return self.read_raw(offset, available);
+            self.read_raw_into(offset, output)?;
+            return Ok(available);
         };
 
-        let mut output = vec![0; available];
         let mut done = 0usize;
         while done < available {
             let position = offset + done as u64;
@@ -135,47 +149,117 @@ impl LazyRomfs {
             let take = available
                 .saturating_sub(done)
                 .min((entry_end - position) as usize);
+            let destination = &mut output[done..done + take];
             match entry.compression_type {
                 0 => {
                     let physical = entry.physical_offset.checked_add(within as u64)
                         .ok_or("physical read overflow")?;
-                    output[done..done + take].copy_from_slice(&self.read_raw(physical, take)?);
+                    self.read_raw_into(physical, destination)?;
                 }
-                1 => {}
+                1 => destination.fill(0),
                 3 => {
-                    let compressed = self.read_raw(entry.physical_offset, entry.physical_size as usize)?;
-                    let virtual_size = usize::try_from(entry_end - entry.virtual_offset)
+                    let block_size = usize::try_from(entry_end - entry.virtual_offset)
                         .map_err(|_| "virtual extent too large")?;
-                    let block = lz4_flex::block::decompress(
-                        &compressed,
-                        virtual_size,
-                    )
-                    .map_err(|err| {
-                        format!("compressed RomFS LZ4 decode at {position:#x}: {err}")
-                    })?;
-                    if block.len() != virtual_size {
-                        return Err("compressed RomFS block has an unexpected decoded size".into());
-                    }
-                    output[done..done + take].copy_from_slice(&block[within..within + take]);
+                    self.read_lz4_block(storage, index, block_size, within, destination, position)?;
                 }
                 kind => return Err(format!("unsupported RomFS compression type {kind}")),
             }
             done += take;
         }
-        Ok(output)
+        Ok(available)
     }
 
-    fn read_raw(&self, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+    /// Fills `destination` from LZ4 block `index` starting `within` bytes into
+    /// its decoded form. A read of the whole block decodes straight into
+    /// `destination`; a partial read decodes the block once into the shared
+    /// cache so the following reads of the same block (small sequential
+    /// reads, re-reads of a file header) are a copy.
+    fn read_lz4_block(
+        &self,
+        storage: &CompressedRomfs,
+        index: usize,
+        block_size: usize,
+        within: usize,
+        destination: &mut [u8],
+        position: u64,
+    ) -> Result<(), String> {
+        let key = (storage.id, index);
+        if let Some(block) = storage.cache.get(key) {
+            if block.len() != block_size {
+                return Err("compressed RomFS block has an unexpected decoded size".into());
+            }
+            destination.copy_from_slice(&block[within..within + destination.len()]);
+            return Ok(());
+        }
+        let entry = storage.entries[index];
+        let mut scratch = Vec::new();
+        let compressed = self.raw_bytes(entry.physical_offset, entry.physical_size as usize, &mut scratch)?;
+        let decode = |target: &mut [u8]| match lz4_flex::block::decompress_into(compressed, target) {
+            Ok(decoded) if decoded == target.len() => Ok(()),
+            Ok(_) => Err("compressed RomFS block has an unexpected decoded size".to_string()),
+            Err(err) => Err(format!("compressed RomFS LZ4 decode at {position:#x}: {err}")),
+        };
+        if within == 0 && destination.len() == block_size {
+            return decode(destination);
+        }
+        let mut block = vec![0; block_size];
+        decode(&mut block)?;
+        destination.copy_from_slice(&block[within..within + destination.len()]);
+        storage.cache.insert(key, block.into());
+        Ok(())
+    }
+
+    /// Physical bytes at `offset`: borrowed from the mapping when the storage
+    /// is a plain file range, otherwise read into `scratch`.
+    fn raw_bytes<'a>(&'a self, offset: u64, size: usize, scratch: &'a mut Vec<u8>) -> Result<&'a [u8], String> {
+        if self.patched.is_some() {
+            scratch.resize(size, 0);
+            self.read_raw_into(offset, scratch)?;
+            return Ok(scratch);
+        }
+        let range = self.raw_range(offset, size)?;
+        self.mmap.get(range).ok_or_else(|| "RomFS storage is truncated".into())
+    }
+
+    fn raw_range(&self, offset: u64, size: usize) -> Result<Range<usize>, String> {
         if offset.checked_add(size as u64).is_none_or(|end| end > self.range.len() as u64) {
             return Err("RomFS physical read exceeds its storage".into());
-        }
-        if let Some(patched) = &self.patched {
-            return patched.read(offset, size);
         }
         let start = self.range.start.checked_add(usize::try_from(offset).map_err(|_| "RomFS offset overflow")?)
             .ok_or("RomFS offset overflow")?;
         let end = start.checked_add(size).ok_or("RomFS read overflow")?;
-        self.mmap.get(start..end).map(|bytes| bytes.to_vec()).ok_or_else(|| "RomFS storage is truncated".into())
+        Ok(start..end)
+    }
+
+    fn read_raw(&self, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+        let mut output = vec![0; size];
+        self.read_raw_into(offset, &mut output)?;
+        Ok(output)
+    }
+
+    fn read_raw_into(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
+        let range = self.raw_range(offset, out.len())?;
+        if let Some(patched) = &self.patched {
+            return patched.read_into(offset, out);
+        }
+        let bytes = self.mmap.get(range).ok_or("RomFS storage is truncated")?;
+        out.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Statistics of the decoded-block cache this storage uses, if it is
+    /// compressed.
+    pub fn block_cache_stats(&self) -> Option<crate::block_cache::BlockCacheStats> {
+        self.compressed.as_ref().map(|storage| storage.cache.stats())
+    }
+
+    /// Points this storage (and clones made from it afterwards) at `cache`
+    /// instead of the process-wide one, under a fresh cache identity.
+    pub fn use_block_cache(&mut self, cache: Arc<crate::block_cache::BlockCache>) {
+        if let Some(storage) = &mut self.compressed {
+            storage.cache = cache;
+            storage.id = crate::block_cache::next_storage_id();
+        }
     }
 
     pub fn from_range(mmap: Arc<Mmap>, range: Range<usize>) -> Result<Self, String> {
@@ -329,8 +413,10 @@ impl CompressedRomfs {
             storage.range.len()
         );
         Ok(Self {
-            entries,
+            entries: entries.into(),
             virtual_size,
+            id: crate::block_cache::next_storage_id(),
+            cache: crate::block_cache::BlockCache::global(),
         })
     }
 }

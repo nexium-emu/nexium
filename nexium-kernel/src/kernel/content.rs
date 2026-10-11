@@ -133,7 +133,206 @@ enum Storage<'a> {
     Bytes(&'a [u8]),
 }
 
-impl Storage<'_> {
+/// An owned handle on a storage that can be read without the kernel: the
+/// loader storages are immutable and share their mappings and caches.
+#[derive(Clone)]
+enum SharedStorage {
+    Application(AppRomfs),
+    Archive(LazyRomfs),
+}
+
+impl SharedStorage {
+    fn read_exact(&self, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+        let mut bytes = off_lock::buffer(size);
+        let got = match self {
+            Self::Application(storage) => storage.read_into(offset, &mut bytes)?,
+            Self::Archive(storage) => storage.read_into(offset, &mut bytes)?,
+        };
+        bytes.truncate(got);
+        Ok(bytes)
+    }
+}
+
+/// Large RomFS reads (file data is mmapped, possibly decompressed, and
+/// copied out) can take tens of milliseconds. Holding the global kernel lock
+/// that long stalls every other core and vsync, so a read of at least
+/// `off_lock_read_min()` bytes runs on a worker thread while the requesting
+/// guest thread is parked on its `svcSendSyncRequest`, exactly like a
+/// DequeueBuffer or GPU-drain retry. The re-issued request (same thread, same
+/// request) collects the bytes and copies them into guest memory under the
+/// lock, so the guest sees the same reply and the same buffer contents, only
+/// later. Without a guest thread to park (tests, host calls) reads run inline.
+mod off_lock {
+    use super::super::{rewind_svc_for_retry_after, IPC_RETRY_INTERVAL};
+    use super::{Kernel, SharedStorage};
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const DEFAULT_MIN_KIB: usize = 1024;
+    const ABANDONED_AFTER: Duration = Duration::from_secs(30);
+
+    /// `NEXIUM_FS_OFFLOCK_READ_KIB`: reads of at least this many KiB run off
+    /// the kernel lock (default 1024; 0 or "off" keeps every read inline).
+    pub(super) fn min_size() -> Option<usize> {
+        static MIN: OnceLock<Option<usize>> = OnceLock::new();
+        *MIN.get_or_init(|| {
+            match std::env::var("NEXIUM_FS_OFFLOCK_READ_KIB").ok().as_deref().map(str::trim) {
+                None | Some("") => Some(DEFAULT_MIN_KIB << 10),
+                Some("off") | Some("0") => None,
+                Some(value) => Some(value.parse::<usize>().map_or(DEFAULT_MIN_KIB, |kib| kib.max(1)) << 10),
+            }
+        })
+    }
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub(super) struct Request {
+        pub port: String,
+        pub offset: u64,
+        pub size: usize,
+        pub target: u64,
+    }
+
+    type Slot = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
+
+    struct Pending {
+        request: Request,
+        result: Slot,
+        started: Instant,
+    }
+
+    /// In-flight reads keyed by (kernel, guest thread).
+    fn pending() -> &'static Mutex<HashMap<(usize, u32), Pending>> {
+        static PENDING: OnceLock<Mutex<HashMap<(usize, u32), Pending>>> = OnceLock::new();
+        PENDING.get_or_init(Default::default)
+    }
+
+    /// Off-lock read buffers are recycled so a large read neither faults in
+    /// a fresh allocation on the worker nor unmaps one under the kernel lock.
+    const POOL_BYTES: usize = 64 << 20;
+    const POOL_BUFFERS: usize = 4;
+
+    fn pool() -> &'static Mutex<Vec<Vec<u8>>> {
+        static POOL: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+        POOL.get_or_init(Default::default)
+    }
+
+    /// A `size`-byte buffer whose contents are unspecified.
+    pub(super) fn buffer(size: usize) -> Vec<u8> {
+        let reused = {
+            let mut pool = pool().lock();
+            pool.iter()
+                .position(|buffer| buffer.capacity() >= size && buffer.capacity() / 2 <= size)
+                .map(|index| pool.swap_remove(index))
+        };
+        let mut buffer = reused.unwrap_or_default();
+        if buffer.len() >= size {
+            buffer.truncate(size);
+        } else {
+            buffer.resize(size, 0);
+        }
+        buffer
+    }
+
+    /// Returns a large owned read buffer to the pool once the guest has its
+    /// bytes.
+    pub(super) fn recycle(bytes: std::borrow::Cow<'_, [u8]>) {
+        let std::borrow::Cow::Owned(buffer) = bytes else { return };
+        if min_size().is_none_or(|min| buffer.capacity() < min) {
+            return;
+        }
+        let mut pool = pool().lock();
+        let pooled: usize = pool.iter().map(Vec::capacity).sum();
+        if pool.len() < POOL_BUFFERS && pooled + buffer.capacity() <= POOL_BYTES {
+            pool.push(buffer);
+        }
+    }
+
+    pub(super) enum Outcome {
+        /// The bytes are here; reply now.
+        Ready(Result<Vec<u8>, String>),
+        /// The thread is parked and will re-issue the request.
+        Retry,
+        /// Read inline under the lock.
+        Inline,
+    }
+
+    pub(super) fn read(
+        kernel: &mut Kernel,
+        request: Request,
+        storage: impl FnOnce(&Kernel) -> Option<SharedStorage>,
+    ) -> Outcome {
+        let Some(min) = min_size() else {
+            return Outcome::Inline;
+        };
+        let Some(thread) = kernel.threads.current_handle() else {
+            return Outcome::Inline;
+        };
+        let key = (Arc::as_ptr(&kernel.address_space) as *const () as usize, thread);
+        let in_flight = {
+            let mut pending = pending().lock();
+            match pending.get(&key) {
+                Some(entry) if entry.request == request => {
+                    let ready = entry.result.lock().take();
+                    if let Some(result) = ready {
+                        pending.remove(&key);
+                        return Outcome::Ready(result);
+                    }
+                    Some(entry.result.clone())
+                }
+                Some(_) => {
+                    pending.remove(&key);
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(slot) = in_flight {
+            if rewind_svc_for_retry_after(kernel, IPC_RETRY_INTERVAL) {
+                return Outcome::Retry;
+            }
+            pending().lock().remove(&key);
+            loop {
+                if let Some(result) = slot.lock().take() {
+                    return Outcome::Ready(result);
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+        if request.size < min {
+            return Outcome::Inline;
+        }
+        let Some(storage) = storage(kernel) else {
+            return Outcome::Inline;
+        };
+        if !rewind_svc_for_retry_after(kernel, IPC_RETRY_INTERVAL) {
+            return Outcome::Inline;
+        }
+        let slot: Slot = Arc::new(Mutex::new(None));
+        let (offset, size, worker_slot) = (request.offset, request.size, slot.clone());
+        let fallback = storage.clone();
+        let spawned = std::thread::Builder::new()
+            .name("nexium-fs-read".into())
+            .spawn(move || {
+                let result = storage.read_exact(offset, size);
+                *worker_slot.lock() = Some(result);
+            });
+        if let Err(error) = spawned {
+            log::warn!("fs: could not start an off-lock read ({error}); reading under the kernel lock");
+            *slot.lock() = Some(fallback.read_exact(offset, size));
+        }
+        let mut pending = pending().lock();
+        let now = Instant::now();
+        pending.retain(|_, entry| {
+            now.duration_since(entry.started) < ABANDONED_AFTER || entry.result.lock().is_none()
+        });
+        pending.insert(key, Pending { request, result: slot, started: now });
+        Outcome::Retry
+    }
+}
+
+impl<'a> Storage<'a> {
     fn len(&self) -> u64 {
         match self {
             Self::Application(storage) => storage.len(),
@@ -142,7 +341,15 @@ impl Storage<'_> {
         }
     }
 
-    fn read(&self, offset: u64, size: usize) -> Result<Cow<'_, [u8]>, String> {
+    fn shared(&self) -> Option<SharedStorage> {
+        match self {
+            Self::Application(storage) => Some(SharedStorage::Application((*storage).clone())),
+            Self::Archive(storage) => Some(SharedStorage::Archive((*storage).clone())),
+            Self::Bytes(_) => None,
+        }
+    }
+
+    fn read(&self, offset: u64, size: usize) -> Result<Cow<'a, [u8]>, String> {
         match self {
             Self::Application(storage) => storage.read(offset, size).map(Cow::Owned),
             Self::Archive(storage) => storage.read(offset, size).map(Cow::Owned),
@@ -405,7 +612,14 @@ pub(super) fn dispatch_file_system(
                 let Ok(count) = usize::try_from(count) else {
                     return Some(build_ipc_response(ctx, INVALID_INPUT, &[], &[]));
                 };
-                let Ok(bytes) = read_application(kernel, start, count) else {
+                let read = match read_off_lock(kernel, port_name, start, count, target.addr, |kernel| {
+                    application_storage(kernel).shared()
+                }) {
+                    off_lock::Outcome::Retry => return Some(Vec::new()),
+                    off_lock::Outcome::Ready(result) => result.map(Cow::Owned),
+                    off_lock::Outcome::Inline => read_application(kernel, start, count),
+                };
+                let Ok(bytes) = read else {
                     return Some(build_ipc_response(ctx, INVALID_INPUT, &[], &[]));
                 };
                 if !bytes.is_empty()
@@ -416,7 +630,9 @@ pub(super) fn dispatch_file_system(
                 {
                     return Some(build_ipc_response(ctx, INVALID_INPUT, &[], &[]));
                 }
-                build_ipc_response(ctx, 0, &(bytes.len() as u64).to_le_bytes(), &[])
+                let read = bytes.len() as u64;
+                off_lock::recycle(bytes);
+                build_ipc_response(ctx, 0, &read.to_le_bytes(), &[])
             }
             2 => build_ipc_response(ctx, 0, &[], &[]),
             4 => build_ipc_response(ctx, 0, &length.to_le_bytes(), &[]),
@@ -484,20 +700,11 @@ pub(super) fn dispatch_file_system(
     Some(result)
 }
 
-pub(super) fn dispatch_storage(
-    kernel: &mut Kernel,
-    ctx: &mut ipc::IpcCtx,
-    port_name: &str,
-    command: u32,
-) -> Option<Vec<u8>> {
-    let storage = if port_name == "IFsStorage" {
-        Some(
-            kernel
-                .application_romfs
-                .as_ref()
-                .map(Storage::Application)
-                .unwrap_or_else(|| Storage::Bytes(kernel.nro_romfs())),
-        )
+/// The storage behind an IFsStorage port: None when `port_name` is not a
+/// storage, Some(None) when its content is missing.
+fn storage_for<'a>(kernel: &'a Kernel, port_name: &str) -> Option<Option<Storage<'a>>> {
+    Some(if port_name == "IFsStorage" {
+        Some(application_storage(kernel))
     } else if port_name == "IFsStoragePatch" {
         kernel.patch_romfs.as_ref().map(Storage::Archive)
     } else if let Some(title_id) = port_name.strip_prefix("IFsStorageData:") {
@@ -506,7 +713,36 @@ pub(super) fn dispatch_storage(
             .and_then(|title_id| data_storage(kernel, title_id))
     } else {
         return None;
-    };
+    })
+}
+
+/// Fetches `size` bytes at `offset` for a read into guest `target` off the
+/// kernel lock when the read is large (see `off_lock`). `Retry` means the
+/// thread was parked to re-issue the request (`ipc_retry_pending` is set and
+/// the caller returns an empty response); `Inline` means read it in place.
+fn read_off_lock(
+    kernel: &mut Kernel,
+    port_name: &str,
+    offset: u64,
+    size: usize,
+    target: u64,
+    storage: impl FnOnce(&Kernel) -> Option<SharedStorage>,
+) -> off_lock::Outcome {
+    let request = off_lock::Request { port: port_name.to_string(), offset, size, target };
+    let outcome = off_lock::read(kernel, request, storage);
+    if matches!(outcome, off_lock::Outcome::Retry) {
+        kernel.ipc_retry_pending = true;
+    }
+    outcome
+}
+
+pub(super) fn dispatch_storage(
+    kernel: &mut Kernel,
+    ctx: &mut ipc::IpcCtx,
+    port_name: &str,
+    command: u32,
+) -> Option<Vec<u8>> {
+    let storage = storage_for(kernel, port_name)?;
     let Some(storage) = storage else {
         return Some(build_ipc_response(ctx, CONTENT_NOT_FOUND, &[], &[]));
     };
@@ -548,7 +784,16 @@ pub(super) fn dispatch_storage(
             let Ok(amount) = usize::try_from(size) else {
                 return Some(build_ipc_response(ctx, INVALID_INPUT, &[], &[]));
             };
-            let bytes = match storage.read(offset, amount) {
+            let read = match read_off_lock(kernel, port_name, offset, amount, target.addr, |kernel| {
+                storage_for(kernel, port_name).flatten().and_then(|storage| storage.shared())
+            }) {
+                off_lock::Outcome::Retry => return Some(Vec::new()),
+                off_lock::Outcome::Ready(result) => result.map(Cow::Owned),
+                off_lock::Outcome::Inline => storage_for(kernel, port_name)
+                    .flatten()
+                    .map_or_else(|| Err("storage is no longer mounted".into()), |storage| storage.read(offset, amount)),
+            };
+            let bytes = match read {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     log::error!("{port_name}.Read failed: {error}");
@@ -587,6 +832,7 @@ pub(super) fn dispatch_storage(
                 size,
                 bytes.len() as u64,
             );
+            off_lock::recycle(bytes);
             Some(build_ipc_response(ctx, 0, &[], &[]))
         }
         2 => Some(build_ipc_response(ctx, 0, &[], &[])),

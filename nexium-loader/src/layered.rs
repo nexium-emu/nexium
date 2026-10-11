@@ -28,6 +28,15 @@ impl AppRomfs {
             AppRomfs::Layered(romfs) => romfs.read(offset, size),
         }
     }
+
+    /// Reads up to `out.len()` bytes at `offset` straight into `out`; see
+    /// [`LazyRomfs::read_into`].
+    pub fn read_into(&self, offset: u64, out: &mut [u8]) -> Result<usize, String> {
+        match self {
+            AppRomfs::Plain(romfs) => romfs.read_into(offset, out),
+            AppRomfs::Layered(romfs) => romfs.read_into(offset, out),
+        }
+    }
 }
 
 enum ExtentSource {
@@ -520,14 +529,26 @@ impl LayeredRomfs {
     pub fn read(&self, offset: u64, size: usize) -> Result<Vec<u8>, String> {
         let available = self.total_len.saturating_sub(offset).min(size as u64) as usize;
         let mut out = vec![0u8; available];
+        self.read_into(offset, &mut out)?;
+        Ok(out)
+    }
+
+    /// Reads up to `out.len()` bytes at `offset` straight into `out` and
+    /// returns how many bytes the image had there. Gaps between extents read
+    /// as zero.
+    pub fn read_into(&self, offset: u64, out: &mut [u8]) -> Result<usize, String> {
+        let available = self.total_len.saturating_sub(offset).min(out.len() as u64) as usize;
+        let out = &mut out[..available];
         if available == 0 {
-            return Ok(out);
+            return Ok(0);
         }
 
+        let mut filled = 0usize;
         if offset < self.meta.len() as u64 {
             let meta_start = offset as usize;
             let take = (self.meta.len() - meta_start).min(available);
             out[..take].copy_from_slice(&self.meta[meta_start..meta_start + take]);
+            filled = take;
         }
 
         let end = offset + available as u64;
@@ -544,23 +565,28 @@ impl LayeredRomfs {
             let out_off = (seg_start - offset) as usize;
             let within = seg_start - extent.start;
             let take = (seg_end - seg_start) as usize;
+            if out_off > filled {
+                out[filled..out_off].fill(0);
+            }
+            let segment = &mut out[out_off..out_off + take];
             match &extent.source {
                 ExtentSource::Base { offset: base_off } => {
                     let base = self
                         .base
                         .as_ref()
                         .ok_or("layered romfs base extent without base image")?;
-                    let bytes = base.read(base_off + within, take)?;
-                    let got = bytes.len().min(take);
-                    out[out_off..out_off + got].copy_from_slice(&bytes[..got]);
+                    let got = base.read_into(base_off + within, segment)?;
+                    segment[got..].fill(0);
                 }
                 ExtentSource::Host { index: host_index } => {
-                    self.read_host(*host_index, within, &mut out[out_off..out_off + take])?;
+                    self.read_host(*host_index, within, segment)?;
                 }
             }
+            filled = filled.max(out_off + take);
             index += 1;
         }
-        Ok(out)
+        out[filled..].fill(0);
+        Ok(available)
     }
 }
 
@@ -673,5 +699,40 @@ mod tests {
         assert_eq!(parsed, b"inner-data-longer");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_into_a_dirty_buffer_matches_read_over_base_and_host_extents() {
+        let root = std::env::temp_dir().join(format!("nexium-layered-into-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("base/dir")).unwrap();
+        std::fs::create_dir_all(root.join("mod/dir")).unwrap();
+        std::fs::write(root.join("base/a.bin"), vec![0x11; 37]).unwrap();
+        std::fs::write(root.join("base/dir/b.bin"), (0..=255u8).cycle().take(5000).collect::<Vec<_>>()).unwrap();
+        std::fs::write(root.join("base/dir/c.bin"), b"replace me").unwrap();
+        std::fs::write(root.join("mod/dir/c.bin"), b"replaced by the overlay").unwrap();
+        std::fs::write(root.join("mod/new.bin"), vec![0x77; 19]).unwrap();
+
+        let image = LayeredRomfs::build(None, &root.join("base")).unwrap();
+        let image = image.read(0, image.len() as usize).unwrap();
+        let mut mmap = memmap2::MmapMut::map_anon(image.len()).unwrap();
+        mmap.copy_from_slice(&image);
+        let base = LazyRomfs::from_range(Arc::new(mmap.make_read_only().unwrap()), 0..image.len()).unwrap();
+        let layered = LayeredRomfs::build(Some(&base), &root.join("mod")).unwrap();
+        let whole = layered.read(0, layered.len() as usize).unwrap();
+        let app = AppRomfs::Layered(Arc::new(layered));
+        let len = whole.len();
+        for offset in (0..len + 8).step_by(7) {
+            for size in [0, 1, 15, 16, 17, 300, 4096, len] {
+                let mut out = vec![0xee; size];
+                let got = app.read_into(offset as u64, &mut out).unwrap();
+                let start = offset.min(len);
+                let want = &whole[start..(start + size).min(len)];
+                assert_eq!(&out[..got], want, "{offset:#x}+{size:#x}");
+                assert!(out[got..].iter().all(|byte| *byte == 0xee));
+                assert_eq!(app.read(offset as u64, size).unwrap(), want);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

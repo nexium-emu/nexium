@@ -184,7 +184,10 @@ impl PatchedRomfs {
         })
     }
 
-    pub(crate) fn read(&self, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+    /// Fills all of `out` from the update filesystem at `offset`, copying each
+    /// extent straight from its source mapping.
+    pub(crate) fn read_into(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
+        let size = out.len();
         if offset
             .checked_add(size as u64)
             .is_none_or(|end| end > self.data_size)
@@ -192,8 +195,8 @@ impl PatchedRomfs {
             return Err("update filesystem read is out of bounds".into());
         }
         let mut position = self.data_offset + offset;
-        let mut output = Vec::with_capacity(size);
-        while output.len() < size {
+        let mut done = 0;
+        while done < size {
             let index = self
                 .entries
                 .partition_point(|entry| entry.offset <= position)
@@ -204,13 +207,14 @@ impl PatchedRomfs {
                 .entries
                 .get(index + 1)
                 .map_or(self.virtual_size, |next| next.offset);
-            let take = (size - output.len()).min((end - position) as usize);
+            let take = (size - done).min((end - position) as usize);
             let source = &self.sources[entry.source];
             let physical = source.range.start + (entry.physical + position - entry.offset) as usize;
-            output.extend_from_slice(&source.mmap[physical..physical + take]);
+            out[done..done + take].copy_from_slice(&source.mmap[physical..physical + take]);
+            done += take;
             position += take as u64;
         }
-        Ok(output)
+        Ok(())
     }
 }
 
@@ -529,5 +533,194 @@ mod tests {
         put64(&mut fixture.base, table + 8, decoded.len() as u64 + 1);
         put64(&mut fixture.base, table + 0x4008, decoded.len() as u64 + 1);
         assert!(fixture.open().unwrap().read(0, decoded.len() + 1).is_err());
+    }
+
+    /// A plain (unpatched) compressed RomFS of many extents mixing LZ4 (3),
+    /// stored (0) and zero-fill (1) blocks of uneven sizes. Returns the image,
+    /// its section and the decoded bytes every read must reproduce.
+    fn multi_block_fixture() -> (Vec<u8>, NcaFsSection, Vec<u8>) {
+        let mut decoded = Vec::new();
+        let mut extents = Vec::new();
+        for block in 0..40usize {
+            let size = 0x800 + (block * 0x3d1) % 0x2c00;
+            let kind = [3u8, 3, 0, 3, 1, 3][block % 6];
+            let start = decoded.len();
+            if kind == 1 {
+                decoded.resize(start + size, 0);
+            } else {
+                decoded.extend((0..size).map(|i| {
+                    let word = (i / 7) as u32 ^ (block as u32).wrapping_mul(0x9e37_79b9);
+                    (word.rotate_left((i % 5) as u32) >> 3) as u8
+                }));
+            }
+            extents.push((start, size, kind));
+        }
+        let leaf = 0x40;
+        let mut data = vec![0u8; leaf];
+        let mut entries = Vec::new();
+        for &(start, size, kind) in &extents {
+            let physical = data.len() - leaf;
+            let stored = match kind {
+                3 => lz4_flex::block::compress(&decoded[start..start + size]),
+                0 => decoded[start..start + size].to_vec(),
+                _ => Vec::new(),
+            };
+            data.extend_from_slice(&stored);
+            entries.push((start as u64, physical as u64, kind, stored.len() as u32));
+        }
+        let table = (data.len() - leaf).div_ceil(0x200) * 0x200;
+        data.resize(leaf + table + 0x8000, 0);
+        let at = leaf + table;
+        put32(&mut data, at + 4, 1);
+        put64(&mut data, at + 8, decoded.len() as u64);
+        let set = at + 0x4000;
+        put32(&mut data, set + 4, entries.len() as u32);
+        put64(&mut data, set + 8, decoded.len() as u64);
+        for (index, &(virtual_offset, physical, kind, physical_size)) in entries.iter().enumerate() {
+            let entry = set + 0x10 + index * 0x18;
+            put64(&mut data, entry, virtual_offset);
+            put64(&mut data, entry + 8, physical);
+            data[entry + 16] = kind;
+            put32(&mut data, entry + 20, physical_size);
+        }
+        let mut section = section(0..data.len(), leaf..data.len());
+        section.compression = Some(NcaCompressionInfo {
+            bucket_offset: table as u64,
+            bucket_size: 0x8000,
+            entry_count: entries.len() as u32,
+        });
+        (data, section, decoded)
+    }
+
+    fn random_reads(seed: u64, count: usize, len: usize) -> Vec<(u64, usize)> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..count)
+            .map(|_| {
+                let offset = next() % (len as u64 + 0x40);
+                let size = match next() % 4 {
+                    0 => (next() % 0x40) as usize,
+                    1 => (next() % 0x3000) as usize,
+                    2 => (next() % 0x10000) as usize,
+                    _ => len,
+                };
+                (offset, size)
+            })
+            .collect()
+    }
+
+    fn expected(decoded: &[u8], offset: u64, size: usize) -> &[u8] {
+        let start = (offset as usize).min(decoded.len());
+        &decoded[start..(start + size).min(decoded.len())]
+    }
+
+    #[test]
+    fn compressed_reads_match_with_and_without_the_block_cache() {
+        use crate::block_cache::BlockCache;
+        let (data, section, decoded) = multi_block_fixture();
+        let mmap = mapped(&data);
+        let mut uncached = LazyRomfs::from_section(mmap.clone(), &section).unwrap();
+        uncached.use_block_cache(Arc::new(BlockCache::new(0)));
+        let small = Arc::new(BlockCache::new(0x6000));
+        let mut cached = LazyRomfs::from_section(mmap, &section).unwrap();
+        cached.use_block_cache(small.clone());
+        assert_eq!(cached.len(), decoded.len() as u64);
+        for (offset, size) in random_reads(0x5eed, 3000, decoded.len()) {
+            let want = expected(&decoded, offset, size);
+            assert_eq!(uncached.read(offset, size).unwrap(), want, "uncached {offset:#x}+{size:#x}");
+            assert_eq!(cached.read(offset, size).unwrap(), want, "cached {offset:#x}+{size:#x}");
+            let mut out = vec![0xee; size + 3];
+            let got = cached.read_into(offset, &mut out).unwrap();
+            assert_eq!(&out[..got], expected(&decoded, offset, size + 3));
+            assert!(out[got..].iter().all(|byte| *byte == 0xee), "read_into wrote past its count");
+        }
+        let stats = small.stats();
+        assert!(stats.hits > 0 && stats.misses > 0 && stats.evictions > 0, "{stats:?}");
+        assert!(stats.bytes <= 0x6000);
+        assert_eq!(uncached.block_cache_stats().unwrap().entries, 0);
+    }
+
+    #[test]
+    fn sequential_small_reads_decode_each_block_once() {
+        use crate::block_cache::BlockCache;
+        let (data, section, decoded) = multi_block_fixture();
+        let cache = Arc::new(BlockCache::new(64 << 20));
+        let mut storage = LazyRomfs::from_section(mapped(&data), &section).unwrap();
+        storage.use_block_cache(cache.clone());
+        let mut streamed = Vec::new();
+        for offset in (0..decoded.len()).step_by(0x100) {
+            streamed.extend(storage.read(offset as u64, 0x100).unwrap());
+        }
+        assert_eq!(streamed, decoded);
+        let lz4_blocks = (0..40).filter(|block| [3, 3, 0, 3, 1, 3][block % 6] == 3).count();
+        let stats = cache.stats();
+        assert_eq!(stats.entries, lz4_blocks);
+        assert_eq!(stats.misses as usize, lz4_blocks, "every LZ4 block is decoded exactly once");
+        let whole = storage.read(0, decoded.len()).unwrap();
+        assert_eq!(whole, decoded);
+    }
+
+    #[test]
+    fn concurrent_readers_share_the_cache_and_agree() {
+        use crate::block_cache::BlockCache;
+        let (data, section, decoded) = multi_block_fixture();
+        let decoded = Arc::new(decoded);
+        let cache = Arc::new(BlockCache::new(0x8000));
+        let mut storage = LazyRomfs::from_section(mapped(&data), &section).unwrap();
+        storage.use_block_cache(cache.clone());
+        let threads: Vec<_> = (0..8u64)
+            .map(|thread| {
+                let storage = storage.clone();
+                let decoded = decoded.clone();
+                std::thread::spawn(move || {
+                    for (offset, size) in random_reads(0xc0ffee + thread * 977, 1500, decoded.len()) {
+                        assert_eq!(storage.read(offset, size).unwrap(), expected(&decoded, offset, size));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(cache.stats().hits > 0);
+        assert!(cache.stats().bytes <= 0x8000);
+    }
+
+    #[test]
+    fn patched_compressed_reads_match_through_the_cache() {
+        use crate::block_cache::BlockCache;
+        let (fixture, decoded) = compressed_fixture();
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let mut storage = fixture.open().unwrap();
+        storage.use_block_cache(cache.clone());
+        for (offset, size) in random_reads(0xbad5eed, 500, decoded.len()) {
+            assert_eq!(storage.read(offset, size).unwrap(), expected(&decoded, offset, size));
+        }
+        assert!(cache.stats().hits > 0);
+    }
+
+    #[test]
+    fn patched_read_into_matches_read_and_leaves_the_tail_alone() {
+        let base: Vec<u8> = (0..64).collect();
+        let patch: Vec<u8> = (128..192).collect();
+        let fixture = Fixture::new(&base, &patch, &[(0, 0, 0), (12, 16, 1), (17, 24, 0)], 32, 8..28);
+        let storage = fixture.open().unwrap();
+        let expected = [&base[8..12], &patch[16..21], &base[24..35]].concat();
+        for offset in 0..22u64 {
+            for size in 0..24usize {
+                let mut out = vec![0xee; size];
+                let got = storage.read_into(offset, &mut out).unwrap();
+                let start = (offset as usize).min(expected.len());
+                let want = &expected[start..(start + size).min(expected.len())];
+                assert_eq!(&out[..got], want);
+                assert!(out[got..].iter().all(|byte| *byte == 0xee));
+                assert_eq!(storage.read(offset, size).unwrap(), want);
+            }
+        }
     }
 }

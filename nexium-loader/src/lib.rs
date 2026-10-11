@@ -1,6 +1,7 @@
 pub mod application;
 mod bktr;
 pub mod bin_read;
+pub mod block_cache;
 pub mod cnmt;
 pub mod container;
 pub mod control;
