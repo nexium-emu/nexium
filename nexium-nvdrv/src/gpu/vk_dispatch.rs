@@ -9350,7 +9350,7 @@ fn trace_vertex_input_batch(
         .iter()
         .filter(|call| call.vs_gpu_va == config.vs_gpu_va && call.fs_gpu_va == config.fs_gpu_va)
     {
-        let Ok(sequence) = TRACED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        let Ok(sequence) = TRACED.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < config.limit).then_some(count + 1)
         }) else {
             return;

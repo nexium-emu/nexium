@@ -1127,7 +1127,7 @@ fn reserve_ordered_present_slot_until(
             return false;
         }
         if pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
                 (inflight < limit).then_some(inflight + 1)
             })
             .is_ok()
