@@ -28,5 +28,5 @@ backend-nce = []
 # Lockstep tests: a deliberately miscompiling Rustarmic (test-only feature)
 # and the random program generator shared with rustarmic's own fuzz tests.
 rustarmic = { path = "../rustarmic", features = ["fault-injection"] }
-rand = "0.8"
+rand = "0.10"
 rand_chacha = "0.3"
