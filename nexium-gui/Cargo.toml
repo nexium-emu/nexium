@@ -70,7 +70,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 # Child X11 window + shape for the native Vulkan game surface. Already in the
 # tree through winit; only the `shape` feature is new.
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "dl-libxcb", "shape"] }
+x11rb = { version = "0.14", default-features = false, features = ["allow-unsafe-code", "dl-libxcb", "shape"] }
 
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
 mimalloc = "0.1.52"
