@@ -22,7 +22,7 @@ android_logger = "0.15"
 android-activity = { version = "0.6", features = ["native-activity"] }
 ndk = "0.9"
 ab_glyph = "0.2"
-epaint_default_fonts = "0.36"
+epaint_default_fonts = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jni = "0.22"
 serde = { version = "1", features = ["derive"] }
