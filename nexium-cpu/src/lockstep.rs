@@ -2836,7 +2836,7 @@ fn replay_mapped(rig: &mut ReplayRig, repro: &Repro, pages: &ReplayPages) -> Res
 }
 
 #[cfg(test)]
-#[path = "../../../rustarmic/tests/control_flow_fuzz.rs"]
+#[path = "../../rustarmic/tests/control_flow_fuzz.rs"]
 #[allow(dead_code, unexpected_cfgs, clippy::all)]
 mod control_flow_fuzz;
 
