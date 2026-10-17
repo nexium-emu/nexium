@@ -5502,7 +5502,7 @@ fn service_for_domain_object(
     })
 }
 
-fn domain_object_keys(kernel: &Kernel, session_handle: u32, object_id: u32) -> Vec<(u32, u32)> {
+pub(crate) fn domain_object_keys(kernel: &Kernel, session_handle: u32, object_id: u32) -> Vec<(u32, u32)> {
     let mut keys = vec![(session_handle, object_id)];
     for handle in domain_group_handles(kernel, session_handle) {
         if handle != session_handle {
@@ -5654,6 +5654,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
                 kernel.open_dir_lists.remove(&(handle, d.object_id));
                 kernel.hwopus_decoders.remove(&(handle, d.object_id));
                 kernel.close_audio_renderer_object(handle, d.object_id);
+                kernel.bcat_objects.remove(&(handle, d.object_id));
             }
             log::debug!(
                 "domain Close-object session={:#x} object_id={}",
@@ -6839,7 +6840,7 @@ fn dispatch_service_v2(
         }
     }
 
-    if let Some(response) = dispatch_aoc_bcat(kernel, port_name, ctx, cmd_id) {
+    if let Some(response) = dispatch_aoc_bcat(kernel, port_name, ctx, session_handle, cmd_id) {
         return response;
     }
 
@@ -14043,8 +14044,12 @@ fn dispatch_aoc_bcat(
     kernel: &mut Kernel,
     port_name: &str,
     ctx: &mut ipc::IpcCtx,
+    session_handle: u32,
     cmd_id: u32,
 ) -> Option<Vec<u8>> {
+    if let Some(response) = crate::services::bcat::dispatch(kernel, ctx, session_handle, port_name, cmd_id) {
+        return Some(response);
+    }
     match port_name {
         "aoc:u" => match cmd_id {
             0..=7 => content::dispatch_add_on_content(kernel, ctx, cmd_id),
