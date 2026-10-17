@@ -501,7 +501,7 @@ fn friend_game_name(friend: &Friend, titles: &[LibraryTitle]) -> String {
         .iter()
         .find(|title| title.title_id == friend.app_id)
         .map(|title| title.name.clone())
-        .or_else(|| nexium_common::nextendo::compatible_title(friend.app_id).map(|title| title.name.to_string()))
+        .or_else(|| nexium_common::nextendo::title_name(friend.app_id))
         .unwrap_or_else(|| "a game".to_string())
 }
 
@@ -528,7 +528,7 @@ fn title_name(title_id: u64, titles: &[LibraryTitle]) -> Option<String> {
         .iter()
         .find(|title| title.title_id == title_id)
         .map(|title| title.name.clone())
-        .or_else(|| nexium_common::nextendo::compatible_title(title_id).map(|title| title.name.to_string()))
+        .or_else(|| nexium_common::nextendo::title_name(title_id))
 }
 
 fn ease(value: f32) -> f32 {
@@ -1334,7 +1334,7 @@ fn account_overview(page: &mut Page, state: &mut HubState, x: f32, y: f32, width
                 .iter()
                 .find(|title| title.title_id == title_id)
                 .map(|title| title.name.clone())
-                .or_else(|| nexium_common::nextendo::compatible_title(title_id).map(|title| title.name.to_string()))
+                .or_else(|| nexium_common::nextendo::title_name(title_id))
                 .unwrap_or_else(|| "a game".into())
         });
     let (status_value, status_color, status_detail) = if !page.frame.settings.share_presence {
@@ -2068,8 +2068,9 @@ fn online_play_page(page: &mut Page, state: &mut HubState, origin: Pos2, width: 
         y = rect.max.y + 10.0 * s;
     }
 
+    let supported = nexium_common::nextendo::supported_titles();
     y += 18.0 * s;
-    page.label(Pos2::new(origin.x + 4.0 * s, y + 10.0 * s), &format!("SUPPORTED GAMES  ·  {}", nexium_common::nextendo::COMPATIBLE_TITLES.len()));
+    page.label(Pos2::new(origin.x + 4.0 * s, y + 10.0 * s), &format!("SUPPORTED GAMES  ·  {}", supported.len()));
     if let Some(players) = page.frame.state.players_online {
         page.text(
             Pos2::new(origin.x + width - 4.0 * s, y + 10.0 * s),
@@ -2080,28 +2081,28 @@ fn online_play_page(page: &mut Page, state: &mut HubState, origin: Pos2, width: 
         );
     }
     y += 26.0 * s;
-    let mut games: Vec<&nexium_common::nextendo::CompatibleTitle> = Vec::new();
-    for title in nexium_common::nextendo::COMPATIBLE_TITLES {
+    let mut games: Vec<&nexium_common::nextendo::TitleSupport> = Vec::new();
+    for title in &supported {
         if !games.iter().any(|known| known.name == title.name) {
             games.push(title);
         }
     }
     let frame = page.frame;
-    let owned = |title: &nexium_common::nextendo::CompatibleTitle| {
-        nexium_common::nextendo::COMPATIBLE_TITLES
+    let owned = |title: &nexium_common::nextendo::TitleSupport| {
+        supported
             .iter()
             .filter(|other| other.name == title.name)
             .find_map(|other| frame.titles.iter().find(|owned| owned.title_id == other.title_id))
             .cloned()
     };
-    let players_for = |title: &nexium_common::nextendo::CompatibleTitle| -> u32 {
-        nexium_common::nextendo::COMPATIBLE_TITLES
+    let players_for = |title: &nexium_common::nextendo::TitleSupport| -> u32 {
+        supported
             .iter()
             .filter(|other| other.name == title.name)
             .map(|other| frame.state.counts.get(&other.title_id).copied().unwrap_or(0))
             .sum()
     };
-    games.sort_by_key(|title| (owned(title).is_none(), std::cmp::Reverse(players_for(title)), title.name));
+    games.sort_by_key(|title| (owned(title).is_none(), std::cmp::Reverse(players_for(title)), title.name.clone()));
     let base_row = rows.len();
     for (index, title) in games.iter().enumerate() {
         let rect = Rect::from_min_size(Pos2::new(origin.x, y), Vec2::new(width, 62.0 * s));
@@ -2128,18 +2129,19 @@ fn online_play_page(page: &mut Page, state: &mut HubState, origin: Pos2, width: 
         }
         let text_x = icon_rect.max.x + 16.0 * s;
         let name_font = FontId::proportional(17.0 * s);
-        let name = look::ellipsize(page.ui, title.name, &name_font, rect.width() * 0.5);
+        let name = look::ellipsize(page.ui, &title.name, &name_font, rect.width() * 0.5);
         page.painter.text(Pos2::new(text_x, rect.center().y - 10.0 * s), egui::Align2::LEFT_CENTER, name, name_font, page.pal.text);
+        let required = if title.any_version { "any version".to_string() } else { format!("v{}", title.version) };
         let (detail, detail_color) = match &library {
             Some(owned) if nexium_common::nextendo::version_matches(owned.title_id, &owned.version) => (
-                format!("In your library  ·  v{} ready", title.version),
+                format!("In your library  ·  {required} ready"),
                 look::ONLINE,
             ),
             Some(owned) => (
-                format!("Needs v{}  ·  you have v{}", title.version, owned.version),
+                format!("Needs {required}  ·  you have v{}", owned.version),
                 look::WARNING,
             ),
-            None => (format!("Requires v{}", title.version), page.pal.muted),
+            None => (format!("Requires {required}"), page.pal.muted),
         };
         page.text(Pos2::new(text_x, rect.center().y + 13.0 * s), egui::Align2::LEFT_CENTER, &detail, 13.0, detail_color);
         let count_text = if players == 0 { "No one online".to_string() } else { format!("{} online", group(players)) };

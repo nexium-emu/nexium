@@ -19,6 +19,7 @@ const STANDING_EVERY: Duration = Duration::from_secs(5 * 60);
 const REFRESH_MARGIN: Duration = Duration::from_secs(120);
 const GAME_TOKEN_MARGIN: Duration = Duration::from_secs(60 * 60);
 const OFFLINE_RETRY: Duration = Duration::from_secs(30);
+const CATALOG_EVERY: Duration = Duration::from_secs(15 * 60);
 const OFFLINE_CONFIRMATIONS: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +187,7 @@ pub struct Nextendo {
 
 impl Nextendo {
     pub fn start(ctx: egui::Context, preferences: Preferences) -> Self {
+        super::launch::install_hook();
         let state = Arc::new(Mutex::new(State::default()));
         let (commands, inbox) = mpsc::channel();
         let (notice_tx, notices) = mpsc::channel();
@@ -281,6 +283,7 @@ struct Schedule {
     game_token: Instant,
     reconnect: Instant,
     players: Instant,
+    catalog: Instant,
 }
 
 impl Schedule {
@@ -295,6 +298,7 @@ impl Schedule {
             game_token: now,
             reconnect: now,
             players: now,
+            catalog: now,
         }
     }
 }
@@ -371,6 +375,7 @@ impl Worker {
 
     fn run(mut self) {
         self.apply_redirect();
+        super::service_catalog::load_cached();
         self.restore();
         loop {
             match self.inbox.recv_timeout(TICK) {
@@ -440,6 +445,13 @@ impl Worker {
 
     fn tick(&mut self) {
         let now = Instant::now();
+        if now >= self.schedule.catalog {
+            self.schedule.catalog = now + CATALOG_EVERY;
+            if let Err(error) = super::service_catalog::refresh(&super::launch::agent()) {
+                log::debug!("nextendo: game catalog unavailable: {error}");
+                self.schedule.catalog = now + OFFLINE_RETRY;
+            }
+        }
         if now >= self.schedule.counts {
             self.schedule.counts = now + COUNTS_EVERY;
             match self.api.online_counts() {

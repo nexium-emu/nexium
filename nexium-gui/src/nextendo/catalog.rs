@@ -11,8 +11,8 @@ pub struct TitleInfo {
 }
 
 impl TitleInfo {
-    pub fn compatible(&self) -> Option<&'static nexium_common::nextendo::CompatibleTitle> {
-        nexium_common::nextendo::compatible_title(self.title_id)
+    pub fn support(&self) -> Option<nexium_common::nextendo::TitleSupport> {
+        nexium_common::nextendo::supported_title(self.title_id)
     }
 
     pub fn version_ok(&self) -> bool {

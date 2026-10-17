@@ -62,6 +62,8 @@ directories = "6"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 base64 = "0.22"
 sha2 = "0.10"
+ring = "0.17"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sdl3 = { version = "0.20.0", default-features = false, features = ["build-from-source-static"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -79,10 +79,7 @@ impl HorizonApp {
                     .playing_path
                     .clone()
                     .and_then(|path| self.library_name(&path))
-                    .or_else(|| {
-                        nexium_common::nextendo::compatible_title(title_id)
-                            .map(|title| title.name.to_string())
-                    })
+                    .or_else(|| nexium_common::nextendo::title_name(title_id))
                     .unwrap_or_default(),
             });
             self.nextendo.set_now_playing(now_playing);
@@ -158,17 +155,17 @@ impl HorizonApp {
                 let Some(info) = self.nextendo_catalog.info(&path) else {
                     continue;
                 };
-                let Some(compatible) = info.compatible() else {
+                let Some(support) = info.support() else {
                     continue;
                 };
                 badges.insert(
                     path,
                     OnlineBadge {
                         players: self.nextendo_state.counts.get(&info.title_id).copied(),
-                        required: compatible.version,
+                        required: if support.any_version { "any".into() } else { support.version.clone() },
                         installed: info.version.clone(),
                         version_ok: info.version_ok(),
-                        enabled: true,
+                        enabled: support.enabled,
                     },
                 );
             }
@@ -203,9 +200,7 @@ impl HorizonApp {
             Notice::FriendOnline { pid, name, app_id, app_name } if alerts => {
                 let body = if app_id != 0 {
                     let game = if app_name.trim().is_empty() {
-                        nexium_common::nextendo::compatible_title(app_id)
-                            .map(|title| title.name.to_string())
-                            .unwrap_or_else(|| "a game".into())
+                        nexium_common::nextendo::title_name(app_id).unwrap_or_else(|| "a game".into())
                     } else {
                         app_name
                     };

@@ -31,7 +31,7 @@ pub struct ChipColors {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnlineBadge {
     pub players: Option<u32>,
-    pub required: &'static str,
+    pub required: String,
     pub installed: String,
     pub version_ok: bool,
     pub enabled: bool,
@@ -290,7 +290,7 @@ mod tests {
     fn badge_headlines_explain_the_state() {
         let mut badge = OnlineBadge {
             players: Some(16),
-            required: "4.0.0",
+            required: "4.0.0".into(),
             installed: "4.0.0".into(),
             version_ok: true,
             enabled: true,
