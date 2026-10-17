@@ -7,6 +7,7 @@ pub mod hid_motion;
 pub mod hid_state;
 pub mod hid_vibration;
 pub mod kernel;
+pub mod online_patches;
 pub mod sdl_emu;
 pub mod services;
 pub mod swkbd_state;

@@ -24,6 +24,7 @@ struct AliveGuard;
 impl Drop for AliveGuard {
     fn drop(&mut self) {
         EMU_ALIVE.store(false, Ordering::Release);
+        nexium_common::nextendo::set_running_title(None);
     }
 }
 
@@ -969,7 +970,8 @@ impl EmulationHandle {
                     title_id == TEARS_OF_THE_KINGDOM_TITLE_ID,
                 );
                 nexium_core::services::am::set_title_nifm_offline(
-                    title_id == MINECRAFT_DUNGEONS_2_TITLE_ID,
+                    title_id == MINECRAFT_DUNGEONS_2_TITLE_ID
+                        && !nexium_common::nextendo::redirect().enabled,
                 );
 
                 let mut cpu = boot_ctx

@@ -413,6 +413,7 @@ impl BootContext {
                 entry.enabled, entry.has_romfs, entry.has_exefs, entry.path.display());
         }
         nexium_loader::mods::apply_exefs_mods(&mut app, &mods)?;
+        crate::online_patches::prepare_and_apply(&mut app)?;
         let application_romfs = nexium_loader::mods::build_mod_romfs(&app, &mods)?;
         let address_space = Arc::new(AddressSpace::new());
         let main_stack_size = application_main_stack_size(app.npdm.main_stack_size);
