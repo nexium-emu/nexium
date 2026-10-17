@@ -6160,7 +6160,7 @@ fn first_ipc_buffer(buffers: &[ipc::IpcBuffer], statics: &[ipc::IpcBuffer]) -> O
         .copied()
 }
 
-fn indexed_ipc_buffer(
+pub(crate) fn indexed_ipc_buffer(
     buffers: &[ipc::IpcBuffer],
     statics: &[ipc::IpcBuffer],
     index: usize,
@@ -6174,7 +6174,7 @@ fn indexed_ipc_buffer(
     }
 }
 
-fn read_ipc_bytes(kernel: &Kernel, buffer: Option<ipc::IpcBuffer>, limit: usize) -> Vec<u8> {
+pub(crate) fn read_ipc_bytes(kernel: &Kernel, buffer: Option<ipc::IpcBuffer>, limit: usize) -> Vec<u8> {
     let Some(buffer) = buffer else {
         return Vec::new();
     };
@@ -6870,6 +6870,9 @@ fn dispatch_service_v2(
     }
 
     if port_name == "sfdnsres" {
+        if let Some(response) = crate::services::resolver::dispatch_name_info(kernel, ctx, cmd_id) {
+            return response;
+        }
         if let Some(response) = dispatch_nextendo_lookup(kernel, ctx, cmd_id) {
             return response;
         }

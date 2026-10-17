@@ -165,6 +165,7 @@ pub(crate) struct HostSocket {
     recv_timeout: Option<Duration>,
     send_timeout: Option<Duration>,
     tls_pending: usize,
+    shut_down: bool,
 }
 
 impl HostSocket {
@@ -182,6 +183,7 @@ impl HostSocket {
             recv_timeout: None,
             send_timeout: None,
             tls_pending: 0,
+            shut_down: false,
         })
     }
 
@@ -373,6 +375,7 @@ impl UdpActivity {
 
 const PARK_DURATION: Duration = Duration::from_secs(5);
 const MAX_PARKED: usize = 8;
+const SWSH_LOCAL_LISTENER_PORT: u16 = 12345;
 
 struct ParkedSocket {
     socket: Socket,
@@ -416,7 +419,7 @@ impl BsdService {
             return;
         };
         let host = mutex.into_inner();
-        if host.socket_type != SOCK_DGRAM || host.socket.peer_addr().is_ok() {
+        if host.socket_type != SOCK_DGRAM || host.shut_down || host.socket.peer_addr().is_ok() {
             return;
         }
         let Some(port) = host
@@ -430,6 +433,14 @@ impl BsdService {
             return;
         };
         self.release_expired_parked();
+        if port == SWSH_LOCAL_LISTENER_PORT
+            && matches!(
+                nexium_common::nextendo::running_title(),
+                Some(nexium_common::nextendo::POKEMON_SWORD | nexium_common::nextendo::POKEMON_SHIELD)
+            )
+        {
+            return;
+        }
         if !self.parked.contains_key(&port) && self.parked.len() >= MAX_PARKED {
             return;
         }
@@ -1446,7 +1457,8 @@ impl BsdService {
             SHUT_RDWR => Shutdown::Both,
             _ => return done(-1, EINVAL),
         };
-        let socket = shared.lock();
+        let mut socket = shared.lock();
+        socket.shut_down = true;
         match socket.socket.shutdown(how) {
             Ok(()) => done(0, 0),
             Err(error) => done(-1, errno_from(&error)),

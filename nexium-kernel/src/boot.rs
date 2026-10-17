@@ -647,6 +647,7 @@ impl BootContext {
         kernel.alias_size = alias_size;
         kernel.is_application = true;
         kernel.title_id = app.title_id;
+        nexium_common::nextendo::set_running_title(Some(app.title_id));
         kernel.save_data_sizes.set_control(app.application_control.as_deref());
         kernel.guest_isa = if a32 {
             nexium_cpu::GuestIsa::AArch32

@@ -146,9 +146,207 @@ pub fn nsd_resolve(fqdn: &str) -> String {
     fqdn.replace('%', "lp1")
 }
 
+const GAI_FAIL: i32 = 4;
+const GAI_FAMILY: i32 = 5;
+const GAI_OVERFLOW: i32 = 14;
+const NETDB_INTERNAL: i32 = -1;
+const EINVAL: i32 = 22;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameInfo {
+    pub host: String,
+    pub service: String,
+}
+
+pub fn name_info(sockaddr: &[u8]) -> Result<NameInfo, i32> {
+    if sockaddr.len() < 8 {
+        return Err(GAI_FAIL);
+    }
+    if u32::from(sockaddr[1]) != AF_INET {
+        return Err(GAI_FAMILY);
+    }
+    let port = u16::from_be_bytes([sockaddr[2], sockaddr[3]]);
+    let host = Ipv4Addr::new(sockaddr[4], sockaddr[5], sockaddr[6], sockaddr[7]);
+    Ok(NameInfo {
+        host: host.to_string(),
+        service: port.to_string(),
+    })
+}
+
+pub fn name_info_fits(info: &NameInfo, host_room: usize, service_room: usize) -> Result<(), i32> {
+    if (host_room != 0 && info.host.len() >= host_room)
+        || (service_room != 0 && info.service.len() >= service_room)
+    {
+        return Err(GAI_OVERFLOW);
+    }
+    Ok(())
+}
+
+pub fn name_info_reply(cmd_id: u32, result: Result<(), i32>) -> Vec<u8> {
+    let (gai, errno) = match result {
+        Ok(()) => (0, 0),
+        Err(gai) => (gai, EINVAL),
+    };
+    if cmd_id == 13 {
+        encode_words(&[gai, if gai == 0 { 0 } else { NETDB_INTERNAL }, errno])
+    } else {
+        encode_words(&[gai, errno])
+    }
+}
+
+pub fn dispatch_name_info(
+    kernel: &crate::kernel::Kernel,
+    ctx: &nexium_ipc::IpcCtx,
+    cmd_id: u32,
+) -> Option<Vec<u8>> {
+    use crate::kernel::svc::{build_ipc_response, indexed_ipc_buffer, read_ipc_bytes};
+    if !matches!(cmd_id, 7 | 13) {
+        return None;
+    }
+    let sockaddr = read_ipc_bytes(
+        kernel,
+        indexed_ipc_buffer(&ctx.send_buffers, &ctx.send_statics, 0),
+        0x40,
+    );
+    let host_out = indexed_ipc_buffer(&ctx.recv_buffers, &ctx.recv_statics, 0);
+    let service_out = indexed_ipc_buffer(&ctx.recv_buffers, &ctx.recv_statics, 1);
+    let room = |buffer: Option<nexium_ipc::IpcBuffer>| buffer.map_or(0, |buffer| buffer.size as usize);
+    let result = name_info(&sockaddr).and_then(|info| {
+        name_info_fits(&info, room(host_out), room(service_out))?;
+        for (buffer, text) in [(host_out, &info.host), (service_out, &info.service)] {
+            if let Some(buffer) = buffer {
+                let mut bytes = text.as_bytes().to_vec();
+                bytes.push(0);
+                kernel
+                    .address_space
+                    .write(buffer.addr, &bytes)
+                    .map_err(|_| GAI_FAIL)?;
+            }
+        }
+        log::debug!("sfdnsres: GetNameInfo {}:{} (cmd {})", info.host, info.service, cmd_id);
+        Ok(())
+    });
+    Some(build_ipc_response(ctx, 0, &name_info_reply(cmd_id, result), &[]))
+}
+
 pub fn c_string(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&byte| byte == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+#[cfg(test)]
+pub(crate) mod harness {
+    use crate::kernel::handles::HandleType;
+    use crate::kernel::session::Session;
+    use crate::kernel::Kernel;
+    use nexium_ipc::{IpcBuffer, IpcCtx, CMIF_IN_MAGIC};
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    pub(crate) const TOKEN: u32 = 0x5A5A_1234;
+
+    pub(crate) struct Harness {
+        pub kernel: Kernel,
+        pub session: u32,
+        next: u64,
+        end: u64,
+    }
+
+    impl Harness {
+        pub(crate) fn new(port: &str) -> Self {
+            static NEXT_SPACE: AtomicU64 = AtomicU64::new(0);
+            let base = 0x2000_0000_0000 + NEXT_SPACE.fetch_add(1, Ordering::Relaxed) * 0x10_0000;
+            let memory = Arc::new(AddressSpace::new());
+            memory.map(base, 0x40000, Perm::RW, "nextendo_service_test").unwrap();
+            let mut kernel = Kernel::new(
+                memory,
+                base,
+                0x1000,
+                base + 0x10000,
+                0x1000,
+                base + 0x18000,
+                0x1000,
+                base + 0x19000,
+                base + 0x1a000,
+            );
+            let session = kernel.handles.create_handle(HandleType::Session);
+            kernel.sessions.insert(session, Session::new(session, port.to_string()));
+            Self {
+                kernel,
+                session,
+                next: base + 0x20000,
+                end: base + 0x40000,
+            }
+        }
+
+        pub(crate) fn session_for(&mut self, port: &str) -> u32 {
+            let handle = self.kernel.handles.create_handle(HandleType::Session);
+            self.kernel.sessions.insert(handle, Session::new(handle, port.to_string()));
+            handle
+        }
+
+        pub(crate) fn request(&self, command: u32, input: &[u8]) -> IpcCtx {
+            let mut bytes = vec![0; 0x100];
+            bytes[..4].copy_from_slice(&4u32.to_le_bytes());
+            let words = (16 + input.len()).div_ceil(4);
+            bytes[4..8].copy_from_slice(&(words as u32).to_le_bytes());
+            let cmif = 0x10;
+            bytes[cmif..cmif + 4].copy_from_slice(&CMIF_IN_MAGIC.to_le_bytes());
+            bytes[cmif + 8..cmif + 12].copy_from_slice(&command.to_le_bytes());
+            bytes[cmif + 12..cmif + 16].copy_from_slice(&TOKEN.to_le_bytes());
+            bytes[cmif + 16..cmif + 16 + input.len()].copy_from_slice(input);
+            let mut ctx = IpcCtx::parse(bytes, false).unwrap();
+            ctx.cmif_in_data_len = input.len();
+            ctx
+        }
+
+        fn alloc(&mut self, size: u64) -> u64 {
+            let addr = self.next;
+            self.next = (addr + size.max(1) + 0xF) & !0xF;
+            assert!(self.next <= self.end, "test arena exhausted");
+            addr
+        }
+
+        pub(crate) fn input(&mut self, bytes: &[u8]) -> IpcBuffer {
+            let addr = self.alloc(bytes.len() as u64);
+            self.kernel.address_space.write(addr, bytes).unwrap();
+            IpcBuffer {
+                addr,
+                size: bytes.len() as u64,
+                mode: 0,
+            }
+        }
+
+        pub(crate) fn output(&mut self, size: u64) -> IpcBuffer {
+            let addr = self.alloc(size);
+            IpcBuffer { addr, size, mode: 0 }
+        }
+
+        pub(crate) fn read(&self, buffer: IpcBuffer) -> Vec<u8> {
+            let mut out = vec![0u8; buffer.size as usize];
+            self.kernel.address_space.read(buffer.addr, &mut out).unwrap();
+            out
+        }
+
+        pub(crate) fn word(bytes: &[u8], offset: usize) -> u32 {
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        }
+
+        pub(crate) fn result(response: &[u8]) -> u32 {
+            assert_eq!(&response[0x10..0x14], b"SFCO");
+            assert_eq!(Self::word(response, 0x1C), TOKEN);
+            Self::word(response, 0x18)
+        }
+
+        pub(crate) fn data(response: &[u8]) -> &[u8] {
+            &response[0x20..]
+        }
+
+        pub(crate) fn moved_handle(response: &[u8]) -> u32 {
+            Self::word(response, 12)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +452,57 @@ mod tests {
         );
         assert_eq!(words(&hostent_reply(2, Ok(20))), vec![0, 0, 20]);
         assert_eq!(words(&hostent_reply(10, Ok(20))), vec![20, 0, 0]);
+    }
+
+    #[test]
+    fn name_info_is_numeric() {
+        let sockaddr = [16u8, 2, 0x1F, 0x90, 192, 168, 1, 20];
+        let info = name_info(&sockaddr).unwrap();
+        assert_eq!(info.host, "192.168.1.20");
+        assert_eq!(info.service, "8080");
+        assert_eq!(name_info(&[16u8, 10, 0, 0, 0, 0, 0, 0]), Err(GAI_FAMILY));
+        assert_eq!(name_info(&[16u8, 2, 0]), Err(GAI_FAIL));
+        assert_eq!(name_info_fits(&info, 0, 0), Ok(()));
+        assert_eq!(name_info_fits(&info, 13, 5), Ok(()));
+        assert_eq!(name_info_fits(&info, 12, 5), Err(GAI_OVERFLOW));
+        assert_eq!(name_info_fits(&info, 13, 4), Err(GAI_OVERFLOW));
+    }
+
+    #[test]
+    fn get_name_info_writes_the_numeric_host_and_service() {
+        use super::harness::Harness;
+        let mut h = Harness::new("sfdnsres");
+        let sockaddr = h.input(&[16u8, 2, 0x1F, 0x90, 192, 168, 1, 20]);
+        let host = h.output(32);
+        let service = h.output(16);
+        let mut ctx = h.request(7, &[]);
+        ctx.send_buffers.push(sockaddr);
+        ctx.recv_buffers.push(host);
+        ctx.recv_buffers.push(service);
+        let response = dispatch_name_info(&h.kernel, &ctx, 7).unwrap();
+        assert_eq!(Harness::result(&response), 0);
+        assert_eq!(words(&Harness::data(&response)[..8]), vec![0, 0]);
+        assert_eq!(&h.read(host)[..13], b"192.168.1.20\0");
+        assert_eq!(&h.read(service)[..5], b"8080\0");
+        let small = h.output(8);
+        let mut ctx = h.request(13, &[]);
+        ctx.send_statics.push(sockaddr);
+        ctx.recv_statics.push(small);
+        ctx.recv_statics.push(service);
+        let response = dispatch_name_info(&h.kernel, &ctx, 13).unwrap();
+        assert_eq!(words(&Harness::data(&response)[..12]), vec![GAI_OVERFLOW, NETDB_INTERNAL, EINVAL]);
+        assert!(dispatch_name_info(&h.kernel, &ctx, 6).is_none());
+    }
+
+    #[test]
+    fn name_info_replies_follow_the_command() {
+        assert_eq!(words(&name_info_reply(7, Ok(()))), vec![0, 0]);
+        assert_eq!(words(&name_info_reply(7, Err(GAI_FAMILY))), vec![GAI_FAMILY, EINVAL]);
+        assert_eq!(words(&name_info_reply(13, Ok(()))), vec![0, 0, 0]);
+        assert_eq!(
+            words(&name_info_reply(13, Err(GAI_OVERFLOW))),
+            vec![GAI_OVERFLOW, NETDB_INTERNAL, EINVAL]
+        );
     }
 
     #[test]
