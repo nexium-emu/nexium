@@ -44,7 +44,7 @@ socket2 = "0.6"
 base64 = "0.22"
 rsa = { version = "0.9", features = ["getrandom"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
 webpki-roots = "1"
 
 [target.'cfg(unix)'.dependencies]
