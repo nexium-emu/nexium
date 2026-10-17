@@ -6374,11 +6374,11 @@ fn ssl_object_key(kernel: &Kernel, session_handle: u32, ctx: &ipc::IpcCtx) -> (u
     }
 }
 
-fn application_version(kernel: &Kernel) -> String {
+pub(crate) fn application_version(kernel: &Kernel) -> String {
     crate::services::resolver::c_string(&kernel.application_display_version)
 }
 
-fn nextendo_identity(kernel: &Kernel) -> Option<nexium_common::nextendo::LinkedAccount> {
+pub(crate) fn nextendo_identity(kernel: &Kernel) -> Option<nexium_common::nextendo::LinkedAccount> {
     use nexium_common::nextendo;
     use std::sync::atomic::{AtomicU64, Ordering};
     static WARNED_TITLE: AtomicU64 = AtomicU64::new(0);
@@ -6398,32 +6398,6 @@ fn nextendo_identity(kernel: &Kernel) -> Option<nexium_common::nextendo::LinkedA
         return None;
     }
     Some(account)
-}
-
-fn dispatch_nextendo_account(
-    kernel: &mut Kernel,
-    ctx: &ipc::IpcCtx,
-    port_name: &str,
-    cmd_id: u32,
-) -> Option<Vec<u8>> {
-    if !matches!(port_name, "IManagerForApplication" | "IManagerForSystemService")
-        || !matches!(cmd_id, 1 | 3 | 4 | 130 | 136)
-    {
-        return None;
-    }
-    let account = nextendo_identity(kernel)?;
-    if matches!(cmd_id, 1 | 130 | 136) {
-        return Some(build_ipc_response(ctx, 0, &account.pid.to_le_bytes(), &[]));
-    }
-    let token = crate::services::nextendo_token::id_token(kernel.title_id, &application_version(kernel))?;
-    let output = indexed_ipc_buffer(&ctx.recv_buffers, &ctx.recv_statics, 0)?;
-    let bytes = token.as_bytes();
-    let len = bytes.len().min(output.size as usize);
-    if kernel.address_space.write(output.addr, &bytes[..len]).is_err() {
-        return None;
-    }
-    log::info!("acc: LoadIdTokenCache served the Nextendo id_token ({} bytes)", len);
-    Some(build_ipc_response(ctx, 0, &(len as u32).to_le_bytes(), &[]))
 }
 
 fn rewind_svc_for_retry(kernel: &mut Kernel) -> bool {
@@ -6822,6 +6796,10 @@ fn dispatch_service_v2(
         kernel, ctx, session_handle, port_name, cmd_id,
     ) { return response; }
 
+    if let Some(response) = crate::services::nas::dispatch(kernel, ctx, session_handle, port_name, cmd_id) {
+        return response;
+    }
+
     if let Some(sub_service) = crate::services::am::proxy_subsession(port_name, cmd_id) {
         log::debug!(
             "{} cmd={} â†’ returning {} sub-session",
@@ -6939,10 +6917,6 @@ fn dispatch_service_v2(
             }
             return build_ipc_response(ctx, reply.rc, &reply.data, &[]);
         }
-    }
-
-    if let Some(response) = dispatch_nextendo_account(kernel, ctx, port_name, cmd_id) {
-        return response;
     }
 
     if let Some((rc, data, handles)) =

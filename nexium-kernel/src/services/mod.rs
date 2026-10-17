@@ -50,6 +50,7 @@ pub mod misc;
 pub mod mm;
 pub mod mount;
 pub mod movie_maker;
+pub mod nas;
 #[cfg(not(target_vendor = "sony"))]
 pub mod nextendo_nat;
 #[cfg(not(target_vendor = "sony"))]
