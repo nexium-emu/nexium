@@ -1,7 +1,6 @@
 use crate::kernel::svc::{build_ipc_response, domain_object_keys, indexed_ipc_buffer};
 use crate::kernel::Kernel;
 use nexium_ipc::IpcCtx;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 const NAME_SIZE: usize = 0x20;
@@ -52,11 +51,18 @@ pub fn encode_name(name: &str) -> [u8; NAME_SIZE] {
     out
 }
 
+#[cfg(not(target_vendor = "sony"))]
 pub fn digest(data: &[u8]) -> [u8; DIGEST_SIZE] {
+    use sha2::{Digest, Sha256};
     let hash = Sha256::digest(data);
     let mut out = [0u8; DIGEST_SIZE];
     out.copy_from_slice(&hash[..DIGEST_SIZE]);
     out
+}
+
+#[cfg(target_vendor = "sony")]
+pub fn digest(_data: &[u8]) -> [u8; DIGEST_SIZE] {
+    [0u8; DIGEST_SIZE]
 }
 
 fn sorted_entries(dir: &Path, directories: bool) -> Vec<PathBuf> {
