@@ -66,6 +66,20 @@ jobs:
           grep -m1 '#define BOOST_LIB_VERSION' "$UNIXROOT/boost/version.hpp" | sed 's/^/using /'
           echo "BOOST_ROOT=$WINROOT" >> "$GITHUB_ENV"
 
+      - name: Locate CMake (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          WINCMAKE="${CMAKE:-C:\Program Files\CMake\bin\cmake.exe}"
+          UNIXCMAKE="${WINCMAKE//\\//}"
+          case "$UNIXCMAKE" in
+            [A-Za-z]:/*) UNIXCMAKE="/$(printf '%s' "${UNIXCMAKE%%:*}" | tr 'A-Z' 'a-z')${UNIXCMAKE#*:}" ;;
+          esac
+          test -x "$UNIXCMAKE" || { echo "::error::no Windows CMake at $WINCMAKE (set CMAKE on the runner)"; exit 1; }
+          "$UNIXCMAKE" --version | head -n 1
+          echo "CMAKE=$WINCMAKE" >> "$GITHUB_ENV"
+
       - name: Build NeXium
         shell: bash
         run: cargo build --release -p nexium-gui --bin nexium
