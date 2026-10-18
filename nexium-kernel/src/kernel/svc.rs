@@ -15041,7 +15041,7 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         }
         16 => kernel.system_resource_size,
         17 => 0,
-        18 => 0,
+        18 => kernel.title_id,
         19 => 0,
         20 => kernel.tls_base + 0x200,
         21 => reported_total_memory(kernel).saturating_sub(kernel.system_resource_size),
@@ -15141,6 +15141,23 @@ mod process_info_tests {
         assert_eq!(svc_get_info(&mut kernel), SUCCESS);
         assert_eq!(cpu.get_register(1), 0x46db000);
         assert!(cpu.get_register(1) < 0x5500000);
+    }
+
+    #[test]
+    fn program_id_info_reports_the_running_title() {
+        let mut kernel = Kernel::new(
+            Arc::new(AddressSpace::new()),
+            0x8000000, 0x1000, 0x20000000, 0x200000,
+            0x30000000, 0x1000, 0x40000000, 0x40001000,
+        );
+        kernel.title_id = 0x0100_FF50_0E34_A000;
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        let _guard = set_current_cpu(&mut cpu, 0);
+        cpu.set_register(1, 18);
+        cpu.set_register(2, 0xffff8001);
+        cpu.set_register(3, 0);
+        assert_eq!(svc_get_info(&mut kernel), SUCCESS);
+        assert_eq!(cpu.get_register(1), 0x0100_FF50_0E34_A000);
     }
 
     #[test]
