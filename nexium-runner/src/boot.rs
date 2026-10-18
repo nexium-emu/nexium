@@ -116,6 +116,34 @@ fn stop_on_aux_stall(
     true
 }
 
+const AUX_FAULT_STREAK_LIMIT: u32 = 1000;
+
+#[derive(Default)]
+struct FaultStreak {
+    pc: u64,
+    count: u32,
+}
+
+impl FaultStreak {
+    fn record(&mut self, pc: u64) -> u32 {
+        if self.count > 0 && self.pc == pc {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.pc = pc;
+            self.count = 1;
+        }
+        self.count
+    }
+
+    fn reset(&mut self) {
+        self.count = 0;
+    }
+}
+
+fn aux_guest_crashed(streak: u32, fault_address_mapped: bool) -> bool {
+    !fault_address_mapped && streak >= AUX_FAULT_STREAK_LIMIT
+}
+
 fn core_park_enabled() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| std::env::var("NEXIUM_CORE_PARK").ok().as_deref() != Some("0"))
@@ -1063,6 +1091,7 @@ impl EmulationHandle {
                                 let mut aux_cycles = 0u64;
                                 let mut aux_svcs = 0u32;
                                 let mut aux_faults = 0u64;
+                                let mut fault_streak = FaultStreak::default();
                                 let mut aux_fault_view_logged = false;
                                 let mut aux_status = std::time::Instant::now();
                                 let spin_yield_n: u32 = std::env::var("NEXIUM_SPIN_YIELD")
@@ -1210,7 +1239,30 @@ impl EmulationHandle {
                                                 aux_faults
                                             );
                                         }
+                                        let pc = cpu_ref().unwrap().get_pc();
+                                        let mapped = run_fault
+                                            .as_ref()
+                                            .is_some_and(|fault| addr_aux.read(fault.addr, &mut [0u8; 1]).is_ok());
+                                        if aux_guest_crashed(fault_streak.record(pc), mapped) {
+                                            log::error!(
+                                                "[core{}] guest thread crashed: exception {:#x} repeated {} times at pc={:#x} lr={:#x}; stopping emulation",
+                                                core_id,
+                                                code,
+                                                fault_streak.count,
+                                                pc,
+                                                cpu_ref().unwrap().get_register(30),
+                                            );
+                                            stop_aux.store(true, Ordering::Release);
+                                            if !emulation_stop_aux.swap(true, Ordering::AcqRel) {
+                                                if let Some(halt) = &halt_main_aux {
+                                                    halt.halt();
+                                                }
+                                            }
+                                            break;
+                                        }
                                         std::thread::sleep(std::time::Duration::from_micros(200));
+                                    } else {
+                                        fault_streak.reset();
                                     }
                                     {
                                         let mut k = kernel_aux.lock();
@@ -2765,6 +2817,19 @@ mod tests {
             assert!(!emulation_stop.load(Ordering::Acquire));
             assert!(!auxiliary_stop.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn repeated_unmapped_faults_at_one_pc_count_as_a_guest_crash() {
+        let mut streak = FaultStreak::default();
+        for _ in 1..AUX_FAULT_STREAK_LIMIT {
+            assert!(!aux_guest_crashed(streak.record(0x8000), false));
+        }
+        assert!(aux_guest_crashed(streak.record(0x8000), false));
+        assert!(!aux_guest_crashed(streak.record(0x8004), false));
+        streak.reset();
+        assert_eq!(streak.record(0x8004), 1);
+        assert!(!aux_guest_crashed(AUX_FAULT_STREAK_LIMIT, true));
     }
 
     #[test]
