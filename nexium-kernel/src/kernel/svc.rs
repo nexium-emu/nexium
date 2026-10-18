@@ -2326,25 +2326,24 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
         0x51 => svc_map_transfer_memory(kernel),
         0x52 => svc_unmap_transfer_memory(kernel),
         0x53 => svc_create_interrupt_event(kernel),
-        0x54 => svc_query_io_mapping(kernel),
-        0x5f => svc_debug_active_process(kernel),
-        0x60 => svc_break_debug_process(kernel),
-        0x61 => svc_terminate_debug_process(kernel),
-        0x62 => svc_get_debug_event(kernel),
-        0x63 => svc_continue_debug_event(kernel),
-        0x64 => svc_get_process_list(kernel),
-        0x65 => svc_get_thread_list(kernel),
-        0x6f => svc_create_port(kernel),
-        0x70 => svc_manage_named_port(kernel),
-        0x71 => svc_connect_to_port(kernel),
+        0x55 => svc_query_io_mapping(kernel),
+        0x60 => svc_debug_active_process(kernel),
+        0x61 => svc_break_debug_process(kernel),
+        0x62 => svc_terminate_debug_process(kernel),
+        0x63 => svc_get_debug_event(kernel),
+        0x64 => svc_continue_debug_event(kernel),
+        0x65 => svc_get_process_list(kernel),
+        0x66 => svc_get_thread_list(kernel),
+        0x70 => svc_create_port(kernel),
+        0x71 => svc_manage_named_port(kernel),
+        0x72 => svc_connect_to_port(kernel),
         0x73 => svc_set_process_memory_permission(kernel),
         0x74 => svc_process_memory_alias(kernel, false),
         0x75 => svc_process_memory_alias(kernel, true),
         0x77 => svc_process_code_memory(kernel, false),
         0x78 => svc_process_code_memory(kernel, true),
-        0x7c => svc_create_resource_limit(kernel),
-        0x7d => svc_set_resource_limit_limit_value(kernel),
-        0x7e => svc_call_secure_monitor(kernel),
+        0x7d => svc_create_resource_limit(kernel),
+        0x7e => svc_set_resource_limit_limit_value(kernel),
         0x7f => svc_guest_probe(kernel),
         _ => {
             log::warn!("unknown SVC: {:#04x}", imm);
@@ -2688,8 +2687,7 @@ fn svc_guest_probe(kernel: &mut Kernel) -> u32 {
         kernel.compatibility_guest_probe_enabled,
         pc_now,
     ) else {
-        log::warn!("[guest-probe] svc 0x7f at pc={:#x} with no action", pc_now);
-        return 0;
+        return svc_call_secure_monitor(kernel);
     };
     if pc_now == probe_pc {
         cpu.set_pc(probe_pc.wrapping_add(4));
