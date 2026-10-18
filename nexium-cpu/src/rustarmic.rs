@@ -827,15 +827,19 @@ impl RustarmicCpu {
                         self.state.ctx.should_halt = 0;
                         self.state.fault_resume = Some((fault.pc, self.state.ctx.pc));
                         self.state.ctx.pc = fault.pc;
-                        log::warn!(
-                            "rustarmic memory fault: pc={:#x} address={:#x} size={} access={:?} cause={:?} retired={}",
-                            fault.pc,
-                            fault.address,
-                            fault.size,
-                            fault.access,
-                            fault.cause,
-                            outcome.retired,
-                        );
+                        static MEMORY_FAULTS: AtomicU64 = AtomicU64::new(0);
+                        if let Some(n) = log_occurrence(&MEMORY_FAULTS) {
+                            log::warn!(
+                                "rustarmic memory fault #{}: pc={:#x} address={:#x} size={} access={:?} cause={:?} retired={}",
+                                n,
+                                fault.pc,
+                                fault.address,
+                                fault.size,
+                                fault.access,
+                                fault.cause,
+                                outcome.retired,
+                            );
+                        }
                         CpuEvent::Exception(0x0E)
                     }
                     StopReason::BudgetExhausted => CpuEvent::Running,
@@ -912,22 +916,32 @@ impl Memory for RegionMemory<'_> {
         if copy_from_regions(&self.regions, addr, &mut buf, true).is_ok() {
             return Some(u32::from_le_bytes(buf));
         }
+        static FETCH_MISSES: AtomicU64 = AtomicU64::new(0);
+        let n = log_occurrence(&FETCH_MISSES)?;
         log::warn!(
-            "rustarmic fetch_inst miss at {:#x} ({} regions)",
+            "rustarmic fetch_inst miss #{} at {:#x} ({} regions)",
+            n,
             addr,
             self.regions.len()
         );
-        for r in self.regions.iter() {
-            log::warn!(
-                "  region {:#x}..{:#x} perm={} x={}",
-                r.va,
-                r.end,
-                r.perm,
-                r.perm.contains(Perm::X)
-            );
+        if n == 1 {
+            for r in self.regions.iter() {
+                log::warn!(
+                    "  region {:#x}..{:#x} perm={} x={}",
+                    r.va,
+                    r.end,
+                    r.perm,
+                    r.perm.contains(Perm::X)
+                );
+            }
         }
         None
     }
+}
+
+fn log_occurrence(counter: &AtomicU64) -> Option<u64> {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    (n <= 16 || n.is_power_of_two()).then_some(n)
 }
 
 fn region_at(regions: &Regions, va: u64) -> Option<&Region> {
