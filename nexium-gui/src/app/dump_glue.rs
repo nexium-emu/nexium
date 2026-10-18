@@ -195,7 +195,7 @@ fn draw_card(
     let size = Vec2::new(width, height);
     let pal = look::palette(if light { 1.0 } else { 0.0 });
     let time = ctx.input(|input| input.time);
-    let action = egui::Area::new(egui::Id::new("dump_card"))
+    let action = egui::Area::new(egui::Id::unique("dump_card"))
         .order(egui::Order::Tooltip)
         .fixed_pos(pos)
         .interactable(true)

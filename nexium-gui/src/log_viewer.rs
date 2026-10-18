@@ -1838,6 +1838,7 @@ impl LogViewer {
         }
         let forced = forced.map(|offset| offset.clamp(0.0, max_offset));
 
+        ui.spacing_mut().scroll.kinetic.rubber_band = false;
         let mut area = if prefs.wrap {
             egui::ScrollArea::vertical()
         } else {
@@ -1850,7 +1851,7 @@ impl LogViewer {
         if let Some(offset) = forced {
             area = area.vertical_scroll_offset(offset);
         }
-        let view_id = ui.id().with("log_viewer_rows");
+        let view_id = ui.scope_id().with("log_viewer_rows");
         let selected = self.selected_range();
         let cursor_row = self.cursor_row();
         let content_w = if prefs.wrap {
@@ -1930,7 +1931,7 @@ impl LogViewer {
         });
 
         let (response, origin) = output.inner;
-        let offset = output.state.offset.y;
+        let offset = output.state.clamped_offset().y;
         let actual_max = (content_h - output.inner_rect.height()).max(0.0);
         let at_bottom = offset >= actual_max - 1.0;
         self.last_inner = output.inner_rect;
@@ -2655,6 +2656,7 @@ mod tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: Vec2::new(0.0, delta_y),
                         phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                         modifiers: Modifiers::NONE,
                     },
                 ]);

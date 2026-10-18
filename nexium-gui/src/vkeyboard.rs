@@ -251,7 +251,7 @@ impl VirtualKeyboard {
 
         if self.open {
             let full = ctx.viewport_rect();
-            let blocker = egui::LayerId::new(egui::Order::Debug, egui::Id::new("vkb_blocker"));
+            let blocker = egui::LayerId::new(egui::Order::Debug, egui::Id::unique("vkb_blocker"));
             ui.scope_builder(egui::UiBuilder::new().layer_id(blocker), |ui| {
                 ui.allocate_rect(full, egui::Sense::click_and_drag());
             });
@@ -415,7 +415,7 @@ impl VirtualKeyboard {
         let full = ctx.viewport_rect();
         let mut p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Debug,
-            egui::Id::new("vkeyboard"),
+            egui::Id::unique("vkeyboard"),
         ));
         p.set_opacity(ease);
 

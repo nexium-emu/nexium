@@ -104,7 +104,7 @@ pub fn header_chip(
         Pos2::new(right - width, center_y - height * 0.5),
         Pos2::new(right, center_y + height * 0.5),
     );
-    let response = ui.interact(rect, egui::Id::new("nextendo_header_chip"), egui::Sense::click());
+    let response = ui.interact(rect, egui::Id::unique("nextendo_header_chip"), egui::Sense::click());
     let hovered = response.hovered();
     let rounding = CornerRadius::from(height * 0.5);
     painter.rect_filled(

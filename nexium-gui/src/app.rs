@@ -1865,7 +1865,7 @@ impl HorizonApp {
         let mut action = None;
 
         egui::Window::new("Game Information")
-            .id(egui::Id::new("game_information_window"))
+            .id(egui::Id::unique("game_information_window"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -2765,7 +2765,7 @@ impl HorizonApp {
         let screen = ctx.viewport_rect();
         let mut paint = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
-            egui::Id::new("icon_picker"),
+            egui::Id::unique("icon_picker"),
         ));
         paint.set_opacity(ease);
         paint.rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(205));
@@ -3127,7 +3127,7 @@ impl HorizonApp {
 
         let mut p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
-            egui::Id::new("carousel_settings"),
+            egui::Id::unique("carousel_settings"),
         ));
         p.set_opacity(ease);
         crate::carousel::draw_backdrop(
@@ -4756,7 +4756,7 @@ impl HorizonApp {
 
         let mut p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
-            egui::Id::new("preferences"),
+            egui::Id::unique("preferences"),
         ));
         p.set_opacity(ease);
         crate::carousel::draw_backdrop(
@@ -7494,7 +7494,7 @@ impl HorizonApp {
         let hit = egui::Rect::from_min_size(pos, egui::vec2(bw, bh));
         let resp = ui.interact(
             hit,
-            egui::Id::new("perf_overlay_drag"),
+            egui::Id::unique("perf_overlay_drag"),
             egui::Sense::click_and_drag(),
         );
         let grip = (20.0 * sc).clamp(16.0, 40.0);
@@ -7502,7 +7502,7 @@ impl HorizonApp {
             egui::Rect::from_min_size(egui::pos2(pos.x + bw - grip, pos.y), egui::vec2(grip, grip));
         let gresp = ui.interact(
             grip_rect,
-            egui::Id::new("perf_resize"),
+            egui::Id::unique("perf_resize"),
             egui::Sense::click_and_drag(),
         );
         if gresp.hovered() || gresp.dragged() {
@@ -7555,7 +7555,7 @@ impl HorizonApp {
 
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
-            egui::Id::new("perf_overlay"),
+            egui::Id::unique("perf_overlay"),
         ));
         p.rect_filled(
             rect,
@@ -7938,7 +7938,7 @@ impl HorizonApp {
         let screen = ctx.viewport_rect();
         let mut p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
-            egui::Id::new("modal_overlay"),
+            egui::Id::unique("modal_overlay"),
         ));
         p.set_opacity(ease);
         p.rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(195));
@@ -8189,7 +8189,7 @@ impl HorizonApp {
         let rect = motion_toast_rect(ctx.viewport_rect(), self.download_toast.is_some());
         let mut tp = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
-            egui::Id::new("motion_toast"),
+            egui::Id::unique("motion_toast"),
         ));
         tp.set_opacity(fade);
         tp.rect_filled(
@@ -8566,7 +8566,7 @@ impl HorizonApp {
             return;
         }
         self.game_bar_tab_rect = Some(tab.expand(3.0));
-        let response = egui::Area::new(egui::Id::new("gamebar_reveal"))
+        let response = egui::Area::new(egui::Id::unique("gamebar_reveal"))
             .order(egui::Order::Foreground)
             .fixed_pos(tab.min)
             .show(ctx, |ui| {
@@ -8947,7 +8947,7 @@ mod guest_input_tests {
         let mut input = InputState::default();
         let wheel = |unit, delta| Event::MouseWheel {
             unit, delta, modifiers: Modifiers { shift: true, ..Default::default() },
-            phase: egui::TouchPhase::Move,
+            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown,
         };
         input.events.push(wheel(MouseWheelUnit::Line, vec2(2.0, -3.0)));
         assert_eq!(guest_wheel_delta(&input), vec2(2.0, -3.0));
@@ -11457,7 +11457,7 @@ impl eframe::App for HorizonApp {
                                 let rect = self.game_draw_rect(panel, tsz, ctx.pixels_per_point());
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
-                                    egui::Id::new("home_zoom"),
+                                    egui::Id::unique("home_zoom"),
                                 ));
                                 draw_zoom_fade_out(&p, rect, tid, ef);
                             }
@@ -11469,7 +11469,7 @@ impl eframe::App for HorizonApp {
                                 let rect = self.game_draw_rect(panel, tsz, ctx.pixels_per_point());
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
-                                    egui::Id::new("home_zoom"),
+                                    egui::Id::unique("home_zoom"),
                                 ));
                                 let cover = (ef * 1.5).min(1.0);
                                 p.rect_filled(
@@ -11522,7 +11522,7 @@ impl eframe::App for HorizonApp {
                                 let rect = self.game_draw_rect(panel, tsz, ctx.pixels_per_point());
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
-                                    egui::Id::new("stop_dissolve"),
+                                    egui::Id::unique("stop_dissolve"),
                                 ));
                                 draw_zoom_fade_out(&p, rect, tid, t);
                             }
@@ -11534,7 +11534,7 @@ impl eframe::App for HorizonApp {
                             let rect = self.game_draw_rect(panel, tsz, ctx.pixels_per_point());
                             let p = ctx.layer_painter(egui::LayerId::new(
                                 egui::Order::Foreground,
-                                egui::Id::new("stop_dissolve"),
+                                egui::Id::unique("stop_dissolve"),
                             ));
                             draw_dissolve(&p, rect, tid, t);
                         }
@@ -11655,7 +11655,7 @@ impl eframe::App for HorizonApp {
                     } else {
                         let fade = (el.min(0.3) / 0.3).min((4.5 - el) / 0.5).clamp(0.0, 1.0);
                         let screen = ctx.viewport_rect();
-                        let mut tp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dl_toast")));
+                        let mut tp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("dl_toast")));
                         tp.set_opacity(fade);
                         let w = 360.0;
                         let rect = egui::Rect::from_min_size(egui::pos2(screen.center().x - w * 0.5, screen.min.y + 24.0), egui::Vec2::new(w, 62.0));

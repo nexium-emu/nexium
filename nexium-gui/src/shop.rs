@@ -328,7 +328,7 @@ impl ShopState {
         let screen = ctx.viewport_rect();
         let mut paint = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
-            egui::Id::new("shop"),
+            egui::Id::unique("shop"),
         ));
         paint.set_opacity(ease);
         paint.rect_filled(screen, egui::CornerRadius::ZERO, pal.bg);
@@ -1492,7 +1492,7 @@ impl ShopState {
         let pop = 0.90 + 0.10 * de;
         let mut dp = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
-            egui::Id::new("shop_dialog"),
+            egui::Id::unique("shop_dialog"),
         ));
         dp.set_opacity(shop_ease * de);
         dp.rect_filled(

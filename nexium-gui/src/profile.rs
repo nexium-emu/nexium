@@ -266,7 +266,7 @@ pub fn profile_view(
 
     let mut backdrop_painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Middle,
-        egui::Id::new("profile_backdrop"),
+        egui::Id::unique("profile_backdrop"),
     ));
     backdrop_painter.set_opacity(backdrop_opacity);
 
@@ -300,7 +300,7 @@ pub fn profile_view(
 
     let mut painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
-        egui::Id::new("profile_bg"),
+        egui::Id::unique("profile_bg"),
     ));
     painter.set_opacity(content_opacity);
 
@@ -613,7 +613,7 @@ pub fn profile_view(
 
     let mut content_painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
-        egui::Id::new("profile_content"),
+        egui::Id::unique("profile_content"),
     ));
     content_painter.set_opacity(ease * content_opacity);
 
@@ -1475,7 +1475,7 @@ fn recently_played_page(
         let secs = play.get(&lib.games[i].path);
         let tex = lib.texture(ctx, i);
         let scaled_rect = scale_rect(rect);
-        let row_resp = ui.interact(scaled_rect, egui::Id::new(("rp_row", i)), Sense::click());
+        let row_resp = ui.interact(scaled_rect, egui::Id::unique(("rp_row", i)), Sense::click());
         if row_resp.clicked() {
             if state.focus_content && state.row_selected == vis {
                 *action =

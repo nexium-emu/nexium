@@ -81,7 +81,7 @@ impl ModManager {
         }
         let mut refresh = edge(SwitchButton::X) && self.pending.is_none();
         let mut close = false;
-        let modal = egui::Modal::new(egui::Id::new("game_mod_manager")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("game_mod_manager")).show(ctx, |ui| {
             ui.set_width((ctx.viewport_rect().width() - 48.0).clamp(280.0, 600.0));
             ui.heading("Game Mods");
             ui.label(

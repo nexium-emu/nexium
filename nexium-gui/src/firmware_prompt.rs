@@ -253,7 +253,7 @@ impl FirmwarePrompt {
             .corner_radius(18)
             .inner_margin(22)
             .stroke(Stroke::new(1.0, accent.gamma_multiply(0.45)));
-        let modal = egui::Modal::new(egui::Id::new("firmware_prompt"))
+        let modal = egui::Modal::new(egui::Id::unique("firmware_prompt"))
             .frame(frame)
             .backdrop_color(Color32::from_black_alpha(175))
             .show(ctx, |ui| {

@@ -123,7 +123,7 @@ impl Toasts {
             if opacity > 0.02 {
                 self.shown.push(rect.expand(8.0 * scale));
             }
-            let response = egui::Area::new(egui::Id::new(("nextendo_toast", toast.id)))
+            let response = egui::Area::new(egui::Id::unique(("nextendo_toast", toast.id)))
                 .order(egui::Order::Tooltip)
                 .fixed_pos(pos)
                 .interactable(true)

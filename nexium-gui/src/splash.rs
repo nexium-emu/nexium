@@ -72,7 +72,7 @@ impl Splash {
             let scene_a = (1.0 - prog).clamp(0.0, 1.0);
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("splash_fade"),
+                egui::Id::unique("splash_fade"),
             ));
             let rect = ctx.viewport_rect();
             painter.rect_filled(

@@ -2524,7 +2524,7 @@ pub fn carousel_view(
 
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Background,
-        egui::Id::new("carousel_bg"),
+        egui::Id::unique("carousel_bg"),
     ));
     if state.nx_logo.is_none() {
         if let Ok(img) = image::load_from_memory(include_bytes!("../../branding/png/logo-256.png"))
@@ -2841,7 +2841,7 @@ pub fn carousel_view(
         let card_game = game_of(i);
         let resp = ui.interact(
             draw_rect,
-            egui::Id::new(("carousel_card", i)),
+            egui::Id::unique(("carousel_card", i)),
             Sense::click(),
         );
         if interactive && resp.clicked() && !state.drag_moved && state.boot_stage == BootStage::None
@@ -4381,7 +4381,7 @@ pub fn carousel_view(
         let av_rect = egui::Rect::from_center_size(scaled_av, Vec2::splat(scaled_av_r * 2.0));
         let av_resp = ui.interact(
             av_rect.expand(3.0 * scale_factor),
-            egui::Id::new("carousel_avatar"),
+            egui::Id::unique("carousel_avatar"),
             Sense::click(),
         );
         if interactive

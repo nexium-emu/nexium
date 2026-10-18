@@ -561,7 +561,7 @@ pub fn hub_view(state: &mut HubState, frame: &HubFrame, ctx: &egui::Context, ui:
         state.focus_content = false;
     }
 
-    let mut backdrop = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("nextendo_backdrop")));
+    let mut backdrop = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("nextendo_backdrop")));
     backdrop.set_opacity(frame.backdrop_opacity);
     crate::carousel::draw_backdrop(
         &backdrop,
@@ -580,7 +580,7 @@ pub fn hub_view(state: &mut HubState, frame: &HubFrame, ctx: &egui::Context, ui:
     };
     backdrop.rect_filled(full, CornerRadius::ZERO, scrim);
 
-    let mut painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("nextendo_hub")));
+    let mut painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("nextendo_hub")));
     painter.set_opacity(frame.content_opacity);
 
     let typing = state.editing();
@@ -807,7 +807,7 @@ pub fn hub_view(state: &mut HubState, frame: &HubFrame, ctx: &egui::Context, ui:
     let content = content_full.translate(Vec2::new((1.0 - eased) * 46.0 * s, 0.0));
 
     let mut content_painter = ctx
-        .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("nextendo_hub_content")))
+        .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("nextendo_hub_content")))
         .with_clip_rect(content_full.expand2(Vec2::new(8.0 * s, 6.0 * s)));
     content_painter.set_opacity(eased * frame.content_opacity);
 
@@ -992,7 +992,7 @@ fn confirm_dialog(
             "Remove",
         ),
     };
-    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("nextendo_confirm")));
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("nextendo_confirm")));
     painter.rect_filled(full, CornerRadius::ZERO, Color32::from_black_alpha(150));
     let card = Rect::from_center_size(full.center(), Vec2::new(500.0 * s, 230.0 * s));
     look::soft_shadow(&painter, card, 16.0 * s, 1.0);
@@ -1237,12 +1237,12 @@ fn waiting_card(page: &mut Page, x: f32, y: f32, width: f32, title: &str, body: 
         let copy = Rect::from_min_size(Pos2::new(reopen.max.x + 12.0 * s, buttons_y), Vec2::new(150.0 * s, 46.0 * s));
         let copied = page
             .ui
-            .memory(|memory| memory.data.get_temp::<f64>(egui::Id::new("nextendo_link_copied")))
+            .memory(|memory| memory.data.get_temp::<f64>(egui::Id::unique("nextendo_link_copied")))
             .is_some_and(|at| page.time - at < 1.6);
         if page.button(0, copy, if copied { "Copied" } else { "Copy link" }, ButtonKind::Secondary, !url.is_empty()) {
             page.ui.ctx().copy_text(url.clone());
             let now = page.time;
-            page.ui.memory_mut(|memory| memory.data.insert_temp(egui::Id::new("nextendo_link_copied"), now));
+            page.ui.memory_mut(|memory| memory.data.insert_temp(egui::Id::unique("nextendo_link_copied"), now));
         }
         let cancel = Rect::from_min_size(Pos2::new(copy.max.x + 12.0 * s, buttons_y), Vec2::new(120.0 * s, 46.0 * s));
         if page.button(0, cancel, "Cancel", ButtonKind::Quiet, true) {

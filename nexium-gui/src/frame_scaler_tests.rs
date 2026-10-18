@@ -56,7 +56,6 @@ fn render_state() -> RenderState {
         queue,
         target_format,
         renderer: Arc::new(egui::mutex::RwLock::new(renderer)),
-        surface_config: eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY,
     }
 }
 
