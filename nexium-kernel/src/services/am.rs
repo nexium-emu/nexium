@@ -708,6 +708,28 @@ fn library_applet_self_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, V
     }
 }
 
+#[cfg(test)]
+mod display_version_tests {
+    use super::application_functions;
+    use crate::kernel::Kernel;
+    use nexium_memory::AddressSpace;
+    use std::sync::Arc;
+
+    #[test]
+    fn display_version_returns_the_application_version() {
+        let mut kernel = Kernel::new(
+            Arc::new(AddressSpace::new()),
+            0x8000000, 0x1000, 0x20000000, 0x200000,
+            0x30000000, 0x1000, 0x40000000, 0x40001000,
+        );
+        kernel.application_display_version = *b"1.1.2\0\0\0\0\0\0\0\0\0\0\0";
+        let (result, data, handles) = application_functions(&mut kernel, 23).unwrap();
+        assert_eq!(result, 0);
+        assert_eq!(data, b"1.1.2\0\0\0\0\0\0\0\0\0\0\0");
+        assert!(handles.is_empty());
+    }
+}
+
 fn application_functions(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         1 => err(0x480),
@@ -718,7 +740,7 @@ fn application_functions(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>,
             ok(lang_code.to_le_bytes().to_vec())
         }
         22 => ok_empty(),
-        23 => ok(vec![0u8; 16]),
+        23 => ok(kernel.application_display_version.to_vec()),
         24 => ok(vec![0u8; 16]),
         25 | 26 => err(nexium_common::result::KERNEL_INVALID_SIZE),
         27 => ok(vec![0u8; 16]),
