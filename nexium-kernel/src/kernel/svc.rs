@@ -9483,7 +9483,52 @@ fn dispatch_service_v2(
         return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
     }
 
-    if port_name == "hwopus" && (cmd_id == 0 || cmd_id == 2 || cmd_id == 4 || cmd_id == 6) {
+    if port_name == "hwopus" && matches!(cmd_id, 0 | 4) {
+        let in_start = ctx.cmif_in_data_off.min(ctx.buf.len());
+        let in_end = in_start
+            .saturating_add(ctx.cmif_in_data_len as usize)
+            .min(ctx.buf.len());
+        let opened =
+            crate::services::hwopus::parse_open_request(&ctx.buf[in_start..in_end], cmd_id == 4)
+                .and_then(|(parameters, transfer_memory_size)| {
+                    crate::services::hwopus::DecoderState::new(parameters, transfer_memory_size)
+                });
+        let decoder = match opened {
+            Ok(decoder) => decoder,
+            Err(result) => {
+                log::warn!(
+                    "hwopus: OpenHardwareOpusDecoder cmd={} rejected with {:#x}",
+                    cmd_id,
+                    result
+                );
+                return build_ipc_response(ctx, result, &[], &[]);
+            }
+        };
+        log::debug!(
+            "hwopus: OpenHardwareOpusDecoder cmd={} {:?}",
+            cmd_id,
+            decoder.parameters()
+        );
+        let is_domain = kernel
+            .sessions
+            .get(&session_handle)
+            .map(|s| s.is_domain)
+            .unwrap_or(false);
+        if is_domain {
+            let object_id = alloc_domain_object(kernel, session_handle, "IHardwareOpusDecoder");
+            let group = domain_group(kernel, session_handle);
+            kernel.hwopus_decoders.insert((group, object_id), decoder);
+            return build_ipc_response_full(ctx, 0, &[], &[], &[], &[object_id]);
+        }
+        let h = kernel.handles.create_handle(HandleType::Session);
+        kernel
+            .sessions
+            .insert(h, Session::new(h, "IHardwareOpusDecoder".to_string()));
+        kernel.hwopus_decoders.insert((h, 0), decoder);
+        return build_ipc_response(ctx, 0, &[], &[h]);
+    }
+
+    if port_name == "hwopus" && (cmd_id == 2 || cmd_id == 6) {
         let in_off = ctx.cmif_in_data_off;
         let sample_rate = u32::from_le_bytes([
             ctx.buf[in_off],
@@ -9520,6 +9565,61 @@ fn dispatch_service_v2(
                 .sessions
                 .insert(h, Session::new(h, "IHardwareOpusDecoder".to_string()));
             return build_ipc_response(ctx, 0, &[], &[h]);
+        }
+    }
+
+    if port_name == "IHardwareOpusDecoder" && matches!(cmd_id, 0 | 4 | 6 | 8) {
+        let key = match ctx.domain {
+            Some(domain) => (domain_group(kernel, session_handle), domain.object_id),
+            None => (session_handle, 0),
+        };
+        if kernel.hwopus_decoders.contains_key(&key) {
+            let reset = matches!(cmd_id, 6 | 8)
+                && ctx.cmif_in_data_len as usize >= 1
+                && ctx.buf.get(ctx.cmif_in_data_off).is_some_and(|&flag| flag != 0);
+            let input = ctx
+                .send_buffers
+                .iter()
+                .find(|b| b.size > 0 && b.addr != 0)
+                .and_then(|b| {
+                    let mut bytes = vec![0u8; b.size as usize];
+                    kernel.address_space.read(b.addr, &mut bytes).ok().map(|_| bytes)
+                })
+                .unwrap_or_default();
+            let output = ctx
+                .recv_buffers
+                .iter()
+                .find(|b| b.size > 0 && b.addr != 0)
+                .copied();
+            let capacity = output.map_or(0, |b| b.size as usize);
+            let decoded = match kernel.hwopus_decoders.get_mut(&key) {
+                Some(decoder) => decoder.decode(&input, capacity, reset),
+                None => Err(crate::services::hwopus::RESULT_LIB_OPUS_INVALID_STATE),
+            };
+            return match decoded {
+                Ok(packet) => {
+                    if let Some(rb) = output {
+                        let n = (rb.size as usize).min(packet.pcm.len());
+                        let _ = kernel.address_space.write(rb.addr, &packet.pcm[..n]);
+                    }
+                    let mut out = Vec::with_capacity(16);
+                    out.extend_from_slice(&packet.consumed.to_le_bytes());
+                    out.extend_from_slice(&packet.sample_count.to_le_bytes());
+                    if cmd_id != 0 {
+                        out.extend_from_slice(&packet.elapsed_us.to_le_bytes());
+                    }
+                    build_ipc_response(ctx, 0, &out, &[])
+                }
+                Err(result) => {
+                    log::debug!(
+                        "hwopus: decode cmd={} key={:?} failed with {:#x}",
+                        cmd_id,
+                        key,
+                        result
+                    );
+                    build_ipc_response(ctx, result, &[], &[])
+                }
+            };
         }
     }
 
