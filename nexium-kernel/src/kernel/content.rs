@@ -10,7 +10,7 @@ use std::borrow::Cow;
 mod tests;
 
 const INVALID_INPUT: u32 = 0xD401;
-const CONTENT_NOT_FOUND: u32 = 0x7D402;
+pub(super) const CONTENT_NOT_FOUND: u32 = 0x7D402;
 const UNSUPPORTED: u32 = 0x177202;
 
 fn input<const N: usize>(ctx: &ipc::IpcCtx, offset: usize) -> Option<[u8; N]> {

@@ -6812,16 +6812,17 @@ fn dispatch_service_v2(
     }
 
     if port_name == "fsp-srv" && matches!(cmd_id, 51 | 52 | 53) {
-        if let Some(root) = fs_save_data_root(kernel, ctx) {
-            log::debug!(
-                "fsp-srv.OpenSaveDataFileSystem cmd={} title_id={:#018x} root={}",
-                cmd_id,
-                kernel.title_id,
-                root.display()
-            );
-            return return_file_system_with_root(kernel, ctx, session_handle, root);
-        }
-        return build_ipc_response(ctx, 0x202, &[], &[]);
+        let root = match fs_save_data_root(kernel, ctx) {
+            Ok(root) => root,
+            Err(result) => return build_ipc_response(ctx, result, &[], &[]),
+        };
+        log::debug!(
+            "fsp-srv.OpenSaveDataFileSystem cmd={} title_id={:#018x} root={}",
+            cmd_id,
+            kernel.title_id,
+            root.display()
+        );
+        return return_file_system_with_root(kernel, ctx, session_handle, root);
     }
 
     if port_name == "fsp-srv" {
@@ -16239,7 +16240,11 @@ fn fs_sd_root(kernel: &mut Kernel) -> Option<std::path::PathBuf> {
     kernel.sd_root.clone()
 }
 
-fn fs_save_data_root(kernel: &Kernel, ctx: &ipc::IpcCtx) -> Option<std::path::PathBuf> {
+fn fs_save_must_exist(title_id: u64, space_id: u8, save_type: u8, program_id: u64) -> bool {
+    space_id == 1 && !matches!(save_type, 4 | 5) && program_id != 0 && program_id != title_id
+}
+
+fn fs_save_data_root(kernel: &Kernel, ctx: &ipc::IpcCtx) -> Result<std::path::PathBuf, u32> {
     let data_start = ctx.cmif_in_data_off.min(ctx.buf.len());
     let data_end = data_start
         .saturating_add(ctx.cmif_in_data_len)
@@ -16256,7 +16261,7 @@ fn fs_save_data_root(kernel: &Kernel, ctx: &ipc::IpcCtx) -> Option<std::path::Pa
     } else {
         kernel.title_id
     };
-    let base = fs_base_root()?;
+    let base = fs_base_root().ok_or(0x202u32)?;
     let title = format!("{:016x}", title_id);
     let root = match space_id {
         0 => base
@@ -16306,11 +16311,33 @@ fn fs_save_data_root(kernel: &Kernel, ctx: &ipc::IpcCtx) -> Option<std::path::Pa
             .join(&user_id)
             .join(&title),
     };
+    if fs_save_must_exist(kernel.title_id, space_id, save_type, program_id) && !root.is_dir() {
+        log::debug!("fs: no save data for program {:#018x} user {}", program_id, user_id);
+        return Err(content::CONTENT_NOT_FOUND);
+    }
     if let Err(e) = std::fs::create_dir_all(&root) {
         log::warn!("fs: failed to create save root {}: {}", root.display(), e);
-        return None;
+        return Err(0x202);
     }
-    Some(root)
+    Ok(root)
+}
+
+#[cfg(test)]
+mod save_data_open_tests {
+    use super::fs_save_must_exist;
+
+    #[test]
+    fn only_other_applications_saves_must_already_exist() {
+        let own = 0x0100_FF50_0E34_A000;
+        let other = 0x0100_F340_0332_C000;
+        assert!(fs_save_must_exist(own, 1, 1, other));
+        assert!(fs_save_must_exist(own, 1, 3, other));
+        assert!(!fs_save_must_exist(own, 1, 1, 0));
+        assert!(!fs_save_must_exist(own, 1, 1, own));
+        assert!(!fs_save_must_exist(own, 1, 4, other));
+        assert!(!fs_save_must_exist(own, 1, 5, other));
+        assert!(!fs_save_must_exist(own, 0, 0, other));
+    }
 }
 
 fn fs_read_le_u64(data: &[u8], off: usize) -> Option<u64> {
