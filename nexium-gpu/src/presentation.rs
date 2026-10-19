@@ -96,6 +96,21 @@ pub struct Snapshot {
     pub pixels: Vec<u8>,
 }
 
+fn swapchain_layer() -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+        }
+        let module: Vec<u16> = "UltraCamVk.dll\0".encode_utf16().collect();
+        if !unsafe { GetModuleHandleW(module.as_ptr()) }.is_null() {
+            return Some("UltraCamVk");
+        }
+    }
+    None
+}
+
 fn present_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -796,6 +811,7 @@ struct Worker {
     images: Vec<SwapImage>,
     retired: Vec<RetiredSwapchain>,
     present_fences: bool,
+    destroy_before_create: bool,
     extent: vk::Extent2D,
     format: vk::Format,
     vsync: bool,
@@ -836,6 +852,12 @@ impl Worker {
         target: Arc<PresentationTarget>,
         present_fences: bool,
     ) -> Result<Self, String> {
+        let layer = swapchain_layer();
+        if let Some(layer) = layer {
+            log::info!(
+                "[vulkan-present] {layer} owns the swapchain; presenting without present fences and destroying each swapchain before its replacement"
+            );
+        }
         let mut worker = Self {
             device: device.clone(),
             surface_api: ash::khr::surface::Instance::new(entry, instance),
@@ -846,7 +868,8 @@ impl Worker {
             swapchain: vk::SwapchainKHR::null(),
             images: Vec::new(),
             retired: Vec::new(),
-            present_fences,
+            present_fences: present_fences && layer.is_none(),
+            destroy_before_create: layer.is_some(),
             extent: vk::Extent2D::default(),
             format: vk::Format::UNDEFINED,
             vsync: true,
@@ -1198,6 +1221,10 @@ impl Worker {
 
     fn recreate(&mut self, state: SurfaceState) -> Result<(), String> {
         self.retire_swapchain();
+        if self.destroy_before_create {
+            self.drain();
+            self.release_retired();
+        }
         unsafe {
             let caps = self
                 .surface_api
