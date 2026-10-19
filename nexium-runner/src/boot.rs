@@ -992,6 +992,7 @@ impl EmulationHandle {
                     Arc::clone(&stop_flag_clone),
                 )?;
                 let title_id = boot_ctx.kernel.lock().title_id;
+                nexium_gpu::presentation::announce_title(title_id);
                 nexium_nvdrv::gpu::configure_fast_gpu_time(title_id == SWITCH_SPORTS_TITLE_ID);
                 nexium_nvdrv::gpu::configure_gpu_accuracy();
                 nexium_nvdrv::gpu::configure_retained_ssbos(

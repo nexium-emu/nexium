@@ -111,6 +111,23 @@ fn swapchain_layer() -> Option<&'static str> {
     None
 }
 
+pub fn announce_title(title_id: u64) {
+    let Some(layer) = swapchain_layer() else {
+        return;
+    };
+    if std::env::var_os("NEXIUM_ANNOUNCE_TITLE").is_none_or(|value| value == "0") {
+        log::info!(
+            "[vulkan-present] {layer} per-title settings stay off; NEXIUM_ANNOUNCE_TITLE=1 announces {title_id:016X}"
+        );
+        return;
+    }
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "Loading title ({title_id:016X})");
+    let _ = stdout.flush();
+    log::info!("[vulkan-present] announced title {title_id:016X} to {layer}");
+}
+
 fn present_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
