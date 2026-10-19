@@ -22770,8 +22770,13 @@ fn map_attrib_format(format: u32) -> Option<vk::Format> {
         (0x04, 3) => Some(vk::Format::R32G32_SINT),
         (0x04, 4) => Some(vk::Format::R32G32_UINT),
 
+        (0x05, 7) => Some(vk::Format::R16G16B16_SFLOAT),
+        (0x05, 2) => Some(vk::Format::R16G16B16_UNORM),
+        (0x05, 1) => Some(vk::Format::R16G16B16_SNORM),
         (0x05, 3) => Some(vk::Format::R16G16B16_SINT),
         (0x05, 4) => Some(vk::Format::R16G16B16_UINT),
+        (0x05, 6) => Some(vk::Format::R16G16B16_SSCALED),
+        (0x05, 5) => Some(vk::Format::R16G16B16_USCALED),
 
         (0x0A, 2) => Some(vk::Format::R8G8B8A8_UNORM),
         (0x0A, 1) => Some(vk::Format::R8G8B8A8_SNORM),
@@ -23769,6 +23774,23 @@ pub(crate) fn write_watch_test_host_or_skip(test: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn three_component_half_attributes_map_to_vulkan_formats() {
+        for (kind, format) in [
+            (7, vk::Format::R16G16B16_SFLOAT),
+            (2, vk::Format::R16G16B16_UNORM),
+            (1, vk::Format::R16G16B16_SNORM),
+            (3, vk::Format::R16G16B16_SINT),
+            (4, vk::Format::R16G16B16_UINT),
+            (6, vk::Format::R16G16B16_SSCALED),
+            (5, vk::Format::R16G16B16_USCALED),
+        ] {
+            assert_eq!(super::map_attrib_format(0x05 | kind << 6), Some(format));
+        }
+        assert_eq!(super::map_attrib_format(0x1c5), Some(vk::Format::R16G16B16_SFLOAT));
+        assert_eq!(super::attrib_format_bytes(0x1c5), 6);
+    }
+
     #[test]
     fn missing_rt_reads_do_not_replay_successful_coverage_groups() {
         use nexium_gpu::renderer::{GuestColorTargetReadbacks, RawColorTargetReadback};
