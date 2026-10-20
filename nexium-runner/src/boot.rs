@@ -1024,6 +1024,13 @@ impl EmulationHandle {
                     }
                 );
                 let halt = Some(cpu.halt_handle());
+                let execution_preempt = cpu.halt_handle();
+                let preempted_main = Arc::new(AtomicBool::new(false));
+                let preempt_flag = Arc::clone(&preempted_main);
+                boot_ctx.address_space.add_execution_preempt(move || {
+                    preempt_flag.store(true, Ordering::Release);
+                    execution_preempt.halt();
+                });
                 let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
                 use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
                 let mut last_map_gen0 = boot_ctx.address_space.generation();
@@ -1079,6 +1086,13 @@ impl EmulationHandle {
                                     }
                                 };
                                 cpu_aux.set_core_id(core_id as u64);
+                                let execution_preempt = cpu_aux.halt_handle();
+                                let preempted_aux = Arc::new(AtomicBool::new(false));
+                                let preempt_flag = Arc::clone(&preempted_aux);
+                                addr_aux.add_execution_preempt(move || {
+                                    preempt_flag.store(true, Ordering::Release);
+                                    execution_preempt.halt();
+                                });
                                 let strict_null_memory = matches!(
                                     backend_aux,
                                     nexium_core::cpu::CpuBackendKind::Rustarmic
@@ -1179,6 +1193,7 @@ impl EmulationHandle {
                                     }
                                     drop(execution_guard);
                                     let event = run.event;
+                                    let preempted = preempted_aux.swap(false, Ordering::AcqRel);
                                     aux_cycles = aux_cycles.saturating_add(run.retired);
                                     if stop_on_aux_stall(event, &emulation_stop_aux, &stop_aux, || {
                                         let cpu = cpu_ref().unwrap();
@@ -1332,7 +1347,7 @@ impl EmulationHandle {
                                             ) {
                                                 k.try_yield_current_ready(cpu_ref().unwrap());
                                             }
-                                        } else if spin_yield_n != 0 {
+                                        } else if spin_yield_n != 0 && !preempted {
                                             slice_iters = slice_iters.saturating_add(1);
                                             if slice_iters >= spin_yield_n {
                                                 slice_iters = 0;
@@ -1817,6 +1832,7 @@ impl EmulationHandle {
                         }
                         let run = cpu.run_with_count(cpu_slice);
                         let event = run.event;
+                        let preempted = preempted_main.swap(false, Ordering::AcqRel);
                         let pc_after = cpu.get_pc();
                         // Taken once per slice: the [guest-fault] line and the exception
                         // report below both use it.
@@ -2064,7 +2080,8 @@ impl EmulationHandle {
                             break;
                         }
 
-                        let no_svc_progress = matches!(event, nexium_core::cpu::CpuEvent::Running);
+                        let no_svc_progress =
+                            !preempted && matches!(event, nexium_core::cpu::CpuEvent::Running);
                         if matches!(event, nexium_core::cpu::CpuEvent::Svc(_)) {
                             no_svc_in_spin = 0;
                         }

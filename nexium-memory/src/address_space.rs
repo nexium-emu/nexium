@@ -1,5 +1,5 @@
 use bytemuck::{NoUninit, Pod};
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -291,6 +291,7 @@ struct VersionedHostRegionChange {
 pub struct AddressSpace {
     id: u64,
     execution_map: RwLock<()>,
+    execution_preempt: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
     regions: Mutex<Vec<Arc<Region>>>,
     host_changes: Mutex<Vec<VersionedHostRegionChange>>,
     generation: AtomicU64,
@@ -301,6 +302,7 @@ impl AddressSpace {
         Self {
             id: ADDRESS_SPACE_IDS.fetch_add(1, Ordering::Relaxed),
             execution_map: RwLock::new(()),
+            execution_preempt: Mutex::new(Vec::new()),
             regions: Mutex::new(Vec::new()),
             host_changes: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
@@ -313,6 +315,20 @@ impl AddressSpace {
 
     pub fn execution_guard(&self) -> RwLockReadGuard<'_, ()> {
         self.execution_map.read()
+    }
+
+    pub fn add_execution_preempt(&self, preempt: impl Fn() + Send + Sync + 'static) {
+        self.execution_preempt.lock().push(Box::new(preempt));
+    }
+
+    fn execution_write(&self) -> RwLockWriteGuard<'_, ()> {
+        if let Some(guard) = self.execution_map.try_write() {
+            return guard;
+        }
+        for preempt in self.execution_preempt.lock().iter() {
+            preempt();
+        }
+        self.execution_map.write()
     }
 
     pub fn map(&self, va: u64, len: u64, perm: Perm, name: impl Into<String>) -> Result<usize> {
@@ -337,7 +353,7 @@ impl AddressSpace {
         name: String,
         commit: bool,
     ) -> Result<usize> {
-        let _execution_guard = self.execution_map.write();
+        let _execution_guard = self.execution_write();
         check_aligned("va", va)?;
         check_aligned("len", len)?;
         if len == 0 {
@@ -405,7 +421,7 @@ impl AddressSpace {
     }
 
     pub fn map_alias(&self, dst: u64, src: u64, len: u64, perm: Perm, name: impl Into<String>) -> Result<()> {
-        let _execution_guard = self.execution_map.write();
+        let _execution_guard = self.execution_write();
         for (what, value) in [("dst", dst), ("src", src), ("len", len)] {
             check_aligned(what, value)?;
         }
@@ -441,7 +457,7 @@ impl AddressSpace {
     }
 
     pub fn unmap_alias(&self, dst: u64, src: u64, len: u64) -> Result<()> {
-        let _execution_guard = self.execution_map.write();
+        let _execution_guard = self.execution_write();
         for (what, value) in [("dst", dst), ("src", src), ("len", len)] {
             check_aligned(what, value)?;
         }
@@ -502,7 +518,7 @@ impl AddressSpace {
     }
 
     pub fn unmap(&self, va: u64, len: u64) -> Result<u64> {
-        let _execution_guard = self.execution_map.write();
+        let _execution_guard = self.execution_write();
         check_aligned("va", va)?;
         check_aligned("len", len)?;
         if len == 0 {
@@ -583,7 +599,7 @@ impl AddressSpace {
     }
 
     pub fn resize_committed(&self, va: u64, len: u64) -> Result<()> {
-        let _execution_guard = self.execution_map.write();
+        let _execution_guard = self.execution_write();
         check_aligned("va", va)?;
         check_aligned("len", len)?;
 
@@ -632,7 +648,7 @@ impl AddressSpace {
     }
 
     pub fn protect(&self, va: u64, len: u64, perm: Perm) -> Result<()> {
-        let _execution_guard = self.execution_map.write();
+        let _execution_guard = self.execution_write();
         let regs = self.regions.lock();
         let r = regs
             .binary_search_by_key(&va, |r| r.base)
@@ -2214,5 +2230,49 @@ mod tests {
         reader.join().unwrap();
         assert_eq!(updates.generation, generation + 2);
         assert_eq!(updates.changes.len(), 2);
+    }
+
+    #[test]
+    fn contended_mapping_change_preempts_execution_guards() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let base = (1u64 << 41) + 0x300000;
+        let space = Arc::new(fresh());
+        let preempts = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = Mutex::new(Some(release_tx));
+        let hook_preempts = Arc::clone(&preempts);
+        space.add_execution_preempt(move || {
+            hook_preempts.fetch_add(1, Ordering::Relaxed);
+            if let Some(release) = release.lock().take() {
+                release.send(()).unwrap();
+            }
+        });
+        let (held_tx, held_rx) = mpsc::channel();
+        let reader_space = Arc::clone(&space);
+        let reader = std::thread::spawn(move || {
+            let _execution = reader_space.execution_guard();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        space.map(base, PAGE_SIZE, Perm::RW, "preempted").unwrap();
+        reader.join().unwrap();
+        assert_eq!(preempts.load(Ordering::Relaxed), 1);
+        assert!(space.host_region_at(base).is_some());
+    }
+
+    #[test]
+    fn uncontended_mapping_change_skips_preemption() {
+        let base = (1u64 << 41) + 0x400000;
+        let space = fresh();
+        let preempts = Arc::new(AtomicUsize::new(0));
+        let hook_preempts = Arc::clone(&preempts);
+        space.add_execution_preempt(move || {
+            hook_preempts.fetch_add(1, Ordering::Relaxed);
+        });
+        space.map(base, PAGE_SIZE, Perm::RW, "quiet").unwrap();
+        space.unmap(base, PAGE_SIZE).unwrap();
+        assert_eq!(preempts.load(Ordering::Relaxed), 0);
     }
 }
