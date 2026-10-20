@@ -668,6 +668,8 @@ impl Cpu {
         match self {
             #[cfg(nce_runtime)]
             Cpu::Nce(cpu) => Some(cpu.stats()),
+            #[cfg(feature = "backend-rustarmic")]
+            Cpu::Rustarmic(cpu) => Some(cpu.jit_stats()),
             #[allow(unreachable_patterns)]
             _ => None,
         }

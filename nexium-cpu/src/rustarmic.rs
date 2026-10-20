@@ -14,6 +14,9 @@ const NULL_SKIP_MAX: u32 = 64;
 /// above this take the callbacks.
 const FASTMEM_TABLE_MAX_BITS: u32 = 39;
 
+const CODE_CACHE_DEFAULT_MB: usize = 1024;
+const CODE_CACHE_MAX_MB: usize = 2047;
+
 #[derive(Clone, Copy, Debug)]
 struct Region {
     va: u64,
@@ -29,11 +32,20 @@ unsafe impl Sync for Region {}
 /// regions ordered by address and is used for binary search whenever no two
 /// of them overlap (the normal case), where "first match" and "the only
 /// match" coincide.
-#[derive(Default)]
 struct Regions {
     list: Vec<Region>,
     sorted: Vec<Region>,
     disjoint: bool,
+}
+
+impl Default for Regions {
+    fn default() -> Self {
+        Self {
+            list: Vec::new(),
+            sorted: Vec::new(),
+            disjoint: true,
+        }
+    }
 }
 
 impl Regions {
@@ -47,7 +59,42 @@ impl Regions {
 
     fn push(&mut self, region: Region) {
         self.list.push(region);
+        if self.disjoint {
+            if region.end <= region.va {
+                return;
+            }
+            let index = self.sorted.partition_point(|r| r.va < region.va);
+            let after_previous = index == 0 || self.sorted[index - 1].end <= region.va;
+            let before_next = self.sorted.get(index).is_none_or(|next| region.end <= next.va);
+            if after_previous && before_next {
+                self.sorted.insert(index, region);
+                return;
+            }
+        }
         self.rebuild_index();
+    }
+
+    fn remove_sorted_range(&mut self, va: u64, end: u64) {
+        let first = self.sorted.partition_point(|r| r.end <= va);
+        let last = first
+            + self.sorted[first..]
+                .iter()
+                .take_while(|r| r.va < end)
+                .count();
+        if first == last {
+            return;
+        }
+        let mut pieces = Vec::with_capacity(2);
+        let head = self.sorted[first];
+        if head.va < va {
+            pieces.push(Region { end: va, ..head });
+        }
+        let tail = self.sorted[last - 1];
+        if tail.end > end {
+            let host_ptr = tail.host_ptr.wrapping_add((end - tail.va) as usize);
+            pieces.push(Region { va: end, host_ptr, ..tail });
+        }
+        self.sorted.splice(first..last, pieces);
     }
 
     /// Unmaps exactly `[va, end)`: a region partly inside keeps its pieces
@@ -81,7 +128,11 @@ impl Regions {
         }
         self.list = kept;
         if extent.is_some() {
-            self.rebuild_index();
+            if self.disjoint {
+                self.remove_sorted_range(va, end);
+            } else {
+                self.rebuild_index();
+            }
         }
         extent
     }
@@ -296,6 +347,14 @@ fn rustarmic_fastmem_enabled() -> bool {
     !env_disabled("NEXIUM_RUSTARMIC_FASTMEM")
 }
 
+fn code_cache_bytes() -> usize {
+    let mb = std::env::var("NEXIUM_JIT_CACHE_MB")
+        .ok()
+        .and_then(|mb| mb.trim().parse::<usize>().ok())
+        .unwrap_or(CODE_CACHE_DEFAULT_MB);
+    mb.clamp(16, CODE_CACHE_MAX_MB) << 20
+}
+
 #[derive(Clone, Debug)]
 pub struct RustarmicThreadContext {
     v: [[u64; 2]; 32],
@@ -440,7 +499,10 @@ unsafe impl Sync for RustarmicCpu {}
 
 impl RustarmicCpu {
     pub fn new() -> Result<Self, String> {
-        Self::new_with_jit_config(JitConfig::default())
+        Self::new_with_jit_config(JitConfig {
+            code_cache_bytes: code_cache_bytes(),
+            ..JitConfig::default()
+        })
     }
 
     pub fn new_with_engine_config(config: &rustarmic::EngineConfig) -> Result<Self, String> {
@@ -459,6 +521,9 @@ impl RustarmicCpu {
         }
         if env_disabled("NEXIUM_RUSTARMIC_LINK") {
             jit_config.link_blocks = false;
+        }
+        if !env_disabled("NEXIUM_RUSTARMIC_RWX") {
+            jit_config.rwx_code_cache = true;
         }
         // A data abort resumes past the faulting access, as on Dynarmic
         // (whose unmapped callback completes the access and stops after
@@ -568,6 +633,14 @@ impl RustarmicCpu {
 
     pub fn null_skip_count(&self) -> u32 {
         self.state.null_skip_count.load(Ordering::Relaxed)
+    }
+
+    pub fn jit_stats(&self) -> String {
+        format!(
+            "jit_blocks={} jit_bytes={}",
+            self.jit.cache.len(),
+            self.jit.cache.used_bytes()
+        )
     }
 
     pub fn halt_handle(&self) -> HaltHandle {
@@ -2022,6 +2095,45 @@ mod tests {
         assert_eq!(overlapping.find(0x1900).unwrap().perm, Perm::RO);
         assert_eq!(overlapping.find(0x1000).unwrap().perm, Perm::RWX);
         assert!(overlapping.exec_overlaps(0x1900, 4));
+    }
+
+    #[test]
+    fn incremental_index_matches_a_full_rebuild() {
+        let mut r = Regions::default();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let key = |x: &Region| (x.va, x.end, x.host_ptr as u64);
+        for _ in 0..4000 {
+            let va = next(64) * 0x1000;
+            let end = va + next(8) * 0x1000;
+            match next(6) {
+                0 | 1 => {
+                    r.remove_range(va, end);
+                }
+                2 => r.push(region(va, end, Perm::RW, 0x10_0000 + va)),
+                _ => {
+                    r.remove_range(va, end);
+                    r.push(region(va, end, Perm::RW, 0x10_0000 + va));
+                }
+            }
+            let mut rebuilt = Regions {
+                list: r.list.clone(),
+                ..Regions::default()
+            };
+            rebuilt.rebuild_index();
+            assert_eq!(r.disjoint, rebuilt.disjoint);
+            if r.disjoint {
+                assert_eq!(
+                    r.sorted.iter().map(key).collect::<Vec<_>>(),
+                    rebuilt.sorted.iter().map(key).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]
