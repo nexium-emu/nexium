@@ -450,6 +450,58 @@ fn parse_injected_input(text: &str) -> Option<ControllerInput> {
     (any && active).then_some(input)
 }
 
+fn keyboard_usage(name: &str) -> Option<u8> {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_bytes() {
+        [c @ b'A'..=b'Z'] => Some(0x04 + (c - b'A')),
+        [c @ b'1'..=b'9'] => Some(0x1E + (c - b'1')),
+        [b'0'] => Some(0x27),
+        _ => match upper.as_str() {
+            "ENTER" => Some(0x28),
+            "ESCAPE" => Some(0x29),
+            "TAB" => Some(0x2B),
+            "SPACE" => Some(0x2C),
+            _ => upper
+                .strip_prefix('F')
+                .and_then(|n| n.parse::<u8>().ok())
+                .filter(|n| (1..=12).contains(n))
+                .map(|n| 0x3A + n - 1),
+        },
+    }
+}
+
+fn parse_injected_keys(text: &str) -> Option<KeyboardInput> {
+    let mut keyboard = KeyboardInput { connected: true, ..KeyboardInput::default() };
+    let mut any = false;
+    for value in text.split_whitespace().filter_map(|token| token.strip_prefix("keys=")) {
+        for usage in value.split(',').filter_map(keyboard_usage) {
+            keyboard.keys[usize::from(usage / 8)] |= 1 << (usage % 8);
+            any = true;
+        }
+    }
+    any.then_some(keyboard)
+}
+
+fn injected_keyboard() -> Option<KeyboardInput> {
+    use std::sync::{Mutex, OnceLock};
+    type KeyboardCache = Mutex<(std::time::Instant, Option<KeyboardInput>)>;
+    static STATE: OnceLock<Option<(std::path::PathBuf, KeyboardCache)>> = OnceLock::new();
+    let (path, cache) = STATE
+        .get_or_init(|| {
+            std::env::var_os("NEXIUM_HID_INJECT").map(|value| {
+                let stale = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                (std::path::PathBuf::from(value), Mutex::new((stale, None)))
+            })
+        })
+        .as_ref()?;
+    let mut cache = cache.lock().ok()?;
+    if cache.0.elapsed() >= std::time::Duration::from_millis(25) {
+        cache.0 = std::time::Instant::now();
+        cache.1 = std::fs::read_to_string(path).ok().and_then(|text| parse_injected_keys(&text));
+    }
+    cache.1
+}
+
 impl HidState {
     pub fn new() -> Self {
         let mut s = Self {
@@ -716,6 +768,7 @@ impl HidState {
         self.publish_newly_assigned();
 
         let (mouse, keyboard, touch) = selected_auxiliary_input(self.mouse, self.keyboard, self.touch, exclusive);
+        let keyboard = injected_keyboard().unwrap_or(keyboard);
         let previous_mouse = if exclusive { MouseInput::default() } else { self.last_written_mouse };
         Self::write_mouse_lifo(&mut self.buf[..], &mouse, &previous_mouse, sampling);
         self.last_written_mouse = mouse;
@@ -1668,6 +1721,16 @@ mod tests {
         assert!(selected_auxiliary_input(mouse, keyboard, touch, false) == (mouse, keyboard, touch));
         assert!(selected_auxiliary_input(mouse, keyboard, touch, true)
             == (MouseInput::default(), KeyboardInput::default(), TouchInput::default()));
+    }
+
+    #[test]
+    fn injected_keys_set_hid_usage_bits() {
+        let keyboard = parse_injected_keys("keys=G,f1,Enter").unwrap();
+        assert_eq!(keyboard.keys[0x0A / 8], 1 << (0x0A % 8));
+        assert!(keyboard.keys[0x3A / 8] & (1 << (0x3A % 8)) != 0);
+        assert!(keyboard.keys[0x28 / 8] & (1 << (0x28 % 8)) != 0);
+        assert!(keyboard.connected);
+        assert!(parse_injected_keys("buttons=A").is_none());
     }
 
     #[test]
