@@ -670,6 +670,9 @@ pub struct Translator {
     cc_source: Option<Value>,
     carry_source: Option<Value>,
     carry_guard: Option<(Predicate, Option<ValueId>)>,
+    overflow_source: Option<Value>,
+    overflow_add: Option<(Value, Value, ValueId)>,
+    overflow_negated_b: bool,
     pending_bindless_origin_checks: Vec<PendingBindlessOriginCheck>,
     select_pred_defs: HashMap<ValueId, ValueId>,
     pub finished: bool,
@@ -729,6 +732,9 @@ impl Translator {
             cc_source: None,
             carry_source: None,
             carry_guard: None,
+            overflow_source: None,
+            overflow_add: None,
+            overflow_negated_b: false,
             pending_bindless_origin_checks: Vec::new(),
             select_pred_defs: HashMap::new(),
             finished: false,
@@ -855,8 +861,6 @@ impl Translator {
                     | Opcode::ISCADD32I
                     | Opcode::LOP32I
             );
-        let r2p_cc = ((raw >> 40) & 1) != 0
-            && matches!(opcode, Opcode::R2P_reg | Opcode::R2P_cbuf | Opcode::R2P_imm);
         let control_ambiguity = matches!(
             opcode,
             Opcode::BAR
@@ -879,7 +883,7 @@ impl Translator {
                 | Opcode::RTT
                 | Opcode::SYNC
         );
-        regular_cc || immediate_cc || r2p_cc || control_ambiguity
+        regular_cc || immediate_cc || control_ambiguity
     }
 
     fn trace_cbuf_handle_origin(
@@ -1441,7 +1445,30 @@ impl Translator {
         );
         if raw & (1 << 47) != 0 && pred.is_none() {
             self.cc_source = Some(Value::Inst(id));
+            self.reset_carry_and_overflow();
         }
+    }
+
+    fn reset_carry_and_overflow(&mut self) {
+        self.carry_source = Some(Value::Zero);
+        self.carry_guard = None;
+        self.overflow_source = Some(Value::Zero);
+        self.overflow_add = None;
+    }
+
+    fn overflow_value(&mut self) -> Option<Value> {
+        if let Some(overflow) = self.overflow_source {
+            return Some(overflow);
+        }
+        let (a, b, result) = self.overflow_add?;
+        let b = if self.overflow_negated_b { self.emit_ineg_value(b) } else { b };
+        let a_changed = self.emit_ilop_value(a, Value::Inst(result), LogicOp::Xor, false, false);
+        let b_changed = self.emit_ilop_value(b, Value::Inst(result), LogicOp::Xor, false, false);
+        let both = self.emit_ilop_value(a_changed, b_changed, LogicOp::And, false, false);
+        let overflow = self.emit_ishr_imm_value(both, 31);
+        self.overflow_source = Some(overflow);
+        self.overflow_add = None;
+        Some(overflow)
     }
 
     fn half_swizzle(bits: u8) -> HalfSwizzle {
@@ -1828,6 +1855,9 @@ impl Translator {
         if cc {
             let unsigned_a = if neg_a { self.emit_ineg_value(a) } else { a };
             self.record_add_flags(result, unsigned_a, pred);
+            self.overflow_source = None;
+            self.overflow_add = pred.is_none().then_some((unsigned_a, b, result));
+            self.overflow_negated_b = neg_b;
         }
         true
     }
@@ -2522,6 +2552,93 @@ impl Translator {
         }
     }
 
+    fn cc_flag_mask(&mut self, index: u32, pred: Option<Predicate>) -> Option<Value> {
+        match index {
+            0 | 1 => {
+                let source = self.cc_source?;
+                Some(self.emit_value(Op::ISet {
+                    cmp: if index == 0 { ICmp::Eq } else { ICmp::Lt },
+                    signed: index == 1,
+                    a: source,
+                    b: Value::Zero,
+                    bool_float: false,
+                }))
+            }
+            2 => {
+                let guarded = self.carry_guard.is_none_or(|(guard, version)| {
+                    Some(guard) == pred && self.pred_state.get(&guard.idx).copied() == version
+                });
+                let carry = self.carry_source.filter(|_| guarded)?;
+                Some(self.emit_ineg_value(carry))
+            }
+            _ => {
+                let overflow = self.overflow_value()?;
+                Some(self.emit_ineg_value(overflow))
+            }
+        }
+    }
+
+    fn emit_p2r(&mut self, raw: u64, pred: Option<Predicate>) -> bool {
+        let cc_mode = ((raw >> 40) & 1) != 0;
+        let offset = (((raw >> 41) & 3) as u32) * 8;
+        let mask = imm20(raw) as u32;
+        let items = if cc_mode { 4 } else { 7 };
+        let mut insert = Value::Zero;
+        for index in 0..items {
+            if (mask >> index) & 1 == 0 {
+                continue;
+            }
+            let flag = if cc_mode {
+                let Some(flag) = self.cc_flag_mask(index, pred) else {
+                    return false;
+                };
+                flag
+            } else {
+                self.emit_predicate_mask(Predicate {
+                    idx: index as u8,
+                    negate: false,
+                })
+            };
+            let bit = self.emit_ilop_imm_value(flag, 1 << (index + offset), LogicOp::And, false, false);
+            insert = self.emit_ilop_value(insert, bit, LogicOp::Or, false, false);
+        }
+        let src = self.read_reg(reg_a(raw));
+        let kept = self.emit_ilop_imm_value(src, !(mask << offset), LogicOp::And, false, false);
+        let result = self.emit_ilop_value(kept, insert, LogicOp::Or, false, false);
+        self.write_reg(reg_dest(raw), Op::Mov(result), pred);
+        true
+    }
+
+    fn emit_r2p_cc(&mut self, raw: u64, mask: u32, pred: Option<Predicate>) -> bool {
+        if pred.is_some() {
+            return false;
+        }
+        let mask = mask & 0xf;
+        if mask & 0b11 == 0b01 || mask & 0b11 == 0b10 {
+            return false;
+        }
+        let offset = (((raw >> 41) & 3) as u32) * 8;
+        let src = self.read_reg(reg_a(raw));
+        if mask & 0b11 != 0 {
+            let zero = self.emit_bfe_value(src, offset, 1, false);
+            let sign = self.emit_bfe_value(src, offset + 1, 1, false);
+            let sign_mask = self.emit_ineg_value(sign);
+            let magnitude = self.emit_ilop_imm_value(sign_mask, 1, LogicOp::Or, false, false);
+            let nonzero = self.emit_iadd_value(zero, Value::ImmU32(1), false, true);
+            self.cc_source =
+                Some(self.emit_ilop_value(magnitude, nonzero, LogicOp::And, false, false));
+        }
+        if mask & 0b100 != 0 {
+            self.carry_source = Some(self.emit_bfe_value(src, offset + 2, 1, false));
+            self.carry_guard = None;
+        }
+        if mask & 0b1000 != 0 {
+            self.overflow_source = Some(self.emit_bfe_value(src, offset + 3, 1, false));
+            self.overflow_add = None;
+        }
+        true
+    }
+
     fn iadd3_half(&mut self, value: Value, half: u8) -> Value {
         match half {
             1 => self.emit_bfe_value(value, 0, 16, false),
@@ -2907,6 +3024,10 @@ impl Translator {
         let writes_cc = i2i_cc(raw);
         if writes_cc {
             self.cc_source = None;
+            self.carry_source = None;
+            self.carry_guard = None;
+            self.overflow_source = None;
+            self.overflow_add = None;
         }
         let src_signed = i2i_src_signed(raw);
         let dst_signed = i2i_dst_signed(raw);
@@ -2984,6 +3105,7 @@ impl Translator {
 
         if writes_cc && pred.is_none() && !abs && !neg && !sat {
             self.cc_source = Some(value);
+            self.reset_carry_and_overflow();
         }
 
         self.write_reg(reg_dest(raw), Op::Mov(value), pred);
@@ -3006,6 +3128,7 @@ impl Translator {
         );
         if raw & (1 << 47) != 0 && pred.is_none() {
             self.cc_source = Some(Value::Inst(id));
+            self.reset_carry_and_overflow();
         }
     }
 
@@ -3077,6 +3200,8 @@ impl Translator {
         if Self::invalidates_cc_source(decoded.opcode, raw) {
             self.cc_source = None;
             self.carry_source = None;
+            self.overflow_source = None;
+            self.overflow_add = None;
         }
         match decoded.opcode {
             Opcode::NOP => {}
@@ -4099,7 +4224,7 @@ impl Translator {
                     || aoffi
                     || lc
                     || sparse_pred != PT
-                    || tex_type != 2
+                    || !matches!(tex_type, 2 | 3)
                     || mask == 0
                 {
                     log::debug!(
@@ -4124,6 +4249,7 @@ impl Translator {
                 let derivative = reg_b(raw);
                 let u = self.read_reg(coord);
                 let v = self.read_reg(coord.wrapping_add(1));
+                let array = (tex_type == 3).then(|| self.read_reg(coord.wrapping_add(2)));
                 let dpdx = (
                     self.read_reg(derivative),
                     self.read_reg(derivative.wrapping_add(2)),
@@ -4152,7 +4278,7 @@ impl Translator {
                             tex_id,
                             u,
                             v,
-                            array: None,
+                            array,
                             volume: None,
                             cube: None,
                             implicit_lod: false,
@@ -6066,33 +6192,52 @@ impl Translator {
                 self.emit_pset(raw, pred);
             }
 
-            Opcode::R2P_reg | Opcode::R2P_cbuf | Opcode::R2P_imm => {
-                if ((raw >> 40) & 1) != 0 {
-                    log::debug!(
-                        "R2P condition-code mode is not yet modeled raw={:#018x}",
-                        raw,
-                    );
+            Opcode::P2R_imm => {
+                if !self.emit_p2r(raw, pred) {
+                    log::debug!("P2R condition code is unknown raw={:#018x}", raw);
                     self.program.emit_void(Op::Unimplemented {
-                        opcode: decoded.opcode,
+                        opcode: Opcode::P2R_imm,
                         raw,
                     });
                     self.unimplemented_count += 1;
                     return false;
                 }
-                match decoded.opcode {
-                    Opcode::R2P_reg => {
-                        let mask = self.read_reg(reg_b(raw));
-                        self.emit_r2p(raw, mask, None, pred);
+            }
+
+            Opcode::R2P_reg | Opcode::R2P_cbuf | Opcode::R2P_imm => {
+                if ((raw >> 40) & 1) != 0 {
+                    if decoded.opcode != Opcode::R2P_imm
+                        || !self.emit_r2p_cc(raw, imm20(raw) as u32, pred)
+                    {
+                        self.cc_source = None;
+                        self.carry_source = None;
+                        log::debug!(
+                            "R2P condition-code mode is not modeled for raw={:#018x}",
+                            raw,
+                        );
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: decoded.opcode,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
                     }
-                    Opcode::R2P_cbuf => {
-                        let mask = Value::Inst(self.load_cbuf(raw));
-                        self.emit_r2p(raw, mask, None, pred);
+                } else {
+                    match decoded.opcode {
+                        Opcode::R2P_reg => {
+                            let mask = self.read_reg(reg_b(raw));
+                            self.emit_r2p(raw, mask, None, pred);
+                        }
+                        Opcode::R2P_cbuf => {
+                            let mask = Value::Inst(self.load_cbuf(raw));
+                            self.emit_r2p(raw, mask, None, pred);
+                        }
+                        Opcode::R2P_imm => {
+                            let mask = imm20(raw) as u32;
+                            self.emit_r2p(raw, Value::ImmU32(mask), Some(mask), pred);
+                        }
+                        _ => unreachable!(),
                     }
-                    Opcode::R2P_imm => {
-                        let mask = imm20(raw) as u32;
-                        self.emit_r2p(raw, Value::ImmU32(mask), Some(mask), pred);
-                    }
-                    _ => unreachable!(),
                 }
             }
 
@@ -8086,13 +8231,55 @@ mod tests {
     }
 
     #[test]
+    fn captured_2d_array_txd_reads_the_layer_after_the_coordinates() {
+        for (raw, coord, derivative) in [
+            (0xde3a_0143_b187_0c18u64, 12u8, 24u8),
+            (0xde3a_0143_b1c7_0c1c, 12, 28),
+            (0xde3a_0163_b187_0c18, 12, 24),
+            (0xde3a_0163_b1c7_0c0c, 12, 28),
+        ] {
+            assert_eq!(decode_one(raw).unwrap().opcode, Opcode::TXD);
+            let mut translator = Translator::new_fragment();
+            assert!(translator.translate(raw), "raw={raw:#018x}");
+            assert_eq!(translator.unimplemented_count, 0, "raw={raw:#018x}");
+            let instructions = &translator.program.instructions;
+            assert!(matches!(
+                instructions[0].op,
+                Op::TextureGradients {
+                    dpdx: (Value::GprIn(x0), Value::GprIn(x1)),
+                    dpdy: (Value::GprIn(y0), Value::GprIn(y1)),
+                    ..
+                } if (x0, y0, x1, y1) == (derivative, derivative + 1, derivative + 2, derivative + 3)
+            ));
+            let samples: Vec<_> = instructions[1..]
+                .iter()
+                .map(|inst| match inst.op {
+                    Op::SampleTex {
+                        u: Value::GprIn(u),
+                        v: Value::GprIn(v),
+                        array: Some(Value::GprIn(layer)),
+                        component,
+                        ..
+                    } => (u, v, layer, component),
+                    ref other => panic!("unexpected {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                samples,
+                (0..3).map(|component| (coord, coord + 1, coord + 2, component)).collect::<Vec<_>>(),
+                "raw={raw:#018x}"
+            );
+        }
+    }
+
+    #[test]
     fn unhandled_txd_modes_fail_closed() {
         let captured = 0xde38_0081_a047_0e0cu64;
         let unsupported = [
             captured | (1u64 << 35),
             captured | (1u64 << 50),
             captured & !(7u64 << 51),
-            (captured & !(7u64 << 28)) | (3u64 << 28),
+            (captured & !(7u64 << 28)) | (4u64 << 28),
             captured & !(0xfu64 << 31),
         ];
         for raw in unsupported {
@@ -12806,7 +12993,7 @@ mod tests {
     }
 
     #[test]
-    fn i2i_cc_source_is_invalidated_by_r2p_cc() {
+    fn r2p_cc_without_flag_bits_keeps_the_condition_code() {
         const I2I_CC: u64 = 0x5ce0_8000_0017_0aff;
         const R2P_CC: u64 = 0x38f0_0100_0607_1400;
         const CSETP_NEU_P0: u64 = 0x50a0_0380_0007_0d07;
@@ -12817,18 +13004,192 @@ mod tests {
         ));
         let mut t = Translator::new();
         assert!(t.translate(I2I_CC));
+        assert!(t.translate(R2P_CC));
         assert_eq!(t.cc_source, Some(Value::GprIn(1)));
-        assert!(!t.translate(R2P_CC));
-        assert_eq!(t.cc_source, None);
-        assert!(!t.translate(CSETP_NEU_P0));
-        assert_eq!(t.unimplemented_count, 2);
-        assert!(matches!(
-            t.program.instructions.last().map(|inst| &inst.op),
-            Some(Op::Unimplemented {
-                opcode: Opcode::CSETP,
-                raw: CSETP_NEU_P0,
-            })
-        ));
+        assert!(t.translate(CSETP_NEU_P0));
+        assert_eq!(t.unimplemented_count, 0);
+    }
+
+    fn eval_cc_program(program: &Program, regs: &HashMap<u8, u32>) -> HashMap<ValueId, u32> {
+        fn compare<T: PartialOrd>(cmp: ICmp, a: T, b: T) -> bool {
+            match cmp {
+                ICmp::F => false,
+                ICmp::Lt => a < b,
+                ICmp::Eq => a == b,
+                ICmp::Le => a <= b,
+                ICmp::Gt => a > b,
+                ICmp::Ne => a != b,
+                ICmp::Ge => a >= b,
+                ICmp::T => true,
+            }
+        }
+        let mut values: HashMap<ValueId, u32> = HashMap::new();
+        for inst in &program.instructions {
+            let value = |v: &Value| -> u32 {
+                match v {
+                    Value::Zero => 0,
+                    Value::ImmU32(imm) => *imm,
+                    Value::GprIn(reg) => regs[reg],
+                    Value::Inst(id) => values[id],
+                    other => panic!("unexpected operand {other:?}"),
+                }
+            };
+            assert!(inst.pred.is_none(), "unexpected predicate in {:?}", inst.op);
+            let result = match &inst.op {
+                Op::Mov(a) => value(a),
+                Op::IAdd { a, b, neg_a, neg_b } => {
+                    let a = if *neg_a { value(a).wrapping_neg() } else { value(a) };
+                    let b = if *neg_b { value(b).wrapping_neg() } else { value(b) };
+                    a.wrapping_add(b)
+                }
+                Op::IShr { a, b, signed: false } => value(a) >> (value(b) & 31),
+                Op::Bfe { a, b, signed: false } => {
+                    let control = value(b);
+                    let field = u64::from(value(a)) >> (control & 0xff);
+                    (field & ((1u64 << ((control >> 8) & 0xff)) - 1)) as u32
+                }
+                Op::ILop { a, b, op, not_a, not_b } => {
+                    let a = if *not_a { !value(a) } else { value(a) };
+                    let b = if *not_b { !value(b) } else { value(b) };
+                    match op {
+                        LogicOp::And => a & b,
+                        LogicOp::Or => a | b,
+                        LogicOp::Xor => a ^ b,
+                        LogicOp::PassB => b,
+                    }
+                }
+                Op::ISet { cmp, signed, a, b, bool_float: false } => {
+                    let hit = if *signed {
+                        compare(*cmp, value(a) as i32, value(b) as i32)
+                    } else {
+                        compare(*cmp, value(a), value(b))
+                    };
+                    if hit { u32::MAX } else { 0 }
+                }
+                Op::ISetPred { .. } => continue,
+                other => panic!("unexpected op {other:?}"),
+            };
+            if let Some(id) = inst.result {
+                values.insert(id, result);
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn captured_totk_cc_save_and_restore_feeds_csetp_neu() {
+        const I2I_CC: u64 = 0x5ce0_8000_0017_0aff;
+        const P2R_CC_R13: u64 = 0x38e8_0100_00f7_ff0d;
+        const IADD_CC: u64 = 0x5c10_8000_0037_0404;
+        const R2P_CC_R13: u64 = 0x38f0_0100_00f7_0d00;
+        const CSETP_NEU_P0: u64 = 0x50a0_0380_0007_0d07;
+
+        assert_eq!(decode_one(P2R_CC_R13).map(|decoded| decoded.opcode), Some(Opcode::P2R_imm));
+        let mut t = Translator::new();
+        for raw in [I2I_CC, P2R_CC_R13, IADD_CC, R2P_CC_R13, CSETP_NEU_P0] {
+            assert!(t.translate(raw), "raw={raw:#018x}");
+        }
+        assert_eq!(t.unimplemented_count, 0);
+        let Some(Op::ISetPred { src_a, cmp: ICmp::Ne, dest_p: 0, .. }) =
+            t.program.instructions.last().map(|inst| inst.op.clone())
+        else {
+            panic!("CSETP did not lower to a predicate set");
+        };
+        let saved = t
+            .program
+            .instructions
+            .iter()
+            .find(|inst| inst.dest_reg == Some(13))
+            .and_then(|inst| inst.result)
+            .expect("P2R wrote R13");
+        for r1 in [0u32, 1, 7, 0x8000_0000, 0xffff_ffff] {
+            let regs = HashMap::from([(1u8, r1), (3, 5), (4, 0xffff_fffb)]);
+            let values = eval_cc_program(&t.program, &regs);
+            let expected_flags = u32::from(r1 == 0) | (u32::from((r1 as i32) < 0) << 1);
+            assert_eq!(values[&saved], expected_flags, "r1={r1:#x}");
+            let restored = match src_a {
+                Value::Inst(id) => values[&id],
+                other => panic!("restored condition code is {other:?}"),
+            };
+            assert_eq!(restored != 0, r1 != 0, "r1={r1:#x}");
+            assert_eq!((restored as i32) < 0, (r1 as i32) < 0, "r1={r1:#x}");
+        }
+    }
+
+    #[test]
+    fn p2r_cc_saves_reset_carry_and_add_overflow() {
+        const IADD_CC_R4: u64 = 0x5c10_8000_0037_0404;
+        const I2I_CC: u64 = 0x5ce0_8000_0017_0aff;
+        const P2R_CC_R13: u64 = 0x38e8_0100_00f7_ff0d;
+        let saved = |t: &Translator| {
+            t.program
+                .instructions
+                .iter()
+                .rev()
+                .find(|inst| inst.dest_reg == Some(13))
+                .and_then(|inst| inst.result)
+                .expect("P2R wrote R13")
+        };
+        let regs = HashMap::from([(1u8, 7u32), (3, 5), (4, 0xffff_fffb)]);
+
+        let mut reset = Translator::new();
+        for raw in [IADD_CC_R4, I2I_CC, P2R_CC_R13] {
+            assert!(reset.translate(raw), "raw={raw:#018x}");
+        }
+        assert_eq!(eval_cc_program(&reset.program, &regs)[&saved(&reset)], 0);
+
+        let mut added = Translator::new();
+        for raw in [IADD_CC_R4, P2R_CC_R13] {
+            assert!(added.translate(raw), "raw={raw:#018x}");
+        }
+        assert_eq!(eval_cc_program(&added.program, &regs)[&saved(&added)], 0b0101);
+        let overflow = HashMap::from([(1u8, 7u32), (3, 1), (4, 0x7fff_ffff)]);
+        assert_eq!(eval_cc_program(&added.program, &overflow)[&saved(&added)], 0b1010);
+    }
+
+    #[test]
+    fn unknown_carry_fails_closed_and_restored_carry_feeds_iadd_x() {
+        const R2P_CC_ZS: u64 = 0x38f0_0100_0037_0d00;
+        const P2R_CC_ALL: u64 = 0x38e8_0100_00f7_ff0d;
+        const P2R_CC_ZS: u64 = 0x38e8_0100_0037_ff0d;
+        const GUARDED_IADD_CC: u64 = 0x5c10_8000_0030_0404;
+        const R2P_CC_CARRY: u64 = 0x38f0_0100_0047_0d00;
+        const IADD_X: u64 = 0x5c10_0800_0037_0505;
+
+        let mut unknown = Translator::new();
+        assert!(unknown.translate(R2P_CC_ZS));
+        assert!(unknown.translate(P2R_CC_ZS));
+        assert!(!unknown.translate(P2R_CC_ALL));
+
+        let mut restored = Translator::new();
+        assert!(restored.translate(GUARDED_IADD_CC));
+        assert!(restored.translate(R2P_CC_CARRY));
+        assert!(restored.translate(IADD_X));
+        assert_eq!(restored.unimplemented_count, 0);
+    }
+
+    #[test]
+    fn p2r_predicate_mode_and_partial_r2p_cc_translate() {
+        const P2R_PR_R13: u64 = 0x38e8_0000_00f7_ff0d;
+        const I2I_CC: u64 = 0x5ce0_8000_0017_0aff;
+        const R2P_CC_CARRY: u64 = 0x38f0_0100_0047_0d00;
+        const R2P_CC_ZERO: u64 = 0x38f0_0100_0017_0d00;
+
+        let mut packed = Translator::new();
+        assert!(packed.translate(P2R_PR_R13));
+        assert_eq!(packed.unimplemented_count, 0);
+        assert!(packed.program.instructions.iter().any(|inst| inst.dest_reg == Some(13)));
+
+        let mut carry = Translator::new();
+        assert!(carry.translate(I2I_CC));
+        assert!(carry.translate(R2P_CC_CARRY));
+        assert_eq!(carry.cc_source, Some(Value::GprIn(1)));
+        assert!(carry.carry_source.is_some());
+
+        let mut partial = Translator::new();
+        assert!(!partial.translate(R2P_CC_ZERO));
+        assert_eq!(partial.unimplemented_count, 1);
+        assert_eq!(partial.cc_source, None);
     }
 
     #[test]
