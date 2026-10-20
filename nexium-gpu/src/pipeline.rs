@@ -63,7 +63,9 @@ impl CurrentPipeline {
     }
 }
 
-const SPEC_VERSION: u32 = 62;
+const SPEC_VERSION: u32 = 63;
+const LEGACY_SPEC_VERSION: u32 = 62;
+const NO_SPEC_MODULE: u32 = u32::MAX;
 const MAX_SPEC_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const SPECS_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
@@ -89,10 +91,14 @@ fn specs_save_due(specs_dirty: bool, since_last_save: std::time::Duration) -> bo
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
+    #[serde(skip)]
     pub key: PipelineKey,
-    pub vs_spirv: Vec<u32>,
-    pub gs_spirv: Vec<u32>,
-    pub fs_spirv: Vec<u32>,
+    #[serde(skip)]
+    pub vs_spirv: Arc<Vec<u32>>,
+    #[serde(skip)]
+    pub gs_spirv: Arc<Vec<u32>>,
+    #[serde(skip)]
+    pub fs_spirv: Arc<Vec<u32>>,
     pub bindings: Vec<(u32, u32, u32)>,
     pub attrs: Vec<(u32, u32, i32, u32)>,
     pub topology: i32,
@@ -119,16 +125,167 @@ pub struct PipelineSpec {
     pub depth_clip_control_enabled: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct SpecFile {
     version: u32,
-    specs: Vec<PipelineSpec>,
+    modules: Vec<Vec<u32>>,
+    specs: Vec<StoredSpec>,
+}
+
+#[derive(serde::Deserialize)]
+struct StoredSpec {
+    key: PipelineKey,
+    modules: [u32; 3],
+    spec: PipelineSpec,
 }
 
 #[derive(serde::Serialize)]
 struct BorrowedSpecFile<'a> {
     version: u32,
-    specs: Vec<&'a PipelineSpec>,
+    modules: Vec<&'a [u32]>,
+    specs: Vec<BorrowedStoredSpec<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct BorrowedStoredSpec<'a> {
+    key: PipelineKey,
+    modules: [u32; 3],
+    spec: &'a PipelineSpec,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacySpecFile {
+    version: u32,
+    specs: Vec<LegacySpec>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacySpec {
+    key: PipelineKey,
+    vs_spirv: Vec<u32>,
+    gs_spirv: Vec<u32>,
+    fs_spirv: Vec<u32>,
+    spec: PipelineSpec,
+}
+
+#[derive(Default)]
+struct SpecModuleTable<'a> {
+    modules: Vec<&'a [u32]>,
+    by_ptr: HashMap<*const Vec<u32>, u32>,
+    by_hash: HashMap<u64, Vec<u32>>,
+}
+
+impl<'a> SpecModuleTable<'a> {
+    fn intern(&mut self, module: &'a Arc<Vec<u32>>) -> u32 {
+        if module.is_empty() {
+            return NO_SPEC_MODULE;
+        }
+        if let Some(&index) = self.by_ptr.get(&Arc::as_ptr(module)) {
+            return index;
+        }
+        let candidates = self
+            .by_hash
+            .entry(crate::renderer::hash_spirv(module))
+            .or_default();
+        let index = match candidates
+            .iter()
+            .copied()
+            .find(|&index| self.modules[index as usize] == module.as_slice())
+        {
+            Some(index) => index,
+            None => {
+                let index = self.modules.len() as u32;
+                self.modules.push(module.as_slice());
+                candidates.push(index);
+                index
+            }
+        };
+        self.by_ptr.insert(Arc::as_ptr(module), index);
+        index
+    }
+}
+
+fn encode_spec_file<W: Write>(specs: &[Arc<PipelineSpec>], writer: W) -> postcard::Result<W> {
+    let mut table = SpecModuleTable::default();
+    let stored: Vec<BorrowedStoredSpec> = specs
+        .iter()
+        .map(|spec| BorrowedStoredSpec {
+            key: spec.key,
+            modules: [
+                table.intern(&spec.vs_spirv),
+                table.intern(&spec.gs_spirv),
+                table.intern(&spec.fs_spirv),
+            ],
+            spec: spec.as_ref(),
+        })
+        .collect();
+    let file = BorrowedSpecFile {
+        version: SPEC_VERSION,
+        modules: table.modules,
+        specs: stored,
+    };
+    postcard::to_io(&file, writer)
+}
+
+type DecodedSpecs = (HashMap<PipelineKey, Arc<PipelineSpec>>, bool);
+
+fn decode_spec_file(bytes: &[u8]) -> Result<DecodedSpecs, String> {
+    let (version, _) = postcard::take_from_bytes::<u32>(bytes)
+        .map_err(|error| format!("header unreadable: {error:?}"))?;
+    if version == LEGACY_SPEC_VERSION {
+        let file: LegacySpecFile = postcard::from_bytes(bytes)
+            .map_err(|error| format!("version {version} deserialize failed: {error:?}"))?;
+        let mut interned: HashMap<u64, Vec<Arc<Vec<u32>>>> = HashMap::new();
+        let mut intern = |words: Vec<u32>| -> Arc<Vec<u32>> {
+            if words.is_empty() {
+                return Arc::default();
+            }
+            let candidates = interned
+                .entry(crate::renderer::hash_spirv(&words))
+                .or_default();
+            if let Some(existing) = candidates.iter().find(|module| ***module == words) {
+                return Arc::clone(existing);
+            }
+            let module = Arc::new(words);
+            candidates.push(Arc::clone(&module));
+            module
+        };
+        let mut specs = HashMap::with_capacity(file.specs.len());
+        for legacy in file.specs {
+            let mut spec = legacy.spec;
+            spec.key = legacy.key;
+            spec.vs_spirv = intern(legacy.vs_spirv);
+            spec.gs_spirv = intern(legacy.gs_spirv);
+            spec.fs_spirv = intern(legacy.fs_spirv);
+            specs.insert(spec.key, Arc::new(spec));
+        }
+        return Ok((specs, true));
+    }
+    if version != SPEC_VERSION {
+        return Err(format!("version {version} != {SPEC_VERSION}"));
+    }
+    let file: SpecFile = postcard::from_bytes(bytes)
+        .map_err(|error| format!("version {version} deserialize failed: {error:?}"))?;
+    let modules: Vec<Arc<Vec<u32>>> = file.modules.into_iter().map(Arc::new).collect();
+    let module = |index: u32| -> Result<Arc<Vec<u32>>, String> {
+        if index == NO_SPEC_MODULE {
+            return Ok(Arc::default());
+        }
+        modules
+            .get(index as usize)
+            .cloned()
+            .ok_or_else(|| format!("module {index} out of range"))
+    };
+    let mut specs = HashMap::with_capacity(file.specs.len());
+    for stored in file.specs {
+        let mut spec = stored.spec;
+        spec.key = stored.key;
+        spec.vs_spirv = module(stored.modules[0])?;
+        spec.gs_spirv = module(stored.modules[1])?;
+        spec.fs_spirv = module(stored.modules[2])?;
+        specs.insert(spec.key, Arc::new(spec));
+    }
+    Ok((specs, false))
 }
 
 struct LimitedSpecWriter<W> {
@@ -152,10 +309,6 @@ impl<W: Write> Write for LimitedSpecWriter<W> {
 }
 
 fn write_spec_snapshot(path: &std::path::Path, specs: &[Arc<PipelineSpec>]) {
-    let file = BorrowedSpecFile {
-        version: SPEC_VERSION,
-        specs: specs.iter().map(Arc::as_ref).collect(),
-    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -171,7 +324,7 @@ fn write_spec_snapshot(path: &std::path::Path, specs: &[Arc<PipelineSpec>]) {
         writer: std::io::BufWriter::new(output),
         remaining: MAX_SPEC_CACHE_BYTES,
     };
-    let serialized = postcard::to_io(&file, &mut writer);
+    let serialized = encode_spec_file(specs, &mut writer);
     if serialized.is_err() || writer.flush().is_err() {
         log::warn!("shader specs save failed or exceeded {} bytes; preserving previous cache", MAX_SPEC_CACHE_BYTES);
         drop(writer);
@@ -992,7 +1145,7 @@ impl PipelineCache {
             .ok();
 
         let specs_disk_path = specs_path(device_tag);
-        let specs: HashMap<PipelineKey, Arc<PipelineSpec>> = specs_disk_path
+        let (specs, specs_migrated): DecodedSpecs = specs_disk_path
             .as_ref()
             .and_then(|p| {
                 let meta = std::fs::metadata(p).ok()?;
@@ -1011,25 +1164,20 @@ impl PipelineCache {
                     }
                 }
             })
-            .and_then(|bytes| match postcard::from_bytes::<SpecFile>(&bytes) {
-                Ok(f) if f.version == SPEC_VERSION => Some(f),
-                Ok(f) => {
-                    log::warn!(
-                        "shader specs version {} != {}, ignoring",
-                        f.version,
-                        SPEC_VERSION
-                    );
-                    None
-                }
-                Err(e) => {
-                    log::warn!("shader specs deserialize failed: {:?}", e);
+            .and_then(|bytes| match decode_spec_file(&bytes) {
+                Ok(decoded) => Some(decoded),
+                Err(error) => {
+                    log::warn!("shader specs ignored: {}", error);
                     None
                 }
             })
-            .map(|f| f.specs.into_iter().map(|s| (s.key, Arc::new(s))).collect())
             .unwrap_or_default();
         let specs_count = specs.len();
-        log::info!("shader specs loaded: {}", specs_count);
+        if specs_migrated {
+            log::info!("shader specs loaded: {} (migrating to the deduplicated format)", specs_count);
+        } else {
+            log::info!("shader specs loaded: {}", specs_count);
+        }
 
         let (specs_tx, specs_rx) = std::sync::mpsc::sync_channel::<Vec<Arc<PipelineSpec>>>(1);
         let specs_writer_path = specs_disk_path.clone();
@@ -1124,8 +1272,8 @@ impl PipelineCache {
             external_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_detached_builds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             specs,
-            specs_dirty: false,
-            specs_saved_count: specs_count,
+            specs_dirty: specs_migrated,
+            specs_saved_count: if specs_migrated { 0 } else { specs_count },
             specs_saved_at: std::time::Instant::now(),
             specs_tx: Some(specs_tx),
         })
@@ -1626,6 +1774,7 @@ mod tests {
         cache_save_due, known_driver_hostile_pipeline, specs_save_due, CurrentPipeline,
         PipelineKey, CACHE_SAVE_IDLE_INTERVAL, SPECS_SAVE_INTERVAL,
     };
+    use std::sync::Arc;
 
     /// Records every pipeline the cache asks to destroy.
     #[derive(Default)]
@@ -1989,25 +2138,68 @@ mod tests {
     }
 
     #[test]
-    fn streamed_spec_snapshot_preserves_disk_format() {
-        let spec = super::PipelineSpec {
-            vs_spirv: vec![0x07230203, 0x00010000, 0, u32::MAX],
-            fs_spirv: vec![7, 3, 1],
+    fn spec_file_round_trips_with_shared_modules() {
+        let vs = Arc::new(vec![0x07230203, 0x00010000, 0, u32::MAX]);
+        let first = Arc::new(super::PipelineSpec {
+            key: PipelineKey { vs_hash: 1, ..Default::default() },
+            vs_spirv: Arc::clone(&vs),
+            fs_spirv: Arc::new(vec![7, 3, 1]),
             bindings: vec![(0, 16, 1)],
             attrs: vec![(0, 0, 109, 4)],
             ..Default::default()
+        });
+        let second = Arc::new(super::PipelineSpec {
+            key: PipelineKey { vs_hash: 2, ..Default::default() },
+            vs_spirv: Arc::new(vs.as_ref().clone()),
+            fs_spirv: Arc::new(vec![9]),
+            topology: 4,
+            ..Default::default()
+        });
+        let bytes = super::encode_spec_file(&[first.clone(), second.clone()], Vec::new()).unwrap();
+        let (specs, migrated) = super::decode_spec_file(&bytes).unwrap();
+        assert!(!migrated);
+        let a = &specs[&first.key];
+        let b = &specs[&second.key];
+        assert_eq!(*a.vs_spirv, *first.vs_spirv);
+        assert_eq!(*a.fs_spirv, *first.fs_spirv);
+        assert!(a.gs_spirv.is_empty());
+        assert_eq!(a.bindings, first.bindings);
+        assert_eq!(a.attrs, first.attrs);
+        assert!(Arc::ptr_eq(&a.vs_spirv, &b.vs_spirv));
+        assert_eq!(*b.fs_spirv, vec![9]);
+        assert_eq!(b.topology, 4);
+    }
+
+    #[test]
+    fn legacy_spec_file_is_migrated_with_shared_modules() {
+        #[derive(serde::Serialize)]
+        struct LegacyOut<'a> {
+            key: PipelineKey,
+            vs: &'a [u32],
+            gs: &'a [u32],
+            fs: &'a [u32],
+            spec: &'a super::PipelineSpec,
+        }
+        let spec = super::PipelineSpec {
+            bindings: vec![(1, 32, 0)],
+            topology: 3,
+            ..Default::default()
         };
-        let borrowed = super::BorrowedSpecFile {
-            version: super::SPEC_VERSION,
-            specs: vec![&spec],
-        };
-        let mut streamed = Vec::new();
-        postcard::to_io(&borrowed, &mut streamed).unwrap();
-        let file = super::SpecFile { version: super::SPEC_VERSION, specs: vec![spec] };
-        assert_eq!(streamed, postcard::to_allocvec(&file).unwrap());
-        let decoded: super::SpecFile = postcard::from_bytes(&streamed).unwrap();
-        assert_eq!(decoded.specs[0].vs_spirv, file.specs[0].vs_spirv);
-        assert_eq!(decoded.specs[0].attrs, file.specs[0].attrs);
+        let key = PipelineKey { fs_hash: 5, ..Default::default() };
+        let words = [0x07230203u32, 1, 2];
+        let legacy = (
+            super::LEGACY_SPEC_VERSION,
+            vec![LegacyOut { key, vs: &words, gs: &[], fs: &words, spec: &spec }],
+        );
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let (specs, migrated) = super::decode_spec_file(&bytes).unwrap();
+        assert!(migrated);
+        let loaded = &specs[&key];
+        assert_eq!(loaded.bindings, spec.bindings);
+        assert_eq!(loaded.topology, 3);
+        assert_eq!(*loaded.vs_spirv, words.to_vec());
+        assert!(Arc::ptr_eq(&loaded.vs_spirv, &loaded.fs_spirv));
+        assert!(loaded.gs_spirv.is_empty());
     }
 
     #[test]
