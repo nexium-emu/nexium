@@ -167,6 +167,12 @@ pub(crate) fn dispatch(
     port_name: &str,
     cmd_id: u32,
 ) -> Option<Vec<u8>> {
+    if !matches!(
+        port_name,
+        "IDeliveryCacheStorageService" | "IDeliveryCacheDirectoryService" | "IDeliveryCacheFileService"
+    ) {
+        return None;
+    }
     let root = package_root(kernel.title_id);
     let ok = |ctx: &IpcCtx, data: &[u8]| Some(build_ipc_response(ctx, 0, data, &[]));
     let fail = |ctx: &IpcCtx, rc: u32| Some(build_ipc_response(ctx, rc, &[], &[]));
