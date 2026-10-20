@@ -11,6 +11,7 @@ const GROUPS_Y: u32 = 16;
 const SINK_BYTES: u64 = GROUPS_X as u64 * GROUPS_Y as u64 * 64 * 4;
 const MIN_ROUNDS: u32 = 16;
 const MAX_ROUNDS: u32 = 1 << 16;
+const IDLE_PER_BUSY: u32 = 4;
 
 struct Signal {
     parked: AtomicBool,
@@ -98,7 +99,9 @@ fn run() {
             log::warn!("force max clocks stopped: {error}");
             return;
         }
-        rounds = next_rounds(rounds, started.elapsed());
+        let elapsed = started.elapsed();
+        rounds = next_rounds(rounds, elapsed);
+        std::thread::sleep(elapsed * IDLE_PER_BUSY);
     }
 }
 
