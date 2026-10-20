@@ -275,6 +275,16 @@ impl ComputeBarrierCache {
     }
 }
 
+fn dma_narrow_resolve_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_DMA_NARROW_RESOLVE").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
 fn mirror_sweep_per_entry_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -413,6 +423,9 @@ pub(crate) struct PrepState {
     compute_snapshot_revision: Option<(u64, u64)>,
     compute_barrier_cache: ComputeBarrierCache,
     renderer_guest_writes_pending: bool,
+    ssbo_refreshed_at: Option<std::time::Instant>,
+    ssbo_refreshed_epoch: u64,
+    mirror_acquire_epoch: u64,
     #[cfg(test)]
     pub(crate) prepared_packet_drain_counts: PreparedPacketDrainCounts,
 }
@@ -507,7 +520,7 @@ impl PrepState {
                 self.record_flush_reason(reason);
                 self.flush_vk(mappings, mem_read, mem_write);
                 if clear_ssbo {
-                    self.ssbo_snapshot_cache.clear_ssbo_snapshots();
+                    self.ssbo_snapshot_cache.retain_watchable_full_aurora_snapshots();
                 }
                 true
             }
@@ -725,6 +738,7 @@ impl PrepState {
             }
             PrepEvent::ConstbufWrites { writes, trace } => {
                 let kp = kickprof::start();
+                self.sync_semaphore_acquire_sweep();
                 self.commit_constbuf_writes(&writes, trace, mappings, mem_write);
                 kickprof::add(kickprof::CBUFWB, kp);
                 true
@@ -861,14 +875,21 @@ impl PrepState {
                         && writes
                             .iter()
                             .all(|write| write.can_complete_asynchronously());
-                let defer_synthetic_writes = !can_complete_asynchronously
-                    && !writes.is_empty()
+                let synthetic_only = !writes.is_empty()
                     && writes
                         .iter()
-                        .all(|write| !write.requires_renderer_completion())
+                        .all(|write| !write.requires_renderer_completion());
+                let immediate_synthetic_writes =
+                    synthetic_only && super::accuracy::normal_accuracy();
+                let defer_synthetic_writes = !can_complete_asynchronously
+                    && !immediate_synthetic_writes
+                    && synthetic_only
                     && super::engines::maxwell_compute::has_pending_writebacks()
                     && self.compute_landing_possible();
-                if can_complete_asynchronously || defer_synthetic_writes {
+                if can_complete_asynchronously
+                    || defer_synthetic_writes
+                    || immediate_synthetic_writes
+                {
                     self.land_or_resolve_pending_compute(mappings, mem_write);
                 } else {
                     self.resolve_pending_compute(mappings, mem_write);
@@ -1057,6 +1078,7 @@ impl PrepState {
                 mut replay_constbuf_writes,
                 constbuf_trace,
             } => {
+                self.sync_semaphore_acquire_sweep();
                 self.drain_landed_compute(mappings);
                 self.publish_pending_storage_readbacks(false, mappings, mem_read, mem_write);
                 let kp_pre = kickprof::start();
@@ -1332,7 +1354,7 @@ impl PrepState {
                         self.ssbo_snapshot_cache
                             .invalidate_gpu_write(mappings, dst_gpu, dst_size);
                         if super::engines::maxwell_compute::has_pending_writebacks() {
-                            let overlaps = spans.iter().any(|&(gpu_va, size)| {
+                            let span_overlaps = |&(gpu_va, size): &(u64, usize)| {
                                 let cpu_addr = mappings
                                     .cpu_range_for(gpu_va)
                                     .map(|(cpu, _)| cpu)
@@ -1340,9 +1362,49 @@ impl PrepState {
                                 super::engines::maxwell_compute::pending_writeback_overlaps(
                                     gpu_va, cpu_addr, size,
                                 )
-                            });
+                            };
+                            let overlaps = spans.iter().any(span_overlaps);
                             if overlaps {
-                                self.resolve_pending_compute(mappings, mem_write);
+                                let trace = super::engines::maxwell_compute::compute_sync_trace_enabled()
+                                    .then(|| {
+                                        (
+                                            std::time::Instant::now(),
+                                            span_overlaps(&spans[0]),
+                                            span_overlaps(&spans[1]),
+                                            super::engines::maxwell_compute::pending_writeback_count(),
+                                        )
+                                    });
+                                if dma_narrow_resolve_enabled() {
+                                    let ranges: Vec<(u64, u64, usize)> = spans
+                                        .iter()
+                                        .map(|&(gpu_va, size)| {
+                                            let cpu_addr = mappings
+                                                .cpu_range_for(gpu_va)
+                                                .map(|(cpu, _)| cpu)
+                                                .unwrap_or(0);
+                                            (gpu_va, cpu_addr, size)
+                                        })
+                                        .collect();
+                                    self.resolve_pending_compute_overlapping(mappings, mem_write, &ranges);
+                                } else {
+                                    self.resolve_pending_compute(mappings, mem_write);
+                                }
+                                if let Some((started, source, destination, before)) = trace {
+                                    log::warn!(
+                                        "[ktl] us={} csync kind=dma arg={:#x} src_overlap={} dst_overlap={} src={:#x}+{:#x} dst={:#x}+{:#x} pending={}->{} ms={:.3}",
+                                        crate::timeline_us(),
+                                        arg,
+                                        source,
+                                        destination,
+                                        spans[0].0,
+                                        spans[0].1,
+                                        spans[1].0,
+                                        spans[1].1,
+                                        before,
+                                        super::engines::maxwell_compute::pending_writeback_count(),
+                                        started.elapsed().as_secs_f64() * 1000.0
+                                    );
+                                }
                             }
                         }
                         if let Some(r) = self.renderer.clone() {
@@ -1456,6 +1518,7 @@ impl PrepState {
                                             );
                                             return false;
                                         }
+                                        fermi_2d.trace_blit("ordered-exact", arg);
                                         let kp = kickprof::start();
                                         let pre = fermi_2d.blit_count;
                                         if !fermi_2d.commit_ordered_exact_blit(arg, &preview) {
@@ -1481,6 +1544,85 @@ impl PrepState {
                                         kickprof::count(kickprof::FERMI_DRAIN_SKIPPED, 1);
                                         return true;
                                     }
+                                }
+                            }
+                        }
+                        if fermi_ordered_exact_enabled() && fermi_ordered_region_enabled() {
+                            if let (Some(preview), Some(renderer), Some(render_thread)) = (
+                                fermi_2d.preview_ordered_region_blit(
+                                    arg,
+                                    mappings,
+                                    self.renderer.as_deref(),
+                                ),
+                                self.renderer.clone(),
+                                crate::render_thread::maybe_render_thread(),
+                            ) {
+                                let compute_overlap = match (
+                                    usize::try_from(preview.source_size),
+                                    usize::try_from(preview.destination_size),
+                                ) {
+                                    (Ok(source_size), Ok(destination_size)) => {
+                                        super::engines::maxwell_compute::has_pending_writebacks()
+                                            && (super::engines::maxwell_compute::pending_writeback_overlaps(
+                                                preview.source.gpu_va,
+                                                preview.source_cpu,
+                                                source_size,
+                                            ) || super::engines::maxwell_compute::pending_writeback_overlaps(
+                                                preview.destination.gpu_va,
+                                                preview.destination_cpu,
+                                                destination_size,
+                                            ))
+                                    }
+                                    _ => true,
+                                };
+                                if !compute_overlap {
+                                    self.record_flush_reason(kickprof::FLUSH_HARD_FERMI);
+                                    self.flush_vk(mappings, mem_read, mem_write);
+                                    self.ssbo_snapshot_cache.clear_ssbo_snapshots();
+                                    let source = preview.source;
+                                    let destination = preview.destination;
+                                    let region = preview.region;
+                                    render_thread.submit_named(
+                                        "fermi-ordered-region-copy",
+                                        Box::new(move || {
+                                            match renderer.execute_ordered_rt_copy_region(
+                                                source,
+                                                destination,
+                                                region,
+                                            ) {
+                                                Ok(true) => {}
+                                                Ok(false) => log::warn!(
+                                                    "Fermi2D: ordered RT region copy {} -> {} skipped",
+                                                    source.label(),
+                                                    destination.label()
+                                                ),
+                                                Err(error) => log::warn!(
+                                                    "Fermi2D: ordered RT region copy failed: {}",
+                                                    error
+                                                ),
+                                            }
+                                        }),
+                                    );
+                                    fermi_2d.trace_blit("ordered-region", arg);
+                                    let kp = kickprof::start();
+                                    let pre = fermi_2d.blit_count;
+                                    fermi_2d.commit_ordered_region_blit(arg, &preview);
+                                    if let Some((gpu_addr, size)) =
+                                        fermi_2d.take_logical_guest_write_span()
+                                    {
+                                        self.ssbo_snapshot_cache
+                                            .invalidate_gpu_write(mappings, gpu_addr, size);
+                                    }
+                                    self.invalidate_resolved_compute_writebacks(mappings);
+                                    let n = fermi_2d.blit_count - pre;
+                                    if n > 0 {
+                                        stats
+                                            .fermi_2d_blits
+                                            .fetch_add(n, AtomicOrdering::Relaxed);
+                                    }
+                                    kickprof::add(kickprof::FERMI, kp);
+                                    kickprof::count(kickprof::FERMI_DRAIN_SKIPPED, 1);
+                                    return true;
                                 }
                             }
                         }
@@ -1551,7 +1693,7 @@ impl PrepState {
                     if kepler_memory.method_requires_hard_boundary(method) {
                         self.record_flush_reason(kickprof::FLUSH_HARD_KEPLER_MEMORY);
                         self.flush_vk(mappings, mem_read, mem_write);
-                        self.ssbo_snapshot_cache.clear_ssbo_snapshots();
+                        self.ssbo_snapshot_cache.retain_watchable_full_aurora_snapshots();
                     }
                     let kp = kickprof::start();
                     let outcome =
@@ -1572,7 +1714,7 @@ impl PrepState {
                         self.flush_vk(mappings, mem_read, mem_write);
                         if kepler_compute.method_writes_guest_memory(method, is_last) {
                             kickprof::count(kickprof::KC_CACHE_CLEAR, 1);
-                            self.ssbo_snapshot_cache.clear_ssbo_snapshots();
+                            self.ssbo_snapshot_cache.retain_watchable_full_aurora_snapshots();
                         }
                     }
                     let kp = kickprof::start();
@@ -1634,6 +1776,7 @@ impl PrepState {
     }
 
     pub(crate) fn begin_ssbo_snapshot_epoch(&mut self) {
+        self.ssbo_refreshed_at = None;
         self.ssbo_snapshot_cache.mirror_bump_sweep();
         self.ssbo_snapshot_cache.mirror_begin_kick();
         self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
@@ -1745,12 +1888,41 @@ impl PrepState {
         if mirror_sweep_per_entry_enabled() {
             self.ssbo_snapshot_cache.mirror_bump_sweep();
         }
-        self.ssbo_snapshot_cache.refresh_ssbo_guest_writes();
+        if self.ssbo_snapshot_cache.has_watched_ssbo_state() && self.ssbo_refresh_due() {
+            self.ssbo_snapshot_cache.refresh_ssbo_guest_writes();
+        }
         super::pusher::kickprof::add(super::pusher::kickprof::ENQ_WATCH, watch_started);
         let retain_started = super::pusher::kickprof::start();
         self.ssbo_snapshot_cache
             .retain_watchable_full_aurora_snapshots();
         super::pusher::kickprof::add(super::pusher::kickprof::ENTRY_PREP, retain_started);
+    }
+
+    fn ssbo_refresh_due(&mut self) -> bool {
+        const NORMAL_ENTRY_REFRESH_INTERVAL: Duration = Duration::from_millis(1);
+        if !super::accuracy::normal_accuracy() {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let epoch = SEMAPHORE_ACQUIRE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        if self.ssbo_refreshed_epoch == epoch
+            && self
+                .ssbo_refreshed_at
+                .is_some_and(|at| now.duration_since(at) < NORMAL_ENTRY_REFRESH_INTERVAL)
+        {
+            return false;
+        }
+        self.ssbo_refreshed_at = Some(now);
+        self.ssbo_refreshed_epoch = epoch;
+        true
+    }
+
+    fn sync_semaphore_acquire_sweep(&mut self) {
+        let epoch = SEMAPHORE_ACQUIRE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        if self.mirror_acquire_epoch != epoch {
+            self.mirror_acquire_epoch = epoch;
+            self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
+        }
     }
 
     pub(crate) fn record_flush_reason(&self, phase: usize) {
@@ -2024,6 +2196,29 @@ impl PrepState {
         spans
     }
 
+    #[track_caller]
+    pub(crate) fn resolve_pending_compute_overlapping(
+        &mut self,
+        mappings: &GpuMappings,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        ranges: &[(u64, u64, usize)],
+    ) {
+        if !super::engines::maxwell_compute::has_pending_writebacks() {
+            return;
+        }
+        super::watchdog::phase(super::watchdog::Phase::ComputeResolve, 0);
+        let Some(renderer) = self.renderer.as_deref() else {
+            return;
+        };
+        let spans = super::engines::maxwell_compute::resolve_pending_writebacks_overlapping_report(
+            renderer, mappings, mem_write, ranges,
+        );
+        for span in &spans {
+            self.ssbo_snapshot_cache
+                .invalidate_gpu_write(mappings, span.gpu_va, span.len);
+        }
+    }
+
     pub(crate) fn invalidate_resolved_compute_writebacks(&mut self, mappings: &GpuMappings) {
         for span in super::engines::maxwell_compute::take_resolved_writeback_spans() {
             self.ssbo_snapshot_cache
@@ -2150,8 +2345,9 @@ impl PrepState {
                     );
                     run_bytes.extend_from_slice(&dword.to_le_bytes());
                 }
-                mem_write(cpu, &run_bytes);
-                if self.renderer.is_some()
+                let written = mem_write(cpu, &run_bytes);
+                if written
+                    && self.renderer.is_some()
                     && self
                         .ssbo_snapshot_cache
                         .mirror_write_through(cpu, &run_bytes)
@@ -2216,10 +2412,19 @@ impl PrepState {
             compute_snapshot_revision: None,
             compute_barrier_cache: ComputeBarrierCache::default(),
             renderer_guest_writes_pending: false,
+            ssbo_refreshed_at: None,
+            ssbo_refreshed_epoch: 0,
+            mirror_acquire_epoch: SEMAPHORE_ACQUIRE_EPOCH.load(std::sync::atomic::Ordering::Acquire),
             #[cfg(test)]
             prepared_packet_drain_counts: PreparedPacketDrainCounts::default(),
         }
     }
+}
+
+static SEMAPHORE_ACQUIRE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_semaphore_acquire() {
+    SEMAPHORE_ACQUIRE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 fn fermi_lazy_drain_enabled() -> bool {
@@ -2239,6 +2444,15 @@ fn fermi_ordered_exact_value_enabled(value: Option<&str>) -> bool {
             || value.eq_ignore_ascii_case("false")
             || value.eq_ignore_ascii_case("off")
             || value.eq_ignore_ascii_case("no")
+    })
+}
+
+fn fermi_ordered_region_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fermi_ordered_exact_value_enabled(
+            std::env::var("NEXIUM_FERMI_ORDERED_REGION").ok().as_deref(),
+        )
     })
 }
 
@@ -2984,6 +3198,18 @@ mod tests {
             state.ssbo_snapshot_cache.mirror_sweep_generation(),
             after_barrier
         );
+    }
+
+    #[test]
+    fn semaphore_acquire_advances_resident_mirror_sweep() {
+        let mut state = PrepState::new();
+        state.sync_semaphore_acquire_sweep();
+        let before = state.ssbo_snapshot_cache.mirror_sweep_generation();
+
+        super::note_semaphore_acquire();
+        state.sync_semaphore_acquire_sweep();
+
+        assert_ne!(state.ssbo_snapshot_cache.mirror_sweep_generation(), before);
     }
 
     #[test]

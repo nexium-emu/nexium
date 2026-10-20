@@ -1311,6 +1311,7 @@ fn create_compute_raw_storage_buffer(
         Some(data),
         vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::VERTEX_BUFFER,
         None,
         true,

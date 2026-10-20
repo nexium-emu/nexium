@@ -16,7 +16,7 @@ pub use engines::{
 };
 pub use pusher::{CommandListHeader, Pusher};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -111,8 +111,13 @@ enum PhysicalMappingIdentity {
 // Direct-mapped on 64 KiB pages; 256 slots cover 16 MiB of distinct pages per
 // thread (a 720p RGBA8 target alone spans ~57 pages). Wiped on every mapping
 // generation change, so the larger table only costs a 6 KiB clear per change.
-const MAPPING_LOOKUP_CACHE_SIZE: usize = 256;
+const MAPPING_LOOKUP_CACHE_SIZE: usize = 1024;
 const MAPPING_LOOKUP_CACHE_SHIFT: u32 = 16;
+
+fn mapping_lookup_cache_slot(gpu_va: u64) -> usize {
+    let page = gpu_va >> MAPPING_LOOKUP_CACHE_SHIFT;
+    (page ^ (page >> 10) ^ (page >> 20)) as usize % MAPPING_LOOKUP_CACHE_SIZE
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MappingLookupCacheEntry {
@@ -126,6 +131,7 @@ struct ThreadMappingLookupCache {
     generation: u64,
     entries: [Option<MappingLookupCacheEntry>; MAPPING_LOOKUP_CACHE_SIZE],
     misses: u64,
+    index: Option<Arc<MappingSegmentIndex>>,
 }
 
 impl ThreadMappingLookupCache {
@@ -135,6 +141,7 @@ impl ThreadMappingLookupCache {
             generation: 0,
             entries: [None; MAPPING_LOOKUP_CACHE_SIZE],
             misses: 0,
+            index: None,
         }
     }
 }
@@ -369,13 +376,6 @@ impl GpuMappings {
         gpu_va >= mapping.gpu_va && gpu_va < mapping.gpu_va.saturating_add(mapping.size)
     }
 
-    fn mapping_lookup_slow(&self, gpu_va: u64) -> Option<MappingLookupCacheEntry> {
-        match self.segment_index() {
-            Some(index) => index.lookup(gpu_va),
-            None => self.mapping_lookup_linear(gpu_va),
-        }
-    }
-
     fn mapping_lookup_linear(&self, gpu_va: u64) -> Option<MappingLookupCacheEntry> {
         let mapping_index = self
             .mappings
@@ -416,8 +416,9 @@ impl GpuMappings {
                 cache.instance_id = self.instance_id;
                 cache.generation = self.generation;
                 cache.entries = [None; MAPPING_LOOKUP_CACHE_SIZE];
+                cache.index = None;
             }
-            let slot = (gpu_va >> MAPPING_LOOKUP_CACHE_SHIFT) as usize % MAPPING_LOOKUP_CACHE_SIZE;
+            let slot = mapping_lookup_cache_slot(gpu_va);
             if let Some(cached) = cache.entries[slot] {
                 if gpu_va >= cached.gpu_lo && gpu_va < cached.gpu_hi {
                     debug_assert!(
@@ -429,7 +430,23 @@ impl GpuMappings {
                     return Some(cached);
                 }
             }
-            let cached = self.mapping_lookup_slow(gpu_va)?;
+            let indexed = cache
+                .index
+                .as_ref()
+                .filter(|index| index.generation == self.generation)
+                .map(|index| index.lookup(gpu_va));
+            let cached = match indexed {
+                Some(found) => found,
+                None => {
+                    let index = self.segment_index();
+                    let found = match &index {
+                        Some(index) => index.lookup(gpu_va),
+                        None => self.mapping_lookup_linear(gpu_va),
+                    };
+                    cache.index = index;
+                    found
+                }
+            }?;
             cache.entries[slot] = Some(cached);
             cache.misses = cache.misses.wrapping_add(1);
             Some(cached)
@@ -2699,7 +2716,7 @@ impl GpuContext {
                 &mut **km_guard.as_mut().unwrap(),
             ),
         };
-        let mappings = self.mappings.read();
+        let mut mappings = self.mappings.read();
         pusher::kickprof::add(pusher::kickprof::LOCKS, kp_locks);
         let locks_ms = if profile { elapsed_ms(t0) } else { 0.0 };
 
@@ -2776,6 +2793,7 @@ impl GpuContext {
         }
         let trace_entries = crate::env_flag_set!("NEXIUM_ENTRY_TRACE");
         for entry in entries {
+            RwLockReadGuard::bump(&mut mappings);
             if trace_entries {
                 let va = entry.address();
                 let count = entry.entry_count();
@@ -2812,6 +2830,7 @@ impl GpuContext {
         }
         let entries_ms = if profile { elapsed_ms(t_entries) } else { 0.0 };
         let t_flush = std::time::Instant::now();
+        RwLockReadGuard::bump(&mut mappings);
         pusher.prep_kick_end(
             hard_after,
             writeback_small_rts,

@@ -5909,6 +5909,15 @@ impl Nvdrv {
                         out[12..16].copy_from_slice(&settled.to_le_bytes());
                     } else {
                         Self::fence_wait_stat(true);
+                        if crate::kick_timeline_enabled() {
+                            log::warn!(
+                                "[ktl] us={} eventwait syncpt={} threshold={} current={}",
+                                crate::timeline_us(),
+                                syncpt_id,
+                                threshold,
+                                current_val
+                            );
+                        }
                         let slot = self.next_ctrl_event_slot & 63;
                         self.next_ctrl_event_slot = self.next_ctrl_event_slot.wrapping_add(1);
                         let event_val: u32 = slot | ((syncpt_id & 0xFFF) << 16) | (1 << 28);

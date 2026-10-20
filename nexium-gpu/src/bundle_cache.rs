@@ -8,6 +8,11 @@ const BUNDLE_VERSION: u32 = 97;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const FAILED_REVISION: u64 = 1;
+
+fn failed_entry(content_key: u64) -> u64 {
+    content_key ^ FAILED_REVISION.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -350,18 +355,19 @@ impl BundleStore {
         self.failed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&content_key)
+            .contains(&failed_entry(content_key))
     }
 
     pub fn mark_failed(&self, content_key: u64) {
         if !self.enabled {
             return;
         }
+        let entry = failed_entry(content_key);
         let mut guard = self.failed.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.insert(content_key) {
+        if guard.insert(entry) {
             drop(guard);
             if let Some(tx) = &self.tx {
-                let _ = tx.send(WriterMsg::Failed(content_key));
+                let _ = tx.send(WriterMsg::Failed(entry));
             }
         }
     }

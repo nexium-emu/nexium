@@ -519,6 +519,13 @@ impl DeferredComputeId {
             value = self.ready.wait(value).unwrap_or_else(|error| error.into_inner());
         }
     }
+
+    fn is_published(&self) -> bool {
+        self.value
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
 }
 
 struct DeferredComputeIdSender(Option<Arc<DeferredComputeId>>);
@@ -577,6 +584,37 @@ fn pending_raw_storage_writers(keys: &[ComputeRawStorageKey]) -> Vec<PendingComp
         .collect()
 }
 
+fn unpublished_raw_storage_writer_keys(keys: &[ComputeRawStorageKey]) -> Vec<ComputeRawStorageKey> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let pending = pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    keys.iter()
+        .copied()
+        .filter(|key| {
+            pending.iter().any(|record| {
+                matches!(&record.id, PendingComputeId::Deferred(deferred) if !deferred.is_published())
+                    && record
+                        .texel_targets
+                        .iter()
+                        .any(|target| target.raw_storage_key == Some(*key))
+            })
+        })
+        .collect()
+}
+
+fn deferred_raw_storage_pin_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_DEFERRED_RAW_PIN").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
 fn compute_alias_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -624,6 +662,11 @@ fn compute_output_rt_alias(
     })
 }
 
+pub(crate) fn compute_sync_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_SYNC_TRACE").is_some())
+}
+
 fn compute_offload_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -648,6 +691,7 @@ struct PendingComputeWriteback {
 struct LandingRecord {
     id: PendingComputeId,
     program_gpu_va: u64,
+    serial: u64,
     output_targets: Vec<OutputTarget>,
     texel_targets: Vec<TexelTarget>,
     done: crossbeam::channel::Sender<()>,
@@ -687,6 +731,7 @@ pub(crate) fn schedule_pending_landings(
                 LandingRecord {
                     id: record.id.clone(),
                     program_gpu_va: record.program_gpu_va,
+                    serial: record.serial,
                     output_targets: record.output_targets.clone(),
                     texel_targets: record.texel_targets.clone(),
                     done,
@@ -722,6 +767,7 @@ fn land_records(
                         if let Err(error) = write_back_outputs(
                             result,
                             record.program_gpu_va,
+                            record.serial,
                             &record.output_targets,
                             &record.texel_targets,
                             renderer,
@@ -861,6 +907,15 @@ pub(crate) fn lazy_compute_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_LAZY_COMPUTE").is_none())
 }
 
+pub(crate) fn compute_serial_tracked(serial: u64) -> bool {
+    serial != 0
+        && pending_writebacks()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|record| record.serial == serial)
+}
+
 pub(crate) fn has_pending_writebacks() -> bool {
     !pending_writebacks()
         .lock()
@@ -897,8 +952,20 @@ fn pending_writeback_overlaps_where(
     let pending = pending_writebacks()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    pending.iter().filter(|record| include(record)).any(|record| {
-        record.output_targets.iter().any(|target| {
+    pending
+        .iter()
+        .filter(|record| include(record))
+        .any(|record| pending_writeback_record_overlaps(record, gpu_va, cpu_addr, size))
+}
+
+fn pending_writeback_record_overlaps(
+    record: &PendingComputeWriteback,
+    gpu_va: u64,
+    cpu_addr: u64,
+    size: usize,
+) -> bool {
+    size != 0
+        && (record.output_targets.iter().any(|target| {
             mapped_resources_overlap(
                 gpu_va,
                 cpu_addr,
@@ -916,8 +983,24 @@ fn pending_writeback_overlaps_where(
                 target.cpu_addr,
                 target.guest_size,
             )
+        }))
+}
+
+fn pending_writeback_prefix_len(
+    pending: &[PendingComputeWriteback],
+    overlapping: Option<&[(u64, u64, usize)]>,
+) -> usize {
+    let Some(ranges) = overlapping else {
+        return pending.len();
+    };
+    pending
+        .iter()
+        .rposition(|record| {
+            ranges.iter().any(|&(gpu_va, cpu_addr, size)| {
+                pending_writeback_record_overlaps(record, gpu_va, cpu_addr, size)
+            })
         })
-    })
+        .map_or(0, |index| index + 1)
 }
 
 fn resident_raw_overlap_is_compatible(
@@ -1023,14 +1106,42 @@ pub(crate) fn resolve_pending_writebacks_report(
     mappings: &GpuMappings,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Vec<PendingComputeWritebackSpan> {
+    resolve_pending_writeback_prefix_report(renderer, mappings, mem_write, None)
+}
+
+#[track_caller]
+pub(crate) fn resolve_pending_writebacks_overlapping_report(
+    renderer: &nexium_gpu::Renderer,
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ranges: &[(u64, u64, usize)],
+) -> Vec<PendingComputeWritebackSpan> {
+    resolve_pending_writeback_prefix_report(renderer, mappings, mem_write, Some(ranges))
+}
+
+pub(crate) fn pending_writeback_count() -> usize {
+    pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .len()
+}
+
+#[track_caller]
+fn resolve_pending_writeback_prefix_report(
+    renderer: &nexium_gpu::Renderer,
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    overlapping: Option<&[(u64, u64, usize)]>,
+) -> Vec<PendingComputeWritebackSpan> {
     let records: Vec<PendingComputeWriteback> = {
         let mut pending = pending_writebacks()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !pending.is_empty() {
+        let end = pending_writeback_prefix_len(&pending, overlapping);
+        if end != 0 {
             PENDING_WRITEBACK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
-        pending.drain(..).collect()
+        pending.drain(..end).collect()
     };
     let spans = pending_writeback_target_spans(&records);
     if records.is_empty() {
@@ -1096,6 +1207,7 @@ pub(crate) fn resolve_pending_writebacks_report(
                 if let Err(error) = write_back_outputs(
                     result,
                     record.program_gpu_va,
+                    record.serial,
                     &record.output_targets,
                     &record.texel_targets,
                     renderer,
@@ -1144,6 +1256,49 @@ fn dispatch_requires_pending_writeback_resolution(
     image_overlap: bool,
 ) -> bool {
     raw_storage_overlap || image_overlap
+}
+
+#[cfg(test)]
+mod prefix_resolve_tests {
+    use super::{pending_writeback_prefix_len, PendingComputeId, PendingComputeWriteback, TexelTarget};
+
+    fn texel_record(id: u64, gpu_va: u64, cpu_addr: u64, guest_size: usize) -> PendingComputeWriteback {
+        PendingComputeWriteback {
+            id: PendingComputeId::Ready(id),
+            program_gpu_va: 0,
+            serial: id,
+            output_targets: Vec::new(),
+            texel_targets: vec![TexelTarget {
+                resource_index: 0,
+                binding: 0,
+                gpu_va,
+                cpu_addr,
+                guest_size,
+                raw: true,
+                raw_storage_key: None,
+            }],
+            landed: None,
+        }
+    }
+
+    #[test]
+    fn overlapping_resolve_drains_through_the_last_overlapping_record_only() {
+        let pending = [
+            texel_record(1, 0x1000, 0x8000, 0x100),
+            texel_record(2, 0x4000, 0xb000, 0x100),
+            texel_record(3, 0x1080, 0x8080, 0x40),
+            texel_record(4, 0x6000, 0xd000, 0x100),
+        ];
+        assert_eq!(pending_writeback_prefix_len(&pending, None), 4);
+        assert_eq!(pending_writeback_prefix_len(&pending, Some(&[(0x1090, 0x8090, 0x10)])), 3);
+        assert_eq!(pending_writeback_prefix_len(&pending, Some(&[(0x1000, 0x8000, 0x20)])), 1);
+        assert_eq!(pending_writeback_prefix_len(&pending, Some(&[(0x9000, 0x10000, 0x20)])), 0);
+        assert_eq!(
+            pending_writeback_prefix_len(&pending, Some(&[(0x9000, 0x10000, 0x20), (0x4010, 0xb010, 4)])),
+            2
+        );
+        assert_eq!(pending_writeback_prefix_len(&pending, Some(&[(0x1000, 0x8000, 0)])), 0);
+    }
 }
 
 pub(crate) fn vertex_memory_store_code(code: &[u8]) -> Option<Vec<u8>> {
@@ -1731,15 +1886,42 @@ fn prepare_and_execute(
         .iter()
         .map(|key| key.and_then(|key| renderer.pin_compute_raw_storage(key)))
         .collect();
-    let unpinned_keys: Vec<ComputeRawStorageKey> = raw_storage_keys
+    let mut unpinned_keys: Vec<ComputeRawStorageKey> = raw_storage_keys
         .iter()
         .zip(&raw_storage_leases)
         .filter_map(|(key, lease)| if lease.is_none() { *key } else { None })
         .collect();
+    if deferred_raw_storage_pin_enabled() {
+        let reserved = unpublished_raw_storage_writer_keys(&unpinned_keys);
+        if !reserved.is_empty() {
+            for (key, lease) in raw_storage_keys.iter().zip(&mut raw_storage_leases) {
+                if let Some(key) = key.filter(|key| lease.is_none() && reserved.contains(key)) {
+                    *lease = Some(renderer.reserve_compute_raw_storage(key));
+                }
+            }
+            unpinned_keys.retain(|key| !reserved.contains(key));
+            if compute_sync_trace_enabled() {
+                log::warn!(
+                    "[ktl] us={} csync kind=raw-reserve keys={}",
+                    crate::timeline_us(),
+                    reserved.len()
+                );
+            }
+        }
+    }
     let queued_writers = pending_raw_storage_writers(&unpinned_keys);
     if !queued_writers.is_empty() {
+        let wait_started = compute_sync_trace_enabled().then(std::time::Instant::now);
         for writer in &queued_writers {
             writer.wait();
+        }
+        if let Some(started) = wait_started {
+            log::warn!(
+                "[ktl] us={} csync kind=raw-writer writers={} ms={:.3}",
+                crate::timeline_us(),
+                queued_writers.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
         }
         for (key, lease) in raw_storage_keys.iter().zip(&mut raw_storage_leases) {
             if lease.is_none() {
@@ -2496,6 +2678,7 @@ fn prepare_and_execute(
             let written = write_back_outputs(
                 result,
                 code_gpu,
+                serial,
                 &output_targets,
                 &texel_targets,
                 renderer,
@@ -3759,7 +3942,7 @@ pub(crate) fn snapshot_sparse_texture(
         if !nexium_memory::fastmem::write_watch_available() {
             return None;
         }
-        let commit = nexium_memory::fastmem::commit_generation();
+        let commit = nexium_memory::fastmem::commit_generation_range(cpu, len);
         let mut spans = Vec::new();
         let observation = nexium_memory::fastmem::take_write_watch_spans_observed(cpu, len, &mut spans);
         match observation.result {
@@ -4386,6 +4569,7 @@ fn trace_compute_image_watch(
 fn write_back_outputs(
     result: ComputeDispatchResult,
     program_gpu_va: u64,
+    serial: u64,
     targets: &[OutputTarget],
     texel_targets: &[TexelTarget],
     renderer: &nexium_gpu::Renderer,
@@ -4553,7 +4737,13 @@ fn write_back_outputs(
             let published = mem_write(write.target.cpu_addr, &write.bytes);
             trace_compute_storage_watch(program_gpu_va, write, published);
             if let Some(key) = write.target.raw_storage_key {
-                crate::gpu::graphics_storage::note_writeback(key, &write.bytes, published);
+                crate::gpu::graphics_storage::note_writeback(
+                    key,
+                    serial,
+                    u32::try_from(write.target.resource_index).unwrap_or(u32::MAX),
+                    &write.bytes,
+                    published,
+                );
             }
             if !published {
                 return Err(format!(

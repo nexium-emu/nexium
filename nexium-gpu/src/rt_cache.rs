@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 const RT_COLOR_GPU_PAGE_SHIFT: u32 = 20;
+const VIEW_RETIREMENT_FRAMES: u64 = 3;
+const VIEW_CLOCK_IDLE_CALLS: u32 = 256;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RtAliasIndexedLookupTelemetry {
@@ -569,7 +571,10 @@ pub struct RtCache {
     depth_region_sources: HashMap<RtKey, (RtKey, vk::Image, u64)>,
     pending_view_retirement: HashSet<(bool, RtKey)>,
     obsolete_mapping_views: HashSet<(bool, RtKey)>,
-    view_retirement_epoch: u64,
+    view_clock: u64,
+    view_clock_frame: u64,
+    view_clock_calls: u32,
+    view_scan_clock: Option<u64>,
     guest_stale_color: HashSet<RtKey>,
     guest_stale_depth: HashSet<RtKey>,
     present_excluded: HashSet<RtKey>,
@@ -882,7 +887,10 @@ impl RtCache {
             depth_region_sources: HashMap::default(),
             pending_view_retirement: HashSet::default(),
             obsolete_mapping_views: HashSet::default(),
-            view_retirement_epoch: 0,
+            view_clock: 0,
+            view_clock_frame: 0,
+            view_clock_calls: 0,
+            view_scan_clock: None,
             guest_stale_color: HashSet::default(),
             guest_stale_depth: HashSet::default(),
             present_excluded: HashSet::default(),
@@ -1360,7 +1368,7 @@ impl RtCache {
         let source = self.canonical_depth_key(source);
         if key != source {
             if let Some(image) = self.depth_cache.get(&source) {
-                self.depth_region_sources.insert(key, (source, image.image, self.view_retirement_epoch));
+                self.depth_region_sources.insert(key, (source, image.image, self.view_clock));
                 self.pending_view_retirement.insert((true, key));
             }
         }
@@ -1615,7 +1623,7 @@ impl RtCache {
         self.mark_synced_sample_from(key, stamp);
         if key != source {
             if let Some((source, image)) = self.cache.get_key_value(&source) {
-                self.color_region_sources.insert(key, (*source, image.image, self.view_retirement_epoch));
+                self.color_region_sources.insert(key, (*source, image.image, self.view_clock));
                 self.pending_view_retirement.insert((false, key));
             }
         }
@@ -2560,6 +2568,20 @@ impl RtCache {
         (count, bytes_total)
     }
 
+    fn tick_view_clock(&mut self) {
+        if self.view_clock_frame != self.use_frame {
+            self.view_clock_frame = self.use_frame;
+            self.view_clock = self.view_clock.wrapping_add(1);
+            self.view_clock_calls = 0;
+            return;
+        }
+        self.view_clock_calls += 1;
+        if self.view_clock_calls >= VIEW_CLOCK_IDLE_CALLS {
+            self.view_clock = self.view_clock.wrapping_add(1);
+            self.view_clock_calls = 0;
+        }
+    }
+
     pub(crate) fn retire_redundant_views(
         &mut self,
         retired: &mut Vec<GpuImage>,
@@ -2568,11 +2590,11 @@ impl RtCache {
         if !self.has_pending_view_retirement() {
             return (0, 0);
         }
-        self.view_retirement_epoch = self.view_retirement_epoch.wrapping_add(1);
+        self.tick_view_clock();
         for key in protected {
             for sources in [&mut self.color_region_sources, &mut self.depth_region_sources] {
                 if let Some((_, _, last_used)) = sources.get_mut(key) {
-                    *last_used = self.view_retirement_epoch;
+                    *last_used = self.view_clock;
                 }
             }
         }
@@ -2586,6 +2608,10 @@ impl RtCache {
             count += retired_count;
             bytes = bytes.saturating_add(retired_bytes);
         }
+        if self.view_scan_clock == Some(self.view_clock) {
+            return (count, bytes);
+        }
+        self.view_scan_clock = Some(self.view_clock);
         let pending = std::mem::take(&mut self.pending_view_retirement);
         let mut replacements = HashMap::<(bool, RtKey), RtKey>::default();
         for (depth, key) in pending {
@@ -2630,7 +2656,7 @@ impl RtCache {
         for ((depth, key), source) in replacements {
             let region_sources = if depth { &self.depth_region_sources } else { &self.color_region_sources };
             let recently_used = region_sources.get(&key).is_some_and(|(_, _, last_used)| {
-                self.view_retirement_epoch.wrapping_sub(*last_used) < 64
+                self.view_clock.wrapping_sub(*last_used) < VIEW_RETIREMENT_FRAMES
             });
             if retained_sources.contains(&(depth, key)) || protected.contains(&key) || recently_used {
                 self.pending_view_retirement.insert((depth, source));
@@ -2893,7 +2919,12 @@ impl RtCache {
             .keys()
             .filter(|k| !is_synthetic_copy_key(**k) && k.nvmap_id == nvmap_id && k.gpu_va == gpu_va)
             .filter(|k| !self.obsolete_mapping_views.contains(&(false, **k)))
-            .max_by_key(|k| self.drawn_stamp.get(*k).copied().unwrap_or(0))
+            .max_by_key(|k| {
+                (
+                    !self.color_region_sources.contains_key(*k),
+                    self.drawn_stamp.get(*k).copied().unwrap_or(0),
+                )
+            })
             .copied()
     }
 
@@ -3733,6 +3764,14 @@ impl RtCache {
         self.cache.get(&key).map(|image| image.base_format)
     }
 
+    fn region_view_is_stale(&self, key: RtKey) -> bool {
+        self.color_region_sources.get(&key).is_some_and(|(source, image, _)| {
+            self.cache.get(source).is_some_and(|entry| entry.image == *image)
+                && self.writeback_stamp(*source).unwrap_or(0)
+                    > self.drawn_stamp.get(&key).copied().unwrap_or(0)
+        })
+    }
+
     pub fn find_color_with_format(
         &self,
         want: RtKey,
@@ -3742,7 +3781,9 @@ impl RtCache {
             if self.obsolete_mapping_views.contains(&(false, stored)) || alias_view_metadata_changed(stored, want) {
                 return None;
             }
-            return Some((stored, img.image, img.view, img.layout, img.format));
+            if !self.region_view_is_stale(stored) {
+                return Some((stored, img.image, img.view, img.layout, img.format));
+            }
         }
         if is_synthetic_copy_key(want) {
             return None;
@@ -3750,7 +3791,8 @@ impl RtCache {
         let mut best: Option<(RtKey, &GpuImage)> = None;
         for (k, img) in &self.cache {
             if is_synthetic_copy_key(*k) || k.nvmap_id != want.nvmap_id
-                || self.obsolete_mapping_views.contains(&(false, *k)) {
+                || self.obsolete_mapping_views.contains(&(false, *k))
+                || self.region_view_is_stale(*k) {
                 continue;
             }
             if alias_view_metadata_changed(*k, want) {
@@ -4499,7 +4541,7 @@ impl RtCache {
         self.depth_region_sources.clear();
         self.pending_view_retirement.clear();
         self.obsolete_mapping_views.clear();
-        self.view_retirement_epoch = 0;
+        self.view_scan_clock = None;
         self.note_guest_ranges_changed();
         self.guest_hit_memo.clear();
         self.color_guest_ranges.clear();
@@ -5235,7 +5277,7 @@ mod tests {
     }
 
     fn retire_aged_views(cache: &mut RtCache, retired: &mut Vec<GpuImage>, protected: &[RtKey]) -> (usize, u64) {
-        cache.view_retirement_epoch = cache.view_retirement_epoch.wrapping_add(64);
+        cache.view_clock = cache.view_clock.wrapping_add(super::VIEW_RETIREMENT_FRAMES);
         cache.retire_redundant_views(retired, protected)
     }
 
@@ -5583,6 +5625,52 @@ mod tests {
     }
 
     #[test]
+    fn rt_retirement_ages_region_views_without_presents() {
+        let mut cache = RtCache::new();
+        let source = retirement_key(1248, 720);
+        let target = retirement_key(1245, 700);
+        cache.insert_color_image(source, retirement_color(source, 1));
+        cache.insert_color_image(target, retirement_color(target, 2));
+        let stamp = cache.mark_drawn(source);
+        cache.mark_color_region_synced(target, source, stamp);
+        let mut retired = Vec::new();
+        let calls = super::VIEW_CLOCK_IDLE_CALLS as usize * (super::VIEW_RETIREMENT_FRAMES as usize + 1);
+        let total: usize = (0..calls)
+            .map(|_| cache.retire_redundant_views(&mut retired, &[]).0)
+            .sum();
+        assert_eq!(total, 1);
+        assert!(cache.cache.contains_key(&source));
+        assert!(!cache.has_pending_view_retirement());
+    }
+
+    #[test]
+    fn stale_region_view_is_not_returned_as_a_copy_source() {
+        let mut cache = RtCache::new();
+        let source = retirement_key(1248, 720);
+        let target = retirement_key(1245, 700);
+        cache.insert_color_image(source, retirement_color(source, 1));
+        cache.insert_color_image(target, retirement_color(target, 2));
+        let stamp = cache.mark_drawn(source);
+        cache.mark_color_region_synced(target, source, stamp);
+        assert_eq!(cache.find_color(target).map(|found| found.0), Some(target));
+        cache.mark_drawn(source);
+        assert_ne!(cache.find_color(target).map(|found| found.0), Some(target));
+    }
+
+    #[test]
+    fn region_view_does_not_outrank_its_cleared_source_at_a_va() {
+        let mut cache = RtCache::new();
+        let source = retirement_key(1248, 720);
+        let target = retirement_key(1245, 700);
+        cache.insert_color_image(source, retirement_color(source, 1));
+        cache.insert_color_image(target, retirement_color(target, 2));
+        let stamp = cache.mark_drawn(source);
+        cache.mark_color_region_synced(target, source, stamp);
+        cache.mark_cleared(source, true);
+        assert_eq!(cache.find_color_key_at_va(source.nvmap_id, source.gpu_va), Some(source));
+    }
+
+    #[test]
     fn rt_retirement_keeps_active_derived_views_and_reclaims_unused_copies() {
         let mut cache = RtCache::new();
         let source = retirement_key(1248, 720);
@@ -5595,9 +5683,13 @@ mod tests {
         for _ in 0..128 {
             assert_eq!(cache.retire_redundant_views(&mut retired, &[target]), (0, 0));
         }
-        for _ in 0..63 {
-            assert_eq!(cache.retire_redundant_views(&mut retired, &[]), (0, 0));
+        for _ in 1..super::VIEW_RETIREMENT_FRAMES {
+            cache.reset_frame_draws();
+            for _ in 0..128 {
+                assert_eq!(cache.retire_redundant_views(&mut retired, &[]), (0, 0));
+            }
         }
+        cache.reset_frame_draws();
         assert_eq!(cache.retire_redundant_views(&mut retired, &[]).0, 1);
         assert!(cache.cache.contains_key(&source));
         assert!(!cache.has_pending_view_retirement());

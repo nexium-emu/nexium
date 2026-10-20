@@ -85,6 +85,30 @@ pub(crate) struct ExactIdentityBlitPreview {
     pub(crate) block_size: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OrderedRegionBlitPreview {
+    pub(crate) source: RtKey,
+    pub(crate) destination: RtKey,
+    pub(crate) region: nexium_gpu::renderer::RtCopyRegion,
+    pub(crate) source_cpu: u64,
+    pub(crate) source_size: u64,
+    pub(crate) destination_cpu: u64,
+    pub(crate) destination_size: u64,
+}
+
+fn contiguous_backing(mappings: &GpuMappings, gpu_va: u64, size: u64) -> Option<u64> {
+    let (base, _) = mappings.cpu_range_for(gpu_va)?;
+    let mut offset = 0u64;
+    while offset < size {
+        let (cpu, available) = mappings.cpu_range_for(gpu_va.checked_add(offset)?)?;
+        if available == 0 || cpu != base.checked_add(offset)? {
+            return None;
+        }
+        offset = offset.saturating_add(available);
+    }
+    Some(base)
+}
+
 #[derive(Default, Clone, Copy)]
 struct Surface {
     format: u32,
@@ -353,6 +377,113 @@ impl Fermi2D {
         self.record_logical_guest_write(preview.destination_va, destination_size);
         nexium_gpu::tex_invalidate::bump_region(preview.destination_va, preview.destination_size);
         true
+    }
+
+    fn ordered_region_geometry(&self, terminal_arg: u32) -> Option<nexium_gpu::renderer::RtCopyRegion> {
+        if !matches!(self.operation & 0x7, 0 | 3 | 5)
+            || self.src.format != self.dst.format
+            || self.src.depth > 1
+            || self.dst.depth > 1
+            || self.src._layer != 0
+            || self.dst._layer != 0
+            || self.dst_width_blit <= 0
+            || self.dst_height_blit <= 0
+        {
+            return None;
+        }
+        let bytes_per_pixel = self.dst.format_info()?.bytes_per_pixel();
+        let unit = 1i64 << 32;
+        if fixed_or_one(self.du_dx_low, self.du_dx_high) != unit
+            || fixed_or_one(self.dv_dy_low, self.dv_dy_high) != unit
+        {
+            return None;
+        }
+        let src_x0 = fixed_32_32(self.src_x0_low, self.src_x0_high);
+        let src_y0 = fixed_32_32(self.src_y0_low, terminal_arg);
+        let center = 1i64 << 31;
+        if src_x0 & 0xFFFF_FFFF != center || src_y0 & 0xFFFF_FFFF != center {
+            return None;
+        }
+        let region = nexium_gpu::renderer::RtCopyRegion {
+            src_x: u32::try_from(src_x0 >> 32).ok()?,
+            src_y: u32::try_from(src_y0 >> 32).ok()?,
+            dst_x: u32::try_from(self.dst_x0).ok()?,
+            dst_y: u32::try_from(self.dst_y0).ok()?,
+            width: u32::try_from(self.dst_width_blit).ok()?,
+            height: u32::try_from(self.dst_height_blit).ok()?,
+            bytes_per_pixel,
+        };
+        let inside = |x: u32, y: u32, surface: &Surface| {
+            x.checked_add(region.width).is_some_and(|end| end <= surface.width)
+                && y.checked_add(region.height).is_some_and(|end| end <= surface.height)
+        };
+        (inside(region.src_x, region.src_y, &self.src) && inside(region.dst_x, region.dst_y, &self.dst))
+            .then_some(region)
+    }
+
+    fn ordered_region_backing(
+        &self,
+        terminal_arg: u32,
+        mappings: &GpuMappings,
+    ) -> Option<OrderedRegionBlitPreview> {
+        let region = self.ordered_region_geometry(terminal_arg)?;
+        let src_va = self.src.gpu_va();
+        let dst_va = self.dst.gpu_va();
+        let source_size = u64::try_from(self.src.storage_size()).ok().filter(|size| *size != 0)?;
+        let destination_size =
+            u64::try_from(self.dst.storage_size()).ok().filter(|size| *size != 0)?;
+        let source_cpu = contiguous_backing(mappings, src_va, source_size)?;
+        let destination_cpu = contiguous_backing(mappings, dst_va, destination_size)?;
+        if source_cpu < destination_cpu.checked_add(destination_size)?
+            && destination_cpu < source_cpu.checked_add(source_size)?
+        {
+            return None;
+        }
+        Some(OrderedRegionBlitPreview {
+            source: RtKey::new(mappings.nvmap_id_for(src_va)?, self.src.width, self.src.height, src_va),
+            destination: RtKey::new(
+                mappings.nvmap_id_for(dst_va)?,
+                self.dst.width,
+                self.dst.height,
+                dst_va,
+            ),
+            region,
+            source_cpu,
+            source_size,
+            destination_cpu,
+            destination_size,
+        })
+    }
+
+    pub(crate) fn preview_ordered_region_blit(
+        &self,
+        terminal_arg: u32,
+        mappings: &GpuMappings,
+        renderer: Option<&nexium_gpu::Renderer>,
+    ) -> Option<OrderedRegionBlitPreview> {
+        let renderer = renderer?;
+        let preview = self.ordered_region_backing(terminal_arg, mappings)?;
+        renderer
+            .ordered_rt_copy_region_ready(preview.source, preview.destination, preview.region)
+            .then_some(preview)
+    }
+
+    pub(crate) fn commit_ordered_region_blit(
+        &mut self,
+        terminal_arg: u32,
+        preview: &OrderedRegionBlitPreview,
+    ) {
+        self.src_y0_high = terminal_arg;
+        self.guest_write_range = None;
+        self.logical_guest_write_span = None;
+        self.blit_count = self.blit_count.wrapping_add(1);
+        if let Ok(size) = usize::try_from(preview.destination_size) {
+            self.record_logical_guest_write(preview.destination.gpu_va, size);
+        }
+        nexium_gpu::tex_invalidate::bump_region(
+            preview.destination.gpu_va,
+            preview.destination_size,
+        );
     }
 
     pub fn take_guest_write_range(&mut self) -> Option<(u64, u64)> {
@@ -834,6 +965,56 @@ impl Fermi2D {
         }
     }
 
+    pub(crate) fn trace_blit(&self, path: &str, terminal_arg: u32) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TRACE_VA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let Some(va) = *TRACE_VA.get_or_init(|| {
+            std::env::var("NEXIUM_FERMI_TRACE_VA")
+                .ok()
+                .and_then(|value| u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok())
+        }) else {
+            return;
+        };
+        let covers = |surface: &Surface| {
+            let base = surface.gpu_va();
+            va >= base && va < base.saturating_add(surface.storage_size() as u64)
+        };
+        if !covers(&self.dst) && !covers(&self.src) {
+            return;
+        }
+        if COUNT.fetch_add(1, Ordering::Relaxed) >= 400 {
+            return;
+        }
+        log::warn!(
+            "[fermi-trace] path={} src={:#x} {}x{} fmt={:#x} layout={} pitch={} block={:#x} dst={:#x} {}x{} fmt={:#x} layout={} pitch={} block={:#x} rect=({},{} {}x{}) src0=({:#x},{:#x}) du={:#x} dv={:#x} op={}",
+            path,
+            self.src.gpu_va(),
+            self.src.width,
+            self.src.height,
+            self.src.format,
+            self.src.memory_layout,
+            self.src.pitch,
+            self.src.block_size,
+            self.dst.gpu_va(),
+            self.dst.width,
+            self.dst.height,
+            self.dst.format,
+            self.dst.memory_layout,
+            self.dst.pitch,
+            self.dst.block_size,
+            self.dst_x0,
+            self.dst_y0,
+            self.dst_width_blit,
+            self.dst_height_blit,
+            fixed_32_32(self.src_x0_low, self.src_x0_high),
+            fixed_32_32(self.src_y0_low, terminal_arg),
+            fixed_or_one(self.du_dx_low, self.du_dx_high),
+            fixed_or_one(self.dv_dy_low, self.dv_dy_high),
+            self.operation
+        );
+    }
+
     fn write_surface(s: &mut Surface, off: u32, arg: u32) {
         match off {
             SURFACE_FORMAT => s.format = arg,
@@ -936,6 +1117,7 @@ impl Fermi2D {
                                     }
                                 }),
                             );
+                            self.trace_blit("async-exact", _src_y0_high);
                             self.blit_count = self.blit_count.wrapping_add(1);
                             let destination_size = self.dst.storage_size();
                             self.record_logical_guest_write(dst_va, destination_size);
@@ -972,6 +1154,7 @@ impl Fermi2D {
             renderer, mappings, src_va, dst_va, src_limit, dst_limit, width, height, dst_x_step,
             dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
         ) {
+            self.trace_blit("exact-identity", _src_y0_high);
             self.blit_count = self.blit_count.wrapping_add(1);
             let destination_size = self.dst.storage_size();
             self.record_logical_guest_write(dst_va, destination_size);
@@ -992,12 +1175,14 @@ impl Fermi2D {
             renderer, mappings, src_va, dst_va, width, height, dst_x_step, dst_y_step, src_x0,
             src_y0, du_dx, dv_dy,
         ) {
+            self.trace_blit("rt-resolve", _src_y0_high);
             self.blit_count = self.blit_count.wrapping_add(1);
             let destination_size = self.dst.storage_size();
             self.record_logical_guest_write(dst_va, destination_size);
             nexium_gpu::tex_invalidate::bump_region(dst_va, destination_size as u64);
             return;
         }
+        self.trace_blit("cpu", _src_y0_high);
         self.stage_blit_rt_source(mappings, renderer, mem_write);
         let src_size = self.src.storage_size().min(src_limit as usize);
         let dst_size = self.dst.storage_size().min(dst_limit as usize);
@@ -1507,16 +1692,47 @@ fn copy_same_format_block_linear(
             dst_surface.block_width_log2(),
             dst_surface.block_height_log2(),
         );
-        for &(src_x_offset, dst_x_offset) in &columns {
-            let src_offset = src_y_offset + src_x_offset;
-            let dst_offset = dst_y_offset + dst_x_offset;
-            if src_offset + bpp <= src.len() && dst_offset + bpp <= dst.len() {
-                dst[dst_offset..dst_offset + bpp]
-                    .copy_from_slice(&src[src_offset..src_offset + bpp]);
+        match bpp {
+            1 => copy_block_linear_pixels::<1>(src, dst, src_y_offset, dst_y_offset, &columns),
+            2 => copy_block_linear_pixels::<2>(src, dst, src_y_offset, dst_y_offset, &columns),
+            4 => copy_block_linear_pixels::<4>(src, dst, src_y_offset, dst_y_offset, &columns),
+            8 => copy_block_linear_pixels::<8>(src, dst, src_y_offset, dst_y_offset, &columns),
+            16 => copy_block_linear_pixels::<16>(src, dst, src_y_offset, dst_y_offset, &columns),
+            _ => {
+                for &(src_x_offset, dst_x_offset) in &columns {
+                    let src_offset = src_y_offset + src_x_offset;
+                    let dst_offset = dst_y_offset + dst_x_offset;
+                    if src_offset + bpp <= src.len() && dst_offset + bpp <= dst.len() {
+                        dst[dst_offset..dst_offset + bpp]
+                            .copy_from_slice(&src[src_offset..src_offset + bpp]);
+                    }
+                }
             }
         }
     }
     true
+}
+
+fn copy_block_linear_pixels<const N: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    src_row: usize,
+    dst_row: usize,
+    columns: &[(usize, usize)],
+) {
+    for &(src_x_offset, dst_x_offset) in columns {
+        let src_offset = src_row + src_x_offset;
+        let dst_offset = dst_row + dst_x_offset;
+        let (Some(pixel), Some(out)) = (
+            src.get(src_offset..src_offset + N),
+            dst.get_mut(dst_offset..dst_offset + N),
+        ) else {
+            continue;
+        };
+        let pixel: &[u8; N] = pixel.try_into().unwrap();
+        let out: &mut [u8; N] = out.try_into().unwrap();
+        *out = *pixel;
+    }
 }
 
 fn reachable_unit_step_range(
@@ -1779,6 +1995,131 @@ mod tests {
                 preview.destination_va,
                 preview.destination_size,
             ),
+            generation
+        );
+    }
+
+    fn region_fermi(src_gpu: u64, dst_gpu: u64) -> Fermi2D {
+        let surface = |gpu_va: u64, height: u32| Surface {
+            format: FMT_A8B8G8R8_UNORM,
+            memory_layout: MEMORY_LAYOUT_BLOCK_LINEAR,
+            block_size: 2 << 4,
+            depth: 1,
+            width: 64,
+            height,
+            offset_high: (gpu_va >> 32) as u32,
+            offset_low: gpu_va as u32,
+            ..Surface::default()
+        };
+        Fermi2D {
+            src: surface(src_gpu, 30),
+            dst: surface(dst_gpu, 32),
+            operation: 3,
+            dst_width_blit: 64,
+            dst_height_blit: 30,
+            du_dx_high: 1,
+            dv_dy_high: 1,
+            src_x0_low: 1 << 31,
+            src_y0_low: 1 << 31,
+            src_y0_high: 7,
+            ..Fermi2D::default()
+        }
+    }
+
+    #[test]
+    fn ordered_region_geometry_accepts_only_unscaled_centered_copies() {
+        let fermi = region_fermi(0x7f30_1000_0000, 0x7f30_2000_0000);
+        let region = fermi.ordered_region_geometry(0).unwrap();
+        assert_eq!(
+            (region.src_x, region.src_y, region.dst_x, region.dst_y),
+            (0, 0, 0, 0)
+        );
+        assert_eq!((region.width, region.height, region.bytes_per_pixel), (64, 30, 4));
+        assert!(fermi.ordered_region_geometry(1).is_none());
+
+        let mut offset = region_fermi(0x7f30_1000_0000, 0x7f30_2000_0000);
+        offset.dst_height_blit = 20;
+        offset.dst_y0 = 12;
+        let region = offset.ordered_region_geometry(9).unwrap();
+        assert_eq!((region.src_y, region.dst_y, region.height), (9, 12, 20));
+        assert!(offset.ordered_region_geometry(11).is_none());
+
+        let mut scaled = region_fermi(0x7f30_1000_0000, 0x7f30_2000_0000);
+        scaled.du_dx_high = 2;
+        assert!(scaled.ordered_region_geometry(0).is_none());
+
+        let mut corner = region_fermi(0x7f30_1000_0000, 0x7f30_2000_0000);
+        corner.src_x0_low = 0;
+        assert!(corner.ordered_region_geometry(0).is_none());
+
+        let mut mirrored = region_fermi(0x7f30_1000_0000, 0x7f30_2000_0000);
+        mirrored.dst_width_blit = -64;
+        assert!(mirrored.ordered_region_geometry(0).is_none());
+
+        let mut too_tall = region_fermi(0x7f30_1000_0000, 0x7f30_2000_0000);
+        too_tall.dst_height_blit = 31;
+        assert!(too_tall.ordered_region_geometry(0).is_none());
+
+        let mut converted = region_fermi(0x7f30_1000_0000, 0x7f30_2000_0000);
+        converted.dst.format = converted.src.format + 1;
+        assert!(converted.ordered_region_geometry(0).is_none());
+    }
+
+    #[test]
+    fn ordered_region_backing_spans_contiguous_segments_but_not_gaps() {
+        const SRC_GPU: u64 = 0x7f31_1000_0000;
+        const DST_GPU: u64 = 0x7f31_2000_0000;
+        const SRC_CPU: u64 = 0x5f31_1000_0000;
+        const DST_CPU: u64 = 0x5f31_2000_0000;
+        let fermi = region_fermi(SRC_GPU, DST_GPU);
+
+        let mut split = GpuMappings::new();
+        split.add(SRC_GPU, 0x10_000, SRC_CPU, 81);
+        split.add(DST_GPU, 0x1000, DST_CPU, 82);
+        split.add(DST_GPU + 0x1000, 0x10_000, DST_CPU + 0x1000, 82);
+        let preview = fermi.ordered_region_backing(0, &split).unwrap();
+        assert_eq!(preview.source, RtKey::new(81, 64, 30, SRC_GPU));
+        assert_eq!(preview.destination, RtKey::new(82, 64, 32, DST_GPU));
+        assert_eq!(preview.destination_cpu, DST_CPU);
+        assert_eq!(preview.destination_size, 0x2000);
+
+        let mut gap = GpuMappings::new();
+        gap.add(SRC_GPU, 0x10_000, SRC_CPU, 81);
+        gap.add(DST_GPU, 0x1000, DST_CPU, 82);
+        gap.add(DST_GPU + 0x1000, 0x10_000, DST_CPU + 0x3000, 82);
+        assert!(fermi.ordered_region_backing(0, &gap).is_none());
+
+        let mut short = GpuMappings::new();
+        short.add(SRC_GPU, 0x10_000, SRC_CPU, 81);
+        short.add(DST_GPU, 0x1fff, DST_CPU, 82);
+        assert!(fermi.ordered_region_backing(0, &short).is_none());
+
+        let mut overlapping = GpuMappings::new();
+        overlapping.add(SRC_GPU, 0x10_000, SRC_CPU, 81);
+        overlapping.add(DST_GPU, 0x10_000, SRC_CPU + 0x1000, 82);
+        assert!(fermi.ordered_region_backing(0, &overlapping).is_none());
+    }
+
+    #[test]
+    fn ordered_region_commit_records_the_destination_write() {
+        const SRC_GPU: u64 = 0x7f32_1000_0000;
+        const DST_GPU: u64 = 0x7f32_2000_0000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(SRC_GPU, 0x10_000, 0x5f32_1000_0000, 83);
+        mappings.add(DST_GPU, 0x10_000, 0x5f32_2000_0000, 84);
+        let mut fermi = region_fermi(SRC_GPU, DST_GPU);
+        let preview = fermi.ordered_region_backing(0, &mappings).unwrap();
+        fermi.record_guest_write(0x1234, 8);
+        let generation = nexium_gpu::tex_invalidate::region_gen_range(DST_GPU, 0x2000);
+
+        fermi.commit_ordered_region_blit(0, &preview);
+
+        assert_eq!(fermi.src_y0_high, 0);
+        assert_eq!(fermi.blit_count, 1);
+        assert_eq!(fermi.take_guest_write_range(), None);
+        assert_eq!(fermi.take_logical_guest_write_span(), Some((DST_GPU, 0x2000)));
+        assert_ne!(
+            nexium_gpu::tex_invalidate::region_gen_range(DST_GPU, 0x2000),
             generation
         );
     }

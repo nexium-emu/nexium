@@ -1322,7 +1322,7 @@ impl Pusher {
                 state.record_flush_reason(reason);
                 state.flush_vk(mappings, mem_read, mem_write);
                 if clear_ssbo {
-                    state.ssbo_snapshot_cache.clear_ssbo_snapshots();
+                    state.ssbo_snapshot_cache.retain_watchable_full_aurora_snapshots();
                 }
             }
             super::prep::PrepLane::Threaded(handle) => {
@@ -2635,6 +2635,7 @@ impl Pusher {
                             nexium_common::host_wake::micro_pause();
                         }
                     }
+                    super::prep::note_semaphore_acquire();
                 }
                 kickprof::add(kickprof::SEMACQ, kp);
             }

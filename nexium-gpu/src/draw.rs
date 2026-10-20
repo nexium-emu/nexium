@@ -180,6 +180,7 @@ pub struct GraphicsStorageResidentRef {
     pub offset: u64,
     pub writes: bool,
     pub seed: Option<std::sync::Arc<Vec<u8>>>,
+    pub compute_seed: Option<ComputeOverlay>,
 }
 
 #[derive(Clone, Debug)]

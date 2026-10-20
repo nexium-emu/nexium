@@ -2,7 +2,7 @@ use ash::vk;
 use ash::vk::Handle;
 use parking_lot::Mutex;
 use std::collections::{
-    hash_map::DefaultHasher, hash_map::Entry, BTreeMap, HashMap, HashSet, VecDeque,
+    hash_map::DefaultHasher, hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque,
 };
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -730,6 +730,8 @@ struct ResidentVbCache {
     head: u64,
     free: ResidentFreeList,
     slabs: HashMap<(u64, u32), Vec<ResidentVbSlab>>,
+    lru: BTreeSet<(u64, u64, u64, u32)>,
+    slot_uses: Vec<Vec<ResidentSlabUse>>,
     clock: u64,
     last_fail: u8,
 }
@@ -741,8 +743,15 @@ impl ResidentVbCache {
         let Some(bit) = 1u64.checked_shl(frame_slot as u32) else {
             return;
         };
-        for versions in self.slabs.values_mut() {
-            for slab in versions {
+        let Some(uses) = self.slot_uses.get_mut(frame_slot) else {
+            return;
+        };
+        for slab_use in uses.drain(..) {
+            if let Some(slab) = self.slabs.get_mut(&slab_use.key()).and_then(|versions| {
+                versions
+                    .iter_mut()
+                    .find(|slab| slab.offset == slab_use.offset)
+            }) {
                 slab.in_flight_mask &= !bit;
             }
         }
@@ -752,6 +761,9 @@ impl ResidentVbCache {
         let Some(bit) = 1u64.checked_shl(frame_slot as u32) else {
             return;
         };
+        if self.slot_uses.len() <= frame_slot {
+            self.slot_uses.resize_with(frame_slot + 1, Vec::new);
+        }
         for slab_use in used {
             if let Some(slab) = self.slabs.get_mut(&slab_use.key()).and_then(|versions| {
                 versions
@@ -759,8 +771,23 @@ impl ResidentVbCache {
                     .find(|slab| slab.offset == slab_use.offset)
             }) {
                 slab.in_flight_mask |= bit;
+                self.slot_uses[frame_slot].push(*slab_use);
             }
         }
+    }
+
+    fn touch(&mut self, key: (u64, u32), offset: u64, previous: u64, clock: u64) {
+        self.lru.remove(&(previous, offset, key.0, key.1));
+        self.lru.insert((clock, offset, key.0, key.1));
+    }
+
+    fn evictable(&self, key: (u64, u32), offset: u64, used: &HashSet<ResidentSlabUse>) -> bool {
+        !used.contains(&ResidentSlabUse::new(key.0, key.1, offset))
+            && self.slabs.get(&key).is_some_and(|versions| {
+                versions
+                    .iter()
+                    .any(|slab| slab.offset == offset && slab.in_flight_mask == 0)
+            })
     }
 
     fn alloc(&mut self, chunk_count: u32, used: &HashSet<ResidentSlabUse>) -> Option<u64> {
@@ -773,35 +800,35 @@ impl ResidentVbCache {
             self.head += bytes;
             return Some(offset);
         }
+        let mut cursor = None;
         loop {
-            let mut victim = None;
-            for (&key, versions) in &self.slabs {
-                for (index, slab) in versions.iter().enumerate() {
-                    let slab_use = ResidentSlabUse::new(key.0, key.1, slab.offset);
-                    if slab.in_flight_mask != 0 || used.contains(&slab_use) {
-                        continue;
-                    }
-                    let candidate = (slab.last_used, slab.offset, key, index);
-                    if victim.is_none_or(|current| candidate < current) {
-                        victim = Some(candidate);
-                    }
-                }
-            }
-            let (_, _, victim_key, victim_index) = victim?;
+            let candidates = match cursor {
+                Some(after) => self
+                    .lru
+                    .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded)),
+                None => self.lru.range(..),
+            };
+            let victim = candidates
+                .copied()
+                .find(|&(_, offset, first, count)| self.evictable((first, count), offset, used));
+            let (last_used, victim_offset, first, count) = victim?;
+            let victim_key = (first, count);
+            self.lru.remove(&(last_used, victim_offset, first, count));
             let versions = self.slabs.get_mut(&victim_key)?;
-            let slab = versions.swap_remove(victim_index);
-            let remove_key = versions.is_empty();
-            if remove_key {
+            let victim_index = versions.iter().position(|slab| slab.offset == victim_offset)?;
+            versions.swap_remove(victim_index);
+            if versions.is_empty() {
                 self.slabs.remove(&victim_key);
             }
             let victim_bytes =
-                u64::from(victim_key.1).checked_mul(crate::draw::RESIDENT_CHUNK_SIZE as u64)?;
-            if !self.free.insert(slab.offset, victim_bytes) {
+                u64::from(count).checked_mul(crate::draw::RESIDENT_CHUNK_SIZE as u64)?;
+            if !self.free.insert(victim_offset, victim_bytes) {
                 return None;
             }
             if let Some(offset) = self.free.take(bytes) {
                 return Some(offset);
             }
+            cursor = Some((last_used, victim_offset, first, count));
         }
     }
 
@@ -874,9 +901,11 @@ impl ResidentVbCache {
         });
         if let Some(index) = exact_index {
             let slab = self.slabs.get_mut(&key)?.get_mut(index)?;
-            slab.last_used = clock;
-            used.insert(ResidentSlabUse::new(key.0, key.1, slab.offset));
-            return Some((self.buffer, slab.offset, ResidentResolveKind::Hit));
+            let previous = std::mem::replace(&mut slab.last_used, clock);
+            let offset = slab.offset;
+            used.insert(ResidentSlabUse::new(key.0, key.1, offset));
+            self.touch(key, offset, previous, clock);
+            return Some((self.buffer, offset, ResidentResolveKind::Hit));
         }
         let reusable_index = self.slabs.get(&key).and_then(|versions| {
             versions
@@ -913,9 +942,11 @@ impl ResidentVbCache {
                 }
             }
             slab.versions = chunks.iter().map(resident_chunk_version).collect();
-            slab.last_used = clock;
-            used.insert(ResidentSlabUse::new(key.0, key.1, slab.offset));
-            return Some((self.buffer, slab.offset, ResidentResolveKind::Version));
+            let previous = std::mem::replace(&mut slab.last_used, clock);
+            let offset = slab.offset;
+            used.insert(ResidentSlabUse::new(key.0, key.1, offset));
+            self.touch(key, offset, previous, clock);
+            return Some((self.buffer, offset, ResidentResolveKind::Version));
         }
         let had_logical_slab = self.slabs.contains_key(&key);
         let offset = match self.alloc(count, used) {
@@ -946,6 +977,7 @@ impl ResidentVbCache {
             in_flight_mask: 0,
             last_used: clock,
         });
+        self.lru.insert((clock, offset, key.0, key.1));
         used.insert(ResidentSlabUse::new(key.0, key.1, offset));
         Some((
             self.buffer,
@@ -989,6 +1021,8 @@ fn create_resident_vb_cache(
         head: 0,
         free: ResidentFreeList::default(),
         slabs: HashMap::new(),
+        lru: BTreeSet::new(),
+        slot_uses: Vec::new(),
         clock: 0,
         last_fail: RESIDENT_FAIL_OTHER,
     })
@@ -4907,6 +4941,131 @@ fn bind_graphics_storage(
     })
 }
 
+fn adopt_compute_graphics_storage(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    cmd: vk::CommandBuffer,
+    entries: &mut HashMap<crate::compute::ComputeRawStorageKey, GraphicsStorageEntry>,
+    retired: &mut Vec<(u64, crate::compute::ComputeBufferResource)>,
+    batch: &mut GraphicsStorageBatch,
+    batch_serial: u64,
+    sources: &HashMap<u64, Vec<(u32, vk::Buffer)>>,
+    resident: &crate::draw::GraphicsStorageResidentRef,
+    seed: crate::draw::ComputeOverlay,
+) -> Result<(), String> {
+    let key = resident.key;
+    let source = sources
+        .get(&seed.serial)
+        .and_then(|entries| entries.iter().find(|(index, _)| *index == seed.resource_index))
+        .map(|(_, buffer)| *buffer)
+        .ok_or_else(|| {
+            format!(
+                "compute seed serial={} resource={} for {:#x}+{:#x} is no longer resident",
+                seed.serial, seed.resource_index, key.gpu_va, key.size
+            )
+        })?;
+    if seed.dst_offset != 0 || seed.len < key.size {
+        return Err(format!(
+            "compute seed covers {:#x}+{:#x} of {:#x}+{:#x}",
+            seed.dst_offset, seed.len, key.gpu_va, key.size
+        ));
+    }
+    let size = usize::try_from(key.size).map_err(|_| "compute seed size overflows".to_string())?;
+    let resource = crate::compute::create_graphics_storage_buffer(device, mem_props, &vec![0u8; size])?;
+    let before = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::HOST_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+    let after = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[before],
+            &[],
+            &[],
+        );
+        device.cmd_copy_buffer(
+            cmd,
+            source,
+            resource.buffer,
+            &[vk::BufferCopy {
+                src_offset: seed.src_offset,
+                dst_offset: 0,
+                size: key.size,
+            }],
+        );
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_GRAPHICS,
+            vk::DependencyFlags::empty(),
+            &[after],
+            &[],
+            &[],
+        );
+    }
+    let used = batch.used.contains(&key);
+    let replaced = entries.insert(
+        key,
+        GraphicsStorageEntry {
+            generation: resident.generation,
+            resource,
+            last_submit_generation: 0,
+            last_batch: batch_serial,
+        },
+    );
+    if let Some(old) = replaced {
+        let retire_at = if used {
+            GRAPHICS_STORAGE_PENDING_SUBMIT
+        } else {
+            old.last_submit_generation
+        };
+        retired.push((retire_at, old.resource));
+    }
+    if !used {
+        batch.used.push(key);
+    }
+    if graphics_storage_trace_enabled() {
+        log::warn!(
+            "[graphics-storage] renderer adopts compute gpu={:#x}+{:#x} generation={} serial={} resource={} src_offset={:#x}",
+            key.gpu_va,
+            key.size,
+            resident.generation,
+            seed.serial,
+            seed.resource_index,
+            seed.src_offset
+        );
+    }
+    Ok(())
+}
+
+fn compute_seed_alias_info(
+    sources: &HashMap<u64, Vec<(u32, vk::Buffer)>>,
+    resident: &crate::draw::GraphicsStorageResidentRef,
+    seed: crate::draw::ComputeOverlay,
+    range: u64,
+    alignment: u64,
+) -> Option<vk::DescriptorBufferInfo> {
+    let buffer = sources
+        .get(&seed.serial)?
+        .iter()
+        .find(|(index, _)| *index == seed.resource_index)
+        .map(|(_, buffer)| *buffer)?;
+    let offset = seed.src_offset.checked_add(resident.offset)?;
+    (seed.dst_offset == 0
+        && resident.offset.checked_add(range)? <= seed.len
+        && offset % alignment.max(1) == 0)
+        .then_some(vk::DescriptorBufferInfo {
+            buffer,
+            offset,
+            range,
+        })
+}
+
 fn finish_graphics_storage_batch(
     entries: &mut HashMap<crate::compute::ComputeRawStorageKey, GraphicsStorageEntry>,
     retired: &mut Vec<(u64, crate::compute::ComputeBufferResource)>,
@@ -4950,6 +5109,49 @@ fn adopt_graphics_storage_for_compute(
         if graphics_storage_trace_enabled() {
             log::warn!(
                 "[graphics-storage] compute reuses adopted gpu={:#x}+{:#x} generation={}",
+                key.gpu_va,
+                key.size,
+                generation
+            );
+        }
+        return;
+    }
+    if graphics_key == key
+        && inner.compute_raw_storage_cache.contains_key(&key)
+        && inner
+            .graphics_storage
+            .get(&key)
+            .is_some_and(|entry| entry.generation == generation)
+    {
+        let Some(entry) = inner.graphics_storage.remove(&key) else {
+            return;
+        };
+        inner.raw_storage_resident.lock().resident.remove(&key);
+        let replaced = inner.compute_raw_storage_cache.insert(
+            key,
+            CachedComputeRawStorage {
+                resource: entry.resource,
+                ready: true,
+                valid: true,
+                dirty: true,
+            },
+        );
+        if let Some(replaced) = replaced {
+            let serials = overlay_source_serials(inner, replaced.resource.buffer);
+            let retire_generation = if serials.is_empty() {
+                inner.submit_state.generation.load(std::sync::atomic::Ordering::Acquire)
+            } else {
+                u64::MAX
+            };
+            inner.parked_compute_buffers.push(ParkedComputeBuffer {
+                resource: replaced.resource,
+                serials,
+                retire_generation,
+            });
+        }
+        if graphics_storage_trace_enabled() {
+            log::warn!(
+                "[graphics-storage] compute takes newer graphics gpu={:#x}+{:#x} generation={}",
                 key.gpu_va,
                 key.size,
                 generation
@@ -5308,6 +5510,22 @@ impl Renderer {
             key,
             residency: Arc::clone(&self.raw_storage_resident),
         })
+    }
+
+    pub fn reserve_compute_raw_storage(
+        &self,
+        key: crate::compute::ComputeRawStorageKey,
+    ) -> ComputeRawStorageLease {
+        *self
+            .raw_storage_resident
+            .lock()
+            .queued_uses
+            .entry(key)
+            .or_default() += 1;
+        ComputeRawStorageLease {
+            key,
+            residency: Arc::clone(&self.raw_storage_resident),
+        }
     }
 
     pub fn invalidate_compute_raw_storage_range(
@@ -8025,6 +8243,137 @@ impl Renderer {
         self.resolve_rt_copy_exact_to_key(src_key, expected_src_stamp, expected_bpp, dst_key)
     }
 
+    pub fn ordered_rt_copy_region_ready(
+        &self,
+        source: RtKey,
+        destination: RtKey,
+        region: RtCopyRegion,
+    ) -> bool {
+        let inner = self.inner.lock();
+        ordered_rt_copy_region_targets(&inner.rt_cache, source, destination, region).is_some()
+    }
+
+    pub fn execute_ordered_rt_copy_region(
+        &self,
+        source: RtKey,
+        destination: RtKey,
+        region: RtCopyRegion,
+    ) -> Result<bool, String> {
+        self.prewait_pending_computes_unlocked();
+        let mut inner = self.inner.lock();
+        settle_all_pending_computes(&mut inner);
+        let RendererInner {
+            device,
+            queue,
+            submit_state,
+            submit_timeline,
+            rt_cache,
+            rt_copy_slots,
+            rt_copy_slot_index,
+            ..
+        } = &mut *inner;
+        let Some(targets) = ordered_rt_copy_region_targets(rt_cache, source, destination, region)
+        else {
+            return Ok(false);
+        };
+        let copy_slot = acquire_rt_copy_slot(device, rt_copy_slots, rt_copy_slot_index)?;
+        reset_command_buffer(device, copy_slot.cmd)?;
+        let cmd = copy_slot.cmd;
+        let begin = vk::CommandBufferBeginInfo {
+            s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+            flags: vk::CommandBufferUsageFlags::empty(),
+            p_inheritance_info: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        unsafe {
+            device
+                .begin_command_buffer(cmd, &begin)
+                .map_err(|e| format!("begin_command_buffer(rt region copy): {:?}", e))?;
+        }
+        transition_image(
+            device,
+            cmd,
+            targets.src_image,
+            targets.src_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        transition_image(
+            device,
+            cmd,
+            targets.dst_image,
+            targets.dst_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        let subresource = vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let copy = vk::ImageCopy {
+            src_subresource: subresource,
+            src_offset: vk::Offset3D {
+                x: region.src_x as i32,
+                y: region.src_y as i32,
+                z: 0,
+            },
+            dst_subresource: subresource,
+            dst_offset: vk::Offset3D {
+                x: region.dst_x as i32,
+                y: region.dst_y as i32,
+                z: 0,
+            },
+            extent: vk::Extent3D {
+                width: region.width,
+                height: region.height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            device.cmd_copy_image(
+                cmd,
+                targets.src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                targets.dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+        }
+        transition_image(
+            device,
+            cmd,
+            targets.src_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        transition_image(
+            device,
+            cmd,
+            targets.dst_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        unsafe {
+            device
+                .end_command_buffer(cmd)
+                .map_err(|e| format!("end_command_buffer(rt region copy): {:?}", e))?;
+        }
+        submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            copy_slot.fence,
+        )?;
+        copy_slot.in_flight = true;
+        rt_cache.set_color_layout(targets.src_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        rt_cache.set_color_layout(targets.dst_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        rt_cache.mark_drawn(targets.dst_key);
+        Ok(true)
+    }
+
     pub fn execute_ordered_rt_copy_exact(
         &self,
         source_alias: RtKey,
@@ -9869,7 +10218,6 @@ impl Renderer {
         } else {
             None
         };
-        rt_cache.reset_frame_draws();
 
         let completion = take_pipelined_readback_completion(
             device,
@@ -9906,6 +10254,7 @@ impl Renderer {
                 submission: PipelinedPresentSubmission::Backpressured,
             };
         };
+        rt_cache.reset_frame_draws();
 
         let copy_rect = if key.width != width || key.height != height {
             None
@@ -10413,9 +10762,9 @@ impl Renderer {
 
         pipeline_cache.register_spec(crate::pipeline::PipelineSpec {
             key,
-            vs_spirv: vs_spirv.to_vec(),
-            gs_spirv: gs_spirv.to_vec(),
-            fs_spirv: fs_spirv.to_vec(),
+            vs_spirv: Arc::new(vs_spirv.to_vec()),
+            gs_spirv: Arc::new(gs_spirv.to_vec()),
+            fs_spirv: Arc::new(fs_spirv.to_vec()),
             bindings: layout
                 .bindings
                 .iter()
@@ -15681,6 +16030,67 @@ impl Renderer {
                         ssbo_bindings.push(idx);
                         ssbo_provided[idx as usize] = true;
                         continue;
+                    }
+                    if let Some((resident, seed)) = snapshot
+                        .resident
+                        .as_ref()
+                        .filter(|_| call.storage_readback.is_none())
+                        .and_then(|resident| resident.compute_seed.map(|seed| (resident, seed)))
+                        .filter(|(resident, _)| {
+                            !graphics_storage
+                                .get(&resident.key)
+                                .is_some_and(|entry| entry.generation == resident.generation)
+                                && resident
+                                    .seed
+                                    .as_ref()
+                                    .is_none_or(|seed| seed.len() as u64 != resident.key.size)
+                        })
+                    {
+                        if pass_open {
+                            unsafe {
+                                device.cmd_end_rendering(cmd);
+                            }
+                            finish_color_pass(
+                                device,
+                                cmd,
+                                rt_cache,
+                                &color_bind,
+                                &mut color_layouts,
+                                pass_rt_layout,
+                                &mut pass_dirty,
+                                &mut color_sync_checked,
+                                &pass_trace_calls,
+                            );
+                            pass_open = false;
+                            pass_trace_calls.clear();
+                            color_sync_checked.clear();
+                        }
+                        if let Err(error) = adopt_compute_graphics_storage(
+                            device,
+                            mem_props,
+                            cmd,
+                            graphics_storage,
+                            retired_graphics_storage,
+                            &mut graphics_storage_pass,
+                            graphics_storage_serial,
+                            compute_overlay_sources,
+                            resident,
+                            seed,
+                        ) {
+                            note_graphics_storage_bind_failure(&error);
+                            if let Some(info) = compute_seed_alias_info(
+                                compute_overlay_sources,
+                                resident,
+                                seed,
+                                snapshot.logical_size as u64,
+                                cbuf_alignment,
+                            ) {
+                                ssbo_infos.push(info);
+                                ssbo_bindings.push(idx);
+                                ssbo_provided[idx as usize] = true;
+                                continue;
+                            }
+                        }
                     }
                     if let Some(resident) = snapshot
                         .resident
@@ -24087,6 +24497,103 @@ enum ExactRtCopySource {
 
 fn resolved_rt_copy_key(width: u32, height: u32, dst_va: u64) -> RtKey {
     RtKey::new(RESOLVED_RT_COPY_NVMAP_ID, width, height, dst_va)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtCopyRegion {
+    pub src_x: u32,
+    pub src_y: u32,
+    pub dst_x: u32,
+    pub dst_y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_pixel: usize,
+}
+
+struct RtCopyRegionTargets {
+    src_key: RtKey,
+    src_image: vk::Image,
+    src_layout: vk::ImageLayout,
+    dst_key: RtKey,
+    dst_image: vk::Image,
+    dst_layout: vk::ImageLayout,
+}
+
+fn rt_copy_region_fits(
+    key: RtKey,
+    extent: Option<vk::Extent2D>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    extent.is_some_and(|extent| extent.width == key.width && extent.height == key.height)
+        && x.checked_add(width).is_some_and(|end| end <= key.width)
+        && y.checked_add(height).is_some_and(|end| end <= key.height)
+}
+
+fn rt_copy_region_covers(key: RtKey, region: RtCopyRegion) -> bool {
+    region.dst_x == 0
+        && region.dst_y == 0
+        && region.width == key.width
+        && region.height == key.height
+}
+
+fn ordered_rt_copy_region_targets(
+    rt_cache: &RtCache,
+    source: RtKey,
+    destination: RtKey,
+    region: RtCopyRegion,
+) -> Option<RtCopyRegionTargets> {
+    if region.width == 0
+        || region.height == 0
+        || source == destination
+        || is_synthetic_copy_key(source)
+        || is_synthetic_copy_key(destination)
+    {
+        return None;
+    }
+    let (src_key, src_image, _, src_layout, src_format, src_stamp) =
+        rt_cache.color_exact_with_format(source)?;
+    let (dst_key, dst_image, _, dst_layout, dst_format, _) =
+        rt_cache.color_exact_with_format(destination)?;
+    let partial = !rt_copy_region_covers(dst_key, region);
+    if src_stamp == 0
+        || src_image == dst_image
+        || src_layout == vk::ImageLayout::UNDEFINED
+        || rt_cache.color_is_guest_stale(src_key)
+        || (partial
+            && (dst_layout == vk::ImageLayout::UNDEFINED
+                || rt_cache.color_is_guest_stale(dst_key)))
+        || exact_rt_copy_format_bpp(src_format) != Some(region.bytes_per_pixel)
+        || exact_rt_copy_format_bpp(dst_format) != Some(region.bytes_per_pixel)
+        || !rt_copy_region_fits(
+            src_key,
+            rt_cache.color_extent(src_key),
+            region.src_x,
+            region.src_y,
+            region.width,
+            region.height,
+        )
+        || !rt_copy_region_fits(
+            dst_key,
+            rt_cache.color_extent(dst_key),
+            region.dst_x,
+            region.dst_y,
+            region.width,
+            region.height,
+        )
+    {
+        return None;
+    }
+    Some(RtCopyRegionTargets {
+        src_key,
+        src_image,
+        src_layout,
+        dst_key,
+        dst_image,
+        dst_layout,
+    })
 }
 
 fn ordered_rt_copy_source_identity(source_alias: RtKey, actual: RtKey) -> bool {
@@ -35887,6 +36394,8 @@ mod tests {
             head: 0,
             free: super::ResidentFreeList::default(),
             slabs: HashMap::new(),
+            lru: std::collections::BTreeSet::new(),
+            slot_uses: Vec::new(),
             clock: 0,
             last_fail: super::RESIDENT_FAIL_OTHER,
         }
@@ -36821,6 +37330,30 @@ mod tests {
                 ..exact
             }
         ));
+    }
+
+    #[test]
+    fn reserved_raw_storage_blocks_release_until_the_lease_drops() {
+        let residency = std::sync::Arc::new(parking_lot::Mutex::new(
+            super::ComputeRawStorageResidency::default(),
+        ));
+        let key = crate::compute::ComputeRawStorageKey {
+            mapping_epoch: 1,
+            nvmap_id: 7,
+            gpu_va: 0x1000,
+            cpu_addr: 0x2000,
+            size: 0x100,
+        };
+        *residency.lock().queued_uses.entry(key).or_default() += 1;
+        let lease = super::ComputeRawStorageLease {
+            key,
+            residency: std::sync::Arc::clone(&residency),
+        };
+        residency.lock().resident.insert(key);
+        assert_eq!(residency.lock().queued_uses.get(&key), Some(&1));
+        drop(lease);
+        assert!(!residency.lock().queued_uses.contains_key(&key));
+        assert!(residency.lock().resident.contains(&key));
     }
 
     #[test]

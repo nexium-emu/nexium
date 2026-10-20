@@ -2388,7 +2388,11 @@ pub(crate) fn swizzle_block_linear_into(
             let copy_len = span
                 .min(dst.len().saturating_sub(dst_off))
                 .min(src_linear.len().saturating_sub(src_off));
-            if copy_len != 0 {
+            if copy_len == 16 {
+                let source: &[u8; 16] = src_linear[src_off..src_off + 16].try_into().unwrap();
+                let target: &mut [u8; 16] = (&mut dst[dst_off..dst_off + 16]).try_into().unwrap();
+                *target = *source;
+            } else if copy_len != 0 {
                 dst[dst_off..dst_off + copy_len]
                     .copy_from_slice(&src_linear[src_off..src_off + copy_len]);
             }
