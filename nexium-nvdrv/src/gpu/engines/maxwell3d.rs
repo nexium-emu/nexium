@@ -869,6 +869,7 @@ pub struct Maxwell3D {
     draw_state_dirty_categories: DrawStateDirty,
     draw_state_identities: DrawStateIdentities,
     last_draw_allows_continuation: bool,
+    cbdata_narrow_dirty: bool,
 }
 
 const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
@@ -1230,6 +1231,7 @@ impl Maxwell3D {
             draw_state_dirty_categories: DrawStateDirty::ALL,
             draw_state_identities: DrawStateIdentities::INITIAL,
             last_draw_allows_continuation: false,
+            cbdata_narrow_dirty: crate::gpu::vk_dispatch::cbdata_narrow_dirty_enabled(),
         }
     }
 
@@ -2186,9 +2188,11 @@ impl Maxwell3D {
                     self.regs.pending_constbuf_writes.push((target, arg));
                 }
                 self.regs.constbuf_load_offset = self.regs.constbuf_load_offset.wrapping_add(4);
-                self.mark_draw_state_categories(
-                    DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS),
-                );
+                if !self.cbdata_narrow_dirty {
+                    self.mark_draw_state_categories(
+                        DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS),
+                    );
+                }
             }
 
             0x904 | 0x90C | 0x914 | 0x91C | 0x924 => {
@@ -3229,6 +3233,7 @@ mod tests {
     #[test]
     fn repeated_effect_writes_advance_category_identities() {
         let mut engine = Maxwell3D::new();
+        engine.cbdata_narrow_dirty = false;
         let texture_resource = DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS);
 
         engine.write_register(0x3DD, 1);
@@ -3314,6 +3319,131 @@ mod tests {
             DrawStateDirty::FIXED_FUNCTION
         );
         assert_eq!(engine.pending_draws[1].state_identities, fixed_identities);
+    }
+
+    #[test]
+    fn new_engine_reads_the_cbdata_narrow_dirty_switch() {
+        assert_eq!(
+            Maxwell3D::new().cbdata_narrow_dirty,
+            crate::gpu::vk_dispatch::cbdata_narrow_dirty_enabled()
+        );
+    }
+
+    #[test]
+    fn narrow_inline_constant_writes_leave_category_identities_alone() {
+        let mut engine = Maxwell3D::new();
+        engine.cbdata_narrow_dirty = true;
+        let texture_resource = DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS);
+        engine.write_register(0x8E0, 0x100);
+        engine.write_register(0x8E1, 0);
+        engine.write_register(0x8E2, 0x1000);
+        engine.write_register(0x8E3, 0);
+        engine.draw_state_dirty_since_last_draw = false;
+        engine.draw_state_dirty_categories = DrawStateDirty::NONE;
+        let before = engine.draw_state_identities;
+
+        engine.write_register(0x8E4, 0xABCD_EF01);
+        engine.write_register(0x8E4, 0xABCD_EF01);
+        engine.write_register(0x8F3, 0x1234_5678);
+
+        assert_eq!(engine.draw_state_identities, before);
+        assert_eq!(engine.draw_state_dirty_categories, DrawStateDirty::NONE);
+        assert!(engine.draw_state_dirty_since_last_draw);
+        assert_eq!(
+            engine.regs.pending_constbuf_writes,
+            vec![
+                (0x1000, 0xABCD_EF01),
+                (0x1004, 0xABCD_EF01),
+                (0x1008, 0x1234_5678)
+            ]
+        );
+
+        engine.write_register(0x904, 1);
+        let mut expected_bind = before;
+        expected_bind.bump(texture_resource);
+        assert_eq!(engine.draw_state_identities, expected_bind);
+        assert_eq!(engine.draw_state_dirty_categories, texture_resource);
+    }
+
+    #[test]
+    fn inline_constant_write_between_draws_keeps_signature_identities_and_blocks_coalescing() {
+        for narrow in [true, false] {
+            let mut engine = Maxwell3D::new();
+            engine.cbdata_narrow_dirty = narrow;
+            engine.dispatch_method(0x8e0, 0x100, true);
+            engine.dispatch_method(0x8e1, 0, true);
+            engine.dispatch_method(0x8e2, 0x1000, true);
+            engine.dispatch_method(0x8e3, 0, true);
+            engine.dispatch_method(0x586, 5, true);
+            engine.dispatch_method(0x35d, 4, true);
+            engine.dispatch_method(0x35e, 6, true);
+            engine.dispatch_method(0x585, 0, true);
+
+            engine.dispatch_method(0x8e4, 0xabcd_ef01, true);
+            engine.dispatch_method(0x586, 5 | (1 << 26), true);
+            engine.dispatch_method(0x35d, 4, true);
+            engine.dispatch_method(0x35e, 6, true);
+            engine.dispatch_method(0x585, 0, true);
+
+            assert_eq!(engine.pending_draws.len(), 2, "narrow={narrow}");
+            let first = &engine.pending_draws[0];
+            let second = &engine.pending_draws[1];
+            assert_eq!(first.instance_count, 1, "narrow={narrow}");
+            assert_eq!(second.instance_count, 1, "narrow={narrow}");
+            assert!(!second.state_clean_from_previous, "narrow={narrow}");
+            assert_eq!(second.constbuf_write_count, 1, "narrow={narrow}");
+            let (a, b) = (first.state_identities, second.state_identities);
+            assert_eq!(a.render_targets, b.render_targets, "narrow={narrow}");
+            assert_eq!(a.shaders, b.shaders, "narrow={narrow}");
+            assert_eq!(a.fixed_function, b.fixed_function, "narrow={narrow}");
+            assert_eq!(a.vertex_input, b.vertex_input, "narrow={narrow}");
+            assert_eq!(a.textures == b.textures, narrow, "narrow={narrow}");
+            assert_eq!(
+                a.resource_bindings == b.resource_bindings,
+                narrow,
+                "narrow={narrow}"
+            );
+            let expected_categories = if narrow {
+                DrawStateDirty::NONE
+            } else {
+                DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS)
+            };
+            assert_eq!(
+                second.state_dirty_categories, expected_categories,
+                "narrow={narrow}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_signature_registers_map_to_identity_keyed_categories() {
+        let keyed = DrawStateDirty::RENDER_TARGETS
+            .union(DrawStateDirty::SHADERS)
+            .union(DrawStateDirty::FIXED_FUNCTION);
+        let mut methods: Vec<u32> = (0..8u32)
+            .flat_map(|rt| (0..=8u32).map(move |field| 0x200 + rt * 0x10 + field))
+            .collect();
+        methods.extend([
+            0x487, 0x574, 0x3F8, 0x3F9, 0x3FA, 0x3FB, 0x3FC, 0x3FD, 0x3FE, 0x48A, 0x48B, 0x54E,
+            0x582, 0x583, 0x851, 0x4B3, 0x4BA, 0x4E0, 0x4D8,
+        ]);
+        for method in methods {
+            assert_ne!(
+                Maxwell3D::draw_state_categories(method).bits() & keyed.bits(),
+                0,
+                "{method:#x}"
+            );
+            let mut engine = Maxwell3D::new();
+            let before = engine.draw_state_identities;
+            let value = engine.reg_file[method as usize] ^ 1;
+            engine.write_register(method, value);
+            let after = engine.draw_state_identities;
+            assert_ne!(
+                (after.render_targets, after.shaders, after.fixed_function),
+                (before.render_targets, before.shaders, before.fixed_function),
+                "{method:#x}"
+            );
+        }
     }
 
     #[test]

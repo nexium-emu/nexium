@@ -147,6 +147,15 @@ fn predictive_rt_boundary_enabled() -> bool {
     })
 }
 
+pub(crate) fn cbdata_narrow_dirty_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        default_on_env_switch_value_enabled(
+            std::env::var("NEXIUM_CBDATA_NARROW_DIRTY").ok().as_deref(),
+        )
+    })
+}
+
 fn tic_plan_memo_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -2224,7 +2233,7 @@ pub(crate) struct SsboSnapshotCache {
     /// one at a time. It is only a prediction: a stale value costs an extra
     /// soft flush or the post-build `same_rt_bindings` rebuild, never a wrong
     /// binding.
-    rt_signature_memo: Option<(RtBindingSignature, u64)>,
+    rt_signature_memo: Option<(RtBindingSignature, RtSignatureMemoKey)>,
     cbuf_barrier_mode: bool,
     cbuf_window_mode: bool,
     resolution_windows: [Option<ResolutionWindow>; 4],
@@ -7033,6 +7042,7 @@ pub(crate) fn enqueue_draws(
     );
     let mut completed = true;
     let predictive_rt_boundary = predictive_rt_boundary_enabled();
+    let rt_boundary_predictor = RtBoundaryPredictor::new();
     let mut vertex_store_cache: HashMap<u64, Option<Arc<Vec<u8>>>> = HashMap::new();
     let mut derived_state_cache = DrawDerivedStateCache::new(draw_derived_cache_enabled());
     for draw in draws {
@@ -7257,9 +7267,9 @@ pub(crate) fn enqueue_draws(
         }
         let flush_predicted_boundary = predictive_rt_boundary
             && if let Some(last) = batch.last() {
-                let boundary = predict_rt_boundary(
+                let boundary = rt_boundary_predictor.predict(
                     &mut rt_signature_memo,
-                    draw.state_clean_from_previous,
+                    draw,
                     mappings.generation(),
                     || draw_rt_binding_signature(draw, mappings, mem_read).ok(),
                     |signature| signature.matches_call(last),
@@ -7404,6 +7414,10 @@ pub(crate) fn enqueue_draws(
                         }
                     };
                 }
+                rt_boundary_predictor.drop_mispredicted(
+                    &mut ssbo_snapshot_cache.rt_signature_memo,
+                    |signature| signature.matches_call(&call),
+                );
                 register_small_rts_after_prior_work(&call.small_color_rt_writebacks, || {});
                 if let Some(probe) = compute_probe.as_deref_mut() {
                     probe.record_call(&call, mappings);
@@ -8388,6 +8402,42 @@ impl RtBindingSignature {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RtSignatureMemoKey {
+    render_targets: u64,
+    shaders: u64,
+    fixed_function: u64,
+    mapping_generation: u64,
+}
+
+fn rt_signature_memo_key(
+    draw: &DrawCall,
+    mapping_generation: u64,
+    identity_keyed: bool,
+) -> (bool, RtSignatureMemoKey) {
+    if !identity_keyed {
+        return (
+            draw.state_clean_from_previous,
+            RtSignatureMemoKey {
+                render_targets: 0,
+                shaders: 0,
+                fixed_function: 0,
+                mapping_generation,
+            },
+        );
+    }
+    let identities = draw.state_identities;
+    (
+        true,
+        RtSignatureMemoKey {
+            render_targets: identities.render_targets,
+            shaders: identities.shaders,
+            fixed_function: identities.fixed_function,
+            mapping_generation,
+        },
+    )
+}
+
 /// RT-boundary prediction for one draw: reuses the previous draw's signature
 /// when the register state is unchanged and the GPU mappings are the same
 /// generation, recomputes it otherwise, and reports a boundary when the
@@ -8395,22 +8445,86 @@ impl RtBindingSignature {
 /// whether to soft-flush *before* building the draw; the post-build
 /// `same_rt_bindings` check stays authoritative, so a stale or failed
 /// prediction can cost a flush or a rebuild but never mixes RT bindings.
-fn predict_rt_boundary<S>(
-    memo: &mut Option<(S, u64)>,
-    state_clean_from_previous: bool,
-    mapping_generation: u64,
+fn predict_rt_boundary<S, K: PartialEq>(
+    memo: &mut Option<(S, K)>,
+    reuse_allowed: bool,
+    key: K,
     compute: impl FnOnce() -> Option<S>,
     matches_last: impl FnOnce(&S) -> bool,
 ) -> bool {
-    let reuse = state_clean_from_previous
-        && memo
-            .as_ref()
-            .is_some_and(|(_, generation)| *generation == mapping_generation);
+    let reuse = reuse_allowed && memo.as_ref().is_some_and(|(_, memo_key)| *memo_key == key);
     if !reuse {
-        *memo = compute().map(|signature| (signature, mapping_generation));
+        *memo = compute().map(|signature| (signature, key));
     }
     memo.as_ref()
         .is_some_and(|(signature, _)| !matches_last(signature))
+}
+
+fn drop_mispredicted_rt_signature_memo<S, K>(
+    memo: &mut Option<(S, K)>,
+    matches_built: impl FnOnce(&S) -> bool,
+) {
+    if memo
+        .as_ref()
+        .is_some_and(|(signature, _)| !matches_built(signature))
+    {
+        *memo = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RtBoundaryPredictor {
+    identity_keyed: bool,
+}
+
+impl RtBoundaryPredictor {
+    fn new() -> Self {
+        Self {
+            identity_keyed: cbdata_narrow_dirty_enabled(),
+        }
+    }
+
+    fn predict<S>(
+        self,
+        memo: &mut Option<(S, RtSignatureMemoKey)>,
+        draw: &DrawCall,
+        mapping_generation: u64,
+        compute: impl FnOnce() -> Option<S>,
+        matches_last: impl FnOnce(&S) -> bool,
+    ) -> bool {
+        let (reuse_allowed, key) =
+            rt_signature_memo_key(draw, mapping_generation, self.identity_keyed);
+        let mut computed = false;
+        let boundary = predict_rt_boundary(
+            memo,
+            reuse_allowed,
+            key,
+            || {
+                computed = true;
+                compute()
+            },
+            matches_last,
+        );
+        super::pusher::kickprof::count(
+            if computed {
+                super::pusher::kickprof::RT_SIGNATURE_MEMO_COMPUTE
+            } else {
+                super::pusher::kickprof::RT_SIGNATURE_MEMO_REUSE
+            },
+            1,
+        );
+        boundary
+    }
+
+    fn drop_mispredicted<S>(
+        self,
+        memo: &mut Option<(S, RtSignatureMemoKey)>,
+        matches_built: impl FnOnce(&S) -> bool,
+    ) {
+        if self.identity_keyed {
+            drop_mispredicted_rt_signature_memo(memo, matches_built);
+        }
+    }
 }
 
 fn draw_rt_binding_signature(
@@ -12891,6 +13005,7 @@ struct DrawDerivedStateCacheEntry {
     source: DrawDerivedStateSource,
     dependencies: Vec<DrawDerivedStateDependency>,
     watches: Vec<DrawDerivedStateWatch>,
+    cbuf_words: Vec<(u64, u32)>,
     value: DrawDerivedStateValue,
 }
 
@@ -12982,7 +13097,9 @@ impl DrawDerivedStateCache {
     fn lookup(
         &mut self,
         source: &DrawDerivedStateSource,
+        mappings: &GpuMappings,
         snapshot_cache: &mut SsboSnapshotCache,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> Option<DrawDerivedStateValue> {
         if !self.enabled {
             return None;
@@ -12998,6 +13115,11 @@ impl DrawDerivedStateCache {
                     dependency.gpu_addr,
                     dependency.len as u64,
                 ) != dependency.generation
+            }) {
+                return None;
+            }
+            if entry.cbuf_words.iter().any(|&(gpu_addr, value)| {
+                read_draw_derived_cbuf_word(gpu_addr, mappings, mem_read) != Some(value)
             }) {
                 return None;
             }
@@ -13035,11 +13157,13 @@ impl DrawDerivedStateCache {
         value
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn store(
         &mut self,
         source: DrawDerivedStateSource,
         value: DrawDerivedStateValue,
         mut ranges: Vec<(u64, usize)>,
+        cbuf_words: Vec<(u64, u32)>,
         mappings: &GpuMappings,
         snapshot_cache: &mut SsboSnapshotCache,
         expected_write_serial: u64,
@@ -13115,6 +13239,7 @@ impl DrawDerivedStateCache {
             source,
             dependencies,
             watches,
+            cbuf_words,
             value,
         });
         profile_draw_derived_cache_store();
@@ -13184,24 +13309,13 @@ fn append_draw_derived_indirect_table_ranges(
     }
 }
 
-fn draw_derived_dependency_ranges(
+fn draw_derived_cbuf_ranges(
     source: &DrawDerivedStateSource,
     value: &DrawDerivedStateValue,
     vs_tables: &[IndirectTableKey],
     fs_tables: &[IndirectTableKey],
 ) -> Vec<(u64, usize)> {
     let mut ranges = Vec::new();
-    for index in [0usize, 1, 5] {
-        let program = source.shader_programs[index];
-        if program.enabled || program.address_lo != 0 {
-            ranges.push((
-                source
-                    .program_region_gpu_va
-                    .wrapping_add(program.address_lo as u64),
-                SPH_SIZE + MAX_SASS_BYTES,
-            ));
-        }
-    }
     append_draw_derived_texture_cbuf_ranges(
         &mut ranges,
         value.fs_texture_metadata.as_ref(),
@@ -13216,6 +13330,60 @@ fn draw_derived_dependency_ranges(
     );
     append_draw_derived_indirect_table_ranges(&mut ranges, vs_tables, &source.vs_cbuf_binds);
     append_draw_derived_indirect_table_ranges(&mut ranges, fs_tables, &source.fs_cbuf_binds);
+    ranges
+}
+
+fn read_draw_derived_cbuf_word(
+    gpu_addr: u64,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Option<u32> {
+    let cpu_addr = mappings.cpu_address_for(gpu_addr)?;
+    let mut bytes = [0u8; 4];
+    if !mem_read(cpu_addr, &mut bytes) {
+        return None;
+    }
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn read_draw_derived_cbuf_words(
+    ranges: &[(u64, usize)],
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Option<Vec<(u64, u32)>> {
+    let mut words = Vec::new();
+    for &(gpu_addr, len) in ranges {
+        for offset in (0..len as u64).step_by(4) {
+            let word_addr = gpu_addr.wrapping_add(offset);
+            words.push((
+                word_addr,
+                read_draw_derived_cbuf_word(word_addr, mappings, mem_read)?,
+            ));
+        }
+    }
+    words.sort_unstable();
+    words.dedup();
+    Some(words)
+}
+
+fn draw_derived_dependency_ranges(
+    source: &DrawDerivedStateSource,
+    value: &DrawDerivedStateValue,
+    cbuf_ranges: &[(u64, usize)],
+) -> Vec<(u64, usize)> {
+    let mut ranges = Vec::new();
+    for index in [0usize, 1, 5] {
+        let program = source.shader_programs[index];
+        if program.enabled || program.address_lo != 0 {
+            ranges.push((
+                source
+                    .program_region_gpu_va
+                    .wrapping_add(program.address_lo as u64),
+                SPH_SIZE + MAX_SASS_BYTES,
+            ));
+        }
+    }
+    ranges.extend_from_slice(cbuf_ranges);
     if source.tic_pool_gpu_va != 0 {
         ranges.extend(
             value
@@ -15103,9 +15271,9 @@ fn execute_one_inner(
             spirv_environment_fingerprint,
         )
     });
-    let derived_state = derived_state_source
-        .as_ref()
-        .and_then(|source| derived_state_cache.lookup(source, ssbo_snapshot_cache));
+    let derived_state = derived_state_source.as_ref().and_then(|source| {
+        derived_state_cache.lookup(source, mappings, ssbo_snapshot_cache, mem_read)
+    });
     let depth_clip_control = depth_clip_control_enabled();
     let apply_z_remap = draw.depth_mode == 0 && !depth_clip_control;
     let (vptx_scale_z, vptx_translate_z) = (1.0_f32, 0.0_f32);
@@ -17714,20 +17882,26 @@ fn execute_one_inner(
                     cache.get(&fs_addr).cloned().unwrap_or_default(),
                 )
             };
-            let derived_ranges = draw_derived_dependency_ranges(
-                &current_source,
-                &derived_value,
-                &vs_tables,
-                &fs_tables,
-            );
-            derived_state_cache.store(
-                current_source,
-                derived_value,
-                derived_ranges,
-                mappings,
-                ssbo_snapshot_cache,
-                expected_write_serial,
-            );
+            let cbuf_ranges =
+                draw_derived_cbuf_ranges(&current_source, &derived_value, &vs_tables, &fs_tables);
+            let derived_ranges =
+                draw_derived_dependency_ranges(&current_source, &derived_value, &cbuf_ranges);
+            let cbuf_words = if cbdata_narrow_dirty_enabled() {
+                read_draw_derived_cbuf_words(&cbuf_ranges, mappings, mem_read)
+            } else {
+                Some(Vec::new())
+            };
+            if let Some(cbuf_words) = cbuf_words {
+                derived_state_cache.store(
+                    current_source,
+                    derived_value,
+                    derived_ranges,
+                    cbuf_words,
+                    mappings,
+                    ssbo_snapshot_cache,
+                    expected_write_serial,
+                );
+            }
         }
     }
     let call = Maxwell3dDrawCall {
@@ -24634,6 +24808,7 @@ mod tests {
             source,
             dependencies: Vec::new(),
             watches: Vec::new(),
+            cbuf_words: Vec::new(),
             value: test_draw_derived_value(),
         });
     }
@@ -24654,7 +24829,9 @@ mod tests {
         let mut snapshots = SsboSnapshotCache::default();
         seed_draw_derived_cache(&mut cache, source.clone());
 
-        let hit = cache.lookup(&source, &mut snapshots).unwrap();
+        let hit = cache
+            .lookup(&source, &GpuMappings::new(), &mut snapshots, &|_, _| false)
+            .unwrap();
 
         assert_eq!(hit.fs_input_map, [1; 32]);
         assert_eq!(hit.fs_output_map, 2);
@@ -24697,7 +24874,9 @@ mod tests {
         for changed in variants {
             let mut cache = DrawDerivedStateCache::new(true);
             seed_draw_derived_cache(&mut cache, source.clone());
-            assert!(cache.lookup(&changed, &mut snapshots).is_none());
+            assert!(cache
+                .lookup(&changed, &GpuMappings::new(), &mut snapshots, &|_, _| false)
+                .is_none());
             assert!(cache.entry.is_none());
         }
     }
@@ -24738,9 +24917,14 @@ mod tests {
                 generation,
             });
 
-        assert!(cache.lookup(&source, &mut snapshots).is_some());
+        let mappings = GpuMappings::new();
+        assert!(cache
+            .lookup(&source, &mappings, &mut snapshots, &|_, _| false)
+            .is_some());
         nexium_gpu::tex_invalidate::bump_region(gpu_addr, 32);
-        assert!(cache.lookup(&source, &mut snapshots).is_none());
+        assert!(cache
+            .lookup(&source, &mappings, &mut snapshots, &|_, _| false)
+            .is_none());
         assert!(cache.entry.is_none());
     }
 
@@ -24809,13 +24993,123 @@ mod tests {
             ..key
         };
 
-        let first = draw_derived_dependency_ranges(&source, &value, &[key, out_of_bounds], &[]);
-        let changed = draw_derived_dependency_ranges(&source, &value, &[changed_key], &[]);
+        let dependencies = |tables: &[IndirectTableKey]| {
+            draw_derived_dependency_ranges(
+                &source,
+                &value,
+                &super::draw_derived_cbuf_ranges(&source, &value, tables, &[]),
+            )
+        };
+        let first = dependencies(&[key, out_of_bounds]);
+        let changed = dependencies(&[changed_key]);
 
         assert!(first.contains(&(0x8020, 12)));
         assert!(!first.contains(&(0x80fc, 8)));
         assert!(changed.contains(&(0x8030, 12)));
         assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn draw_derived_cbuf_ranges_are_the_cbuf_part_of_the_dependencies() {
+        let mut source = test_draw_derived_source();
+        source.vs_cbuf_binds[2] = (0x8000, 0x100);
+        source.fs_cbuf_binds[0] = (0xa000, 0x100);
+        let mut value = test_draw_derived_value();
+        value.fs_texture_metadata = Arc::new(FragmentTextureNumericMetadata {
+            descriptor_ids: vec![3],
+            ..Default::default()
+        });
+        let table = IndirectTableKey {
+            binding: 2,
+            offset: 0x20,
+            entries: 3,
+        };
+
+        let cbuf = super::draw_derived_cbuf_ranges(&source, &value, &[table], &[]);
+        let all = draw_derived_dependency_ranges(&source, &value, &cbuf);
+        let without_cbuf = draw_derived_dependency_ranges(&source, &value, &[]);
+
+        assert_eq!(cbuf, vec![(0xa00c, 4), (0x8020, 12)]);
+        assert_eq!(all.len(), without_cbuf.len() + cbuf.len());
+        assert!(cbuf.iter().chain(&without_cbuf).all(|range| all.contains(range)));
+        assert!(all
+            .iter()
+            .any(|&(_, len)| len == super::SPH_SIZE + super::MAX_SASS_BYTES));
+    }
+
+    #[test]
+    fn draw_derived_cache_drops_entries_whose_cbuf_words_changed() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x8000, 0x100, 0x9000, 1);
+        let handle = std::cell::Cell::new(0x0012_3456u32);
+        let reads = std::cell::Cell::new(0usize);
+        let mem_read = |cpu: u64, out: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            let word = match cpu {
+                0x9010 => handle.get(),
+                0x9014 => 0x0abc_0def,
+                _ => return false,
+            };
+            out.copy_from_slice(&word.to_le_bytes());
+            true
+        };
+        let words = super::read_draw_derived_cbuf_words(
+            &[(0x8014, 4), (0x8010, 8)],
+            &mappings,
+            &mem_read,
+        )
+        .unwrap();
+        assert_eq!(words, vec![(0x8010, 0x0012_3456), (0x8014, 0x0abc_0def)]);
+        assert!(super::read_draw_derived_cbuf_words(&[(0x8018, 4)], &mappings, &mem_read)
+            .is_none());
+        assert!(super::read_draw_derived_cbuf_words(&[(0x9000, 4)], &mappings, &mem_read)
+            .is_none());
+
+        let source = test_draw_derived_source();
+        let mut snapshots = SsboSnapshotCache::default();
+        let mut cache = DrawDerivedStateCache::new(true);
+        let seed = |cache: &mut DrawDerivedStateCache, cbuf_words: Vec<(u64, u32)>| {
+            seed_draw_derived_cache(cache, source.clone());
+            cache.entry.as_mut().unwrap().cbuf_words = cbuf_words;
+        };
+
+        seed(&mut cache, words.clone());
+        reads.set(0);
+        assert!(cache.lookup(&source, &mappings, &mut snapshots, &mem_read).is_some());
+        assert_eq!(reads.get(), words.len());
+
+        let mut changed = source.clone();
+        changed.resource_identity += 1;
+        reads.set(0);
+        assert!(cache.lookup(&changed, &mappings, &mut snapshots, &mem_read).is_none());
+        assert!(cache.entry.is_none());
+        assert_eq!(reads.get(), 0);
+
+        let stale_gpu_addr = 0x7d5a_0000_0000u64;
+        seed(&mut cache, words.clone());
+        cache.entry.as_mut().unwrap().dependencies.push(DrawDerivedStateDependency {
+            gpu_addr: stale_gpu_addr,
+            len: 32,
+            generation: nexium_gpu::tex_invalidate::region_gen_range(stale_gpu_addr, 32),
+        });
+        nexium_gpu::tex_invalidate::bump_region(stale_gpu_addr, 32);
+        reads.set(0);
+        assert!(cache.lookup(&source, &mappings, &mut snapshots, &mem_read).is_none());
+        assert_eq!(reads.get(), 0);
+
+        seed(&mut cache, words.clone());
+        handle.set(0x0012_3457);
+        assert!(cache.lookup(&source, &mappings, &mut snapshots, &mem_read).is_none());
+        assert!(cache.entry.is_none());
+
+        seed(&mut cache, vec![(0x8018, 0)]);
+        assert!(cache.lookup(&source, &mappings, &mut snapshots, &mem_read).is_none());
+        assert!(cache.entry.is_none());
+
+        seed(&mut cache, Vec::new());
+        assert!(cache
+            .lookup(&source, &GpuMappings::new(), &mut snapshots, &|_, _| false)
+            .is_some());
     }
 
     #[test]
@@ -34495,23 +34789,32 @@ mod tests {
     /// batching is identical.
     #[test]
     fn rt_boundary_prediction_only_refines_unpredicted_batching() {
-        use super::predict_rt_boundary;
+        use super::{predict_rt_boundary, RtBoundaryPredictor, RtSignatureMemoKey};
         #[derive(Clone, Copy, Debug)]
         enum Event {
             Draw,
             Disabled,
             Clear,
             RegisterChange(u32),
+            UnkeyedRegisterChange,
             HiddenMemoryChange(u32),
             Remap,
         }
-        fn simulate(events: &[Event], predictive: bool) -> (Vec<Vec<(usize, u32)>>, usize) {
+        #[derive(Clone, Copy, Debug)]
+        enum Mode {
+            Plain,
+            Reference,
+            Predictor(RtBoundaryPredictor),
+        }
+        fn simulate(events: &[Event], mode: Mode) -> (Vec<Vec<(usize, u32)>>, usize) {
             let signature = |registers: u32, memory: u32, generation: u64| {
                 (registers.wrapping_mul(31) ^ memory.wrapping_mul(7) ^ generation as u32) % 4
             };
             let (mut registers, mut memory, mut generation) = (0u32, 0u32, 0u64);
             let mut dirty = true;
-            let mut persisted: Option<(u32, u64)> = None;
+            let mut draw = crate::gpu::engines::DrawCall::default();
+            let mut reference: Option<(u32, u64)> = None;
+            let mut persisted: Option<(u32, RtSignatureMemoKey)> = None;
             let mut batch: Vec<(usize, u32)> = Vec::new();
             let mut batches = Vec::new();
             let mut computed = 0usize;
@@ -34520,14 +34823,27 @@ mod tests {
                     Event::RegisterChange(value) => {
                         registers = value;
                         dirty = true;
+                        match value % 3 {
+                            0 => draw.state_identities.render_targets += 1,
+                            1 => draw.state_identities.shaders += 1,
+                            _ => draw.state_identities.fixed_function += 1,
+                        }
+                    }
+                    Event::UnkeyedRegisterChange => {
+                        dirty = true;
+                        draw.state_identities.textures += 1;
+                        draw.state_identities.vertex_input += 1;
+                        draw.state_identities.resource_bindings += 1;
                     }
                     Event::HiddenMemoryChange(value) => memory = value,
                     Event::Remap => generation += 1,
                     Event::Disabled => {
+                        let _ = reference.take();
                         let _ = persisted.take();
                         dirty = false;
                     }
                     Event::Clear => {
+                        let _ = reference.take();
                         let _ = persisted.take();
                         if !batch.is_empty() {
                             batches.push(std::mem::take(&mut batch));
@@ -34535,13 +34851,29 @@ mod tests {
                         dirty = false;
                     }
                     Event::Draw => {
+                        let mut reference_memo = reference.take();
                         let mut memo = persisted.take();
                         let built = signature(registers, memory, generation);
-                        let predicted = predictive
-                            && if let Some(&(_, last)) = batch.last() {
+                        draw.state_clean_from_previous = !dirty;
+                        let predicted = match (mode, batch.last()) {
+                            (Mode::Reference, Some(&(_, last))) => {
                                 let boundary = predict_rt_boundary(
-                                    &mut memo,
+                                    &mut reference_memo,
                                     !dirty,
+                                    generation,
+                                    || {
+                                        computed += 1;
+                                        Some(built)
+                                    },
+                                    |predicted| *predicted == last,
+                                );
+                                reference = reference_memo.take();
+                                boundary
+                            }
+                            (Mode::Predictor(predictor), Some(&(_, last))) => {
+                                let boundary = predictor.predict(
+                                    &mut memo,
+                                    &draw,
                                     generation,
                                     || {
                                         computed += 1;
@@ -34551,14 +34883,19 @@ mod tests {
                                 );
                                 persisted = memo.take();
                                 boundary
-                            } else {
-                                false
-                            };
+                            }
+                            _ => false,
+                        };
                         if predicted && !batch.is_empty() {
                             batches.push(std::mem::take(&mut batch));
                         }
                         if batch.last().is_some_and(|&(_, last)| last != built) {
                             batches.push(std::mem::take(&mut batch));
+                        }
+                        if let Mode::Predictor(predictor) = mode {
+                            predictor.drop_mispredicted(&mut persisted, |signature| {
+                                *signature == built
+                            });
                         }
                         batch.push((index, built));
                         dirty = false;
@@ -34580,7 +34917,13 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             (seed >> 33) % bound
         };
-        let (mut reused, mut predicted_draws) = (0usize, 0usize);
+        let legacy = RtBoundaryPredictor {
+            identity_keyed: false,
+        };
+        let identity = RtBoundaryPredictor {
+            identity_keyed: true,
+        };
+        let (mut reused, mut identity_reused, mut predicted_draws) = (0usize, 0usize, 0usize);
         for round in 0..400 {
             let hidden_changes = round % 2 == 0;
             let events: Vec<Event> = (0..200)
@@ -34591,14 +34934,27 @@ mod tests {
                     11 | 12 => Event::RegisterChange(next(6) as u32),
                     13 if hidden_changes => Event::HiddenMemoryChange(next(3) as u32),
                     14 => Event::Remap,
+                    15 => Event::UnkeyedRegisterChange,
                     _ => Event::Draw,
                 })
                 .collect();
-            let (plain, _) = simulate(&events, false);
-            let (predicted, computed) = simulate(&events, true);
+            let (plain, _) = simulate(&events, Mode::Plain);
+            let (predicted, computed) = simulate(&events, Mode::Reference);
+            assert_eq!(
+                simulate(&events, Mode::Predictor(legacy)),
+                (predicted.clone(), computed),
+                "round {round}: the legacy memo key changed prediction"
+            );
+            let (identity_batches, identity_computed) =
+                simulate(&events, Mode::Predictor(identity));
+            assert_eq!(
+                identity_batches, plain,
+                "round {round}: identity-keyed prediction changed batching"
+            );
             let draws = events.iter().filter(|event| matches!(event, Event::Draw)).count();
             predicted_draws += draws;
             reused += draws.saturating_sub(computed);
+            identity_reused += draws.saturating_sub(identity_computed);
             for batches in [&plain, &predicted] {
                 for batch in batches.iter() {
                     assert!(
@@ -34618,6 +34974,243 @@ mod tests {
             }
         }
         assert!(reused * 4 > predicted_draws, "memo rarely reused: {reused}/{predicted_draws}");
+        assert!(
+            identity_reused > reused,
+            "identity key reused less: {identity_reused} <= {reused} of {predicted_draws}"
+        );
+    }
+
+    #[test]
+    fn rt_boundary_predictor_reads_the_cbdata_narrow_dirty_switch() {
+        assert_eq!(
+            super::RtBoundaryPredictor::new().identity_keyed,
+            super::cbdata_narrow_dirty_enabled()
+        );
+    }
+
+    #[test]
+    fn rt_signature_memo_key_tracks_only_signature_identities() {
+        use super::rt_signature_memo_key;
+        use crate::gpu::engines::maxwell3d::DrawStateIdentities;
+        let mut draw = crate::gpu::engines::DrawCall {
+            state_identities: DrawStateIdentities {
+                render_targets: 3,
+                shaders: 5,
+                textures: 7,
+                vertex_input: 11,
+                fixed_function: 13,
+                resource_bindings: 17,
+            },
+            ..Default::default()
+        };
+        let (reuse_allowed, key) = rt_signature_memo_key(&draw, 9, true);
+        assert!(reuse_allowed);
+        assert_eq!(
+            (
+                key.render_targets,
+                key.shaders,
+                key.fixed_function,
+                key.mapping_generation
+            ),
+            (3, 5, 13, 9)
+        );
+        draw.state_identities.textures += 1;
+        draw.state_identities.vertex_input += 1;
+        draw.state_identities.resource_bindings += 1;
+        assert_eq!(rt_signature_memo_key(&draw, 9, true), (true, key));
+        for change in 0..4 {
+            let mut changed = draw.clone();
+            let mut generation = 9;
+            match change {
+                0 => changed.state_identities.render_targets += 1,
+                1 => changed.state_identities.shaders += 1,
+                2 => changed.state_identities.fixed_function += 1,
+                _ => generation += 1,
+            }
+            assert_ne!(
+                rt_signature_memo_key(&changed, generation, true).1,
+                key,
+                "change {change}"
+            );
+        }
+
+        draw.state_clean_from_previous = true;
+        let (legacy_reuse, legacy_key) = rt_signature_memo_key(&draw, 9, false);
+        assert!(legacy_reuse);
+        draw.state_identities.render_targets += 1;
+        draw.state_identities.shaders += 1;
+        assert_eq!(rt_signature_memo_key(&draw, 9, false), (true, legacy_key));
+        draw.state_clean_from_previous = false;
+        assert_eq!(rt_signature_memo_key(&draw, 9, false), (false, legacy_key));
+        assert_ne!(rt_signature_memo_key(&draw, 10, false).1, legacy_key);
+    }
+
+    #[test]
+    fn identity_keyed_rt_memo_is_reused_across_unkeyed_state_changes() {
+        use super::RtBoundaryPredictor;
+        let mut sequence = Vec::new();
+        let mut current = crate::gpu::engines::DrawCall::default();
+        sequence.push(current.clone());
+        current.state_identities.textures += 1;
+        current.state_identities.resource_bindings += 1;
+        sequence.push(current.clone());
+        current.state_identities.vertex_input += 1;
+        sequence.push(current.clone());
+        current.state_identities.render_targets += 1;
+        sequence.push(current.clone());
+        current.state_identities.textures += 1;
+        sequence.push(current.clone());
+        assert!(sequence.iter().all(|draw| !draw.state_clean_from_previous));
+
+        for (identity_keyed, expected_computes) in [(true, 2), (false, 5)] {
+            let predictor = RtBoundaryPredictor { identity_keyed };
+            let mut memo = None;
+            let mut computes = 0;
+            let mut last_signature = sequence[0].state_identities.render_targets;
+            let mut boundaries = Vec::new();
+            for draw in &sequence {
+                let built = draw.state_identities.render_targets;
+                boundaries.push(predictor.predict(
+                    &mut memo,
+                    draw,
+                    4,
+                    || {
+                        computes += 1;
+                        Some(built)
+                    },
+                    |signature| *signature == last_signature,
+                ));
+                predictor.drop_mispredicted(&mut memo, |signature| *signature == built);
+                last_signature = built;
+            }
+            assert_eq!(
+                boundaries,
+                [false, false, false, true, false],
+                "identity_keyed={identity_keyed}"
+            );
+            assert_eq!(computes, expected_computes, "identity_keyed={identity_keyed}");
+        }
+    }
+
+    #[test]
+    fn mispredicted_rt_memo_is_dropped_instead_of_flushing_every_draw() {
+        use super::{drop_mispredicted_rt_signature_memo, predict_rt_boundary};
+        for (heal, expected_flushes) in [(false, 5), (true, 0)] {
+            let mut memo: Option<(u32, u64)> = None;
+            let mut last: Option<u32> = None;
+            let mut predicted_flushes = 0;
+            for index in 0..8 {
+                let built = u32::from(index >= 2);
+                let predicted = last.is_some_and(|last_signature| {
+                    predict_rt_boundary(
+                        &mut memo,
+                        true,
+                        7u64,
+                        || Some(built),
+                        |signature| *signature == last_signature,
+                    )
+                });
+                predicted_flushes += usize::from(predicted);
+                if heal {
+                    drop_mispredicted_rt_signature_memo(&mut memo, |signature| *signature == built);
+                }
+                last = Some(built);
+            }
+            assert_eq!(predicted_flushes, expected_flushes, "heal={heal}");
+        }
+
+        let mut memo = Some((3u32, 1u64));
+        drop_mispredicted_rt_signature_memo(&mut memo, |signature| *signature == 3);
+        assert_eq!(memo, Some((3, 1)));
+        drop_mispredicted_rt_signature_memo(&mut memo, |signature| *signature == 4);
+        assert_eq!(memo, None);
+    }
+
+    #[test]
+    fn rt_signature_only_changes_with_identity_keyed_registers() {
+        use super::draw_rt_binding_signature;
+        use crate::gpu::engines::{Maxwell3D, MACRO_REGISTERS_START};
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x10_0000, 0x100_0000, 0x4000_0000, 3);
+        let mem_read = |cpu: u64, out: &mut [u8]| {
+            out.fill(0);
+            if out.len() > 0x48 {
+                out[0x48] = if cpu & 0x100 != 0 { 0xff } else { 0x0f };
+            }
+            true
+        };
+        let baseline = |zeta_extent: u32| {
+            let mut engine = Maxwell3D::new();
+            for (method, value) in [
+                (0x201, 0x10_0000),
+                (0x202, 64),
+                (0x203, 64),
+                (0x204, crate::gpu::formats::FMT_A8B8G8R8_UNORM),
+                (0x211, 0x20_0000),
+                (0x212, 64),
+                (0x213, 64),
+                (0x214, crate::gpu::formats::FMT_A8B8G8R8_UNORM),
+                (0x487, 2 | (1 << 7)),
+                (0x3f9, 0x30_0000),
+                (0x3fa, 0x14),
+                (0x48a, zeta_extent),
+                (0x48b, zeta_extent),
+                (0x3fd, 64 << 16),
+                (0x3fe, 64 << 16),
+                (0x54e, 1),
+                (0x4b3, 1),
+                (0x4ba, 1),
+                (0x583, 0x40_0000),
+                (0x850, 1),
+                (0x851, 0x100),
+            ] {
+                engine.dispatch_method(method, value, true);
+            }
+            engine
+        };
+        let signature = |engine: &mut Maxwell3D| {
+            engine.dispatch_method(0x35e, 3, true);
+            let draw = engine.pending_draws.pop().unwrap();
+            let identities = draw.state_identities;
+            (
+                (
+                    identities.render_targets,
+                    identities.shaders,
+                    identities.fixed_function,
+                ),
+                draw_rt_binding_signature(&draw, &mappings, &mem_read).ok(),
+            )
+        };
+        let mut methods: Vec<u32> = (0x40..MACRO_REGISTERS_START)
+            .filter(|&method| Maxwell3D::is_pusher_passive_method(method))
+            .collect();
+        methods.extend(0x60..=0x6d);
+        methods.extend(0x8e4..=0x8f3);
+        let mut unkeyed_writes = 0usize;
+        for zeta_extent in [64, 0] {
+            let reference = signature(&mut baseline(zeta_extent))
+                .1
+                .expect("baseline RT signature resolves");
+            assert!(reference.depth_key.is_some());
+            assert_eq!(reference.color_rt_keys.len(), 2);
+            for &method in &methods {
+                for flip in [1u32, u32::MAX] {
+                    let mut engine = baseline(zeta_extent);
+                    let (keys_before, before) = signature(&mut engine);
+                    let value = engine.reg_file[method as usize] ^ flip;
+                    engine.dispatch_method(method, value, true);
+                    let (keys_after, after) = signature(&mut engine);
+                    if keys_after == keys_before {
+                        unkeyed_writes += 1;
+                        assert_eq!(
+                            after, before,
+                            "method={method:#x} value={value:#x} zeta_extent={zeta_extent}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(unkeyed_writes > 1000, "unkeyed_writes={unkeyed_writes}");
     }
 
     #[test]

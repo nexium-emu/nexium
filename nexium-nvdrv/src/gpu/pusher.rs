@@ -384,7 +384,9 @@ pub(crate) mod kickprof {
     pub const BLK_LOCK: usize = 189;
     pub const BLK_RESERVE: usize = 190;
     pub const BLK_SEND: usize = 191;
-    pub const COUNT: usize = 192;
+    pub const RT_SIGNATURE_MEMO_COMPUTE: usize = 192;
+    pub const RT_SIGNATURE_MEMO_REUSE: usize = 193;
+    pub const COUNT: usize = 194;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -579,6 +581,8 @@ pub(crate) mod kickprof {
         "blklock",
         "blkreserve",
         "blksend",
+        "rtsigcompute",
+        "rtsigreuse",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
