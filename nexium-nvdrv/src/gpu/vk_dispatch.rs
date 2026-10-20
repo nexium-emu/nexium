@@ -593,6 +593,72 @@ fn cfg_ssbo_writes(cfg: &nexium_shader::Cfg) -> GraphicsSsboWrites {
     writes
 }
 
+const VIEWPORT_INDEX_ATTRIBUTE: u32 = 0x68;
+const VIEWPORT_MASK_ATTRIBUTE: u32 = 0x3a0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RasterStageEffects {
+    side_effects: bool,
+    selects_viewport: bool,
+    emits_points_or_lines: bool,
+}
+
+impl RasterStageEffects {
+    fn union(self, other: Self) -> Self {
+        Self {
+            side_effects: self.side_effects || other.side_effects,
+            selects_viewport: self.selects_viewport || other.selects_viewport,
+            emits_points_or_lines: self.emits_points_or_lines || other.emits_points_or_lines,
+        }
+    }
+}
+
+fn cfg_raster_stage_effects(cfg: &nexium_shader::Cfg) -> RasterStageEffects {
+    let writes = cfg_ssbo_writes(cfg);
+    let mut constant_facts = None;
+    let selects_viewport = cfg
+        .blocks
+        .iter()
+        .flat_map(|block| &block.program.instructions)
+        .any(|instruction| {
+            let nexium_shader::IrOp::StoreAttr { slot, src } = &instruction.op else {
+                return false;
+            };
+            let viewport_zero_value = match *slot {
+                VIEWPORT_INDEX_ATTRIBUTE => 0,
+                VIEWPORT_MASK_ATTRIBUTE => 1,
+                _ => return false,
+            };
+            constant_facts
+                .get_or_insert_with(|| nexium_shader::IrConstantFacts::analyze(cfg))
+                .value_u32(src)
+                != Some(viewport_zero_value)
+        });
+    RasterStageEffects {
+        side_effects: writes.mask != 0 || writes.unknown,
+        selects_viewport,
+        emits_points_or_lines: false,
+    }
+}
+
+fn geometry_raster_stage_effects(
+    cfg: &nexium_shader::Cfg,
+    options: nexium_spirv::GeometryOptions,
+) -> RasterStageEffects {
+    RasterStageEffects {
+        emits_points_or_lines: options.output_mode
+            != nexium_spirv::GeometryOptions::default().output_mode,
+        ..cfg_raster_stage_effects(cfg)
+    }
+}
+
+fn draw_raster_effects(
+    vertex: RasterStageEffects,
+    geometry: Option<RasterStageEffects>,
+) -> RasterStageEffects {
+    geometry.map_or(vertex, |geometry| vertex.union(geometry))
+}
+
 static TITLE_RETAINED_SSBO: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -7615,14 +7681,13 @@ fn prepare_graphics_clear_op(
         .ok_or_else(|| format!("RT gpu_va={:#x} unresolved: clear={:#x} target={:?}", rt_gpu_va, draw.clear_mask, rt))?;
     let rt_format = map_rt_format_for_key(rt.format, rt_key);
     let mask = draw.clear_mask;
-    let want_color_clear = clear_surface_wants_color(mask);
+    let clear_scissor =
+        guest_clear_scissor(draw, rt_key.width, rt_key.height, zero_viewport_hw_enabled());
+    let want_color_clear = clear_surface_wants_color(mask) && clear_scissor != GuestScissor::Empty;
+    let color_clear_dropped = clear_surface_wants_color(mask) && !want_color_clear;
     let want_depth_clear = (mask & 0x1) != 0 && draw.zeta_enable;
     let want_stencil_clear = (mask & 0x2) != 0 && draw.zeta_enable;
-    let clear_scissor = if draw.clear_control & 0x100 != 0 {
-        scissor_rect(draw, rt_key.width, rt_key.height)
-    } else {
-        None
-    };
+    let clear_scissor = clear_scissor.rect();
     let color = want_color_clear.then_some(nexium_gpu::renderer::GraphicsColorClear {
         key: rt_key,
         format: rt_format,
@@ -7656,6 +7721,15 @@ fn prepare_graphics_clear_op(
     };
     if !clear.is_valid() {
         return Ok(None);
+    }
+    if color_clear_dropped {
+        note_zero_raster_draw(
+            draw,
+            0,
+            0,
+            ZeroRasterReason::EmptyScissor,
+            ZeroRasterOutcome::ColorClearDropped,
+        );
     }
     let op_seq = next_gpu_op_seq();
     trace_clear(
@@ -12565,6 +12639,7 @@ struct GeometryShader {
     requirements: PackedCbufReadRequirements,
     ssbo_descs: Vec<nexium_shader::StorageBufferAddr>,
     ssbo_writes: GraphicsSsboWrites,
+    raster: RasterStageEffects,
 }
 
 fn prepare_geometry_shader(
@@ -12635,6 +12710,7 @@ fn prepare_geometry_shader(
         }
     }
     let ssbo_writes = cfg_ssbo_writes(&cfg);
+    let raster = geometry_raster_stage_effects(&cfg, options);
     let reads = collect_cbuf_reads(&cfg, nexium_spirv::GFX_CBUF_STAGE_SLOTS * 2);
     let outputs: &[u32] = if options.passthrough { forward_locations } else { &[] };
     let (spirv, cbuf_mask) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -12644,7 +12720,7 @@ fn prepare_geometry_shader(
         options.input_vertices, options.output_vertices, options.passthrough, outputs, ssbo_descs.len(), ssbo_base,
         ssbo_writes.mask, if ssbo_writes.unknown { "+unknown" } else { "" });
     let shader = Arc::new(GeometryShader { spirv: Arc::new(spirv), cbuf_mask,
-        requirements: packed_cbuf_read_requirements(&reads), ssbo_descs, ssbo_writes });
+        requirements: packed_cbuf_read_requirements(&reads), ssbo_descs, ssbo_writes, raster });
     cache.insert(key, shader.clone());
     Ok(shader)
 }
@@ -12673,6 +12749,7 @@ struct ShaderBundle {
     ssbo_descs: Vec<nexium_shader::StorageBufferAddr>,
     static_readonly_ssbo_mask: u8,
     ssbo_writes: GraphicsSsboWrites,
+    vertex_raster: RasterStageEffects,
 }
 
 fn bundle_content_key(
@@ -14975,14 +15052,22 @@ fn execute_one_inner(
     if draw.is_clear {
         let op_seq = next_gpu_op_seq();
         let mask = draw.clear_mask;
-        let want_color_clear = clear_surface_wants_color(mask);
+        let clear_scissor =
+            guest_clear_scissor(draw, rt_key.width, rt_key.height, zero_viewport_hw_enabled());
+        let want_color_clear =
+            clear_surface_wants_color(mask) && clear_scissor != GuestScissor::Empty;
+        if clear_surface_wants_color(mask) && !want_color_clear {
+            note_zero_raster_draw(
+                draw,
+                0,
+                0,
+                ZeroRasterReason::EmptyScissor,
+                ZeroRasterOutcome::ColorClearDropped,
+            );
+        }
         let want_depth_clear = (mask & 0x1) != 0 && draw.zeta_enable;
         let want_stencil_clear = (mask & 0x2) != 0 && draw.zeta_enable;
-        let clear_scissor = if draw.clear_control & 0x100 != 0 {
-            scissor_rect(draw, rt_key.width, rt_key.height)
-        } else {
-            None
-        };
+        let clear_scissor = clear_scissor.rect();
         let color = [
             draw.clear_color.r,
             draw.clear_color.g,
@@ -16018,6 +16103,7 @@ fn execute_one_inner(
             let static_readonly_ssbo_mask =
                 static_readonly_ssbo_mask(&ssbo_descs, &vs_cfg, &fs_cfg);
             let ssbo_writes = graphics_ssbo_writes(&vs_cfg, &fs_cfg);
+            let vertex_raster = cfg_raster_stage_effects(&vs_cfg);
             'translate: {
                 if let Some(rec) = l2_store.get(content_key).filter(|rec| {
                     let matches = ssbo_descs.iter().map(|d| {
@@ -16063,6 +16149,7 @@ fn execute_one_inner(
                         cbuf_used: rec.cbuf_used,
                         static_readonly_ssbo_mask,
                         ssbo_writes,
+                        vertex_raster,
                         ssbo_descs,
                     });
                     guard.insert(shader_key, b.clone());
@@ -16272,6 +16359,7 @@ fn execute_one_inner(
                     ssbo_descs,
                     static_readonly_ssbo_mask,
                     ssbo_writes,
+                    vertex_raster,
                 });
                 guard.insert(shader_key, b.clone());
                 l2_store.insert(std::sync::Arc::new(
@@ -16400,6 +16488,21 @@ fn execute_one_inner(
             nexium_spirv::VertexOptions { vptx_scale_z, vptx_translate_z, apply_z_remap, window_ndc, ..Default::default() },
             &forward_locations, bundle.ssbo_descs.len() as u32)?)
     } else { None };
+    let raster_effects = draw_raster_effects(
+        bundle.vertex_raster,
+        geometry.as_ref().map(|shader| shader.raster),
+    );
+    let zero_viewport_hw = zero_viewport_hw_enabled();
+    if skips_degenerate_viewport(draw, zero_viewport_hw, raster_effects) {
+        note_zero_raster_draw(
+            draw,
+            vs_addr,
+            fs_addr,
+            ZeroRasterReason::DegenerateViewport,
+            ZeroRasterOutcome::Skipped,
+        );
+        return Ok(None);
+    }
     let gs_storage = geometry.as_ref().filter(|shader| !shader.ssbo_descs.is_empty());
     let ssbo_descs: std::borrow::Cow<'_, [nexium_shader::StorageBufferAddr]> = match gs_storage {
         Some(shader) => {
@@ -17267,6 +17370,25 @@ fn execute_one_inner(
         compact_attachments.iter().take(color_rt_keys.len().max(1).min(8))
             .any(|attachment| !attachment.color_write_mask.is_empty()),
     );
+    let (vp_rect, scissor) = match draw_raster(
+        draw,
+        raster_key.width,
+        raster_key.height,
+        signed_viewport_nvmap(raster_key.nvmap_id),
+        zero_viewport_hw,
+        raster_effects,
+    ) {
+        DrawRaster::Skip(reason) => {
+            note_zero_raster_draw(draw, vs_addr, fs_addr, reason, ZeroRasterOutcome::Skipped);
+            return Ok(None);
+        }
+        DrawRaster::Draw { vp_rect, scissor, note } => {
+            if let Some((reason, outcome)) = note {
+                note_zero_raster_draw(draw, vs_addr, fs_addr, reason, outcome);
+            }
+            (vp_rect, scissor)
+        }
+    };
     let blend_state = BlendState {
         enabled: compact_attachments[0].enabled,
         src_factor: compact_attachments[0].src_factor,
@@ -17951,13 +18073,8 @@ fn execute_one_inner(
         rt_format,
         depth_range: guest_depth_range(draw.viewport_transform_en, draw.depth_mode,
             draw.viewport.scale_z, draw.viewport.translate_z),
-        vp_rect: guest_viewport_rect(
-            draw,
-            raster_key.width as f32,
-            raster_key.height as f32,
-            signed_viewport_nvmap(raster_key.nvmap_id),
-        ),
-        scissor: scissor_rect(draw, raster_key.width, raster_key.height),
+        vp_rect,
+        scissor,
         state: DrawState {
             topology,
             vertex_count: eff_vertex_count,
@@ -18501,6 +18618,11 @@ fn small_color_clear_writeback(draw: &DrawCall, mappings: &GpuMappings) -> Optio
     let slot = ((draw.clear_mask >> 6) & 0xF).min(7) as usize;
     let rt = &draw.rt[slot];
     let key = rt_key_for_clear(rt, mappings, msaa_samples(draw.multisample_mode), draw.clear_mask)?;
+    if guest_clear_scissor(draw, key.width, key.height, zero_viewport_hw_enabled())
+        == GuestScissor::Empty
+    {
+        return None;
+    }
     let tile_mode = small_rt_tile_mode_for_target(draw, key, rt)?;
     Some(SmallColorRtWriteback { key, tile_mode })
 }
@@ -19586,6 +19708,42 @@ fn guest_viewport_rect(
     Some([x, y, w, h])
 }
 
+fn guest_viewport_degenerate(draw: &DrawCall) -> bool {
+    let viewport = draw.viewport;
+    draw.viewport_transform_en
+        && [viewport.scale_x, viewport.scale_y, viewport.translate_x, viewport.translate_y]
+            .into_iter()
+            .all(f32::is_finite)
+        && (viewport.scale_x == 0.0 || viewport.scale_y == 0.0)
+}
+
+fn rasterizes_triangles(draw: &DrawCall, effects: RasterStageEffects) -> bool {
+    matches!(draw.topology, 4..=7) && !effects.emits_points_or_lines
+}
+
+fn degenerate_viewport_rect(draw: &DrawCall, rt_w: f32, rt_h: f32) -> [f32; 4] {
+    [
+        draw.viewport.translate_x.clamp(0.0, (rt_w - 1.0).max(0.0)),
+        draw.viewport.translate_y.clamp(0.0, (rt_h - 1.0).max(0.0)),
+        1.0,
+        1.0,
+    ]
+}
+
+fn zero_viewport_hw_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        default_on_env_switch_value_enabled(std::env::var("NEXIUM_ZERO_VIEWPORT_HW").ok().as_deref())
+    })
+}
+
+fn viewport_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        explicit_env_switch_value_enabled(std::env::var("NEXIUM_VIEWPORT_TRACE").ok().as_deref())
+    })
+}
+
 fn signed_viewport_rect() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -19603,15 +19761,31 @@ fn raster_target_key(color: RtKey, depth: Option<RtKey>, color_writes: bool) -> 
     if color_writes { color } else { depth.unwrap_or(color) }
 }
 
-fn scissor_rect(draw: &DrawCall, rt_w: u32, rt_h: u32) -> Option<[i32; 4]> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestScissor {
+    Disabled,
+    Rect([i32; 4]),
+    Empty,
+}
+
+impl GuestScissor {
+    fn rect(self) -> Option<[i32; 4]> {
+        match self {
+            Self::Rect(rect) => Some(rect),
+            Self::Disabled | Self::Empty => None,
+        }
+    }
+}
+
+fn guest_scissor(draw: &DrawCall, rt_w: u32, rt_h: u32) -> GuestScissor {
     if !draw.scissor.enabled {
-        return None;
+        return GuestScissor::Disabled;
     }
     let clip = draw.surface_clip.effective(rt_w, rt_h);
     let x0 = draw.scissor.min_x.min(rt_w);
     let x1 = draw.scissor.max_x.min(rt_w);
     if x1 <= x0 {
-        return None;
+        return GuestScissor::Empty;
     }
     let (y0, y1) = if draw.window_origin.lower_left() {
         let clip_h = clip.height as i32;
@@ -19625,9 +19799,154 @@ fn scissor_rect(draw: &DrawCall, rt_w: u32, rt_h: u32) -> Option<[i32; 4]> {
     let y0 = y0.min(rt_h);
     let y1 = y1.min(rt_h);
     if y1 <= y0 {
-        return None;
+        return GuestScissor::Empty;
     }
-    Some([x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32])
+    GuestScissor::Rect([x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32])
+}
+
+fn guest_clear_scissor(draw: &DrawCall, rt_w: u32, rt_h: u32, hw_semantics: bool) -> GuestScissor {
+    if draw.clear_control & 0x100 == 0 {
+        return GuestScissor::Disabled;
+    }
+    match guest_scissor(draw, rt_w, rt_h) {
+        GuestScissor::Empty if !hw_semantics => GuestScissor::Disabled,
+        scissor => scissor,
+    }
+}
+
+const EMPTY_SCISSOR_RECT: [i32; 4] = [0, 0, 0, 0];
+const VIEWPORT_TRACE_MAX_PAIRS: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroRasterReason {
+    DegenerateViewport,
+    EmptyScissor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroRasterOutcome {
+    Skipped,
+    ScissorEmptied,
+    ColorClearDropped,
+    KeptForViewportSelect,
+    KeptForPointsOrLines,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DrawRaster {
+    Skip(ZeroRasterReason),
+    Draw {
+        vp_rect: Option<[f32; 4]>,
+        scissor: Option<[i32; 4]>,
+        note: Option<(ZeroRasterReason, ZeroRasterOutcome)>,
+    },
+}
+
+fn skips_degenerate_viewport(
+    draw: &DrawCall,
+    hw_semantics: bool,
+    effects: RasterStageEffects,
+) -> bool {
+    hw_semantics
+        && !effects.selects_viewport
+        && !effects.side_effects
+        && rasterizes_triangles(draw, effects)
+        && guest_viewport_degenerate(draw)
+}
+
+fn draw_raster(
+    draw: &DrawCall,
+    rt_w: u32,
+    rt_h: u32,
+    force_signed: bool,
+    hw_semantics: bool,
+    effects: RasterStageEffects,
+) -> DrawRaster {
+    let scissor = guest_scissor(draw, rt_w, rt_h);
+    let guest_viewport = || guest_viewport_rect(draw, rt_w as f32, rt_h as f32, force_signed);
+    let kept = |note| DrawRaster::Draw { vp_rect: guest_viewport(), scissor: scissor.rect(), note };
+    if !hw_semantics {
+        return kept(None);
+    }
+    let degenerate = guest_viewport_degenerate(draw);
+    let empty = scissor == GuestScissor::Empty;
+    if !degenerate && !empty {
+        return kept(None);
+    }
+    if effects.selects_viewport {
+        let reason = if degenerate {
+            ZeroRasterReason::DegenerateViewport
+        } else {
+            ZeroRasterReason::EmptyScissor
+        };
+        return kept(Some((reason, ZeroRasterOutcome::KeptForViewportSelect)));
+    }
+    let (reason, vp_rect) = if degenerate && rasterizes_triangles(draw, effects) {
+        (
+            ZeroRasterReason::DegenerateViewport,
+            Some(degenerate_viewport_rect(draw, rt_w as f32, rt_h as f32)),
+        )
+    } else if empty {
+        (ZeroRasterReason::EmptyScissor, guest_viewport())
+    } else {
+        return kept(Some((
+            ZeroRasterReason::DegenerateViewport,
+            ZeroRasterOutcome::KeptForPointsOrLines,
+        )));
+    };
+    if !effects.side_effects {
+        return DrawRaster::Skip(reason);
+    }
+    DrawRaster::Draw {
+        vp_rect,
+        scissor: Some(EMPTY_SCISSOR_RECT),
+        note: Some((reason, ZeroRasterOutcome::ScissorEmptied)),
+    }
+}
+
+fn note_zero_raster_draw(
+    draw: &DrawCall,
+    vs_addr: u64,
+    fs_addr: u64,
+    reason: ZeroRasterReason,
+    outcome: ZeroRasterOutcome,
+) {
+    if matches!(outcome, ZeroRasterOutcome::Skipped | ZeroRasterOutcome::ColorClearDropped) {
+        super::pusher::kickprof::count(super::pusher::kickprof::ZERO_RASTER_SKIP, 1);
+    }
+    if !viewport_trace_enabled() {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u64, u64)>>> = OnceLock::new();
+    {
+        let mut seen = SEEN
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap();
+        if seen.len() >= VIEWPORT_TRACE_MAX_PAIRS || !seen.insert((vs_addr, fs_addr)) {
+            return;
+        }
+    }
+    log::warn!(
+        "[viewport-trace] vs={vs_addr:#x} fs={fs_addr:#x} outcome={outcome:?} reason={reason:?} topology={} vp_en={} scale=({:?},{:?}) translate=({:?},{:?}) swizzle={:#x} origin={:#x} clip=({},{} {}x{}) scissor={}:({},{})->({},{})",
+        draw.topology,
+        draw.viewport_transform_en,
+        draw.viewport.scale_x,
+        draw.viewport.scale_y,
+        draw.viewport.translate_x,
+        draw.viewport.translate_y,
+        draw.viewport.swizzle,
+        draw.window_origin.raw,
+        draw.surface_clip.x,
+        draw.surface_clip.y,
+        draw.surface_clip.width,
+        draw.surface_clip.height,
+        draw.scissor.enabled,
+        draw.scissor.min_x,
+        draw.scissor.min_y,
+        draw.scissor.max_x,
+        draw.scissor.max_y,
+    );
 }
 
 fn flip_front_face(v: u32) -> u32 {
@@ -28225,10 +28544,432 @@ mod tests {
         draw.scissor.max_x = 896;
         draw.scissor.max_y = 896;
         let raster = super::raster_target_key(color, Some(depth), false);
-        assert_eq!(super::scissor_rect(&draw, raster.width, raster.height), Some([0, 0, 896, 896]));
+        assert_eq!(super::guest_scissor(&draw, raster.width, raster.height).rect(), Some([0, 0, 896, 896]));
         let raster = super::raster_target_key(color, Some(depth), true);
-        assert_eq!(super::scissor_rect(&draw, raster.width, raster.height), Some([0, 0, 896, 720]));
+        assert_eq!(super::guest_scissor(&draw, raster.width, raster.height).rect(), Some([0, 0, 896, 720]));
         assert_eq!(super::raster_target_key(color, None, false), color);
+    }
+
+    fn zero_viewport_test_draw(scale: [f32; 2], translate: [f32; 2]) -> crate::gpu::engines::DrawCall {
+        let mut draw = crate::gpu::engines::DrawCall::default();
+        draw.topology = 4;
+        draw.viewport_transform_en = true;
+        draw.viewport.scale_x = scale[0];
+        draw.viewport.scale_y = scale[1];
+        draw.viewport.translate_x = translate[0];
+        draw.viewport.translate_y = translate[1];
+        draw
+    }
+
+    fn zero_viewport_test_cfg(op: nexium_shader::IrOp) -> nexium_shader::Cfg {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit_void(op);
+        nexium_shader::Cfg {
+            blocks: vec![nexium_shader::BasicBlock {
+                id: 0,
+                start_offset: 0,
+                end_offset: 8,
+                branch: nexium_shader::BranchKind::Exit,
+                program,
+                reg_exit: std::collections::HashMap::new(),
+                pred_exit: std::collections::HashMap::new(),
+                pred_phis: Vec::new(),
+            }],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        }
+    }
+
+    const ZERO_VIEWPORT_QUIET: super::RasterStageEffects = super::RasterStageEffects {
+        side_effects: false,
+        selects_viewport: false,
+        emits_points_or_lines: false,
+    };
+    const ZERO_VIEWPORT_WRITER: super::RasterStageEffects = super::RasterStageEffects {
+        side_effects: true,
+        selects_viewport: false,
+        emits_points_or_lines: false,
+    };
+
+    #[test]
+    fn totk_zero_scale_ui_viewport_is_degenerate_and_skipped_without_side_effects() {
+        let draw = zero_viewport_test_draw([0.0, -0.0], [0.0, 1080.0]);
+        assert!(super::guest_viewport_degenerate(&draw));
+        assert_eq!(super::guest_viewport_rect(&draw, 1920.0, 1080.0, true), None);
+        assert!(super::skips_degenerate_viewport(&draw, true, ZERO_VIEWPORT_QUIET));
+        assert_eq!(
+            super::draw_raster(&draw, 1920, 1080, true, true, ZERO_VIEWPORT_QUIET),
+            super::DrawRaster::Skip(super::ZeroRasterReason::DegenerateViewport)
+        );
+        assert!(!super::skips_degenerate_viewport(&draw, true, ZERO_VIEWPORT_WRITER));
+        assert_eq!(
+            super::draw_raster(&draw, 1920, 1080, true, true, ZERO_VIEWPORT_WRITER),
+            super::DrawRaster::Draw {
+                vp_rect: Some([0.0, 1079.0, 1.0, 1.0]),
+                scissor: Some([0, 0, 0, 0]),
+                note: Some((super::ZeroRasterReason::DegenerateViewport, super::ZeroRasterOutcome::ScissorEmptied)),
+            }
+        );
+        let mut lower_left = draw.clone();
+        lower_left.window_origin.raw = 1;
+        assert!(super::guest_viewport_degenerate(&lower_left));
+        assert_eq!(
+            super::draw_raster(&lower_left, 1920, 1080, true, true, ZERO_VIEWPORT_QUIET),
+            super::DrawRaster::Skip(super::ZeroRasterReason::DegenerateViewport)
+        );
+        let mut outside = zero_viewport_test_draw([0.0, 0.0], [-40.0, 5000.0]);
+        outside.window_origin.raw = 1;
+        assert_eq!(
+            super::draw_raster(&outside, 1920, 1080, true, true, ZERO_VIEWPORT_WRITER),
+            super::DrawRaster::Draw {
+                vp_rect: Some([0.0, 1079.0, 1.0, 1.0]),
+                scissor: Some([0, 0, 0, 0]),
+                note: Some((super::ZeroRasterReason::DegenerateViewport, super::ZeroRasterOutcome::ScissorEmptied)),
+            }
+        );
+    }
+
+    #[test]
+    fn viewport_selecting_shaders_and_kill_switch_keep_zero_scale_fallback() {
+        let draw = zero_viewport_test_draw([0.0, -0.0], [0.0, 1080.0]);
+        let old = super::DrawRaster::Draw { vp_rect: None, scissor: None, note: None };
+        let index_store = nexium_shader::IrOp::StoreAttr {
+            slot: 0x68,
+            src: nexium_shader::IrValue::ImmU32(1),
+        };
+        let selector = super::cfg_raster_stage_effects(&zero_viewport_test_cfg(index_store));
+        assert!(selector.selects_viewport);
+        for effects in [
+            selector,
+            super::RasterStageEffects { side_effects: true, selects_viewport: true, emits_points_or_lines: false },
+            ZERO_VIEWPORT_WRITER.union(selector),
+        ] {
+            assert!(!super::skips_degenerate_viewport(&draw, true, effects));
+            assert_eq!(
+                super::draw_raster(&draw, 1920, 1080, true, true, effects),
+                super::DrawRaster::Draw {
+                    vp_rect: None,
+                    scissor: None,
+                    note: Some((super::ZeroRasterReason::DegenerateViewport, super::ZeroRasterOutcome::KeptForViewportSelect)),
+                }
+            );
+        }
+        assert!(!super::skips_degenerate_viewport(&draw, false, ZERO_VIEWPORT_QUIET));
+        assert_eq!(super::draw_raster(&draw, 1920, 1080, true, false, ZERO_VIEWPORT_QUIET), old);
+    }
+
+    #[test]
+    fn flipped_capture_viewport_is_unchanged_by_zero_viewport_rules() {
+        let draw = zero_viewport_test_draw([285.0, -52.5], [285.0, 52.5]);
+        let expected = Some([0.0, 105.0, 570.0, -105.0]);
+        assert!(!super::guest_viewport_degenerate(&draw));
+        assert_eq!(super::guest_viewport_rect(&draw, 576.0, 105.0, true), expected);
+        for hw_semantics in [true, false] {
+            assert!(!super::skips_degenerate_viewport(&draw, hw_semantics, ZERO_VIEWPORT_QUIET));
+            assert_eq!(
+                super::draw_raster(&draw, 576, 105, true, hw_semantics, ZERO_VIEWPORT_QUIET),
+                super::DrawRaster::Draw { vp_rect: expected, scissor: None, note: None }
+            );
+        }
+    }
+
+    #[test]
+    fn lower_left_and_negated_viewports_keep_their_rects() {
+        let base = zero_viewport_test_draw([640.0, 360.0], [640.0, 360.0]);
+        let mut lower_left = base.clone();
+        lower_left.window_origin.raw = 1;
+        let mut negated = base.clone();
+        negated.viewport.swizzle = 0x6430;
+        let mut both = lower_left.clone();
+        both.viewport.swizzle = 0x6430;
+        let mut clipped = lower_left.clone();
+        clipped.surface_clip.height = 700;
+        for (draw, expected) in [
+            (&base, None),
+            (&lower_left, Some([0.0, 720.0, 1280.0, -720.0])),
+            (&negated, Some([0.0, 720.0, 1280.0, -720.0])),
+            (&both, Some([0.0, 0.0, 1280.0, 720.0])),
+            (&clipped, Some([0.0, 700.0, 1280.0, -720.0])),
+        ] {
+            assert!(!super::guest_viewport_degenerate(draw));
+            assert_eq!(super::guest_viewport_rect(draw, 1280.0, 720.0, true), expected);
+            assert_eq!(
+                super::draw_raster(draw, 1280, 720, true, true, ZERO_VIEWPORT_QUIET),
+                super::DrawRaster::Draw { vp_rect: expected, scissor: None, note: None }
+            );
+        }
+    }
+
+    #[test]
+    fn sub_pixel_and_non_finite_viewports_keep_the_fallback() {
+        let thin = zero_viewport_test_draw([0.25, 360.0], [100.0, 360.0]);
+        assert!(!super::guest_viewport_degenerate(&thin));
+        assert_eq!(super::guest_viewport_rect(&thin, 1280.0, 720.0, true), None);
+        assert_eq!(
+            super::draw_raster(&thin, 1280, 720, true, true, ZERO_VIEWPORT_QUIET),
+            super::DrawRaster::Draw { vp_rect: None, scissor: None, note: None }
+        );
+        assert!(!super::guest_viewport_degenerate(&zero_viewport_test_draw(
+            [640.0, -0.4],
+            [640.0, 360.0]
+        )));
+        let pixel = zero_viewport_test_draw([0.5, 0.5], [100.5, 200.5]);
+        assert!(!super::guest_viewport_degenerate(&pixel));
+        assert_eq!(
+            super::guest_viewport_rect(&pixel, 1280.0, 720.0, true),
+            Some([100.0, 200.0, 1.0, 1.0])
+        );
+        for draw in [
+            zero_viewport_test_draw([f32::NAN, 360.0], [640.0, 360.0]),
+            zero_viewport_test_draw([0.0, 360.0], [f32::INFINITY, 360.0]),
+            zero_viewport_test_draw([640.0, 0.0], [640.0, f32::NAN]),
+            zero_viewport_test_draw([640.0, f32::NEG_INFINITY], [640.0, 360.0]),
+        ] {
+            assert!(!super::guest_viewport_degenerate(&draw));
+            assert_eq!(super::guest_viewport_rect(&draw, 1280.0, 720.0, true), None);
+            assert!(!super::skips_degenerate_viewport(&draw, true, ZERO_VIEWPORT_QUIET));
+            assert_eq!(
+                super::draw_raster(&draw, 1280, 720, true, true, ZERO_VIEWPORT_QUIET),
+                super::DrawRaster::Draw { vp_rect: None, scissor: None, note: None }
+            );
+        }
+    }
+
+    #[test]
+    fn transform_disabled_viewports_keep_surface_clip_behaviour() {
+        let mut full = zero_viewport_test_draw([0.0, -0.0], [0.0, 1080.0]);
+        full.viewport_transform_en = false;
+        let mut clipped = full.clone();
+        clipped.surface_clip.x = 16;
+        clipped.surface_clip.y = 8;
+        clipped.surface_clip.width = 640;
+        clipped.surface_clip.height = 360;
+        for (draw, expected) in [(&full, None), (&clipped, Some([16.0, 8.0, 640.0, 360.0]))] {
+            assert!(!super::guest_viewport_degenerate(draw));
+            assert!(!super::skips_degenerate_viewport(draw, true, ZERO_VIEWPORT_QUIET));
+            assert_eq!(super::guest_viewport_rect(draw, 1920.0, 1080.0, true), expected);
+            assert_eq!(
+                super::draw_raster(draw, 1920, 1080, true, true, ZERO_VIEWPORT_QUIET),
+                super::DrawRaster::Draw { vp_rect: expected, scissor: None, note: None }
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_empty_scissors_are_empty_and_rasterize_nothing() {
+        let mut draw = zero_viewport_test_draw([640.0, 360.0], [640.0, 360.0]);
+        assert_eq!(super::guest_scissor(&draw, 1280, 720), super::GuestScissor::Disabled);
+        assert_eq!(super::guest_scissor(&draw, 1280, 720).rect(), None);
+        draw.scissor.enabled = true;
+        draw.scissor.max_x = 896;
+        draw.scissor.max_y = 896;
+        assert_eq!(
+            super::guest_scissor(&draw, 1280, 720),
+            super::GuestScissor::Rect([0, 0, 896, 720])
+        );
+        let mut lower_left = draw.clone();
+        lower_left.window_origin.raw = 1;
+        lower_left.scissor.max_y = 100;
+        assert_eq!(
+            super::guest_scissor(&lower_left, 1280, 720),
+            super::GuestScissor::Rect([0, 620, 896, 100])
+        );
+        let mut empty_x = draw.clone();
+        empty_x.scissor.min_x = 300;
+        empty_x.scissor.max_x = 300;
+        let mut outside_y = draw.clone();
+        outside_y.scissor.min_y = 720;
+        let mut lower_left_outside = lower_left.clone();
+        lower_left_outside.scissor.min_y = 720;
+        lower_left_outside.scissor.max_y = 800;
+        let selector = super::RasterStageEffects { side_effects: false, selects_viewport: true, emits_points_or_lines: false };
+        for empty in [&empty_x, &outside_y, &lower_left_outside] {
+            assert_eq!(super::guest_scissor(empty, 1280, 720), super::GuestScissor::Empty);
+            assert_eq!(super::guest_scissor(empty, 1280, 720).rect(), None);
+            let viewport = super::guest_viewport_rect(empty, 1280.0, 720.0, true);
+            assert!(!super::skips_degenerate_viewport(empty, true, ZERO_VIEWPORT_QUIET));
+            assert_eq!(
+                super::draw_raster(empty, 1280, 720, true, true, ZERO_VIEWPORT_QUIET),
+                super::DrawRaster::Skip(super::ZeroRasterReason::EmptyScissor)
+            );
+            assert_eq!(
+                super::draw_raster(empty, 1280, 720, true, true, ZERO_VIEWPORT_WRITER),
+                super::DrawRaster::Draw {
+                    vp_rect: viewport,
+                    scissor: Some([0, 0, 0, 0]),
+                    note: Some((super::ZeroRasterReason::EmptyScissor, super::ZeroRasterOutcome::ScissorEmptied)),
+                }
+            );
+            for (hw_semantics, effects) in [(true, selector), (false, ZERO_VIEWPORT_QUIET)] {
+                assert_eq!(
+                    super::draw_raster(empty, 1280, 720, true, hw_semantics, effects),
+                    super::DrawRaster::Draw {
+                        vp_rect: viewport,
+                        scissor: None,
+                        note: hw_semantics.then_some((super::ZeroRasterReason::EmptyScissor, super::ZeroRasterOutcome::KeptForViewportSelect)),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_viewport_kill_switch_restores_old_viewport_and_scissor() {
+        let mut empty_scissor = zero_viewport_test_draw([640.0, 360.0], [640.0, 360.0]);
+        empty_scissor.scissor.enabled = true;
+        empty_scissor.scissor.min_x = 64;
+        empty_scissor.scissor.max_x = 64;
+        empty_scissor.scissor.max_y = 720;
+        let mut zero_and_empty = zero_viewport_test_draw([0.0, -0.0], [0.0, 1080.0]);
+        zero_and_empty.scissor = empty_scissor.scissor;
+        let mut clipped = zero_viewport_test_draw([0.0, 0.0], [0.0, 0.0]);
+        clipped.scissor.enabled = true;
+        clipped.scissor.min_x = 10;
+        clipped.scissor.max_x = 300;
+        clipped.scissor.max_y = 200;
+        let draws = [
+            (zero_viewport_test_draw([0.0, -0.0], [0.0, 1080.0]), None, None),
+            (zero_viewport_test_draw([0.25, 360.0], [100.0, 360.0]), None, None),
+            (
+                zero_viewport_test_draw([285.0, -52.5], [285.0, 52.5]),
+                Some([0.0, 105.0, 570.0, -105.0]),
+                None,
+            ),
+            (empty_scissor, None, None),
+            (zero_and_empty, None, None),
+            (clipped, None, Some([10, 0, 290, 200])),
+        ];
+        let stage_effects = [
+            ZERO_VIEWPORT_QUIET,
+            ZERO_VIEWPORT_WRITER,
+            super::RasterStageEffects { side_effects: false, selects_viewport: true, emits_points_or_lines: false },
+        ];
+        for (draw, vp_rect, scissor) in &draws {
+            assert_eq!(super::guest_viewport_rect(draw, 1280.0, 720.0, true), *vp_rect);
+            assert_eq!(super::guest_scissor(draw, 1280, 720).rect(), *scissor);
+            for effects in stage_effects {
+                assert!(!super::skips_degenerate_viewport(draw, false, effects));
+                assert_eq!(
+                    super::draw_raster(draw, 1280, 720, true, false, effects),
+                    super::DrawRaster::Draw { vp_rect: *vp_rect, scissor: *scissor, note: None }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raster_stage_effects_track_storage_writes_and_viewport_selection() {
+        use nexium_shader::{IrOp, IrValue};
+        let effects = |op| super::cfg_raster_stage_effects(&zero_viewport_test_cfg(op));
+        let store_attr = |slot| IrOp::StoreAttr { slot, src: IrValue::ImmU32(1) };
+        let selector = super::RasterStageEffects { side_effects: false, selects_viewport: true, emits_points_or_lines: false };
+        assert_eq!(effects(store_attr(0x68)), selector);
+        assert_eq!(effects(store_attr(0x3a0)), ZERO_VIEWPORT_QUIET);
+        assert_eq!(effects(IrOp::StoreAttr { slot: 0x3a0, src: IrValue::ImmU32(2) }), selector);
+        for src in [IrValue::Zero, IrValue::ImmU32(0)] {
+            assert_eq!(effects(IrOp::StoreAttr { slot: 0x68, src }), ZERO_VIEWPORT_QUIET);
+        }
+        for slot in [0x60, 0x64, 0x6c, 0x70, 0x80, 0x3a4] {
+            assert_eq!(effects(store_attr(slot)), ZERO_VIEWPORT_QUIET);
+        }
+        assert_eq!(
+            effects(IrOp::StoreStorage {
+                buffer_index: 0,
+                addr_lo: IrValue::Zero,
+                base_addr_lo: IrValue::Zero,
+                imm: 0,
+                value: IrValue::Zero,
+                cbuf_binding: 0,
+                cbuf_offset: 0x10,
+                align: 16,
+            }),
+            ZERO_VIEWPORT_WRITER
+        );
+        assert_eq!(
+            effects(IrOp::StoreGlobal { addr_lo: IrValue::Zero, offset: 0, value: IrValue::Zero }),
+            ZERO_VIEWPORT_WRITER
+        );
+        assert_eq!(
+            effects(IrOp::LoadStorage {
+                buffer_index: 0,
+                addr_lo: IrValue::Zero,
+                base_addr_lo: IrValue::Zero,
+                imm: 0,
+                cbuf_binding: 0,
+                cbuf_offset: 0x10,
+                align: 16,
+            }),
+            ZERO_VIEWPORT_QUIET
+        );
+        assert_eq!(
+            ZERO_VIEWPORT_WRITER.union(selector),
+            super::RasterStageEffects { side_effects: true, selects_viewport: true, emits_points_or_lines: false }
+        );
+        assert_eq!(ZERO_VIEWPORT_QUIET.union(ZERO_VIEWPORT_QUIET), ZERO_VIEWPORT_QUIET);
+    }
+
+    #[test]
+    fn zero_scale_points_lines_and_geometry_outputs_are_preserved() {
+        let mut draw = zero_viewport_test_draw([0.0, -0.0], [0.0, 1080.0]);
+        let expected = super::DrawRaster::Draw {
+            vp_rect: None,
+            scissor: None,
+            note: Some((super::ZeroRasterReason::DegenerateViewport, super::ZeroRasterOutcome::KeptForPointsOrLines)),
+        };
+        for topology in 0..=3 {
+            draw.topology = topology;
+            assert!(!super::skips_degenerate_viewport(&draw, true, ZERO_VIEWPORT_QUIET));
+            assert_eq!(super::draw_raster(&draw, 1920, 1080, true, true, ZERO_VIEWPORT_QUIET), expected);
+        }
+        draw.topology = 4;
+        let cfg = zero_viewport_test_cfg(nexium_shader::IrOp::StoreAttr {
+            slot: 0x70,
+            src: nexium_shader::IrValue::Zero,
+        });
+        let mut header = [0u8; 80];
+        header[16..20].copy_from_slice(&3u32.to_le_bytes());
+        for output in [1u32, 6, 7] {
+            header[12..16].copy_from_slice(&(output << 24).to_le_bytes());
+            let options = nexium_spirv::GeometryOptions::from_header(4, &header).unwrap();
+            let effects = super::draw_raster_effects(
+                ZERO_VIEWPORT_QUIET,
+                Some(super::geometry_raster_stage_effects(&cfg, options)),
+            );
+            assert_eq!(effects.emits_points_or_lines, output != 7);
+            assert_eq!(super::skips_degenerate_viewport(&draw, true, effects), output == 7);
+            if output != 7 {
+                assert_eq!(super::draw_raster(&draw, 1920, 1080, true, true, effects), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_clear_scissor_respects_clear_control_and_kill_switch() {
+        let mut draw = zero_viewport_test_draw([640.0, 360.0], [640.0, 360.0]);
+        draw.scissor.enabled = true;
+        draw.scissor.min_x = 64;
+        draw.scissor.max_x = 64;
+        draw.scissor.max_y = 720;
+        assert_eq!(super::guest_clear_scissor(&draw, 1280, 720, true), super::GuestScissor::Disabled);
+        draw.clear_control = 0x100;
+        assert_eq!(super::guest_clear_scissor(&draw, 1280, 720, true), super::GuestScissor::Empty);
+        assert_eq!(super::guest_clear_scissor(&draw, 1280, 720, false), super::GuestScissor::Disabled);
+        draw.scissor.max_x = 128;
+        for enabled in [true, false] {
+            assert_eq!(super::guest_clear_scissor(&draw, 1280, 720, enabled), super::GuestScissor::Rect([64, 0, 64, 720]));
+        }
+    }
+
+    #[test]
+    fn constant_zero_viewport_selection_is_proven_through_ir() {
+        use nexium_shader::{IrOp, IrValue};
+        let mut cfg = zero_viewport_test_cfg(IrOp::StoreAttr { slot: 0x70, src: IrValue::Zero });
+        let program = &mut cfg.blocks[0].program;
+        let zero = program.emit(IrOp::Mov(IrValue::ImmU32(0)), None);
+        program.emit_void(IrOp::StoreAttr { slot: 0x68, src: IrValue::Inst(zero) });
+        assert!(!super::cfg_raster_stage_effects(&cfg).selects_viewport);
+        cfg.blocks[0].program.emit_void(IrOp::StoreAttr { slot: 0x68, src: IrValue::GprIn(0) });
+        assert!(super::cfg_raster_stage_effects(&cfg).selects_viewport);
     }
 
     #[test]
