@@ -424,6 +424,71 @@ pub fn commit_generation() -> u64 {
     COMMIT_GENERATION.load(Ordering::Relaxed)
 }
 
+type CommitChanges = std::collections::BTreeMap<u64, (u64, u64)>;
+static COMMIT_CHANGES: OnceLock<Mutex<CommitChanges>> = OnceLock::new();
+
+fn commit_changes() -> &'static Mutex<CommitChanges> {
+    COMMIT_CHANGES.get_or_init(|| Mutex::new(CommitChanges::new()))
+}
+
+fn record_commit_change(changes: &mut CommitChanges, lo: u64, hi: u64, generation: u64) {
+    if hi <= lo {
+        return;
+    }
+    let overlapping: Vec<(u64, u64, u64)> = changes
+        .range(..hi)
+        .rev()
+        .take_while(|&(_, &(end, _))| end > lo)
+        .map(|(&start, &(end, previous))| (start, end, previous))
+        .collect();
+    for (start, end, previous) in overlapping {
+        changes.remove(&start);
+        if start < lo {
+            changes.insert(start, (lo, previous));
+        }
+        if end > hi {
+            changes.insert(hi, (end, previous));
+        }
+    }
+    changes.insert(lo, (hi, generation));
+}
+
+fn commit_change_generation(changes: &CommitChanges, lo: u64, hi: u64) -> u64 {
+    changes
+        .range(..hi)
+        .rev()
+        .take_while(|&(_, &(end, _))| end > lo)
+        .map(|(_, &(_, generation))| generation)
+        .max()
+        .unwrap_or(0)
+}
+
+fn note_commit_changes(ranges: &[(u64, u64)]) {
+    let mut changes = commit_changes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = COMMIT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    for &(lo, hi) in ranges {
+        record_commit_change(&mut changes, lo, hi, generation);
+    }
+}
+
+pub fn commit_generation_range(va: u64, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let Some(lo) = va_offset(va) else {
+        return commit_generation();
+    };
+    let Some(hi) = lo.checked_add(len as u64) else {
+        return commit_generation();
+    };
+    let changes = commit_changes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    commit_change_generation(&changes, lo, hi)
+}
+
 pub fn write_watch_available() -> bool {
     ARENA_WRITE_WATCH.load(Ordering::Acquire) || soft_write_watch_available()
 }
@@ -620,7 +685,7 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
     let fresh = !is_committed(&ranges, va, end);
     update_commit_refs(&mut ranges, va, end, true);
     if fresh {
-        COMMIT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        note_commit_changes(&[(va, end)]);
     }
     Some(ptr)
 }
@@ -660,15 +725,17 @@ pub fn decommit(ptr: *mut u8, len: usize) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let released = update_commit_refs(&mut ranges, lo, hi, false);
-    if !released.is_empty() {
-        COMMIT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if released.is_empty() {
+        return;
     }
-    for (released_lo, released_hi) in released {
+    note_commit_changes(&released);
+    for &(released_lo, released_hi) in &released {
         let released_ptr = unsafe { base.add(released_lo as usize) };
         sys::decommit(released_ptr, (released_hi - released_lo) as usize);
         #[cfg(windows)]
         crate::soft_watch::mark_dirty_host(released_ptr, (released_hi - released_lo) as usize);
     }
+    note_commit_changes(&released);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1364,6 +1431,26 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn commit_changes_report_the_newest_overlapping_generation() {
+        let mut changes = CommitChanges::new();
+        record_commit_change(&mut changes, 0x1000, 0x5000, 1);
+        record_commit_change(&mut changes, 0x3000, 0x4000, 2);
+        record_commit_change(&mut changes, 0x8000, 0x9000, 3);
+        assert_eq!(commit_change_generation(&changes, 0x1000, 0x2000), 1);
+        assert_eq!(commit_change_generation(&changes, 0x2000, 0x3800), 2);
+        assert_eq!(commit_change_generation(&changes, 0x4000, 0x5000), 1);
+        assert_eq!(commit_change_generation(&changes, 0x5000, 0x8000), 0);
+        assert_eq!(commit_change_generation(&changes, 0x0, 0x10000), 3);
+        record_commit_change(&mut changes, 0x0, 0x10000, 4);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(commit_change_generation(&changes, 0x5000, 0x6000), 4);
+        record_commit_change(&mut changes, 0x2000, 0x3000, 5);
+        assert_eq!(changes.len(), 3);
+        assert_eq!(commit_change_generation(&changes, 0x1000, 0x2000), 4);
+        assert_eq!(commit_change_generation(&changes, 0x2fff, 0x3001), 5);
     }
 
     #[test]
