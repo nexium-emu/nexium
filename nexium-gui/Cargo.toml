@@ -49,7 +49,7 @@ symphonia = { version = "0.6", default-features = false, features = ["mp3"] }
 ringbuf = { workspace = true }
 nexium-kernel = { workspace = true, default-features = false }
 once_cell = { workspace = true }
-parking_lot = "0.12"
+parking_lot = "0.13"
 crossbeam = "0.8"
 
 log = "0.4"
