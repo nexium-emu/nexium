@@ -10,7 +10,7 @@ nexium-common.workspace = true
 nexium-spirv.workspace = true
 
 ash = "0.38"
-parking_lot = "0.12"
+parking_lot = "0.13"
 log = "0.4"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
