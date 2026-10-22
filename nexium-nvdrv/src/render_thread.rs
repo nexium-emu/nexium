@@ -15,6 +15,7 @@ enum RenderWork {
     Job(&'static str, RenderJob),
     Draw(PreparedDrawBatch),
     DrawGroup(Vec<PreparedDrawBatch>),
+    RtInvalidation(Arc<nexium_gpu::Renderer>, Vec<(u64, u64, u64)>),
 }
 
 pub struct RenderThread {
@@ -791,6 +792,18 @@ fn retain_received_if_unsealed<T>(received: T, hard_after: impl FnOnce() -> bool
     }
 }
 
+fn apply_rt_invalidations(
+    renderer: &nexium_gpu::Renderer,
+    spans: &[(u64, u64, u64)],
+    worker_pending: &AtomicUsize,
+) {
+    let busy_started = crate::gpu::pusher::kickprof::rate_start();
+    crate::gpu::watchdog::render_phase("rt-invalidation", spans.len() as u64);
+    renderer.invalidate_render_target_ranges(spans);
+    crate::gpu::pusher::kickprof::add_render_job(busy_started, "rt-invalidation");
+    worker_pending.fetch_sub(1, Ordering::Release);
+}
+
 fn execute_job(label: &'static str, job: RenderJob, worker_pending: &AtomicUsize) {
     let profile = render_profile_enabled();
     let started = profile.then(std::time::Instant::now);
@@ -970,6 +983,9 @@ fn render_worker(
         };
         match work {
             RenderWork::Job(label, job) => execute_job(label, job, &worker_pending),
+            RenderWork::RtInvalidation(renderer, spans) => {
+                apply_rt_invalidations(&renderer, &spans, &worker_pending);
+            }
             RenderWork::DrawGroup(group) => {
                 enqueue_draw_group_fifo(&mut queued_draws, group);
             }
@@ -1042,6 +1058,13 @@ fn render_worker(
                         }
                         RenderWork::DrawGroup(group) => {
                             enqueue_draw_group_fifo(&mut queued_draws, group);
+                            continue;
+                        }
+                        RenderWork::RtInvalidation(_, spans) => {
+                            if let Some(last) = draws.last_mut() {
+                                last.push_rt_invalidations(spans);
+                            }
+                            worker_pending.fetch_sub(1, Ordering::Release);
                             continue;
                         }
                         next => {
@@ -1137,6 +1160,23 @@ impl RenderThread {
                 );
             }
         }
+    }
+
+    pub(crate) fn submit_rt_invalidation(
+        &self,
+        renderer: Arc<nexium_gpu::Renderer>,
+        spans: Vec<(u64, u64, u64)>,
+    ) -> bool {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        if self
+            .tx
+            .send(RenderWork::RtInvalidation(renderer, spans))
+            .is_err()
+        {
+            self.pending.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+        true
     }
 
     pub fn try_submit(&self, job: RenderJob) -> bool {

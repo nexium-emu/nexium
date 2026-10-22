@@ -47,7 +47,10 @@ pub(crate) enum PrepEvent {
         payload: u32,
         long: bool,
     },
-    KickBegin,
+    KickBegin {
+        swept: Vec<(u64, usize)>,
+        dirty: Vec<(u64, usize)>,
+    },
     EntryBegin,
     HardFlush {
         reason: usize,
@@ -107,12 +110,17 @@ fn eager_clear_resolve_enabled() -> bool {
     })
 }
 
-fn draw_target_ranges(draw: &super::engines::maxwell3d::DrawCall) -> Vec<(u64, u64)> {
+const DRAW_TARGET_RANGE_SLOTS: usize = 9;
+
+fn draw_target_ranges_array(
+    draw: &super::engines::maxwell3d::DrawCall,
+) -> ([(u64, u64); DRAW_TARGET_RANGE_SLOTS], usize) {
     const CONSERVATIVE_BYTES_PER_PIXEL: u64 = 16;
-    let mut ranges = Vec::with_capacity(9);
+    let mut ranges = [(0u64, 0u64); DRAW_TARGET_RANGE_SLOTS];
+    let mut count = 0usize;
     for rt in &draw.rt {
         let base = (u64::from(rt.address_hi) << 32) | u64::from(rt.address_lo);
-        if base == 0 {
+        if base == 0 || count == ranges.len() {
             continue;
         }
         let size = u64::from(rt.width)
@@ -120,26 +128,99 @@ fn draw_target_ranges(draw: &super::engines::maxwell3d::DrawCall) -> Vec<(u64, u
             .saturating_mul(u64::from(rt.depth.max(1)))
             .saturating_mul(CONSERVATIVE_BYTES_PER_PIXEL)
             .max(u64::from(rt.layer_stride).saturating_mul(u64::from(rt.depth.max(1))));
-        ranges.push((base, size));
+        ranges[count] = (base, size);
+        count += 1;
     }
-    if draw.zeta_enable {
+    if draw.zeta_enable && count < ranges.len() {
         let base = (u64::from(draw.zeta.address_hi) << 32) | u64::from(draw.zeta.address_lo);
         if base != 0 {
             let size = u64::from(draw.zeta.width)
                 .saturating_mul(u64::from(draw.zeta.height))
                 .saturating_mul(CONSERVATIVE_BYTES_PER_PIXEL)
                 .max(u64::from(draw.zeta.array_pitch));
-            ranges.push((base, size));
+            ranges[count] = (base, size);
+            count += 1;
         }
     }
-    ranges
+    (ranges, count)
+}
+
+fn draw_target_ranges(draw: &super::engines::maxwell3d::DrawCall) -> Vec<(u64, u64)> {
+    let (ranges, count) = draw_target_ranges_array(draw);
+    ranges[..count].to_vec()
 }
 
 fn draws_write_pending_compute(draws: &[DrawCall], ranges: &[(u64, u64)]) -> bool {
     draws.iter().any(|draw| {
-        draw_target_ranges(draw).into_iter().any(|(base, size)| {
+        let (targets, count) = draw_target_ranges_array(draw);
+        targets[..count].iter().any(|&(base, size)| {
             ranges.iter().any(|&(address, length)| ranges_overlap(base, size, address, length))
         })
+    })
+}
+
+fn draws_write_pending_compute_sorted(draws: &[DrawCall], merged: &[(u64, u64)]) -> bool {
+    if merged.is_empty() {
+        return false;
+    }
+    draws.iter().any(|draw| {
+        let (targets, count) = draw_target_ranges_array(draw);
+        targets[..count]
+            .iter()
+            .any(|&(base, size)| sorted_ranges_overlap(merged, base, size))
+    })
+}
+
+fn draws_write_pending_compute_any(draws: &[DrawCall], barrier: &ComputeMemoryBarrier) -> bool {
+    if compute_target_fast_enabled() {
+        draws_write_pending_compute_sorted(draws, &barrier.gpu_ranges_merged)
+    } else {
+        draws_write_pending_compute(draws, &barrier.gpu_ranges)
+    }
+}
+
+fn sorted_ranges_overlap(merged: &[(u64, u64)], base: u64, size: u64) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let end = base.saturating_add(size);
+    let index = merged.partition_point(|&(range_base, _)| range_base < end);
+    index != 0 && {
+        let (range_base, range_size) = merged[index - 1];
+        range_size != 0 && range_base.saturating_add(range_size) > base
+    }
+}
+
+fn coalesce_sorted_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for &(base, size) in ranges {
+        if size == 0 {
+            continue;
+        }
+        let end = base.saturating_add(size);
+        if let Some(last) = merged.last_mut() {
+            let last_end = last.0.saturating_add(last.1);
+            if base <= last_end {
+                last.1 = end.max(last_end) - last.0;
+                continue;
+            }
+        }
+        merged.push((base, size));
+    }
+    merged
+}
+
+fn compute_target_fast_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_COMPUTE_TARGET_FAST").map_or(true, |value| value != "0")
+    })
+}
+
+fn barrier_span_reuse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_BARRIER_SPAN_REUSE").map_or(true, |value| value != "0")
     })
 }
 
@@ -163,6 +244,19 @@ pub(crate) fn compute_barrier_bypass() -> ComputeBarrierBypassGuard {
     ComputeBarrierBypassGuard(COMPUTE_BARRIER_BYPASS.with(|bypass| bypass.replace(true)))
 }
 
+fn kc_barrier_backtrace_filter() -> Option<Option<u64>> {
+    static FILTER: std::sync::OnceLock<Option<Option<u64>>> = std::sync::OnceLock::new();
+    *FILTER.get_or_init(|| {
+        let value = std::env::var("NEXIUM_KC_BARRIER_BACKTRACE").ok()?;
+        let value = value.trim();
+        let parsed = value
+            .strip_prefix("0x")
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .or_else(|| value.parse::<u64>().ok());
+        Some(parsed.filter(|len| *len > 1))
+    })
+}
+
 fn compute_barrier_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_KC_BARRIER_DISABLE").is_some())
@@ -182,6 +276,7 @@ fn deferred_compute_draw_resolve_enabled() -> bool {
 struct ComputeMemoryBarrier {
     cpu_ranges: Arc<[(u64, u64)]>,
     gpu_ranges: Arc<[(u64, u64)]>,
+    gpu_ranges_merged: Arc<[(u64, u64)]>,
     spans: Arc<[super::engines::maxwell_compute::PendingComputeWritebackSpan]>,
     revision: u64,
     armed: std::cell::Cell<bool>,
@@ -201,9 +296,11 @@ impl ComputeMemoryBarrier {
         }
         gpu_ranges.sort_unstable();
         gpu_ranges.dedup();
+        let gpu_ranges_merged = coalesce_sorted_ranges(&gpu_ranges);
         Self {
             cpu_ranges: cpu_ranges.into(),
             gpu_ranges: gpu_ranges.into(),
+            gpu_ranges_merged: gpu_ranges_merged.into(),
             spans: spans.to_vec().into(),
             revision: 0,
             armed: std::cell::Cell::new(!spans.is_empty()),
@@ -237,6 +334,24 @@ impl ComputeMemoryBarrier {
                 self.cpu_ranges.len(),
                 trigger
             );
+            let capture = match kc_barrier_backtrace_filter() {
+                Some(Some(filter)) => {
+                    static CAPTURED: AtomicU64 = AtomicU64::new(0);
+                    len as u64 == filter
+                        && super::engines::maxwell_compute::resolve_depth() == 0
+                        && CAPTURED.fetch_add(1, Ordering::Relaxed) < 24
+                }
+                Some(None) => trigger % 400 == 0 && trigger < 24_000,
+                None => false,
+            };
+            if capture {
+                log::warn!(
+                    "[kc-barrier-bt] trigger={} len={:#x} {}",
+                    trigger,
+                    len,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
         }
         self.armed.set(false);
         resolve();
@@ -272,6 +387,17 @@ impl ComputeBarrierCache {
             self.revision = Some(revision);
         }
         self.barrier.clone()
+    }
+
+    fn get_current(&mut self, mappings: &GpuMappings) -> ComputeMemoryBarrier {
+        let revision = super::engines::maxwell_compute::pending_writeback_revision();
+        if barrier_span_reuse_enabled()
+            && self.revision == Some((revision, mappings.generation()))
+        {
+            return self.barrier.clone();
+        }
+        let spans = super::engines::maxwell_compute::pending_writeback_spans_snapshot();
+        self.get(revision, &spans, mappings)
     }
 }
 
@@ -406,11 +532,32 @@ pub(crate) struct PrepEngines<'a> {
     pub(crate) kepler_memory: &'a mut KeplerMemory,
 }
 
+fn rt_invalidation_prelude_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_RT_INVALIDATION_PRELUDE").map_or(true, |value| value != "0")
+    })
+}
+
+fn ssbo_refresh_interval() -> Duration {
+    static INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        Duration::from_micros(
+            std::env::var("NEXIUM_SSBO_REFRESH_US")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1000),
+        )
+    })
+}
+
 pub(crate) struct PrepState {
     pub(crate) renderer: Option<Arc<nexium_gpu::Renderer>>,
     pub(crate) guest_memory: Option<super::GuestMemoryAccess>,
     pending_small_rt_wb:
         Option<std::sync::mpsc::Receiver<(bool, Vec<super::vk_dispatch::GuestWriteChunk>)>>,
+    pending_cpu_rt_wb:
+        Vec<std::sync::mpsc::Receiver<(bool, Vec<super::vk_dispatch::GuestWriteChunk>)>>,
     pub(crate) vk_batch: PendingDrawBatch,
     pub(crate) prepared_draw_packets: PreparedDrawPacketizer,
     vk_flush_completed: bool,
@@ -506,10 +653,10 @@ impl PrepState {
                 self.process_inline_upload_methods(methods, mappings, mem_read, mem_write);
                 true
             }
-            PrepEvent::KickBegin => {
+            PrepEvent::KickBegin { swept, dirty } => {
                 self.drain_landed_compute(mappings);
                 self.publish_pending_storage_readbacks(false, mappings, mem_read, mem_write);
-                self.begin_ssbo_snapshot_epoch();
+                self.begin_ssbo_snapshot_epoch_with(Some((swept, dirty)));
                 true
             }
             PrepEvent::EntryBegin => {
@@ -1078,23 +1225,22 @@ impl PrepState {
                 mut replay_constbuf_writes,
                 constbuf_trace,
             } => {
+                if !super::pusher::Pusher::entry_begin_events_enabled() {
+                    self.begin_ssbo_snapshot_entry();
+                }
                 self.sync_semaphore_acquire_sweep();
                 self.drain_landed_compute(mappings);
+                self.join_cpu_rt_writebacks(mappings, 8);
                 self.publish_pending_storage_readbacks(false, mappings, mem_read, mem_write);
                 let kp_pre = kickprof::start();
-                let compute_spans =
-                    super::engines::maxwell_compute::pending_writeback_spans_snapshot();
-                let memory_barrier = self.compute_barrier_cache.get(
-                    super::engines::maxwell_compute::pending_writeback_revision(),
-                    &compute_spans,
-                    mappings,
-                );
+                let memory_barrier = self.compute_barrier_cache.get_current(mappings);
+                let compute_spans = memory_barrier.spans.clone();
                 if !compute_spans.is_empty() {
                     let deferred = deferred_compute_draw_resolve_enabled()
                         && crate::render_thread::maybe_render_thread().is_some();
                     if eager_clear_resolve_enabled()
                         || (!deferred && draws.iter().any(|draw| !draw.is_clear))
-                        || draws_write_pending_compute(&draws, &memory_barrier.gpu_ranges)
+                        || draws_write_pending_compute_any(&draws, &memory_barrier)
                     {
                         self.resolve_pending_compute(mappings, mem_write);
                         memory_barrier.armed.set(false);
@@ -1348,6 +1494,7 @@ impl PrepState {
                         self.flush_vk(mappings, mem_read, mem_write);
                     }
                     let kp = kickprof::start();
+                    let mut deferred = false;
                     if requires_hard_boundary {
                         let spans = maxwell_dma.transfer_spans(arg);
                         let (dst_gpu, dst_size) = spans[1];
@@ -1374,7 +1521,8 @@ impl PrepState {
                                             super::engines::maxwell_compute::pending_writeback_count(),
                                         )
                                     });
-                                if dma_narrow_resolve_enabled() {
+                                deferred = self.try_defer_dma(maxwell_dma, arg, mappings);
+                                if !deferred && dma_narrow_resolve_enabled() {
                                     let ranges: Vec<(u64, u64, usize)> = spans
                                         .iter()
                                         .map(|&(gpu_va, size)| {
@@ -1386,12 +1534,12 @@ impl PrepState {
                                         })
                                         .collect();
                                     self.resolve_pending_compute_overlapping(mappings, mem_write, &ranges);
-                                } else {
+                                } else if !deferred {
                                     self.resolve_pending_compute(mappings, mem_write);
                                 }
                                 if let Some((started, source, destination, before)) = trace {
                                     log::warn!(
-                                        "[ktl] us={} csync kind=dma arg={:#x} src_overlap={} dst_overlap={} src={:#x}+{:#x} dst={:#x}+{:#x} pending={}->{} ms={:.3}",
+                                        "[ktl] us={} csync kind=dma arg={:#x} src_overlap={} dst_overlap={} src={:#x}+{:#x} dst={:#x}+{:#x} pending={}->{} deferred={} ms={:.3}",
                                         crate::timeline_us(),
                                         arg,
                                         source,
@@ -1402,12 +1550,13 @@ impl PrepState {
                                         spans[1].1,
                                         before,
                                         super::engines::maxwell_compute::pending_writeback_count(),
+                                        deferred,
                                         started.elapsed().as_secs_f64() * 1000.0
                                     );
                                 }
                             }
                         }
-                        if let Some(r) = self.renderer.clone() {
+                        if let Some(r) = self.renderer.clone().filter(|_| !deferred) {
                             let stage_started = kickprof::start();
                             let recorded: std::cell::RefCell<Vec<(u64, usize)>> =
                                 std::cell::RefCell::new(Vec::new());
@@ -1426,8 +1575,12 @@ impl PrepState {
                         }
                     }
                     let pre = maxwell_dma.blit_count;
-                    maxwell_dma
-                        .dispatch_method(method, arg, mappings, mem_read, mem_write, mem_copy);
+                    if deferred {
+                        maxwell_dma.commit_deferred_pitch_launch(arg, mappings);
+                    } else {
+                        maxwell_dma
+                            .dispatch_method(method, arg, mappings, mem_read, mem_write, mem_copy);
+                    }
                     if requires_hard_boundary {
                         if let Some((cpu_addr, size)) = maxwell_dma.take_guest_write_range() {
                             if let Some(r) = self.renderer.clone() {
@@ -1698,12 +1851,7 @@ impl PrepState {
                     let kp = kickprof::start();
                     let outcome =
                         kepler_memory.dispatch_method(method, arg, mappings, mem_read, mem_write);
-                    super::pusher::apply_kepler_memory_write(
-                        &mut self.ssbo_snapshot_cache,
-                        mappings,
-                        self.renderer.as_ref(),
-                        outcome,
-                    );
+                    self.apply_kepler_memory_write(mappings, mem_read, mem_write, outcome);
                     kickprof::add(kickprof::KEPLER, kp);
                     true
                 }
@@ -1736,12 +1884,7 @@ impl PrepState {
                             &content_key,
                         )
                     };
-                    super::pusher::apply_kepler_memory_write(
-                        &mut self.ssbo_snapshot_cache,
-                        mappings,
-                        self.renderer.as_ref(),
-                        outcome,
-                    );
+                    self.apply_kepler_memory_write(mappings, mem_read, mem_write, outcome);
                     self.invalidate_resolved_compute_writebacks(mappings);
                     kickprof::add(kickprof::KEPLER, kp);
                     true
@@ -1776,11 +1919,21 @@ impl PrepState {
     }
 
     pub(crate) fn begin_ssbo_snapshot_epoch(&mut self) {
+        self.begin_ssbo_snapshot_epoch_with(None);
+    }
+
+    pub(crate) fn begin_ssbo_snapshot_epoch_with(
+        &mut self,
+        sweep: Option<(Vec<(u64, usize)>, Vec<(u64, usize)>)>,
+    ) {
         self.ssbo_refreshed_at = None;
         self.ssbo_snapshot_cache.mirror_bump_sweep();
         self.ssbo_snapshot_cache.mirror_begin_kick();
         self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
         self.ssbo_snapshot_cache.reset_epoch();
+        if let Some((swept, dirty)) = sweep {
+            self.ssbo_snapshot_cache.adopt_decode_sweep(&swept, &dirty);
+        }
         self.ssbo_snapshot_cache.refresh_input_guest_writes();
     }
 
@@ -1789,6 +1942,9 @@ impl PrepState {
         self.ssbo_snapshot_cache.profile_epoch();
         self.ssbo_snapshot_cache.clear_ssbo_snapshots();
         self.ssbo_snapshot_cache.clear_prepared_texture_snapshots();
+        if nexium_memory::fastmem::decode_write_watch_sweep_enabled() {
+            publish_decode_sweep_plan(nexium_memory::fastmem::write_watch_memo_used_ranges());
+        }
         super::pusher::kickprof::add(super::pusher::kickprof::EPOCH_END, kp);
     }
 
@@ -1853,12 +2009,60 @@ impl PrepState {
             log::warn!("[rt-writeback] cpu-readable writeback skipped after prepared draw drain failure");
             return false;
         }
+        self.join_cpu_rt_writebacks(mappings, 4);
+        let async_memory = super::vk_dispatch::cpu_rt_writeback_async_enabled()
+            .then(|| self.guest_memory.clone())
+            .flatten()
+            .filter(super::GuestMemoryAccess::is_available);
+        if let Some(memory) = async_memory {
+            if let Some(pending) =
+                super::vk_dispatch::spawn_cpu_readable_rt_writeback_async(renderer, memory)
+            {
+                self.pending_cpu_rt_wb.push(pending);
+                return true;
+            }
+        }
         super::vk_dispatch::writeback_cpu_readable_rts(
             renderer,
             mappings,
             mem_write,
             &mut self.ssbo_snapshot_cache,
         )
+    }
+
+    fn join_cpu_rt_writebacks(&mut self, mappings: &GpuMappings, keep_pending: usize) {
+        let mut index = 0;
+        while index < self.pending_cpu_rt_wb.len() {
+            let must_block = self.pending_cpu_rt_wb.len() - index > keep_pending;
+            let received = if must_block {
+                self.pending_cpu_rt_wb[index]
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .map_err(|_| true)
+            } else {
+                self.pending_cpu_rt_wb[index].try_recv().map_err(|error| {
+                    matches!(error, std::sync::mpsc::TryRecvError::Disconnected)
+                })
+            };
+            match received {
+                Ok((_, chunks)) => {
+                    if !chunks.is_empty() {
+                        super::vk_dispatch::apply_small_rt_writeback_chunks(
+                            &mut self.ssbo_snapshot_cache,
+                            mappings,
+                            &chunks,
+                        );
+                    }
+                    self.pending_cpu_rt_wb.remove(index);
+                }
+                Err(true) => {
+                    if must_block {
+                        log::warn!("[rt-writeback] async cpu-readable writeback join timed out");
+                    }
+                    self.pending_cpu_rt_wb.remove(index);
+                }
+                Err(false) => index += 1,
+            }
+        }
     }
 
     pub(crate) fn process_inline_upload_methods(
@@ -1873,12 +2077,7 @@ impl PrepState {
                 .inline_upload
                 .dispatch_method(method, arg, mappings, mem_read, mem_write);
             if !matches!(outcome, KeplerMemoryWriteOutcome::NoWrite) {
-                super::pusher::apply_kepler_memory_write(
-                    &mut self.ssbo_snapshot_cache,
-                    mappings,
-                    self.renderer.as_ref(),
-                    outcome,
-                );
+                self.apply_kepler_memory_write(mappings, mem_read, mem_write, outcome);
             }
         }
     }
@@ -1899,7 +2098,6 @@ impl PrepState {
     }
 
     fn ssbo_refresh_due(&mut self) -> bool {
-        const NORMAL_ENTRY_REFRESH_INTERVAL: Duration = Duration::from_millis(1);
         if !super::accuracy::normal_accuracy() {
             return true;
         }
@@ -1908,7 +2106,7 @@ impl PrepState {
         if self.ssbo_refreshed_epoch == epoch
             && self
                 .ssbo_refreshed_at
-                .is_some_and(|at| now.duration_since(at) < NORMAL_ENTRY_REFRESH_INTERVAL)
+                .is_some_and(|at| now.duration_since(at) < ssbo_refresh_interval())
         {
             return false;
         }
@@ -1921,6 +2119,7 @@ impl PrepState {
         let epoch = SEMAPHORE_ACQUIRE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
         if self.mirror_acquire_epoch != epoch {
             self.mirror_acquire_epoch = epoch;
+            nexium_memory::fastmem::bump_write_watch_epoch();
             self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
         }
     }
@@ -2018,6 +2217,57 @@ impl PrepState {
         )
     }
 
+    fn apply_kepler_memory_write(
+        &mut self,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        outcome: KeplerMemoryWriteOutcome,
+    ) {
+        if let Some(spans) = super::pusher::kepler_rt_invalidation_spans(mappings, &outcome) {
+            self.route_rt_invalidation(spans, mappings, mem_read, mem_write);
+        }
+        match outcome {
+            KeplerMemoryWriteOutcome::NoWrite => {}
+            KeplerMemoryWriteOutcome::Exact(spans) => {
+                self.ssbo_snapshot_cache.invalidate_gpu_writes(mappings, &spans);
+            }
+            KeplerMemoryWriteOutcome::Unknown(_) => self.ssbo_snapshot_cache.clear(),
+        }
+    }
+
+    fn route_rt_invalidation(
+        &mut self,
+        mut spans: Vec<(u64, u64, u64)>,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        let Some(renderer) = self.renderer.clone() else {
+            return;
+        };
+        let Some(render_thread) = crate::render_thread::maybe_render_thread() else {
+            renderer.invalidate_render_target_ranges(&spans);
+            return;
+        };
+        if !rt_invalidation_prelude_enabled() {
+            render_thread.submit_named(
+                "kepler-guest-write-invalidate",
+                Box::new(move || renderer.invalidate_render_target_ranges(&spans)),
+            );
+            return;
+        }
+        if super::vk_dispatch::draws_touch_rt_spans(&self.vk_batch, &spans) {
+            self.flush_vk_soft(mappings, mem_read, mem_write);
+        }
+        if self.prepared_draw_packets.attach_rt_invalidations(&mut spans) {
+            return;
+        }
+        if !render_thread.submit_rt_invalidation(renderer, spans) {
+            log::warn!("render target invalidation dropped: render thread unavailable");
+        }
+    }
+
     pub(crate) fn flush_vk(
         &mut self,
         mappings: &GpuMappings,
@@ -2053,11 +2303,7 @@ impl PrepState {
         let memory_barrier = if deferred_compute_draw_resolve_enabled()
             && crate::render_thread::maybe_render_thread().is_some()
         {
-            self.compute_barrier_cache.get(
-                super::engines::maxwell_compute::pending_writeback_revision(),
-                &super::engines::maxwell_compute::pending_writeback_spans_snapshot(),
-                mappings,
-            )
+            self.compute_barrier_cache.get_current(mappings)
         } else {
             ComputeMemoryBarrier::default()
         };
@@ -2217,6 +2463,44 @@ impl PrepState {
             self.ssbo_snapshot_cache
                 .invalidate_gpu_write(mappings, span.gpu_va, span.len);
         }
+    }
+
+    fn try_defer_dma(
+        &self,
+        maxwell_dma: &super::engines::MaxwellDma,
+        flags: u32,
+        mappings: &GpuMappings,
+    ) -> bool {
+        if !super::engines::maxwell_compute::dma_defer_enabled() || self.renderer.is_none() {
+            return false;
+        }
+        let Some(memory) = self
+            .guest_memory
+            .as_ref()
+            .filter(|memory| memory.is_available() && memory.reader().is_some())
+        else {
+            return false;
+        };
+        let Some(mut copies) = maxwell_dma.deferrable_pitch_copies(flags, mappings) else {
+            return false;
+        };
+        if !copies.iter().all(|copy| {
+            super::engines::maxwell_compute::pending_writeback_covers(copy.src_cpu, copy.len)
+        }) {
+            return false;
+        }
+        if super::vk_dispatch::cbuf_compute_overlay_enabled() {
+            let spans = super::engines::maxwell_compute::pending_writeback_spans_snapshot();
+            for copy in &mut copies {
+                copy.source = super::vk_dispatch::compute_overlay_source_for_range(
+                    &spans,
+                    copy.src_cpu,
+                    copy.len,
+                );
+            }
+        }
+        super::engines::maxwell_compute::push_deferred_dma(copies, memory.clone());
+        true
     }
 
     pub(crate) fn invalidate_resolved_compute_writebacks(&mut self, mappings: &GpuMappings) {
@@ -2400,6 +2684,7 @@ impl PrepState {
             renderer: None,
             guest_memory: None,
             pending_small_rt_wb: None,
+            pending_cpu_rt_wb: Vec::new(),
             vk_batch: PendingDrawBatch::default(),
             prepared_draw_packets: PreparedDrawPacketizer::default(),
             vk_flush_completed: true,
@@ -2572,6 +2857,24 @@ fn record_prep_event_completion(failed: &AtomicBool, completed: bool) {
 }
 
 const PREP_EVENT_QUEUE_CAPACITY: usize = 4096;
+
+static DECODE_SWEEP_PLAN: std::sync::Mutex<Option<std::sync::Arc<[(u64, usize)]>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn publish_decode_sweep_plan(ranges: Vec<(u64, usize)>) {
+    let mut plan = DECODE_SWEEP_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *plan = Some(std::sync::Arc::from(ranges));
+}
+
+pub(crate) fn decode_sweep_plan() -> Option<std::sync::Arc<[(u64, usize)]>> {
+    DECODE_SWEEP_PLAN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+const PREP_EVENT_BURST: usize = 256;
 const DRAW_VEC_RECYCLE_QUEUE_CAPACITY: usize = 256;
 
 static DRAW_VEC_RECYCLE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -2841,6 +3144,9 @@ pub(crate) fn spawn_prep_thread(
                 let _ = SetThreadPriority(GetCurrentThread(), 2);
             }
             super::vk_dispatch::set_prep_sync_guest_read(resources.mem_read.clone());
+            if nexium_memory::fastmem::decode_write_watch_sweep_enabled() {
+                nexium_memory::fastmem::enable_write_watch_memo_for_thread();
+            }
             let mem_read = move |addr: u64, buf: &mut [u8]| (resources.mem_read)(addr, buf);
             let mem_write = move |addr: u64, buf: &[u8]| (resources.mem_write)(addr, buf);
             let mem_copy =
@@ -2860,7 +3166,7 @@ pub(crate) fn spawn_prep_thread(
                     PrepEvent::SemRelease(_) => 5,
                     PrepEvent::Barrier { .. } => 6,
                     PrepEvent::PullerSemWrite { .. } => 7,
-                    PrepEvent::KickBegin => 8,
+                    PrepEvent::KickBegin { .. } => 8,
                     PrepEvent::EntryBegin => 9,
                     PrepEvent::HardFlush { .. } => 10,
                     PrepEvent::KickEnd { .. } => 11,
@@ -2871,10 +3177,11 @@ pub(crate) fn spawn_prep_thread(
                 }
             }
             let prof_enabled = std::env::var_os("NEXIUM_PREP_PROFILE").is_some();
+            let mut burst: Vec<PrepEvent> = Vec::with_capacity(PREP_EVENT_BURST);
             while let Ok(first) = rx.recv() {
                 let burst_started = prof_enabled.then(std::time::Instant::now);
-                let mut burst = vec![first];
-                while burst.len() < 256 {
+                burst.push(first);
+                while burst.len() < PREP_EVENT_BURST {
                     match rx.try_recv() {
                         Ok(event) => burst.push(event),
                         Err(_) => break,
@@ -2885,7 +3192,7 @@ pub(crate) fn spawn_prep_thread(
                 let mut kepler_compute = resources.kepler_compute.lock();
                 let mut kepler_memory = resources.kepler_memory.lock();
                 let mappings = resources.mappings.read_recursive();
-                for event in burst {
+                for event in burst.drain(..) {
                     if worker_failed.load(Ordering::Acquire) {
                         match event {
                             PrepEvent::KickEnd { on_complete, .. } => {
@@ -3043,6 +3350,7 @@ mod tests {
             gpu_va: 0x1000,
             cpu_addr: 0x8000,
             len: 0x100,
+            source_offset: 0,
         }
     }
 
@@ -3087,6 +3395,40 @@ mod tests {
         assert!(super::draws_write_pending_compute(&[draw.clone()], &barrier.gpu_ranges));
         draw.rt[0].address_lo = 0x9000;
         assert!(!super::draws_write_pending_compute(&[draw], &barrier.gpu_ranges));
+    }
+
+    #[test]
+    fn sorted_pending_compute_overlap_matches_linear_scan() {
+        let ranges = [
+            (0x1000u64, 0x100u64),
+            (0x1100, 0x80),
+            (0x3000, 0x10),
+            (0x5000, 0x1000),
+            (0x5800, 0x100),
+            (0x7000, 0),
+        ];
+        let merged = super::coalesce_sorted_ranges(&ranges);
+        assert_eq!(merged, vec![(0x1000, 0x180), (0x3000, 0x10), (0x5000, 0x1000)]);
+        for base in (0x0..0x8000u64).step_by(0x40) {
+            for size in [0u64, 0x1, 0x40, 0x200, 0x1000, u64::MAX] {
+                let linear = ranges
+                    .iter()
+                    .any(|&(address, length)| super::ranges_overlap(base, size, address, length));
+                assert_eq!(
+                    super::sorted_ranges_overlap(&merged, base, size),
+                    linear,
+                    "base={base:#x} size={size:#x}"
+                );
+            }
+        }
+        let mut draw = DrawCall::default();
+        draw.rt[0].address_lo = 0x5f00;
+        draw.rt[0].width = 4;
+        draw.rt[0].height = 4;
+        draw.rt[0].depth = 1;
+        assert!(super::draws_write_pending_compute_sorted(&[draw.clone()], &merged));
+        draw.rt[0].address_lo = 0x6000;
+        assert!(!super::draws_write_pending_compute_sorted(&[draw], &merged));
     }
 
     #[test]
@@ -3447,7 +3789,12 @@ mod tests {
             .failure_latch()
             .store(true, std::sync::atomic::Ordering::Release);
 
-        assert!(handle.send_recover(PrepEvent::KickBegin).is_err());
+        assert!(handle
+            .send_recover(PrepEvent::KickBegin {
+                swept: Vec::new(),
+                dirty: Vec::new(),
+            })
+            .is_err());
         assert!(matches!(
             handle.shutdown(false),
             PrepThreadShutdown::Joined { drained: false, .. }
