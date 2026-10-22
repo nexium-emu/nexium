@@ -1978,8 +1978,30 @@ impl CensusFoldRing {
 }
 
 const SPH_MEMO_CAPACITY: usize = 64;
-const TEXLAY_MEMO_SETS: usize = 128;
-const TEXLAY_MEMO_WAYS: usize = 2;
+const TEXLAY_MEMO_DEFAULT_SETS: usize = 128;
+const TEXLAY_MEMO_DEFAULT_WAYS: usize = 2;
+
+fn texlay_memo_sets() -> usize {
+    static SETS: OnceLock<usize> = OnceLock::new();
+    *SETS.get_or_init(|| {
+        std::env::var("NEXIUM_TEXLAY_MEMO_SETS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|sets| sets.clamp(16, 65_536).next_power_of_two())
+            .unwrap_or(TEXLAY_MEMO_DEFAULT_SETS)
+    })
+}
+
+fn texlay_memo_ways() -> usize {
+    static WAYS: OnceLock<usize> = OnceLock::new();
+    *WAYS.get_or_init(|| {
+        std::env::var("NEXIUM_TEXLAY_MEMO_WAYS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|ways| ways.clamp(1, 8))
+            .unwrap_or(TEXLAY_MEMO_DEFAULT_WAYS)
+    })
+}
 
 struct TexLayoutMemoEntry {
     vs_addr: u64,
@@ -4456,9 +4478,10 @@ impl SsboSnapshotCache {
             tic_pool_limit,
             via_header_index,
         );
-        let base = (fold as usize & (TEXLAY_MEMO_SETS - 1)) * TEXLAY_MEMO_WAYS;
+        let ways = texlay_memo_ways();
+        let base = (fold as usize & (texlay_memo_sets() - 1)) * ways;
         let mut found = None;
-        for way in 0..TEXLAY_MEMO_WAYS {
+        for way in 0..ways {
             if let Some(entry) = self.texlay_memo[base + way].as_ref() {
                 if entry.vs_addr == vs_addr
                     && entry.fs_addr == fs_addr
@@ -4563,7 +4586,7 @@ impl SsboSnapshotCache {
     fn texlay_memo_store(&mut self, entry: TexLayoutMemoEntry) {
         if self.texlay_memo.is_empty() {
             self.texlay_memo
-                .resize_with(TEXLAY_MEMO_SETS * TEXLAY_MEMO_WAYS, || None);
+                .resize_with(texlay_memo_sets() * texlay_memo_ways(), || None);
         }
         let fold = texlay_memo_fold(
             entry.vs_addr,
@@ -4573,7 +4596,7 @@ impl SsboSnapshotCache {
             entry.tic_pool_limit,
             entry.via_header_index,
         );
-        let base = (fold as usize & (TEXLAY_MEMO_SETS - 1)) * TEXLAY_MEMO_WAYS;
+        let base = (fold as usize & (texlay_memo_sets() - 1)) * texlay_memo_ways();
         let same_key = |candidate: &TexLayoutMemoEntry| {
             candidate.vs_addr == entry.vs_addr
                 && candidate.fs_addr == entry.fs_addr
@@ -13529,7 +13552,10 @@ fn prepare_clear_batch(
     }
 }
 
-pub(crate) fn execute_prepared_draw_batches(mut jobs: Vec<PreparedDrawBatch>) {
+pub(crate) fn execute_prepared_draw_batches(
+    mut jobs: Vec<PreparedDrawBatch>,
+    interludes: &mut [nexium_gpu::renderer::ComputeInterlude],
+) {
     let Some(first) = jobs.first() else {
         return;
     };
@@ -13611,6 +13637,7 @@ pub(crate) fn execute_prepared_draw_batches(mut jobs: Vec<PreparedDrawBatch>) {
                     })
             },
             &fermi_exact_snapshot_leases,
+            interludes,
         );
     if result.as_ref().is_ok_and(|submitted| *submitted) {
         for job in &mut jobs {
@@ -19285,6 +19312,7 @@ fn execute_one_inner(
         sampled_rt_snapshot_slots,
         fragment_barrier_after: false,
         texture_cache_invalidate_after: false,
+        primitive_barrier_after: false,
         clear: false,
         clear_color: [0.0, 0.0, 0.0, 1.0],
         tic_pool_gpu_va: draw.tic_pool_gpu_va,
