@@ -1,5 +1,5 @@
 use ash::vk;
-use std::collections::{HashMap, HashSet};
+use nexium_common::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::Write;
@@ -235,7 +235,7 @@ fn decode_spec_file(bytes: &[u8]) -> Result<DecodedSpecs, String> {
     if version == LEGACY_SPEC_VERSION {
         let file: LegacySpecFile = postcard::from_bytes(bytes)
             .map_err(|error| format!("version {version} deserialize failed: {error:?}"))?;
-        let mut interned: HashMap<u64, Vec<Arc<Vec<u32>>>> = HashMap::new();
+        let mut interned: HashMap<u64, Vec<Arc<Vec<u32>>>> = HashMap::default();
         let mut intern = |words: Vec<u32>| -> Arc<Vec<u32>> {
             if words.is_empty() {
                 return Arc::default();
@@ -250,7 +250,7 @@ fn decode_spec_file(bytes: &[u8]) -> Result<DecodedSpecs, String> {
             candidates.push(Arc::clone(&module));
             module
         };
-        let mut specs = HashMap::with_capacity(file.specs.len());
+        let mut specs = HashMap::with_capacity_and_hasher(file.specs.len(), Default::default());
         for legacy in file.specs {
             let mut spec = legacy.spec;
             spec.key = legacy.key;
@@ -276,7 +276,7 @@ fn decode_spec_file(bytes: &[u8]) -> Result<DecodedSpecs, String> {
             .cloned()
             .ok_or_else(|| format!("module {index} out of range"))
     };
-    let mut specs = HashMap::with_capacity(file.specs.len());
+    let mut specs = HashMap::with_capacity_and_hasher(file.specs.len(), Default::default());
     for stored in file.specs {
         let mut spec = stored.spec;
         spec.key = stored.key;
@@ -1252,13 +1252,13 @@ impl PipelineCache {
             Some(CompileWorker {
                 req_tx,
                 res_rx,
-                in_flight: std::collections::HashMap::new(),
+                in_flight: std::collections::HashMap::default(),
                 handles,
             })
         };
 
         Ok(Self {
-            pipelines: HashMap::new(),
+            pipelines: HashMap::default(),
             current_pipeline: CurrentPipeline::default(),
             layout,
             vk_cache,
@@ -1267,7 +1267,7 @@ impl PipelineCache {
             last_saved_len: initial.len(),
             save_tx: Some(save_tx),
             worker,
-            failed: HashSet::new(),
+            failed: HashSet::default(),
             cache_lock,
             external_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_detached_builds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1708,7 +1708,7 @@ impl PipelineCache {
         let (req_tx, _req_rx) = std::sync::mpsc::channel::<PipelineBuildRequest>();
         let (res_tx, res_rx) = std::sync::mpsc::channel();
         let cache = Self {
-            pipelines: HashMap::new(),
+            pipelines: HashMap::default(),
             current_pipeline: CurrentPipeline::default(),
             layout,
             vk_cache,
@@ -1719,14 +1719,14 @@ impl PipelineCache {
             worker: Some(CompileWorker {
                 req_tx,
                 res_rx,
-                in_flight: std::collections::HashMap::new(),
+                in_flight: std::collections::HashMap::default(),
                 handles: Vec::new(),
             }),
-            failed: HashSet::new(),
+            failed: HashSet::default(),
             cache_lock: std::sync::Arc::new(PipelineCacheLock::new(true)),
             external_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_detached_builds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            specs: HashMap::new(),
+            specs: HashMap::default(),
             specs_dirty: false,
             specs_saved_count: 0,
             specs_saved_at: std::time::Instant::now(),

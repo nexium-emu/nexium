@@ -1,9 +1,8 @@
 use ash::vk;
 use ash::vk::Handle;
 use parking_lot::Mutex;
-use std::collections::{
-    hash_map::DefaultHasher, hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque,
-};
+use nexium_common::fast_hash::{FastMap as HashMap, FastSet as HashSet};
+use std::collections::{hash_map::DefaultHasher, hash_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -178,7 +177,7 @@ fn idle_skip_disabled() -> bool {
 
 pub const GRAPHICS_RING_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
 pub const GRAPHICS_RING_SAFE_BATCH_BYTES: u64 = GRAPHICS_RING_CAPACITY_BYTES / 2;
-const GRAPHICS_FRAME_SLOT_COUNT: usize = 2;
+const GRAPHICS_FRAME_SLOT_COUNT: usize = 8;
 const MAX_STORAGE_BUFFER_OFFSET_ALIGNMENT: u64 = 256;
 const DEFAULT_CLEAR_SLOT_COUNT: usize = 4;
 const MAX_CLEAR_SLOT_COUNT: usize = 64;
@@ -186,20 +185,11 @@ const MAX_CLEAR_SLOT_COUNT: usize = 64;
 fn graphics_frame_slot_count() -> usize {
     static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *COUNT.get_or_init(|| {
-        let requested = std::env::var("NEXIUM_RENDER_FRAME_SLOTS")
+        std::env::var("NEXIUM_RENDER_FRAME_SLOTS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .filter(|count| (2..=8).contains(count))
-            .unwrap_or(GRAPHICS_FRAME_SLOT_COUNT);
-        const SAFE_RING_SLOT_COUNT: usize = GRAPHICS_FRAME_SLOT_COUNT;
-        if requested != SAFE_RING_SLOT_COUNT {
-            log::warn!(
-                "Vulkan graphics frame slots requested {}; forcing {} until the shared graphics ring has per-slot ranges",
-                requested,
-                SAFE_RING_SLOT_COUNT
-            );
-        }
-        SAFE_RING_SLOT_COUNT
+            .filter(|count| (2..=16).contains(count))
+            .unwrap_or(GRAPHICS_FRAME_SLOT_COUNT)
     })
 }
 
@@ -238,6 +228,100 @@ fn frame_slot_submission_complete(
             .get_semaphore_counter_value(submit_timeline)
             .is_ok_and(|completed| completed >= generation)
     }
+}
+
+static STORAGE_OFFSET_ALIGNMENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(256);
+
+pub fn storage_offset_alignment() -> u64 {
+    STORAGE_OFFSET_ALIGNMENT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1)
+}
+
+fn typed_texel_overlay_sources_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_COMPUTE_TYPED_TEXEL_OVERLAY").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn frame_slot_retire_fix_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_FRAME_SLOT_RETIRE_FIX").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn ring_telemetry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_RING_TELEMETRY").is_ok_and(|value| value != "0")
+    })
+}
+
+fn note_ring_telemetry(wrapped: bool, wrap_elapsed: std::time::Duration, upper: u64, used: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BATCHES: AtomicU64 = AtomicU64::new(0);
+    static WRAPS: AtomicU64 = AtomicU64::new(0);
+    static WRAP_NS: AtomicU64 = AtomicU64::new(0);
+    static UPPER: AtomicU64 = AtomicU64::new(0);
+    static USED: AtomicU64 = AtomicU64::new(0);
+    static LAST_NS: AtomicU64 = AtomicU64::new(0);
+    BATCHES.fetch_add(1, Ordering::Relaxed);
+    if wrapped {
+        WRAPS.fetch_add(1, Ordering::Relaxed);
+        WRAP_NS.fetch_add(wrap_elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+    UPPER.fetch_add(upper, Ordering::Relaxed);
+    USED.fetch_add(used, Ordering::Relaxed);
+    let now = monotonic_nanos();
+    let last = LAST_NS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1_000_000_000
+        || LAST_NS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let batches = BATCHES.swap(0, Ordering::Relaxed).max(1);
+    let upper = UPPER.swap(0, Ordering::Relaxed) as f64;
+    let used = USED.swap(0, Ordering::Relaxed) as f64;
+    log::warn!(
+        "[ring-telemetry] batches={} wraps={} wrap_wait_ms={:.3} upper_mib={:.1} used_mib={:.1} upper_per_batch_kib={:.0} used_per_batch_kib={:.0}",
+        batches,
+        WRAPS.swap(0, Ordering::Relaxed),
+        WRAP_NS.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+        upper / 1048576.0,
+        used / 1048576.0,
+        upper / 1024.0 / batches as f64,
+        used / 1024.0 / batches as f64,
+    );
+}
+
+fn readback_idle_fix_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_READBACK_IDLE_FIX").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn frame_slot_retired(
+    device: &ash::Device,
+    submit_timeline: vk::Semaphore,
+    generation: u64,
+    fence: vk::Fence,
+) -> bool {
+    frame_slot_submission_complete(device, submit_timeline, generation)
+        && (!frame_slot_retire_fix_enabled()
+            || unsafe { device.get_fence_status(fence) } == Ok(true))
 }
 
 #[derive(Clone, Debug)]
@@ -404,7 +488,7 @@ struct AuroraResidentSlot {
     logical_size: usize,
     key: Option<SharedSsboKey>,
     source: Option<std::sync::Weak<Vec<u8>>>,
-    in_flight_mask: u8,
+    in_flight_mask: u16,
     last_used: u64,
 }
 
@@ -442,6 +526,7 @@ struct AuroraResidentSsboCache {
     mapped: *mut u8,
     slots: Vec<AuroraResidentSlot>,
     clock: u64,
+    rebar_bytes: u64,
 }
 
 unsafe impl Send for AuroraResidentSsboCache {}
@@ -449,14 +534,14 @@ unsafe impl Sync for AuroraResidentSsboCache {}
 
 impl AuroraResidentSsboCache {
     fn complete_frame_slot(&mut self, frame_slot: usize) {
-        let bit = !(1u8 << frame_slot);
+        let bit = !(1u16 << frame_slot);
         for slot in &mut self.slots {
             slot.in_flight_mask &= bit;
         }
     }
 
     fn mark_submitted(&mut self, frame_slot: usize, resident_slots: &[usize]) {
-        let bit = 1u8 << frame_slot;
+        let bit = 1u16 << frame_slot;
         for &index in resident_slots {
             if let Some(slot) = self.slots.get_mut(index) {
                 slot.in_flight_mask |= bit;
@@ -506,6 +591,7 @@ impl AuroraResidentSsboCache {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
         }
+        crate::memory_select::release_stream_rebar_bytes(self.rebar_bytes);
         self.mapped = std::ptr::null_mut();
     }
 }
@@ -534,6 +620,16 @@ pub(crate) fn resident_vb_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         env_switch_value_default_enabled(std::env::var("NEXIUM_RESIDENT_VB").ok().as_deref())
+    })
+}
+
+fn resident_vb_touch_interval() -> u64 {
+    static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("NEXIUM_RESIDENT_VB_TOUCH_INTERVAL")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(64)
     })
 }
 
@@ -726,10 +822,11 @@ struct ResidentVbCache {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
+    rebar_bytes: u64,
     size: u64,
     head: u64,
     free: ResidentFreeList,
-    slabs: HashMap<(u64, u32), Vec<ResidentVbSlab>>,
+    slabs: nexium_common::fast_hash::FastMap<(u64, u32), Vec<ResidentVbSlab>>,
     lru: BTreeSet<(u64, u64, u64, u32)>,
     slot_uses: Vec<Vec<ResidentSlabUse>>,
     clock: u64,
@@ -757,7 +854,7 @@ impl ResidentVbCache {
         }
     }
 
-    fn mark_submitted(&mut self, frame_slot: usize, used: &HashSet<ResidentSlabUse>) {
+    fn mark_submitted(&mut self, frame_slot: usize, used: &nexium_common::fast_hash::FastSet<ResidentSlabUse>) {
         let Some(bit) = 1u64.checked_shl(frame_slot as u32) else {
             return;
         };
@@ -781,7 +878,7 @@ impl ResidentVbCache {
         self.lru.insert((clock, offset, key.0, key.1));
     }
 
-    fn evictable(&self, key: (u64, u32), offset: u64, used: &HashSet<ResidentSlabUse>) -> bool {
+    fn evictable(&self, key: (u64, u32), offset: u64, used: &nexium_common::fast_hash::FastSet<ResidentSlabUse>) -> bool {
         !used.contains(&ResidentSlabUse::new(key.0, key.1, offset))
             && self.slabs.get(&key).is_some_and(|versions| {
                 versions
@@ -790,7 +887,7 @@ impl ResidentVbCache {
             })
     }
 
-    fn alloc(&mut self, chunk_count: u32, used: &HashSet<ResidentSlabUse>) -> Option<u64> {
+    fn alloc(&mut self, chunk_count: u32, used: &nexium_common::fast_hash::FastSet<ResidentSlabUse>) -> Option<u64> {
         let bytes = u64::from(chunk_count).checked_mul(crate::draw::RESIDENT_CHUNK_SIZE as u64)?;
         if let Some(offset) = self.free.take(bytes) {
             return Some(offset);
@@ -835,7 +932,7 @@ impl ResidentVbCache {
     fn resolve(
         &mut self,
         range: &crate::draw::ResidentVertexRange,
-        used: &mut HashSet<ResidentSlabUse>,
+        used: &mut nexium_common::fast_hash::FastSet<ResidentSlabUse>,
     ) -> Option<(vk::Buffer, u64)> {
         if !range.has_exact_coverage() {
             return None;
@@ -872,7 +969,7 @@ impl ResidentVbCache {
     fn resolve_chunks(
         &mut self,
         chunks: &[crate::draw::ResidentVertexChunk],
-        used: &mut HashSet<ResidentSlabUse>,
+        used: &mut nexium_common::fast_hash::FastSet<ResidentSlabUse>,
     ) -> Option<(vk::Buffer, u64, ResidentResolveKind)> {
         self.last_fail = RESIDENT_FAIL_OTHER;
         let count = u32::try_from(chunks.len()).ok()?;
@@ -901,10 +998,12 @@ impl ResidentVbCache {
         });
         if let Some(index) = exact_index {
             let slab = self.slabs.get_mut(&key)?.get_mut(index)?;
-            let previous = std::mem::replace(&mut slab.last_used, clock);
             let offset = slab.offset;
             used.insert(ResidentSlabUse::new(key.0, key.1, offset));
-            self.touch(key, offset, previous, clock);
+            if clock.wrapping_sub(slab.last_used) >= resident_vb_touch_interval() {
+                let previous = std::mem::replace(&mut slab.last_used, clock);
+                self.touch(key, offset, previous, clock);
+            }
             return Some((self.buffer, offset, ResidentResolveKind::Hit));
         }
         let reusable_index = self.slabs.get(&key).and_then(|versions| {
@@ -996,6 +1095,7 @@ impl ResidentVbCache {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
         }
+        crate::memory_select::release_stream_rebar_bytes(self.rebar_bytes);
         self.mapped = std::ptr::null_mut();
     }
 }
@@ -1005,22 +1105,24 @@ fn create_resident_vb_cache(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
 ) -> Result<ResidentVbCache, String> {
     let size = resident_vb_bytes();
-    let buffer = create_persistent_upload_buffer_sized(
+    let (buffer, rebar_bytes) = create_stream_upload_buffer_sized(
         device,
         mem_props,
         size,
         vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::TRANSFER_DST,
+        "resident vertex cache",
     )?;
     Ok(ResidentVbCache {
         buffer: buffer.buffer,
         memory: buffer.memory,
         mapped: buffer.mapped,
+        rebar_bytes,
         size,
         head: 0,
         free: ResidentFreeList::default(),
-        slabs: HashMap::new(),
+        slabs: Default::default(),
         lru: BTreeSet::new(),
         slot_uses: Vec::new(),
         clock: 0,
@@ -1198,11 +1300,41 @@ fn resident_cbuf_draw_layout_is_valid(
     true
 }
 
+fn resident_cbuf_sparse_fill_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_RESIDENT_CBUF_SPARSE_FILL").map_or(true, |value| value != "0")
+    })
+}
+
+fn zero_resident_cbuf_gaps(dst: &mut [u8], covered: &mut [(usize, usize)]) {
+    covered.sort_unstable();
+    let mut cursor = (nexium_spirv::GFX_CBUF_MIN_SIZE as usize).min(dst.len());
+    for &(start, end) in covered.iter() {
+        let start = start.min(dst.len());
+        if start > cursor {
+            dst[cursor..start].fill(0);
+        }
+        cursor = cursor.max(end.min(dst.len()));
+    }
+    if cursor < dst.len() {
+        dst[cursor..].fill(0);
+    }
+}
+
 fn write_resident_cbuf_payload(draw: &crate::draw::ResidentCbufDraw, dst: &mut [u8]) -> bool {
     if !resident_cbuf_draw_is_valid(draw, dst.len()) {
         return false;
     }
-    dst.fill(0);
+    let sparse = resident_cbuf_sparse_fill_enabled();
+    let mut covered = [(0usize, 0usize); nexium_spirv::GFX_CBUF_SLOTS as usize];
+    let mut covered_count = 0usize;
+    if sparse {
+        let directory_len = (nexium_spirv::GFX_CBUF_MIN_SIZE as usize).min(dst.len());
+        dst[..directory_len].fill(0);
+    } else {
+        dst.fill(0);
+    }
     for logical_slot in 0..nexium_spirv::GFX_CBUF_SLOTS as usize {
         let directory = logical_slot * 8;
         dst[directory..directory + 4]
@@ -1227,6 +1359,10 @@ fn write_resident_cbuf_payload(draw: &crate::draw::ResidentCbufDraw, dst: &mut [
                 dst[output_offset..output_end].copy_from_slice(&source[byte_offset..source_end]);
                 output_offset = output_end;
             }
+            if sparse && covered_count < covered.len() {
+                covered[covered_count] = (packed_offset, output_offset);
+                covered_count += 1;
+            }
         }
     } else {
         for slot in &draw.slots {
@@ -1240,7 +1376,14 @@ fn write_resident_cbuf_payload(draw: &crate::draw::ResidentCbufDraw, dst: &mut [
             let source = &draw.chunks[usize::from(slot.chunk_index)].data;
             dst[packed_offset..packed_offset + byte_len]
                 .copy_from_slice(&source[byte_offset..byte_offset + byte_len]);
+            if sparse && covered_count < covered.len() {
+                covered[covered_count] = (packed_offset, packed_offset + byte_len);
+                covered_count += 1;
+            }
         }
+    }
+    if sparse {
+        zero_resident_cbuf_gaps(dst, &mut covered[..covered_count]);
     }
     true
 }
@@ -1333,11 +1476,11 @@ fn build_shared_ssbo_plan<'a>(
     draw_snapshots: impl IntoIterator<Item = &'a [crate::draw::StorageBufferSnapshot]>,
 ) -> SharedSsboPlan {
     let mut groups: Vec<SharedSsboGroupPlan> = Vec::new();
-    let mut current_groups = HashMap::<SharedSsboKey, usize>::new();
+    let mut current_groups = HashMap::<SharedSsboKey, usize>::default();
     let mut draw_groups = Vec::new();
 
     for snapshots in draw_snapshots {
-        let mut assignments = HashMap::new();
+        let mut assignments = HashMap::default();
         for snapshot in snapshots {
             let Some(key) = shared_aurora_ssbo_key(snapshot) else {
                 continue;
@@ -1568,6 +1711,7 @@ struct RendererInner {
     sampler_anisotropy_supported: bool,
     submit_timeline: vk::Semaphore,
     submit_state: Arc<SubmitState>,
+    gpu_timestamps: Option<crate::gpu_timestamps::GpuTimestamps>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2619,6 +2763,109 @@ impl GraphicsDummyViews {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DummyViewSignature {
+    vs_tex_base: u32,
+    vs_tex_count: u32,
+    fs_sampler_arrayed: bool,
+    vs_sampler_arrayed: bool,
+    depth_compare_2d_mask: u32,
+    depth_compare_cube_mask: u32,
+    depth_compare_cube_array_mask: u32,
+}
+
+struct DummyViewSet {
+    signature: DummyViewSignature,
+    manifest: Vec<TextureNumericBinding>,
+    numeric_types: [nexium_spirv::TextureNumericType; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    views_2d: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    views_cube: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    views_cube_array: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_2d: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_3d: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_cube: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_cube_array: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    texel: [vk::BufferView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+}
+
+impl DummyViewSet {
+    fn signature(call: &crate::draw::Maxwell3dDrawCall) -> DummyViewSignature {
+        DummyViewSignature {
+            vs_tex_base: call.vs_tex_base,
+            vs_tex_count: call.vs_tex_count,
+            fs_sampler_arrayed: call.fs_sampler_arrayed,
+            vs_sampler_arrayed: call.vs_sampler_arrayed,
+            depth_compare_2d_mask: call.depth_compare_2d_mask,
+            depth_compare_cube_mask: call.depth_compare_cube_mask,
+            depth_compare_cube_array_mask: call.depth_compare_cube_array_mask,
+        }
+    }
+
+    fn build(
+        call: &crate::draw::Maxwell3dDrawCall,
+        dummies: &GraphicsDummyViews,
+        signature: DummyViewSignature,
+    ) -> Self {
+        let mut numeric_types =
+            [nexium_spirv::TextureNumericType::Float; MAX_TEXTURE_DESCRIPTOR_COUNT];
+        for binding in &call.texture_numeric_manifest {
+            if let Some(numeric_type) = numeric_types.get_mut(binding.descriptor_slot as usize) {
+                *numeric_type = binding.spirv_type();
+            }
+        }
+        let families = numeric_types.map(texture_numeric_index);
+        let views_2d: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+            std::array::from_fn(|slot| dummies.image_2d_for_slot(call, slot));
+        let views_cube: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+            std::array::from_fn(|slot| dummies.image_cube_for_slot(call, slot));
+        let views_cube_array: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+            std::array::from_fn(|slot| dummies.image_cube_array_for_slot(call, slot));
+        Self {
+            signature,
+            manifest: call.texture_numeric_manifest.clone(),
+            numeric_types,
+            bound_2d: std::array::from_fn(|slot| views_2d[slot][families[slot]]),
+            bound_3d: std::array::from_fn(|slot| dummies.image_3d[families[slot]]),
+            bound_cube: std::array::from_fn(|slot| views_cube[slot][families[slot]]),
+            bound_cube_array: std::array::from_fn(|slot| views_cube_array[slot][families[slot]]),
+            texel: std::array::from_fn(|slot| dummies.texel_buffer[families[slot]]),
+            views_2d,
+            views_cube,
+            views_cube_array,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DummyViewMemo {
+    set: Option<DummyViewSet>,
+}
+
+fn dummy_view_memo_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_DUMMY_VIEW_MEMO").map_or(true, |value| value != "0")
+    })
+}
+
+impl DummyViewMemo {
+    fn resolve(
+        &mut self,
+        call: &crate::draw::Maxwell3dDrawCall,
+        dummies: &GraphicsDummyViews,
+    ) -> &DummyViewSet {
+        let signature = DummyViewSet::signature(call);
+        let hit = dummy_view_memo_enabled()
+            && self.set.as_ref().is_some_and(|set| {
+                set.signature == signature && set.manifest == call.texture_numeric_manifest
+            });
+        if !hit {
+            self.set = Some(DummyViewSet::build(call, dummies, signature));
+        }
+        self.set.as_ref().unwrap()
+    }
+}
+
 fn typed_sampled_image_infos(
     selected_views: &[vk::ImageView],
     selected_layouts: Option<&[vk::ImageLayout]>,
@@ -3199,7 +3446,7 @@ fn trace_gpu_memory(
             .map(|(key, stamp)| format!("{}#{stamp}", key.label()))
             .collect::<Vec<_>>()
             .join(" ");
-        let mut depth_dims: HashMap<(u32, u32), usize> = HashMap::new();
+        let mut depth_dims: HashMap<(u32, u32), usize> = HashMap::default();
         for (key, _, _, _, _) in rt_cache.debug_depth_all() {
             *depth_dims.entry((key.width, key.height)).or_insert(0) += 1;
         }
@@ -3826,13 +4073,23 @@ fn destroy_retired_rt_images(device: &ash::Device, images: &mut Vec<GpuImage>) {
     }
 }
 
+fn frame_slot_upload_pool_max_bytes() -> u64 {
+    (FRAME_SLOT_UPLOAD_POOL_MAX_BYTES * 2 / graphics_frame_slot_count() as u64)
+        .max(TEXTURE_UPLOAD_ARENA_BYTES)
+}
+
+fn texture_upload_arena_retain_bytes() -> u64 {
+    (TEXTURE_UPLOAD_ARENA_RETAIN_BYTES * 2 / graphics_frame_slot_count() as u64)
+        .max(TEXTURE_UPLOAD_ARENA_BYTES)
+}
+
 fn recycle_slot_upload_buffers(device: &ash::Device, slot: &mut FrameSlot) {
     // Keep the first few arena chunks for the next use of this slot; any chunk
     // past the budget was only needed for an unusually heavy frame.
     let mut kept = 0u64;
     let mut arenas = Vec::with_capacity(slot.texture_upload_arenas.len());
     for mut arena in slot.texture_upload_arenas.drain(..) {
-        if kept.saturating_add(arena.buffer.size) <= TEXTURE_UPLOAD_ARENA_RETAIN_BYTES {
+        if kept.saturating_add(arena.buffer.size) <= texture_upload_arena_retain_bytes() {
             kept = kept.saturating_add(arena.buffer.size);
             arena.head = 0;
             arenas.push(arena);
@@ -3854,7 +4111,7 @@ fn recycle_slot_upload_buffers(device: &ash::Device, slot: &mut FrameSlot) {
     let mut retained_bytes = 0u64;
     let mut retained = Vec::with_capacity(slot.free_upload_buffers.len());
     for buffer in slot.free_upload_buffers.drain(..) {
-        if retained_bytes.saturating_add(buffer.size) <= FRAME_SLOT_UPLOAD_POOL_MAX_BYTES {
+        if retained_bytes.saturating_add(buffer.size) <= frame_slot_upload_pool_max_bytes() {
             retained_bytes = retained_bytes.saturating_add(buffer.size);
             retained.push(buffer);
         } else {
@@ -4742,8 +4999,8 @@ struct PendingComputeTexel {
     byte_len: usize,
 }
 
-const COMPUTE_RAW_STORAGE_CACHE_MAX_ITEMS: usize = 512;
-const COMPUTE_RAW_STORAGE_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const COMPUTE_RAW_STORAGE_CACHE_MAX_ITEMS: usize = 1024;
+const COMPUTE_RAW_STORAGE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 struct CachedComputeRawStorage {
     resource: crate::compute::ComputeBufferResource,
@@ -5159,10 +5416,23 @@ fn adopt_graphics_storage_for_compute(
         }
         return;
     }
-    let retained_bytes = inner
+    let mut retained_bytes = inner
         .compute_raw_storage_cache
         .keys()
         .fold(0u64, |total, existing| total.saturating_add(existing.size));
+    if compute_raw_storage_evict_on_full_enabled()
+        && !compute_raw_storage_cache_can_admit(
+            inner.compute_raw_storage_cache.len(),
+            retained_bytes,
+            key.size,
+        )
+    {
+        release_unreferenced_compute_raw_storage(inner);
+        retained_bytes = inner
+            .compute_raw_storage_cache
+            .keys()
+            .fold(0u64, |total, existing| total.saturating_add(existing.size));
+    }
     let adoptable = graphics_key == key
         && !inner.compute_raw_storage_cache.contains_key(&key)
         && inner
@@ -5273,7 +5543,8 @@ struct UboRing {
     mapped: *mut u8,
     size: u64,
     head: u64,
-    slot_head: Vec<u64>,
+    slot_span: Vec<Option<(u64, u64)>>,
+    rebar_bytes: u64,
 }
 
 struct GraphicsStorageReadbackCompletion {
@@ -5975,8 +6246,7 @@ impl Renderer {
         let reinterpret_drained: Vec<_> =
             inner.rt_reinterpret_cache.drain().map(|(_, t)| t).collect();
         let cleared = drained.len() + texel_drained.len() + reinterpret_drained.len();
-        let retire_idx = (inner.frame_index + 1) % inner.frame_slots.len();
-        if inner.frame_slots[retire_idx].in_flight {
+        if let Some(retire_idx) = newest_in_flight_frame_slot(&inner.frame_slots) {
             inner.frame_slots[retire_idx]
                 .retired_textures
                 .extend(drained);
@@ -6057,8 +6327,7 @@ impl Renderer {
                 Some(texture)
             })
             .collect();
-        let retire_idx = (inner.frame_index + 1) % inner.frame_slots.len();
-        if inner.frame_slots[retire_idx].in_flight {
+        if let Some(retire_idx) = newest_in_flight_frame_slot(&inner.frame_slots) {
             inner.frame_slots[retire_idx]
                 .retired_textures
                 .extend(drained);
@@ -6087,6 +6356,15 @@ impl Renderer {
             .lock()
             .rt_cache
             .mark_guest_written_range(cpu_addr, size, gpu_ranges);
+    }
+
+    pub fn invalidate_render_target_ranges(&self, spans: &[(u64, u64, u64)]) {
+        let mut inner = self.inner.lock();
+        for &(cpu_addr, gpu_va, size) in spans {
+            inner
+                .rt_cache
+                .mark_guest_written_range(cpu_addr, size, &[(gpu_va, size)]);
+        }
     }
 
     pub fn apply_render_target_mapping_update(
@@ -6794,6 +7072,10 @@ impl Renderer {
         };
         let min_storage_buffer_offset_alignment =
             props.limits.min_storage_buffer_offset_alignment.max(1);
+        STORAGE_OFFSET_ALIGNMENT.store(
+            min_storage_buffer_offset_alignment,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let max_storage_buffer_range = u64::from(props.limits.max_storage_buffer_range);
         let max_texel_buffer_elements = props.limits.max_texel_buffer_elements;
         let can_pin_guest_warp = subgroup_size_control_supported
@@ -6891,6 +7173,11 @@ impl Renderer {
             );
         }
 
+        let gpu_timestamps = crate::gpu_timestamps::GpuTimestamps::new(
+            &device,
+            qf[queue_family as usize].timestamp_valid_bits,
+            props.limits.timestamp_period,
+        );
         let frame_slot_count = graphics_frame_slot_count();
         let cb_alloc = vk::CommandBufferAllocateInfo {
             s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
@@ -7140,17 +7427,17 @@ impl Renderer {
                 mem_props,
                 cmd_pool,
                 rt_cache,
-                fermi_exact_rt_snapshot_leases: HashMap::new(),
-                fermi_exact_rt_snapshot_ids: HashMap::new(),
+                fermi_exact_rt_snapshot_leases: HashMap::default(),
+                fermi_exact_rt_snapshot_ids: HashMap::default(),
                 next_fermi_exact_rt_snapshot_id: 1,
-                staging: HashMap::new(),
+                staging: HashMap::default(),
                 descriptor_layout,
                 descriptor_pool,
                 shader_compiler,
                 pipeline_cache,
                 compute_backend,
                 compute_unavailable_reason,
-                dummy_images: HashMap::new(),
+                dummy_images: HashMap::default(),
                 dummy_texel_buffers: [None, None, None],
                 default_sampler: None,
                 sampler_cache: nexium_common::fast_hash::FastMap::default(),
@@ -7158,18 +7445,18 @@ impl Renderer {
                 tex_cache: nexium_common::fast_hash::FastMap::default(),
                 tex_cache_bytes: 0,
                 tex_cache_ranges: TextureRangeIndex::default(),
-                texel_buffer_cache: HashMap::new(),
-                rt_reinterpret_cache: HashMap::new(),
+                texel_buffer_cache: HashMap::default(),
+                rt_reinterpret_cache: HashMap::default(),
                 compute_volume_cache: Vec::new(),
                 compute_guest_image_pool: VecDeque::new(),
-                compute_raw_storage_cache: HashMap::new(),
+                compute_raw_storage_cache: HashMap::default(),
                 raw_storage_resident,
-                compute_overlay_sources: HashMap::new(),
+                compute_overlay_sources: HashMap::default(),
                 astc_pipeline: None,
                 astc_pipeline_failed: false,
                 astc_async: AstcAsyncDecodes::default(),
                 parked_compute_buffers: Vec::new(),
-                graphics_storage: HashMap::new(),
+                graphics_storage: HashMap::default(),
                 retired_graphics_storage: Vec::new(),
                 graphics_storage_batch: 0,
                 upload_content_cache: UploadContentCache::default(),
@@ -7186,13 +7473,13 @@ impl Renderer {
                 ubo_ring,
                 aurora_resident_ssbos,
                 resident_vb,
-                compute_guest_content_memo: HashMap::new(),
+                compute_guest_content_memo: HashMap::default(),
                 min_storage_buffer_offset_alignment,
                 max_storage_buffer_range,
                 max_texel_buffer_elements,
-                pending_readbacks: HashMap::new(),
-                pending_readback_order: HashMap::new(),
-                completed_readback_backlogs: HashMap::new(),
+                pending_readbacks: HashMap::default(),
+                pending_readback_order: HashMap::default(),
+                completed_readback_backlogs: HashMap::default(),
                 next_readback_sequence: 1,
                 readback_slots,
                 sync_readback_slot,
@@ -7208,6 +7495,7 @@ impl Renderer {
                 sampler_anisotropy_supported,
                 submit_timeline,
                 submit_state: Arc::clone(&submit_state),
+                gpu_timestamps,
             }),
             device: device_handle,
             submit_timeline,
@@ -9593,7 +9881,9 @@ impl Renderer {
             } {
                 Ok(()) => {
                     sync_readback_slot.in_flight = false;
-                    submit_state.note_queue_drained();
+                    if !readback_idle_fix_enabled() {
+                        submit_state.note_queue_drained();
+                    }
                 }
                 Err(error) => {
                     log::warn!(
@@ -11114,64 +11404,19 @@ impl Renderer {
         {
             let slot = &mut frame_slots[cur_idx];
             if slot.in_flight {
-                if !frame_slot_submission_complete(device, *submit_timeline, slot.submit_generation)
-                {
+                if !frame_slot_retired(device, *submit_timeline, slot.submit_generation, slot.fence) {
                     wait_fence(device, slot.fence)?;
                     *tele_ring_waits += 1;
                 }
-                if !slot.retired_dsets.is_empty() {
-                    unsafe {
-                        let _ =
-                            device.free_descriptor_sets(descriptor_pool.pool, &slot.retired_dsets);
-                    }
-                    slot.retired_dsets.clear();
-                }
-                recycle_descriptor_pools(
-                    device,
-                    &mut slot.retired_dset_pools,
-                    &mut slot.available_dset_pools,
-                );
-                release_fermi_exact_rt_snapshot_lease_refs(
+                recycle_frame_slot(
                     device,
                     *submit_timeline,
+                    slot,
+                    descriptor_pool.pool,
                     fermi_exact_rt_snapshot_leases,
                     fermi_exact_rt_snapshot_ids,
-                    &mut slot.fermi_exact_rt_snapshot_leases,
-                );
-                for (b, m) in slot.retired_buffers.drain(..) {
-                    unsafe {
-                        device.destroy_buffer(b, None);
-                        device.free_memory(m, None);
-                    }
-                }
-                recycle_slot_upload_buffers(device, slot);
-                for view in slot.retired_views.drain(..) {
-                    unsafe {
-                        device.destroy_image_view(view, None);
-                    }
-                }
-                for t in slot.retired_textures.drain(..) {
-                    unsafe {
-                        device.destroy_image_view(t.view, None);
-                        device.destroy_image(t.image, None);
-                        device.free_memory(t.memory, None);
-                    }
-                }
-                for buffer in slot.retired_texel_buffers.drain(..) {
-                    destroy_texel_buffer(device, buffer.resource);
-                }
-                destroy_retired_rt_images(device, &mut slot.retired_rt_images);
-                for t in slot.retired_rt_reinterprets.drain(..) {
-                    unsafe {
-                        device.destroy_image_view(t.view, None);
-                        device.destroy_image(t.image, None);
-                        device.free_memory(t.memory, None);
-                    }
-                }
-                reset_command_buffer(device, slot.cmd)?;
-                slot.in_flight = false;
-                slot.submit_generation = 0;
-                ubo_ring.head = ubo_ring.slot_head[cur_idx];
+                )?;
+                ubo_ring.slot_span[cur_idx] = None;
             }
         }
         trim_derived_texture_cache(
@@ -11903,7 +12148,6 @@ impl Renderer {
             device,
             *submit_timeline,
             frame_slots,
-            other_idx,
             descriptor_pool.pool,
             ubo_ring,
             &vertex_bindings,
@@ -11923,7 +12167,6 @@ impl Renderer {
                     device,
                     *submit_timeline,
                     frame_slots,
-                    other_idx,
                     descriptor_pool.pool,
                     ubo_ring,
                     &fallback_bindings,
@@ -11941,7 +12184,6 @@ impl Renderer {
                         device,
                         *submit_timeline,
                         frame_slots,
-                        other_idx,
                         descriptor_pool.pool,
                         ubo_ring,
                         fermi_exact_rt_snapshot_leases,
@@ -11966,7 +12208,6 @@ impl Renderer {
                     device,
                     *submit_timeline,
                     frame_slots,
-                    other_idx,
                     descriptor_pool.pool,
                     ubo_ring,
                     fermi_exact_rt_snapshot_leases,
@@ -11995,47 +12236,15 @@ impl Renderer {
         }
         if ubo_ring.head + cbuf_size_aligned > ubo_ring.size {
             *tele_ring_wraps += 1;
-            let other = &mut frame_slots[other_idx];
-            if other.in_flight {
-                if !frame_slot_submission_complete(
-                    device,
-                    *submit_timeline,
-                    other.submit_generation,
-                ) {
-                    wait_fence(device, other.fence)?;
-                    *tele_ring_waits += 1;
-                }
-                if !other.retired_dsets.is_empty() {
-                    unsafe {
-                        let _ =
-                            device.free_descriptor_sets(descriptor_pool.pool, &other.retired_dsets);
-                    }
-                    other.retired_dsets.clear();
-                }
-                recycle_descriptor_pools(
-                    device,
-                    &mut other.retired_dset_pools,
-                    &mut other.available_dset_pools,
-                );
-                release_fermi_exact_rt_snapshot_lease_refs(
-                    device,
-                    *submit_timeline,
-                    fermi_exact_rt_snapshot_leases,
-                    fermi_exact_rt_snapshot_ids,
-                    &mut other.fermi_exact_rt_snapshot_leases,
-                );
-                recycle_slot_upload_buffers(device, other);
-                for view in other.retired_views.drain(..) {
-                    unsafe {
-                        device.destroy_image_view(view, None);
-                    }
-                }
-                reset_command_buffer(device, other.cmd)?;
-                other.in_flight = false;
-                other.submit_generation = 0;
-            }
-            ubo_ring.head = 0;
-            ubo_ring.slot_head[other_idx] = 0;
+            ring_wrap_other(
+                device,
+                *submit_timeline,
+                frame_slots,
+                descriptor_pool.pool,
+                ubo_ring,
+                fermi_exact_rt_snapshot_leases,
+                fermi_exact_rt_snapshot_ids,
+            )?;
         }
         let (ubo_buffer, ubo_offset, ubo_ptr) =
             ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
@@ -12124,7 +12333,6 @@ impl Renderer {
                     device,
                     *submit_timeline,
                     frame_slots,
-                    other_idx,
                     descriptor_pool.pool,
                     ubo_ring,
                     fermi_exact_rt_snapshot_leases,
@@ -12154,7 +12362,6 @@ impl Renderer {
                     device,
                     *submit_timeline,
                     frame_slots,
-                    other_idx,
                     descriptor_pool.pool,
                     ubo_ring,
                     fermi_exact_rt_snapshot_leases,
@@ -12645,7 +12852,7 @@ impl Renderer {
         }
 
         let next_idx = other_idx;
-        ubo_ring.slot_head[next_idx] = ubo_ring.head;
+        ubo_ring.slot_span[cur_idx] = Some((0, ubo_ring.head));
         *frame_index = next_idx;
         pipeline_cache.maybe_save(device);
 
@@ -12658,9 +12865,9 @@ impl Renderer {
         let now_ns = monotonic_nanos();
         if now_ns.saturating_sub(*tele_last_emit_ns) >= 1_000_000_000 {
             log::info!(
-                "[ring] head={} slot_head={:?} wraps={} waits={} in_flight=0b{:04b}",
+                "[ring] head={} slot_span={:?} wraps={} waits={} in_flight=0b{:04b}",
                 ubo_ring.head,
-                ubo_ring.slot_head,
+                ubo_ring.slot_span,
                 *tele_ring_wraps,
                 *tele_ring_waits,
                 *tele_in_flight_mask,
@@ -12705,9 +12912,11 @@ impl Renderer {
     {
         let groups = [calls];
         let clear_groups = [&[][..]];
+        let rt_invalidations = [&[][..]];
         self.execute_draw_groups_with_clears_and_texture_generations_and_fermi_exact_rt_snapshot_leases_impl(
             &groups,
             &clear_groups,
+            &rt_invalidations,
             |_, gpu_va, len| read_guest(gpu_va, len).map(SharedGuestSnapshot::from_vec),
             |_, gpu_va, len| texture_generation(gpu_va, len),
             &[],
@@ -12747,9 +12956,11 @@ impl Renderer {
         G: Fn(usize, u64, usize) -> u64,
     {
         let clear_groups = vec![&[][..]; groups.len()];
+        let rt_invalidations = vec![&[][..]; groups.len()];
         self.execute_draw_groups_with_clears_and_texture_generations_and_fermi_exact_rt_snapshot_leases(
             groups,
             &clear_groups,
+            &rt_invalidations,
             read_guest,
             texture_generation,
             fermi_exact_rt_snapshot_lease_ids,
@@ -12763,6 +12974,7 @@ impl Renderer {
         &self,
         groups: &[&[crate::draw::Maxwell3dDrawCall]],
         clear_groups: &[&[GraphicsClearOp]],
+        rt_invalidations: &[&[(u64, u64, u64)]],
         read_guest: F,
         texture_generation: G,
         fermi_exact_rt_snapshot_lease_ids: &[u64],
@@ -12774,6 +12986,7 @@ impl Renderer {
         self.execute_draw_groups_with_clears_and_texture_generations_and_fermi_exact_rt_snapshot_leases_impl(
             groups,
             clear_groups,
+            rt_invalidations,
             read_guest,
             texture_generation,
             fermi_exact_rt_snapshot_lease_ids,
@@ -12788,6 +13001,7 @@ impl Renderer {
         &self,
         groups: &[&[crate::draw::Maxwell3dDrawCall]],
         clear_groups: &[&[GraphicsClearOp]],
+        rt_invalidations: &[&[(u64, u64, u64)]],
         read_guest: F,
         texture_generation: G,
         fermi_exact_rt_snapshot_lease_ids: &[u64],
@@ -12816,6 +13030,13 @@ impl Renderer {
                 "graphics draw/clear group count mismatch: {} draws, {} clears",
                 groups.len(),
                 clear_groups.len()
+            ));
+        }
+        if groups.len() != rt_invalidations.len() {
+            return Err(format!(
+                "graphics draw/invalidation group count mismatch: {} draws, {} invalidations",
+                groups.len(),
+                rt_invalidations.len()
             ));
         }
         if groups.iter().all(|calls| calls.is_empty())
@@ -13182,6 +13403,7 @@ impl Renderer {
             retired_graphics_storage,
             graphics_storage_batch,
             upload_content_cache,
+            gpu_timestamps,
             ..
         } = &mut *inner;
 
@@ -13195,6 +13417,9 @@ impl Renderer {
         } else {
             unsafe { device.get_semaphore_counter_value(*submit_timeline) }.unwrap_or(0)
         };
+        if let Some(timestamps) = gpu_timestamps.as_mut() {
+            timestamps.poll(device, graphics_storage_completed);
+        }
         reap_retired_graphics_storage(device, retired_graphics_storage, graphics_storage_completed);
         let mut graphics_storage_pass = GraphicsStorageBatch::default();
 
@@ -13202,93 +13427,75 @@ impl Renderer {
         let mut rp_fence_wait = std::time::Duration::ZERO;
         {
             let slot = &mut frame_slots[cur_idx];
+            if !slot.in_flight && frame_slot_retire_fix_enabled() {
+                reset_command_buffer(device, slot.cmd)?;
+            }
             if slot.in_flight {
                 let wait_t0 = std::time::Instant::now();
-                if !frame_slot_submission_complete(device, *submit_timeline, slot.submit_generation)
-                {
+                if !frame_slot_retired(device, *submit_timeline, slot.submit_generation, slot.fence) {
                     wait_fence(device, slot.fence)?;
                 }
                 rp_fence_wait = wait_t0.elapsed();
-                if !slot.retired_dsets.is_empty() {
-                    unsafe {
-                        let _ =
-                            device.free_descriptor_sets(descriptor_pool.pool, &slot.retired_dsets);
-                    }
-                    slot.retired_dsets.clear();
-                }
-                recycle_descriptor_pools(
-                    device,
-                    &mut slot.retired_dset_pools,
-                    &mut slot.available_dset_pools,
-                );
-                release_fermi_exact_rt_snapshot_lease_refs(
+                recycle_frame_slot(
                     device,
                     *submit_timeline,
+                    slot,
+                    descriptor_pool.pool,
                     fermi_exact_rt_snapshot_leases,
                     fermi_exact_rt_snapshot_ids,
-                    &mut slot.fermi_exact_rt_snapshot_leases,
-                );
-                for (b, m) in slot.retired_buffers.drain(..) {
-                    unsafe {
-                        device.destroy_buffer(b, None);
-                        device.free_memory(m, None);
-                    }
-                }
-                recycle_slot_upload_buffers(device, slot);
-                for view in slot.retired_views.drain(..) {
-                    unsafe {
-                        device.destroy_image_view(view, None);
-                    }
-                }
-                for t in slot.retired_textures.drain(..) {
-                    unsafe {
-                        device.destroy_image_view(t.view, None);
-                        device.destroy_image(t.image, None);
-                        device.free_memory(t.memory, None);
-                    }
-                }
-                for buffer in slot.retired_texel_buffers.drain(..) {
-                    destroy_texel_buffer(device, buffer.resource);
-                }
-                destroy_retired_rt_images(device, &mut slot.retired_rt_images);
-                for t in slot.retired_rt_reinterprets.drain(..) {
-                    unsafe {
-                        device.destroy_image_view(t.view, None);
-                        device.destroy_image(t.image, None);
-                        device.free_memory(t.memory, None);
-                    }
-                }
-                reset_command_buffer(device, slot.cmd)?;
-                slot.in_flight = false;
-                slot.submit_generation = 0;
-                ubo_ring.head = ubo_ring.slot_head[cur_idx];
+                )?;
+                ubo_ring.slot_span[cur_idx] = None;
+            }
+        }
+        let mut recycled_slots = 0u16;
+        for index in 0..frame_slots.len() {
+            if index == cur_idx {
+                continue;
+            }
+            let slot = &mut frame_slots[index];
+            if slot.in_flight
+                && slot.submit_generation <= graphics_storage_completed
+                && (!frame_slot_retire_fix_enabled()
+                    || unsafe { device.get_fence_status(slot.fence) } == Ok(true))
+            {
+                recycle_frame_slot(
+                    device,
+                    *submit_timeline,
+                    slot,
+                    descriptor_pool.pool,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
+                )?;
+                ubo_ring.slot_span[index] = None;
+                recycled_slots |= 1 << index;
             }
         }
         trim_derived_texture_cache(
             tex_cache, tex_cache_ranges, tex_cache_bytes,
             &mut frame_slots[cur_idx].retired_textures,
         );
-        let rt_retirement = if !rt_cache.has_pending_view_retirement()
-            || rt_texture_options().no_alias_sync || rt_texture_options().no_region_sync
-        {
-            (0, 0)
-        } else {
-            let protected = protected_render_target_keys(
+        let view_retirement_due = rt_cache.has_pending_view_retirement()
+            && !rt_texture_options().no_alias_sync
+            && !rt_texture_options().no_region_sync;
+        let protected = (view_retirement_due || rt_cache.over_budget()).then(|| {
+            protected_render_target_keys(
                 group_preps.iter().flat_map(|(_, preps)| preps.iter().map(|(call, _)| *call)),
                 clear_groups.iter().flat_map(|clears| clears.iter()),
-            );
-            rt_cache.retire_redundant_views(&mut frame_slots[cur_idx].retired_rt_images, &protected)
+            )
+        });
+        let rt_retirement = match protected.as_ref().filter(|_| view_retirement_due) {
+            Some(protected) => {
+                rt_cache.retire_redundant_views(&mut frame_slots[cur_idx].retired_rt_images, protected)
+            }
+            None => (0, 0),
         };
-        let rt_retirement = if rt_cache.over_budget() {
-            let protected = protected_render_target_keys(
-                group_preps.iter().flat_map(|(_, preps)| preps.iter().map(|(call, _)| *call)),
-                clear_groups.iter().flat_map(|clears| clears.iter()),
-            );
-            let evicted =
-                rt_cache.retire_over_budget(&mut frame_slots[cur_idx].retired_rt_images, &protected);
-            (rt_retirement.0 + evicted.0, rt_retirement.1.saturating_add(evicted.1))
-        } else {
-            rt_retirement
+        let rt_retirement = match protected.as_ref().filter(|_| rt_cache.over_budget()) {
+            Some(protected) => {
+                let evicted =
+                    rt_cache.retire_over_budget(&mut frame_slots[cur_idx].retired_rt_images, protected);
+                (rt_retirement.0 + evicted.0, rt_retirement.1.saturating_add(evicted.1))
+            }
+            None => rt_retirement,
         };
         trace_gpu_memory(rt_cache, tex_cache.len(), *tex_cache_bytes, frame_slots, rt_retirement);
         crate::gpu_health::log_memory_budget_periodically(monotonic_nanos());
@@ -13298,6 +13505,16 @@ impl Renderer {
         }
         if let Some(cache) = resident_vb.as_mut() {
             cache.complete_frame_slot(cur_idx);
+        }
+        for index in 0..frame_slots.len() {
+            if recycled_slots & (1 << index) != 0 {
+                if let Some(cache) = aurora_resident_ssbos.as_mut() {
+                    cache.complete_frame_slot(index);
+                }
+                if let Some(cache) = resident_vb.as_mut() {
+                    cache.complete_frame_slot(index);
+                }
+            }
         }
         let rp_fence = rp_t2.elapsed();
         if cbuf_alignment > MAX_STORAGE_BUFFER_OFFSET_ALIGNMENT {
@@ -13323,7 +13540,8 @@ impl Renderer {
         let shared_plan_elapsed = shared_plan_t0.elapsed();
         let shared_upload_t0 = std::time::Instant::now();
         let mut resident_slots_used = Vec::new();
-        let mut resident_vb_used: HashSet<ResidentSlabUse> = HashSet::new();
+        let mut resident_vb_used: nexium_common::fast_hash::FastSet<ResidentSlabUse> =
+            Default::default();
         let mut shared_ssbo_infos = shared_ssbo_plans
             .iter()
             .map(|plan| vec![None; plan.groups.len()])
@@ -13362,24 +13580,31 @@ impl Renderer {
                 batch_ring_upper, ubo_ring.size
             ));
         }
-        if ubo_ring.head.saturating_add(batch_ring_upper) > ubo_ring.size {
-            ring_wrap_other(
-                device,
-                *submit_timeline,
-                frame_slots,
-                other_idx,
-                descriptor_pool.pool,
-                ubo_ring,
-                fermi_exact_rt_snapshot_leases,
-                fermi_exact_rt_snapshot_ids,
-            )?;
-            if let Some(cache) = aurora_resident_ssbos.as_mut() {
-                cache.complete_frame_slot(other_idx);
-            }
-            if let Some(cache) = resident_vb.as_mut() {
-                cache.complete_frame_slot(other_idx);
+        let ring_wrapped = ubo_ring.head.saturating_add(batch_ring_upper) > ubo_ring.size;
+        let ring_wrap_started = ring_telemetry_enabled().then(std::time::Instant::now);
+        let reserved_slots = reserve_ring_span(
+            device,
+            *submit_timeline,
+            frame_slots,
+            cur_idx,
+            descriptor_pool.pool,
+            ubo_ring,
+            batch_ring_upper,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
+        )?;
+        for index in 0..frame_slots.len() {
+            if reserved_slots & (1 << index) != 0 {
+                if let Some(cache) = aurora_resident_ssbos.as_mut() {
+                    cache.complete_frame_slot(index);
+                }
+                if let Some(cache) = resident_vb.as_mut() {
+                    cache.complete_frame_slot(index);
+                }
             }
         }
+        let ring_wrap_elapsed = ring_wrap_started.map(|started| started.elapsed());
+        let ring_batch_start = ubo_ring.head;
         for (prepared_group_index, plan) in shared_ssbo_plans.iter().enumerate() {
             for (plan_group_index, group) in plan.groups.iter().enumerate() {
                 if shared_ssbo_infos[prepared_group_index][plan_group_index].is_some() {
@@ -13492,6 +13717,9 @@ impl Renderer {
                 .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(batch): {:?}", e))?;
         }
+        let timestamp_pair = gpu_timestamps
+            .as_mut()
+            .and_then(|timestamps| timestamps.begin(device, cmd));
         apply_async_astc_uploads(
             device,
             cmd,
@@ -13515,9 +13743,9 @@ impl Renderer {
         let mut descriptor_ssbo_bindings =
             Vec::<u32>::with_capacity(crate::descriptor::MAX_SSBO as usize);
         let mut readonly_ssbo_uploads =
-            HashMap::<ReadonlySsboUploadKey, vk::DescriptorBufferInfo>::new();
+            HashMap::<ReadonlySsboUploadKey, vk::DescriptorBufferInfo>::default();
         let mut storage_readback_ranges = Vec::<(usize, u32, u64, usize)>::new();
-        let mut shared_writer_uploads = HashMap::<(u64, usize), vk::DescriptorBufferInfo>::new();
+        let mut shared_writer_uploads = HashMap::<(u64, usize), vk::DescriptorBufferInfo>::default();
         let mut storage_readback_staging_ranges = Vec::<(u64, usize, u64)>::new();
         let mut storage_readback_staging_mapped: *mut u8 = std::ptr::null_mut();
         let mut descriptor_writes = Vec::with_capacity(17 + crate::descriptor::MAX_SSBO as usize);
@@ -13543,6 +13771,11 @@ impl Renderer {
                     )?;
                     recorded_graphics_state = RecordedGraphicsState::default();
                     hot_generic_texture_bindings.fill(None);
+                    color_sync_checked.clear();
+                }
+                if next_clear_group < group_index
+                    && apply_rt_invalidations(rt_cache, rt_invalidations[next_clear_group])
+                {
                     color_sync_checked.clear();
                 }
                 next_clear_group += 1;
@@ -13654,16 +13887,16 @@ impl Renderer {
             let mut alias_used: Vec<(RtKey, bool)> = Vec::new();
             let mut post_submit_texture_probe: [Option<PostSubmitTextureProbe>; 2] = [None, None];
             let mut tex_raw_cache: HashMap<(u64, usize), Option<SharedGuestSnapshot>> =
-                HashMap::new();
-            let mut tex_raw_hash_cache: HashMap<(u64, usize), u64> = HashMap::new();
+                HashMap::default();
+            let mut tex_raw_hash_cache: HashMap<(u64, usize), u64> = HashMap::default();
             let mut volume_slice_cache: HashMap<
                 (TexCacheKey, usize, Option<RtKey>),
                 Vec<VolumeRtSlice>,
-            > = HashMap::new();
+            > = HashMap::default();
             let mut group_texture_bindings: HashMap<
                 GroupTextureRouteKey,
                 HotGenericTextureBinding,
-            > = HashMap::new();
+            > = HashMap::default();
             let mut pass_open = false;
             let mut pass_depth = false;
             let mut pass_storage_only = false;
@@ -13675,6 +13908,7 @@ impl Renderer {
             let mut had_pass = false;
             let mut group_color_sync_clean = Vec::<(RtKey, vk::Format)>::new();
             let mut recorded_texture_memo_epoch = None;
+            let mut dummy_view_memo = DummyViewMemo::default();
             for (draw_index, (call, prep)) in preps.iter().enumerate() {
                 let call = *call;
                 let storage_readback_key = std::ptr::from_ref(call) as usize;
@@ -13928,45 +14162,20 @@ impl Renderer {
                     }
                 }
 
-                let mut texture_numeric_types =
-                    [nexium_spirv::TextureNumericType::Float; MAX_TEXTURE_DESCRIPTOR_COUNT];
-                for binding in &call.texture_numeric_manifest {
-                    if let Some(numeric_type) =
-                        texture_numeric_types.get_mut(binding.descriptor_slot as usize)
-                    {
-                        *numeric_type = binding.spirv_type();
-                    }
-                }
-                let texture_numeric_families = texture_numeric_types.map(texture_numeric_index);
-                let dummy_views_2d: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    std::array::from_fn(|slot| graphics_dummies.image_2d_for_slot(call, slot));
+                let dummy_set = dummy_view_memo.resolve(call, &graphics_dummies);
+                let texture_numeric_types = dummy_set.numeric_types;
+                let dummy_views_2d: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    &dummy_set.views_2d;
                 let dummy_views_3d = [graphics_dummies.image_3d; MAX_TEXTURE_DESCRIPTOR_COUNT];
-                let dummy_views_cube: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    std::array::from_fn(|slot| graphics_dummies.image_cube_for_slot(call, slot));
-                let dummy_views_cube_array: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    std::array::from_fn(|slot| {
-                        graphics_dummies.image_cube_array_for_slot(call, slot)
-                    });
-                let mut bound_tex_views: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    std::array::from_fn(|slot| {
-                        dummy_views_2d[slot][texture_numeric_families[slot]]
-                    });
-                let mut bound_tex_views_3d: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    std::array::from_fn(|slot| {
-                        dummy_views_3d[slot][texture_numeric_families[slot]]
-                    });
-                let mut bound_tex_views_cube: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    std::array::from_fn(|slot| {
-                        dummy_views_cube[slot][texture_numeric_families[slot]]
-                    });
-                let mut bound_tex_views_cube_array: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    std::array::from_fn(|slot| {
-                        dummy_views_cube_array[slot][texture_numeric_families[slot]]
-                    });
-                let mut bound_texel_views: [vk::BufferView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    std::array::from_fn(|slot| {
-                        graphics_dummies.texel_buffer[texture_numeric_families[slot]]
-                    });
+                let dummy_views_cube: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    &dummy_set.views_cube;
+                let dummy_views_cube_array: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    &dummy_set.views_cube_array;
+                let mut bound_tex_views = dummy_set.bound_2d;
+                let mut bound_tex_views_3d = dummy_set.bound_3d;
+                let mut bound_tex_views_cube = dummy_set.bound_cube;
+                let mut bound_tex_views_cube_array = dummy_set.bound_cube_array;
+                let mut bound_texel_views = dummy_set.texel;
                 let mut stencil_alias_bound = [false; MAX_TEXTURE_DESCRIPTOR_COUNT];
                 let mut bound_tex_layouts =
                     [vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; MAX_TEXTURE_DESCRIPTOR_COUNT];
@@ -15118,7 +15327,7 @@ impl Renderer {
                                     static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> =
                                         OnceLock::new();
                                     let s = SEEN.get_or_init(|| {
-                                        Mutex::new(std::collections::HashSet::new())
+                                        Mutex::new(std::collections::HashSet::default())
                                     });
                                     if s.lock().unwrap().insert(tic.gpu_va) {
                                         if let Some(directory) =
@@ -15605,7 +15814,6 @@ impl Renderer {
                     device,
                     *submit_timeline,
                     frame_slots,
-                    other_idx,
                     descriptor_pool.pool,
                     ubo_ring,
                     &prep.vertex_bindings,
@@ -15645,7 +15853,6 @@ impl Renderer {
                             device,
                             *submit_timeline,
                             frame_slots,
-                            other_idx,
                             descriptor_pool.pool,
                             ubo_ring,
                             &fallback_bindings,
@@ -15726,35 +15933,6 @@ impl Renderer {
                     None
                 };
 
-                let overlay_copies = collect_compute_overlay_copies(
-                    compute_overlay_sources,
-                    &call.resident_vertex,
-                    &vertex_binds,
-                    &aliased_vertex_bindings,
-                );
-                if !overlay_copies.is_empty() {
-                    if pass_open {
-                        unsafe {
-                            device.cmd_end_rendering(cmd);
-                        }
-                        finish_color_pass(
-                            device,
-                            cmd,
-                            rt_cache,
-                            &color_bind,
-                            &mut color_layouts,
-                            pass_rt_layout,
-                            &mut pass_dirty,
-                            &mut color_sync_checked,
-                            &pass_trace_calls,
-                        );
-                        pass_open = false;
-                        pass_trace_calls.clear();
-                        color_sync_checked.clear();
-                    }
-                    record_compute_overlay_copies(device, cmd, &overlay_copies);
-                }
-
                 let resident_cbuf = prep
                     .cbuf_data
                     .is_none()
@@ -15787,6 +15965,44 @@ impl Renderer {
                     offset: ubo_offset,
                     range: cbuf_len as u64,
                 };
+
+                let mut overlay_copies = collect_compute_overlay_copies(
+                    compute_overlay_sources,
+                    &call.resident_vertex,
+                    &vertex_binds,
+                    &aliased_vertex_bindings,
+                );
+                if let Some(draw) = resident_cbuf {
+                    collect_cbuf_overlay_copies(
+                        compute_overlay_sources,
+                        draw,
+                        ubo_buffer,
+                        ubo_offset,
+                        &mut overlay_copies,
+                    );
+                }
+                if !overlay_copies.is_empty() {
+                    if pass_open {
+                        unsafe {
+                            device.cmd_end_rendering(cmd);
+                        }
+                        finish_color_pass(
+                            device,
+                            cmd,
+                            rt_cache,
+                            &color_bind,
+                            &mut color_layouts,
+                            pass_rt_layout,
+                            &mut pass_dirty,
+                            &mut color_sync_checked,
+                            &pass_trace_calls,
+                        );
+                        pass_open = false;
+                        pass_trace_calls.clear();
+                        color_sync_checked.clear();
+                    }
+                    record_compute_overlay_copies(device, cmd, &overlay_copies);
+                }
 
                 if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
                     for binding in &call.texture_numeric_manifest {
@@ -15842,7 +16058,7 @@ impl Renderer {
                         &bound_tex_views,
                         Some(&bound_tex_layouts),
                         &call.texture_numeric_manifest,
-                        &dummy_views_2d,
+                        dummy_views_2d,
                     )
                 });
                 let image_infos_3d = (!sparse_texture_descriptors).then(|| {
@@ -15858,7 +16074,7 @@ impl Renderer {
                         &bound_tex_views_cube,
                         None,
                         &call.texture_numeric_manifest,
-                        &dummy_views_cube,
+                        dummy_views_cube,
                     )
                 });
                 let image_infos_cube_array = (!sparse_texture_descriptors).then(|| {
@@ -15866,7 +16082,7 @@ impl Renderer {
                         &bound_tex_views_cube_array,
                         None,
                         &call.texture_numeric_manifest,
-                        &dummy_views_cube_array,
+                        dummy_views_cube_array,
                     )
                 });
                 let typed_texel_views = (!sparse_texture_descriptors).then(|| {
@@ -16829,6 +17045,9 @@ impl Renderer {
                     rt_cache.set_color_layout(ak, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 }
             }
+            if apply_rt_invalidations(rt_cache, rt_invalidations[group_index]) {
+                color_sync_checked.clear();
+            }
             post_submit_texture_probes.push(post_submit_texture_probe);
         }
         while next_clear_group < clear_groups.len() {
@@ -16843,6 +17062,7 @@ impl Renderer {
                     &|gpu_va, len| read_guest(next_clear_group, gpu_va, len),
                 )?;
             }
+            apply_rt_invalidations(rt_cache, rt_invalidations[next_clear_group]);
             next_clear_group += 1;
         }
         if !storage_readback_writers.is_empty() {
@@ -16913,6 +17133,9 @@ impl Renderer {
                 );
             }
         }
+        if let (Some(timestamps), Some(pair)) = (gpu_timestamps.as_ref(), timestamp_pair) {
+            timestamps.end(device, cmd, pair);
+        }
         unsafe {
             device
                 .end_command_buffer(cmd)
@@ -16952,6 +17175,9 @@ impl Renderer {
             inline_clear_group_count,
             inline_draw_group_count,
         );
+        if let (Some(timestamps), Some(pair)) = (gpu_timestamps.as_mut(), timestamp_pair) {
+            timestamps.submitted(pair, crate::gpu_timestamps::StampKind::Graphics, submit_generation);
+        }
         frame_slots[cur_idx].submit_generation = submit_generation;
         finish_graphics_storage_batch(
             graphics_storage,
@@ -17018,6 +17244,7 @@ impl Renderer {
             rp_prep,
             rp_lock,
             rp_fence,
+            rp_fence_wait,
             rp_record,
             rp_submit,
             rp_t0.elapsed(),
@@ -17032,7 +17259,15 @@ impl Renderer {
             .available_dset_pools
             .extend(available_dset_pools);
         let next_idx = other_idx;
-        ubo_ring.slot_head[next_idx] = ubo_ring.head;
+        if let Some(wrap_elapsed) = ring_wrap_elapsed {
+            note_ring_telemetry(
+                ring_wrapped,
+                wrap_elapsed,
+                batch_ring_upper,
+                ubo_ring.head.saturating_sub(ring_batch_start),
+            );
+        }
+        ubo_ring.slot_span[cur_idx] = Some((ring_batch_start, ubo_ring.head));
         *frame_index = next_idx;
         pipeline_cache.maybe_save(device);
         if !storage_readback_writers.is_empty() {
@@ -17614,6 +17849,7 @@ fn rprof_record(
     prep: std::time::Duration,
     lock: std::time::Duration,
     fence: std::time::Duration,
+    fence_wait: std::time::Duration,
     record: std::time::Duration,
     submit: std::time::Duration,
     total: std::time::Duration,
@@ -17628,6 +17864,7 @@ fn rprof_record(
     static PREP: AtomicU64 = AtomicU64::new(0);
     static LOCK: AtomicU64 = AtomicU64::new(0);
     static FENCE: AtomicU64 = AtomicU64::new(0);
+    static FENCE_WAIT: AtomicU64 = AtomicU64::new(0);
     static RECORD: AtomicU64 = AtomicU64::new(0);
     static SUBMIT: AtomicU64 = AtomicU64::new(0);
     static TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -17636,6 +17873,7 @@ fn rprof_record(
     PREP.fetch_add(prep.as_nanos() as u64, Ordering::Relaxed);
     LOCK.fetch_add(lock.as_nanos() as u64, Ordering::Relaxed);
     FENCE.fetch_add(fence.as_nanos() as u64, Ordering::Relaxed);
+    FENCE_WAIT.fetch_add(fence_wait.as_nanos() as u64, Ordering::Relaxed);
     RECORD.fetch_add(record.as_nanos() as u64, Ordering::Relaxed);
     SUBMIT.fetch_add(submit.as_nanos() as u64, Ordering::Relaxed);
     TOTAL.fetch_add(total.as_nanos() as u64, Ordering::Relaxed);
@@ -17654,12 +17892,13 @@ fn rprof_record(
     if n % 64 == 0 {
         let ms = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / n as f64 / 1_000_000.0;
         log::warn!(
-            "[rprof] batches={} draws={} avg_ms prep={:.2} lock={:.2} fence={:.2} record={:.2} submit={:.2} total={:.2}",
+            "[rprof] batches={} draws={} avg_ms prep={:.2} lock={:.2} fence={:.2} fence_wait={:.2} record={:.2} submit={:.2} total={:.2}",
             n,
             DRAWS.load(Ordering::Relaxed),
             ms(&PREP),
             ms(&LOCK),
             ms(&FENCE),
+            ms(&FENCE_WAIT),
             ms(&RECORD),
             ms(&SUBMIT),
             ms(&TOTAL)
@@ -17875,7 +18114,7 @@ fn trace_rt_stats(
     let Some(seq) = rt_stats_seq() else {
         return;
     };
-    let mut stamps: HashMap<RtKey, u64> = HashMap::new();
+    let mut stamps: HashMap<RtKey, u64> = HashMap::default();
     for (k, stamp) in rt_cache.debug_all() {
         stamps.insert(k, stamp);
     }
@@ -18759,7 +18998,7 @@ fn draw_group_attachment_uses_with_clears(
 }
 
 fn preflight_draw_group_attachment_uses(groups: &[DrawGroupAttachmentUse]) -> Result<(), String> {
-    let mut color_formats = HashMap::<RtKey, (usize, vk::Format)>::new();
+    let mut color_formats = HashMap::<RtKey, (usize, vk::Format)>::default();
     let mut depth_formats = Vec::<(RtKey, usize, vk::Format, vk::ImageAspectFlags)>::new();
     for (group_index, usage) in groups.iter().enumerate() {
         for &(key, format) in &usage.colors {
@@ -19197,6 +19436,47 @@ fn collect_compute_overlay_copies(
     copies
 }
 
+fn collect_cbuf_overlay_copies(
+    sources: &HashMap<u64, Vec<(u32, vk::Buffer)>>,
+    draw: &crate::draw::ResidentCbufDraw,
+    dst: vk::Buffer,
+    dst_base: u64,
+    copies: &mut Vec<ComputeOverlayCopy>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    for overlay in &draw.compute_overlays {
+        let source = sources.get(&overlay.serial).and_then(|entries| {
+            entries
+                .iter()
+                .find(|(index, _)| *index == overlay.resource_index)
+                .map(|(_, buffer)| *buffer)
+        });
+        match source {
+            Some(src) => copies.push(ComputeOverlayCopy {
+                src,
+                dst,
+                region: vk::BufferCopy {
+                    src_offset: overlay.src_offset,
+                    dst_offset: dst_base + overlay.dst_offset,
+                    size: overlay.len,
+                },
+            }),
+            None => {
+                let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+                if misses <= 8 || misses % 1024 == 0 {
+                    log::warn!(
+                        "[cbuf-overlay] source missing serial={} resource={} misses={}",
+                        overlay.serial,
+                        overlay.resource_index,
+                        misses
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn compute_alias_vertex_binding(
     sources: &HashMap<u64, Vec<(u32, vk::Buffer)>>,
     range: &crate::draw::ResidentVertexRange,
@@ -19282,6 +19562,7 @@ fn record_compute_overlay_copies(
     let before = vk::MemoryBarrier {
         s_type: vk::StructureType::MEMORY_BARRIER,
         src_access_mask: vk::AccessFlags::SHADER_WRITE
+            | vk::AccessFlags::SHADER_READ
             | vk::AccessFlags::HOST_WRITE
             | vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
         dst_access_mask: vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
@@ -19290,7 +19571,10 @@ fn record_compute_overlay_copies(
     let after = vk::MemoryBarrier {
         s_type: vk::StructureType::MEMORY_BARRIER,
         src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-        dst_access_mask: vk::AccessFlags::VERTEX_ATTRIBUTE_READ | vk::AccessFlags::INDEX_READ,
+        dst_access_mask: vk::AccessFlags::VERTEX_ATTRIBUTE_READ
+            | vk::AccessFlags::INDEX_READ
+            | vk::AccessFlags::SHADER_READ
+            | vk::AccessFlags::UNIFORM_READ,
         ..Default::default()
     };
     unsafe {
@@ -19298,6 +19582,7 @@ fn record_compute_overlay_copies(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER
                 | vk::PipelineStageFlags::VERTEX_INPUT
+                | vk::PipelineStageFlags::ALL_GRAPHICS
                 | vk::PipelineStageFlags::HOST,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
@@ -19311,7 +19596,7 @@ fn record_compute_overlay_copies(
         device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::VERTEX_INPUT,
+            vk::PipelineStageFlags::VERTEX_INPUT | vk::PipelineStageFlags::ALL_GRAPHICS,
             vk::DependencyFlags::empty(),
             &[after],
             &[],
@@ -19372,7 +19657,7 @@ fn trace_volume_rt_pixels(
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
     if !seen.lock().unwrap().insert(tic.gpu_va) {
         return;
     }
@@ -20581,6 +20866,13 @@ fn compute_raw_storage_keys_conflict(
             || compute_raw_storage_ranges_overlap(a.cpu_addr, a.size, b.cpu_addr, b.size))
 }
 
+fn compute_raw_storage_evict_on_full_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_COMPUTE_RAW_EVICT_ON_FULL").map_or(true, |value| value != "0")
+    })
+}
+
 fn compute_raw_storage_cache_can_admit(
     item_count: usize,
     retained_bytes: u64,
@@ -21159,7 +21451,7 @@ fn free_compute_descriptor_set(
 fn compute_settle_ready_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("NEXIUM_COMPUTE_SETTLE_READY").is_ok_and(|value| value != "0")
+        std::env::var("NEXIUM_COMPUTE_SETTLE_READY").map_or(true, |value| value != "0")
     })
 }
 
@@ -22928,9 +23220,14 @@ fn execute_compute_dispatch(
     let prep_elapsed =
         dispatch_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     let record_started = dispatch_started.map(|_| std::time::Instant::now());
+    let mut compute_timestamp_pair = None;
     let command_result = (|| -> Result<(), String> {
         reset_command_buffer(&inner.device, cmd)?;
         begin_one_time(&inner.device, cmd)?;
+        compute_timestamp_pair = inner
+            .gpu_timestamps
+            .as_mut()
+            .and_then(|timestamps| timestamps.begin(&inner.device, cmd));
         let has_cached_volume_copy = resources.guest_sources.iter().any(|source| {
             matches!(
                 source,
@@ -23394,11 +23691,17 @@ fn execute_compute_dispatch(
                 &[],
             );
         }
+        if let (Some(timestamps), Some(pair)) = (inner.gpu_timestamps.as_ref(), compute_timestamp_pair) {
+            timestamps.end(&inner.device, cmd, pair);
+        }
         end_one_time(&inner.device, cmd)
     })();
     let record_elapsed =
         record_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     if let Err(error) = command_result {
+        if let (Some(timestamps), Some(pair)) = (inner.gpu_timestamps.as_mut(), compute_timestamp_pair) {
+            timestamps.abandon(pair);
+        }
         let _ = reset_command_buffer(&inner.device, cmd);
         resources.destroy(&inner.device);
         if lazy {
@@ -23460,6 +23763,9 @@ fn execute_compute_dispatch(
             }
         },
     };
+    if let (Some(timestamps), Some(pair)) = (inner.gpu_timestamps.as_mut(), compute_timestamp_pair) {
+        timestamps.submitted(pair, crate::gpu_timestamps::StampKind::Compute, submission_generation);
+    }
 
     for guest in &mut resources.guest_images {
         guest.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -23517,12 +23823,13 @@ fn execute_compute_dispatch(
         });
         resident_raw_storage.dedup();
         if dispatch.serial != 0 {
+            let typed_sources = typed_texel_overlay_sources_enabled();
             let overlay_sources: Vec<(u32, vk::Buffer)> = dispatch
                 .texel_buffers
                 .iter()
                 .zip(&resources.texels)
                 .enumerate()
-                .filter(|(_, (request, _))| request.writable && request.raw)
+                .filter(|(_, (request, _))| request.writable && (request.raw || typed_sources))
                 .map(|(index, (_, texel))| (index as u32, texel.buffer))
                 .collect();
             if !overlay_sources.is_empty() {
@@ -25399,7 +25706,7 @@ fn trace_vs_tex_bind_alias_stats(
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<std::collections::HashSet<(u64, u64, usize, RtKey)>>> =
             OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::default()));
         if !seen
             .lock()
             .unwrap()
@@ -25494,7 +25801,7 @@ fn verify_volume_image(
     static SEEN: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
     {
         let mut seen = SEEN
-            .get_or_init(|| Mutex::new(HashMap::new()))
+            .get_or_init(|| Mutex::new(HashMap::default()))
             .lock()
             .unwrap();
         let count = seen.entry(image.as_raw()).or_insert(0);
@@ -25666,7 +25973,7 @@ fn dump_volume_texture_once(raw: &[u8], tic: &crate::texture::TicEntry, layers: 
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Option<Mutex<std::collections::HashSet<u64>>>> = OnceLock::new();
     let Some(seen) = SEEN.get_or_init(|| {
-        std::env::var_os("NEXIUM_DUMP_VOLUME_TEX").map(|_| Mutex::new(std::collections::HashSet::new()))
+        std::env::var_os("NEXIUM_DUMP_VOLUME_TEX").map(|_| Mutex::new(std::collections::HashSet::default()))
     }) else {
         return;
     };
@@ -26000,7 +26307,7 @@ fn effective_texture_block_linear(tic: &crate::texture::TicEntry) -> bool {
     {
         static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<u64>>> =
             std::sync::OnceLock::new();
-        let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::default()));
         let key = tic.gpu_va
             ^ ((tic.block_width_log2 as u64) << 52)
             ^ ((tic.tile_width_spacing as u64) << 56)
@@ -26525,7 +26832,7 @@ fn trace_volume_rt_skip(
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<(u64, u32, &'static str)>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
     if seen.lock().unwrap().insert((tic.gpu_va, layers, reason)) {
         log::warn!(
             "[volume-rt-skip] va={:#x} reason={} {}x{}x{} pitch={} bl={} bw={} bh={} bd={} tw={}",
@@ -26571,7 +26878,7 @@ fn find_volume_rt_slices(
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         static PROBED: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-        let probed = PROBED.get_or_init(|| Mutex::new(HashSet::new()));
+        let probed = PROBED.get_or_init(|| Mutex::new(HashSet::default()));
         if probed.lock().unwrap().insert(tic.gpu_va) {
             log::warn!(
                 "[volume-rt-probe] va={:#x} {}x{}x{} pitch={} offs0={:#x} offslast={:#x} bl={} bw={} bh={} bd={} tw={} base_key={}",
@@ -26616,7 +26923,7 @@ fn find_volume_rt_slices(
                 use std::collections::HashSet;
                 use std::sync::{Mutex, OnceLock};
                 static MISSING: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
-                let missing = MISSING.get_or_init(|| Mutex::new(HashSet::new()));
+                let missing = MISSING.get_or_init(|| Mutex::new(HashSet::default()));
                 if missing.lock().unwrap().insert((tic.gpu_va, layer)) {
                     log::warn!(
                         "[volume-rt-miss] va={:#x} layer={} slice_va={:#x} cpu={:#x} off={:#x} {}x{}x{} bl={} bw={} bh={} bd={} tw={}",
@@ -26656,7 +26963,7 @@ fn find_volume_rt_slices(
             use std::sync::{Mutex, OnceLock};
             static SEEN_SLICE: OnceLock<Mutex<HashSet<(u64, u32, RtKey, u32, u32)>>> =
                 OnceLock::new();
-            let seen = SEEN_SLICE.get_or_init(|| Mutex::new(HashSet::new()));
+            let seen = SEEN_SLICE.get_or_init(|| Mutex::new(HashSet::default()));
             if seen
                 .lock()
                 .unwrap()
@@ -26696,7 +27003,7 @@ fn find_volume_rt_slices(
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         if seen.lock().unwrap().insert(tic.gpu_va) {
             let first = out.first().map(|s| s.key.label()).unwrap_or_default();
             let last = out.last().map(|s| s.key.label()).unwrap_or_default();
@@ -26916,7 +27223,7 @@ where
             let Some(tic) = crate::texture::TicEntry::parse(tic_raw.as_ref()) else {
                 return Ok(None);
             };
-            log_srgb_tic(call, *tex_id, tic);
+            log_srgb_tic(call, *tex_id, &tic);
             pending_texture_for_tic(call, slot, tic_addr, tic)
         })
         .collect()
@@ -26949,7 +27256,7 @@ where
         }
         if let Some(pending) = memo.pendings.get(&route).copied() {
             if let Some((_, tic, _, _)) = pending {
-                log_srgb_tic(call, *tex_id, tic);
+                log_srgb_tic(call, *tex_id, &tic);
             }
             pendings.push(pending);
             continue;
@@ -26964,7 +27271,7 @@ where
             .flatten();
         memo.pendings.insert(route, pending);
         if let Some((_, tic, _, _)) = pending {
-            log_srgb_tic(call, *tex_id, tic);
+            log_srgb_tic(call, *tex_id, &tic);
         }
         pendings.push(pending);
     }
@@ -26999,7 +27306,7 @@ where
     }
 }
 
-fn log_srgb_tic(call: &crate::draw::Maxwell3dDrawCall, tex_id: u32, tic: crate::texture::TicEntry) {
+fn log_srgb_tic(call: &crate::draw::Maxwell3dDrawCall, tex_id: u32, tic: &crate::texture::TicEntry) {
     if tic.is_srgb && tic_srgb_log_enabled() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -27101,7 +27408,7 @@ fn pending_texture_for_tic(
                 Mutex<HashSet<(u64, usize, u64, GraphicsTextureImageKind, crate::texture::TicEntry)>>,
             > = std::sync::OnceLock::new();
             let report = {
-                let mut reported = REPORTED.get_or_init(|| Mutex::new(HashSet::new())).lock();
+                let mut reported = REPORTED.get_or_init(|| Mutex::new(HashSet::default())).lock();
                 reported.len() < 128
                     && reported.insert((call.fs_hash, slot, tic_addr, image_kind, tic))
             };
@@ -27483,7 +27790,7 @@ fn trace_rt_alias_miss_metadata(
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<(u64, usize, RtKey)>>> = OnceLock::new();
     let mut seen = SEEN
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(HashSet::default()))
         .lock()
         .unwrap();
     if !seen.insert((call.fs_gpu_va, slot, want)) {
@@ -27536,7 +27843,7 @@ fn trace_fuzzy_duplicate_reject(
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<(u64, usize, RtKey, RtKey)>>> = OnceLock::new();
     let mut seen = SEEN
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(HashSet::default()))
         .lock()
         .unwrap();
     if seen.insert((call.fs_gpu_va, slot, requested, candidate)) {
@@ -28773,7 +29080,7 @@ fn trace_depth_array_candidate(rt_cache: &RtCache, sk: RtKey, layers: u32, curre
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<RtKey>>> = OnceLock::new();
-    if !SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock().unwrap().insert(sk) {
+    if !SEEN.get_or_init(|| Mutex::new(HashSet::default())).lock().unwrap().insert(sk) {
         return;
     }
     let mut report = format!(
@@ -29259,7 +29566,7 @@ fn trace_rt_alias(
             fuzzy,
         );
         let mut seen = SEEN
-            .get_or_init(|| Mutex::new(HashSet::new()))
+            .get_or_init(|| Mutex::new(HashSet::default()))
             .lock()
             .unwrap();
         if !seen.insert(key) {
@@ -29422,7 +29729,6 @@ fn upload_vertex_bindings(
     device: &ash::Device,
     submit_timeline: vk::Semaphore,
     frame_slots: &mut [FrameSlot],
-    other_idx: usize,
     pool: vk::DescriptorPool,
     ubo_ring: &mut UboRing,
     vertex_bindings: &[PreparedVertexBinding],
@@ -29448,7 +29754,6 @@ fn upload_vertex_bindings(
                 device,
                 submit_timeline,
                 frame_slots,
-                other_idx,
                 pool,
                 ubo_ring,
                 fermi_exact_rt_snapshot_leases,
@@ -29509,75 +29814,191 @@ fn recycle_descriptor_pools(
     }
 }
 
+fn apply_rt_invalidations(rt_cache: &mut RtCache, spans: &[(u64, u64, u64)]) -> bool {
+    for &(cpu_addr, gpu_va, size) in spans {
+        rt_cache.mark_guest_written_range(cpu_addr, size, &[(gpu_va, size)]);
+    }
+    !spans.is_empty()
+}
+
+fn recycle_frame_slot(
+    device: &ash::Device,
+    submit_timeline: vk::Semaphore,
+    slot: &mut FrameSlot,
+    pool: vk::DescriptorPool,
+    fermi_exact_rt_snapshot_leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
+    fermi_exact_rt_snapshot_ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
+) -> Result<(), String> {
+    if !slot.retired_dsets.is_empty() {
+        unsafe {
+            let _ = device.free_descriptor_sets(pool, &slot.retired_dsets);
+        }
+        slot.retired_dsets.clear();
+    }
+    recycle_descriptor_pools(
+        device,
+        &mut slot.retired_dset_pools,
+        &mut slot.available_dset_pools,
+    );
+    release_fermi_exact_rt_snapshot_lease_refs(
+        device,
+        submit_timeline,
+        fermi_exact_rt_snapshot_leases,
+        fermi_exact_rt_snapshot_ids,
+        &mut slot.fermi_exact_rt_snapshot_leases,
+    );
+    for (b, m) in slot.retired_buffers.drain(..) {
+        unsafe {
+            device.destroy_buffer(b, None);
+            device.free_memory(m, None);
+        }
+    }
+    recycle_slot_upload_buffers(device, slot);
+    for view in slot.retired_views.drain(..) {
+        unsafe {
+            device.destroy_image_view(view, None);
+        }
+    }
+    for t in slot.retired_textures.drain(..) {
+        unsafe {
+            device.destroy_image_view(t.view, None);
+            device.destroy_image(t.image, None);
+            device.free_memory(t.memory, None);
+        }
+    }
+    for buffer in slot.retired_texel_buffers.drain(..) {
+        destroy_texel_buffer(device, buffer.resource);
+    }
+    destroy_retired_rt_images(device, &mut slot.retired_rt_images);
+    for t in slot.retired_rt_reinterprets.drain(..) {
+        unsafe {
+            device.destroy_image_view(t.view, None);
+            device.destroy_image(t.image, None);
+            device.free_memory(t.memory, None);
+        }
+    }
+    reset_command_buffer(device, slot.cmd)?;
+    slot.in_flight = false;
+    slot.submit_generation = 0;
+    Ok(())
+}
+
+fn retire_frame_slot(
+    device: &ash::Device,
+    submit_timeline: vk::Semaphore,
+    slot: &mut FrameSlot,
+    pool: vk::DescriptorPool,
+    fermi_exact_rt_snapshot_leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
+    fermi_exact_rt_snapshot_ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
+) -> Result<(), String> {
+    if !frame_slot_retired(device, submit_timeline, slot.submit_generation, slot.fence) {
+        wait_fence(device, slot.fence)?;
+    }
+    recycle_frame_slot(
+        device,
+        submit_timeline,
+        slot,
+        pool,
+        fermi_exact_rt_snapshot_leases,
+        fermi_exact_rt_snapshot_ids,
+    )
+}
+
+fn newest_in_flight_frame_slot(frame_slots: &[FrameSlot]) -> Option<usize> {
+    frame_slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.in_flight)
+        .max_by_key(|(_, slot)| slot.submit_generation)
+        .map(|(index, _)| index)
+}
+
+fn ring_span_overlaps(span: Option<(u64, u64)>, start: u64, end: u64) -> bool {
+    span.is_some_and(|(span_start, span_end)| span_start < end && start < span_end)
+}
+
+fn reserve_ring_span(
+    device: &ash::Device,
+    submit_timeline: vk::Semaphore,
+    frame_slots: &mut [FrameSlot],
+    cur_idx: usize,
+    pool: vk::DescriptorPool,
+    ubo_ring: &mut UboRing,
+    upper: u64,
+    fermi_exact_rt_snapshot_leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
+    fermi_exact_rt_snapshot_ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
+) -> Result<u16, String> {
+    let mut retired = 0u16;
+    if ubo_ring.head.saturating_add(upper) > ubo_ring.size {
+        ubo_ring.head = 0;
+        if frame_slots.len() == 2 {
+            let other_idx = (cur_idx + 1) % 2;
+            if frame_slots[other_idx].in_flight {
+                retire_frame_slot(
+                    device,
+                    submit_timeline,
+                    &mut frame_slots[other_idx],
+                    pool,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
+                )?;
+                retired |= 1 << other_idx;
+            }
+            ubo_ring.slot_span[other_idx] = None;
+            return Ok(retired);
+        }
+    }
+    let end = ubo_ring.head.saturating_add(upper);
+    loop {
+        let oldest = frame_slots
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| {
+                *index != cur_idx
+                    && slot.in_flight
+                    && ring_span_overlaps(ubo_ring.slot_span[*index], ubo_ring.head, end)
+            })
+            .min_by_key(|(_, slot)| slot.submit_generation)
+            .map(|(index, _)| index);
+        let Some(index) = oldest else {
+            return Ok(retired);
+        };
+        retire_frame_slot(
+            device,
+            submit_timeline,
+            &mut frame_slots[index],
+            pool,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
+        )?;
+        ubo_ring.slot_span[index] = None;
+        retired |= 1 << index;
+    }
+}
+
 fn ring_wrap_other(
     device: &ash::Device,
     submit_timeline: vk::Semaphore,
     frame_slots: &mut [FrameSlot],
-    other_idx: usize,
     pool: vk::DescriptorPool,
     ubo_ring: &mut UboRing,
     fermi_exact_rt_snapshot_leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
     fermi_exact_rt_snapshot_ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
 ) -> Result<(), String> {
-    let other = &mut frame_slots[other_idx];
-    if other.in_flight {
-        if !frame_slot_submission_complete(device, submit_timeline, other.submit_generation) {
-            wait_fence(device, other.fence)?;
+    for (index, slot) in frame_slots.iter_mut().enumerate() {
+        if slot.in_flight {
+            retire_frame_slot(
+                device,
+                submit_timeline,
+                slot,
+                pool,
+                fermi_exact_rt_snapshot_leases,
+                fermi_exact_rt_snapshot_ids,
+            )?;
         }
-        if !other.retired_dsets.is_empty() {
-            unsafe {
-                let _ = device.free_descriptor_sets(pool, &other.retired_dsets);
-            }
-            other.retired_dsets.clear();
-        }
-        recycle_descriptor_pools(
-            device,
-            &mut other.retired_dset_pools,
-            &mut other.available_dset_pools,
-        );
-        release_fermi_exact_rt_snapshot_lease_refs(
-            device,
-            submit_timeline,
-            fermi_exact_rt_snapshot_leases,
-            fermi_exact_rt_snapshot_ids,
-            &mut other.fermi_exact_rt_snapshot_leases,
-        );
-        for (b, m) in other.retired_buffers.drain(..) {
-            unsafe {
-                device.destroy_buffer(b, None);
-                device.free_memory(m, None);
-            }
-        }
-        recycle_slot_upload_buffers(device, other);
-        for view in other.retired_views.drain(..) {
-            unsafe {
-                device.destroy_image_view(view, None);
-            }
-        }
-        for t in other.retired_textures.drain(..) {
-            unsafe {
-                device.destroy_image_view(t.view, None);
-                device.destroy_image(t.image, None);
-                device.free_memory(t.memory, None);
-            }
-        }
-        for buffer in other.retired_texel_buffers.drain(..) {
-            destroy_texel_buffer(device, buffer.resource);
-        }
-        destroy_retired_rt_images(device, &mut other.retired_rt_images);
-        for t in other.retired_rt_reinterprets.drain(..) {
-            unsafe {
-                device.destroy_image_view(t.view, None);
-                device.destroy_image(t.image, None);
-                device.free_memory(t.memory, None);
-            }
-        }
-        reset_command_buffer(device, other.cmd)?;
-        other.in_flight = false;
-        other.submit_generation = 0;
+        ubo_ring.slot_span[index] = None;
     }
     ubo_ring.head = 0;
-    ubo_ring.slot_head[other_idx] = 0;
     Ok(())
 }
 
@@ -29998,6 +30419,55 @@ fn create_persistent_upload_buffer_sized(
     result
 }
 
+fn create_stream_upload_buffer_sized(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    requested_size: u64,
+    usage: vk::BufferUsageFlags,
+    name: &str,
+) -> Result<(PersistentUploadBuffer, u64), String> {
+    let size = requested_size.max(16);
+    let info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe {
+        device
+            .create_buffer(&info, None)
+            .map_err(|e| format!("create_buffer({name}): {:?}", e))?
+    };
+    let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let allocation = match crate::memory_select::allocate_stream_memory(device, mem_props, req, name) {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            unsafe {
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(error);
+        }
+    };
+    let memory = allocation.memory;
+    let mapped = unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .and_then(|()| device.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty()))
+    };
+    match mapped {
+        Ok(mapped) => Ok((
+            PersistentUploadBuffer { buffer, memory, size, mapped: mapped as *mut u8 },
+            allocation.rebar_bytes,
+        )),
+        Err(error) => {
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            crate::memory_select::release_stream_rebar_bytes(allocation.rebar_bytes);
+            Err(format!("bind/map {name}: {error:?}"))
+        }
+    }
+}
+
 fn create_persistent_upload_buffer(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -30163,40 +30633,27 @@ fn create_aurora_resident_ssbo_cache(
             .map_err(|e| format!("create_buffer(Aurora resident SSBO): {:?}", e))?
     };
     let req = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let Some(memory_type_index) = find_memory_type(
+    let allocation = match crate::memory_select::allocate_stream_memory(
+        device,
         mem_props,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ) else {
-        unsafe {
-            device.destroy_buffer(buffer, None);
-        }
-        return Err("no HOST_VISIBLE|HOST_COHERENT memory for Aurora resident SSBOs".to_string());
-    };
-    let alloc = vk::MemoryAllocateInfo {
-        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-        allocation_size: req.size,
-        memory_type_index,
-        p_next: std::ptr::null(),
-        _marker: std::marker::PhantomData,
-    };
-    let memory = match unsafe { device.allocate_memory(&alloc, None) } {
-        Ok(memory) => memory,
+        req,
+        "Aurora resident SSBO",
+    ) {
+        Ok(allocation) => allocation,
         Err(error) => {
             unsafe {
                 device.destroy_buffer(buffer, None);
             }
-            return Err(format!(
-                "allocate_memory(Aurora resident SSBO): {:?}",
-                error
-            ));
+            return Err(error);
         }
     };
+    let memory = allocation.memory;
     if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
         unsafe {
             device.destroy_buffer(buffer, None);
             device.free_memory(memory, None);
         }
+        crate::memory_select::release_stream_rebar_bytes(allocation.rebar_bytes);
         return Err(format!(
             "bind_buffer_memory(Aurora resident SSBO): {:?}",
             error
@@ -30210,6 +30667,7 @@ fn create_aurora_resident_ssbo_cache(
                     device.destroy_buffer(buffer, None);
                     device.free_memory(memory, None);
                 }
+                crate::memory_select::release_stream_rebar_bytes(allocation.rebar_bytes);
                 return Err(format!("map_memory(Aurora resident SSBO): {:?}", error));
             }
         };
@@ -30236,6 +30694,7 @@ fn create_aurora_resident_ssbo_cache(
         mapped,
         slots,
         clock: 0,
+        rebar_bytes: allocation.rebar_bytes,
     })
 }
 
@@ -30252,7 +30711,8 @@ fn create_ubo_ring(
             | vk::BufferUsageFlags::UNIFORM_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_DST,
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::TRANSFER_SRC,
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         queue_family_index_count: 0,
         p_queue_family_indices: std::ptr::null(),
@@ -30266,33 +30726,31 @@ fn create_ubo_ring(
             .map_err(|e| format!("create_buffer(ubo_ring): {:?}", e))?
     };
     let req = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let mt = find_memory_type(
-        mem_props,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
-    .ok_or_else(|| "no HOST_VISIBLE|HOST_COHERENT for ubo_ring".to_string())?;
-    let alloc = vk::MemoryAllocateInfo {
-        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-        allocation_size: req.size,
-        memory_type_index: mt,
-        p_next: std::ptr::null(),
-        _marker: std::marker::PhantomData,
+    let allocation = match crate::memory_select::allocate_stream_memory(device, mem_props, req, "graphics ring") {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            unsafe {
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(error);
+        }
     };
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc, None)
-            .map_err(|e| format!("allocate_memory(ubo_ring): {:?}", e))?
-    };
-    unsafe {
-        device
-            .bind_buffer_memory(buffer, memory, 0)
-            .map_err(|e| format!("bind_buffer_memory(ubo_ring): {:?}", e))?;
-    }
+    let memory = allocation.memory;
     let mapped = unsafe {
         device
-            .map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
-            .map_err(|e| format!("map_memory(ubo_ring): {:?}", e))? as *mut u8
+            .bind_buffer_memory(buffer, memory, 0)
+            .and_then(|()| device.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty()))
+    };
+    let mapped = match mapped {
+        Ok(mapped) => mapped as *mut u8,
+        Err(error) => {
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            crate::memory_select::release_stream_rebar_bytes(allocation.rebar_bytes);
+            return Err(format!("bind/map ubo_ring: {:?}", error));
+        }
     };
     Ok(UboRing {
         buffer,
@@ -30300,7 +30758,8 @@ fn create_ubo_ring(
         mapped,
         size,
         head: 0,
-        slot_head: vec![0; frame_slot_count],
+        slot_span: vec![None; frame_slot_count],
+        rebar_bytes: allocation.rebar_bytes,
     })
 }
 
@@ -30631,7 +31090,7 @@ fn dump_texture_bmp_once(
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<(u64, String)>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
     if !seen
         .lock()
         .map(|mut s| s.insert((gpu_va, label.to_string())))
@@ -34605,7 +35064,11 @@ impl Drop for RendererInner {
             self.device.destroy_buffer(self.ubo_ring.buffer, None);
             self.device.free_memory(self.ubo_ring.memory, None);
         }
+        crate::memory_select::release_stream_rebar_bytes(std::mem::take(&mut self.ubo_ring.rebar_bytes));
         self.ubo_ring.mapped = std::ptr::null_mut();
+        if let Some(timestamps) = self.gpu_timestamps.as_mut() {
+            timestamps.destroy(&self.device);
+        }
         self.rt_cache.clear(&self.device);
         unsafe {
             if device_idle {
@@ -34710,7 +35173,8 @@ mod tests {
     };
     use ash::vk;
     use ash::vk::Handle;
-    use std::collections::{HashMap, VecDeque};
+    use nexium_common::fast_hash::FastMap as HashMap;
+    use std::collections::VecDeque;
 
     #[test]
     fn current_batch_protects_attachment_sample_copy_and_clear_keys() {
@@ -34791,7 +35255,7 @@ mod tests {
         let longer = [1, 2, 3, 4, 5];
         let first_hash = texture_content_hash(&first);
         let changed_hash = texture_content_hash(&changed);
-        let mut hashes = HashMap::new();
+        let mut hashes = HashMap::default();
 
         assert_eq!(
             memoized_texture_snapshot_hash(&mut hashes, (0x4000, first.len()), &first),
@@ -34860,7 +35324,7 @@ mod tests {
         let snapshot =
             SharedGuestSnapshot::new_trusted(std::sync::Arc::new(vec![1, 2, 3, 4]), 4, 17).unwrap();
         let mut profile = super::TextureHashProfile::default();
-        let mut memo = HashMap::new();
+        let mut memo = HashMap::default();
         let range = (0x1000, snapshot.len());
         assert!(!profile.observe(&snapshot, None));
         assert_eq!(
@@ -35504,7 +35968,7 @@ mod tests {
     fn texture_range_index_matches_scan_through_insert_remove_and_clear() {
         use std::collections::HashSet;
         let mut index = super::TextureRangeIndex::default();
-        let mut keys = HashSet::new();
+        let mut keys = HashSet::default();
         let mut random = 7u64;
         for i in 0..512 {
             random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -35879,7 +36343,7 @@ mod tests {
         let mut prep_memo = GroupTexturePrepMemo::default();
         let mut profile = RecordTextureMemoProfile::default();
         let mut invalidate_before_call = false;
-        let mut resolved = HashMap::new();
+        let mut resolved = HashMap::default();
         let mut recorded_epoch = None;
 
         assert!(!segment_group_texture_prep_memo(
@@ -35973,7 +36437,7 @@ mod tests {
             view: vk::ImageView::from_raw(12),
             layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         };
-        let mut bindings = HashMap::from([(route, binding)]);
+        let mut bindings = HashMap::from_iter([(route, binding)]);
         assert_eq!(
             group_texture_binding_lookup(&bindings, route, key).map(|hit| hit.view),
             Some(binding.view)
@@ -36139,7 +36603,7 @@ mod tests {
         let binding = super::group_texture_overlay_binding(
             &texture, key, sampled, generation, Some(&snapshot),
         ).unwrap();
-        let mut bindings = HashMap::from([(route, binding)]);
+        let mut bindings = HashMap::from_iter([(route, binding)]);
         assert!(texture.trusted_source_identity.is_none());
         assert!(binding.trusted_source_identity.is_none());
         assert!(group_texture_binding_lookup(&bindings, route, key).is_none());
@@ -36173,7 +36637,7 @@ mod tests {
         let binding = super::group_texture_overlay_binding(
             &texture, key, sampled, generation, Some(&snapshot),
         ).unwrap();
-        let bindings = HashMap::from([(route, binding)]);
+        let bindings = HashMap::from_iter([(route, binding)]);
         for changed in [
             RtKey { cpu_addr: sampled.cpu_addr + 4096, ..sampled },
             RtKey { mapping_epoch: sampled.mapping_epoch + 1, ..sampled },
@@ -36203,7 +36667,7 @@ mod tests {
         let binding = super::group_texture_overlay_binding(
             &texture, key, sampled, generation, Some(&snapshot),
         ).unwrap();
-        let bindings = HashMap::from([(route, binding)]);
+        let bindings = HashMap::from_iter([(route, binding)]);
         let bytes = std::sync::Arc::new(snapshot.as_slice().to_vec());
         let same = SharedGuestSnapshot::new_trusted(bytes.clone(), 4, 17).unwrap();
         assert!(super::group_texture_overlay_binding_lookup(
@@ -36233,7 +36697,7 @@ mod tests {
         let binding = super::group_texture_overlay_binding(
             &texture, key, sampled, generation, Some(&snapshot),
         ).unwrap();
-        let mut bindings = HashMap::from([(route, binding)]);
+        let mut bindings = HashMap::from_iter([(route, binding)]);
         assert_eq!(group_texture_binding_evict_range(&mut bindings, key.gpu_va, key.guest_size), 1);
         texture.invalidate_content();
         assert!(super::group_texture_overlay_binding(
@@ -36291,6 +36755,7 @@ mod tests {
             arena: None,
             arena_slot_start: 0,
             arena_slot_count: 0,
+            compute_overlays: Vec::new(),
         }
     }
 
@@ -36326,6 +36791,7 @@ mod tests {
             arena: Some(std::sync::Arc::new(arena)),
             arena_slot_start: 0,
             arena_slot_count: 1,
+            compute_overlays: Vec::new(),
         }
     }
 
@@ -36393,11 +36859,12 @@ mod tests {
             size: backing.len() as u64,
             head: 0,
             free: super::ResidentFreeList::default(),
-            slabs: HashMap::new(),
+            slabs: HashMap::default(),
             lru: std::collections::BTreeSet::new(),
             slot_uses: Vec::new(),
             clock: 0,
             last_fail: super::RESIDENT_FAIL_OTHER,
+            rebar_bytes: 0,
         }
     }
 
@@ -36422,7 +36889,7 @@ mod tests {
         let chunk_size = crate::draw::RESIDENT_CHUNK_SIZE;
         let mut backing = vec![0u8; 3 * chunk_size];
         let mut cache = resident_test_cache(&mut backing);
-        let mut used = std::collections::HashSet::new();
+        let mut used = std::collections::HashSet::default();
         let v1 = [resident_test_chunk(9, 1, 0x11)];
         let v2 = [resident_test_chunk(9, 2, 0x22)];
         let v3 = [resident_test_chunk(9, 3, 0x33)];
@@ -36463,7 +36930,7 @@ mod tests {
         let chunk_size = crate::draw::RESIDENT_CHUNK_SIZE;
         let mut backing = vec![0u8; 3 * chunk_size];
         let mut cache = resident_test_cache(&mut backing);
-        let mut used = std::collections::HashSet::new();
+        let mut used = std::collections::HashSet::default();
         for key in 1..=3 {
             let chunks = [resident_test_chunk(key, 1, key as u8)];
             cache.resolve_chunks(&chunks, &mut used).unwrap();
@@ -36541,6 +37008,7 @@ mod tests {
             arena: None,
             arena_slot_start: 0,
             arena_slot_count: 0,
+            compute_overlays: Vec::new(),
         };
         let mut dst = vec![0; draw.packed_size];
 
@@ -36659,6 +37127,7 @@ mod tests {
             arena: Some(std::sync::Arc::new(arena)),
             arena_slot_start: 0,
             arena_slot_count: 1,
+            compute_overlays: Vec::new(),
         };
         let mut dst = vec![0; draw.packed_size];
 
@@ -37634,11 +38103,11 @@ mod tests {
         let stream = 17;
         let first_key = RtKey::new(1, 1, 1, 0x1000);
         let second_key = RtKey::new(2, 1, 1, 0x2000);
-        let mut pending_readbacks = HashMap::from([
+        let mut pending_readbacks = HashMap::from_iter([
             (first_key, VecDeque::from([pending(stream, 100, 0, 1)])),
             (second_key, VecDeque::from([pending(stream, 101, 1, 2)])),
         ]);
-        let mut pending_readback_order = HashMap::from([(
+        let mut pending_readback_order = HashMap::from_iter([(
             stream,
             VecDeque::from([
                 PendingReadbackRef {
@@ -37712,14 +38181,14 @@ mod tests {
         let first_stream = 17;
         let second_stream = 23;
         let shared_key = RtKey::new(1, 1, 1, 0x1000);
-        let mut pending_readbacks = HashMap::from([(
+        let mut pending_readbacks = HashMap::from_iter([(
             shared_key,
             VecDeque::from([
                 pending(first_stream, 100, 0, 1),
                 pending(second_stream, 200, 1, 2),
             ]),
         )]);
-        let mut pending_readback_order = HashMap::from([
+        let mut pending_readback_order = HashMap::from_iter([
             (
                 first_stream,
                 VecDeque::from([PendingReadbackRef {
@@ -37764,7 +38233,7 @@ mod tests {
     fn readback_cpu_backlogs_are_fifo_and_stream_local() {
         let first_stream = 17;
         let second_stream = 23;
-        let mut backlogs = HashMap::from([
+        let mut backlogs = HashMap::from_iter([
             (
                 first_stream,
                 VecDeque::from([

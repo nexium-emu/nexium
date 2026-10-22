@@ -586,6 +586,7 @@ pub struct ResidentCbufDraw {
     pub arena: Option<std::sync::Arc<ResidentCbufArena>>,
     pub arena_slot_start: u32,
     pub arena_slot_count: u16,
+    pub compute_overlays: Vec<ComputeOverlay>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
