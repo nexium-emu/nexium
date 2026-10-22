@@ -21,11 +21,13 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 pub type GuestMemoryWriter = Arc<dyn Fn(u64, &[u8]) -> bool + Send + Sync + 'static>;
+pub type GuestMemoryReader = Arc<dyn Fn(u64, &mut [u8]) -> bool + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub(crate) struct GuestMemoryAccess {
     mappings: Arc<RwLock<GpuMappings>>,
     writer: Arc<Mutex<Option<GuestMemoryWriter>>>,
+    reader: Arc<Mutex<Option<GuestMemoryReader>>>,
 }
 
 fn nvprof_enabled() -> bool {
@@ -1810,11 +1812,20 @@ impl GuestMemoryAccess {
         Self {
             mappings,
             writer: Arc::new(Mutex::new(None)),
+            reader: Arc::new(Mutex::new(None)),
         }
     }
 
     fn set_writer(&self, writer: Option<GuestMemoryWriter>) {
         *self.writer.lock() = writer;
+    }
+
+    fn set_reader(&self, reader: Option<GuestMemoryReader>) {
+        *self.reader.lock() = reader;
+    }
+
+    pub(crate) fn reader(&self) -> Option<GuestMemoryReader> {
+        self.reader.lock().clone()
     }
 
     pub(crate) fn is_available(&self) -> bool {
@@ -2050,17 +2061,14 @@ pub fn configure_retained_ssbos(title_default: bool) {
 pub(crate) fn gpu_pipeline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let requested = matches!(
+        let on = !matches!(
             std::env::var("NEXIUM_GPU_PIPELINE").ok().as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("yes")
+            Some("0") | Some("false") | Some("off") | Some("no")
         );
-        let on = requested && experimental_gpu_scheduling_enabled();
         if on {
             log::info!("nexium-nvdrv: GPU decode|prep pipeline ENABLED");
-        } else if requested {
-            log::warn!(
-                "nexium-nvdrv: GPU decode|prep pipeline quarantined; developer opt-in requires NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1"
-            );
+        } else {
+            log::info!("nexium-nvdrv: GPU decode|prep pipeline disabled by NEXIUM_GPU_PIPELINE");
         }
         on
     })
@@ -2308,6 +2316,10 @@ impl GpuContext {
 
     pub fn set_guest_memory_writer(&self, writer: GuestMemoryWriter) {
         self.guest_memory.set_writer(Some(writer));
+    }
+
+    pub fn set_guest_memory_reader(&self, reader: GuestMemoryReader) {
+        self.guest_memory.set_reader(Some(reader));
     }
 
     pub fn alloc_gpu_va(&self, size: u64) -> u64 {
@@ -2830,6 +2842,20 @@ impl GpuContext {
         }
         let entries_ms = if profile { elapsed_ms(t_entries) } else { 0.0 };
         let t_flush = std::time::Instant::now();
+        if !maxwell.pending_draws.is_empty() {
+            pusher.flush_pending_3d(
+                &mut *maxwell,
+                maxwell_dma,
+                fermi_2d,
+                kepler_compute,
+                kepler_memory,
+                &mappings,
+                &*self.stats,
+                &mem_read,
+                &mem_write,
+                &mem_copy,
+            );
+        }
         RwLockReadGuard::bump(&mut mappings);
         pusher.prep_kick_end(
             hard_after,

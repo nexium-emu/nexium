@@ -347,6 +347,10 @@ impl Kernel {
         nvdrv.set_guest_memory_writer(move |addr, bytes| {
             gpu_address_space.write(addr, bytes).is_ok()
         });
+        let gpu_reader_space = Arc::clone(&address_space);
+        nvdrv.set_guest_memory_reader(move |addr, buf| {
+            gpu_reader_space.read(addr, buf).is_ok()
+        });
         let gpu_read_space = Arc::clone(&address_space);
         let gpu_write_space = Arc::clone(&address_space);
         let gpu_copy_space = Arc::clone(&address_space);

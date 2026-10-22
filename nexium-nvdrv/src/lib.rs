@@ -1839,8 +1839,8 @@ fn gpu_thread_mode_request(
     }
 }
 
-fn async_gpu_requires_quarantine(async_gpu: Option<&str>, gpu_pipeline: Option<&str>) -> bool {
-    async_gpu_soft_kicks_value(async_gpu) || gpu_thread_flag_enabled(gpu_pipeline)
+fn async_gpu_requires_quarantine(async_gpu: Option<&str>, _gpu_pipeline: Option<&str>) -> bool {
+    async_gpu_soft_kicks_value(async_gpu)
 }
 
 fn ioctl_requires_async_gpu_drain(device: NvDevice, cmd: u16) -> bool {
@@ -2264,6 +2264,13 @@ impl Nvdrv {
         F: Fn(u64, &[u8]) -> bool + Send + Sync + 'static,
     {
         self.gpu.set_guest_memory_writer(Arc::new(writer));
+    }
+
+    pub fn set_guest_memory_reader<F>(&self, reader: F)
+    where
+        F: Fn(u64, &mut [u8]) -> bool + Send + Sync + 'static,
+    {
+        self.gpu.set_guest_memory_reader(Arc::new(reader));
     }
 
     pub fn set_gpu_async_memory(
@@ -6828,7 +6835,7 @@ mod tests {
         assert!(!async_gpu_requires_quarantine(Some("1"), None));
         assert!(!async_gpu_requires_quarantine(Some("hard"), Some("0")));
         assert!(async_gpu_requires_quarantine(Some("soft"), None));
-        assert!(async_gpu_requires_quarantine(None, Some("1")));
+        assert!(!async_gpu_requires_quarantine(None, Some("1")));
     }
 
     #[test]

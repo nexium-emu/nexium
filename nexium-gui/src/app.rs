@@ -13941,8 +13941,8 @@ fn debug_windows(
                                 &mut app_settings.performance_debug.gpu_pipeline,
                                 "Parallel GPU Command Preparation",
                                 "Separates command decoding and preparation from submission.",
-                                "Developer-only while host completion and device-loss recovery are being hardened.",
-                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_ASYNC_GPU=1\nNEXIUM_GPU_PIPELINE=1",
+                                "Enabled by default since 2026-10-21 (NEXIUM_GPU_PIPELINE=0 restores serial preparation).",
+                                "NEXIUM_GPU_PIPELINE=1",
                             );
                             changed |= performance_debug_toggle(
                                 ui,
