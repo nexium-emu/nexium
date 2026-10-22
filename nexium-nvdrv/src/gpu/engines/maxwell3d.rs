@@ -870,6 +870,8 @@ pub struct Maxwell3D {
     draw_state_identities: DrawStateIdentities,
     last_draw_allows_continuation: bool,
     cbdata_narrow_dirty: bool,
+    plain_registers: Vec<u8>,
+    plain_burst: bool,
 }
 
 const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
@@ -1068,6 +1070,22 @@ fn wf_state_log() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_WATER_FORENSICS").is_some())
 }
 
+fn plain_burst_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_PLAIN_BURST").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        ) && rt_method_trace_window().is_none()
+            && !wf_state_log()
+            && !mme_forensics()
+            && std::env::var_os("NEXIUM_UNKNOWN_METHOD_TRACE").is_none()
+    })
+}
+
+const PLAIN_REGISTER_EXCLUDED_FLAGS: u8 =
+    METHOD_FLAG_FORCE_DIRTY | METHOD_FLAG_NEVER_DIRTY | METHOD_FLAG_ADDR_HI;
+
 fn trace_unknown_method(method: u32) {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -1232,6 +1250,8 @@ impl Maxwell3D {
             draw_state_identities: DrawStateIdentities::INITIAL,
             last_draw_allows_continuation: false,
             cbdata_narrow_dirty: crate::gpu::vk_dispatch::cbdata_narrow_dirty_enabled(),
+            plain_registers: vec![0; MAXWELL3D_REGISTER_COUNT],
+            plain_burst: plain_burst_enabled(),
         }
     }
 
@@ -1405,7 +1425,16 @@ impl Maxwell3D {
             self.mme_active = true;
             self.mme_hash = out.hash;
             self.mme_entry = out.entry;
-            let out = replay_macro_writes(out, |m, a| self.write_register(m, a));
+            crate::gpu::pusher::kickprof::count(
+                crate::gpu::pusher::kickprof::M3D_MACRO_WRITES,
+                out.writes.len() as u64,
+            );
+            let out = if self.plain_burst {
+                self.replay_macro_output(&out.writes);
+                out
+            } else {
+                replay_macro_writes(out, |m, a| self.write_register(m, a))
+            };
             self.mme_active = false;
             self.macro_draw_instance_count = None;
             self.macro_engine.recycle_output(out);
@@ -1499,6 +1528,163 @@ impl Maxwell3D {
         if register_changed {
             self.apply_register_value(method, arg);
         }
+    }
+
+    fn note_plain_register(&mut self, method: u32) {
+        let index = method as usize;
+        if index >= self.plain_registers.len()
+            || matches!(method, 0x45..=0x49 | 0x60..=0x6D)
+            || (0x200..0x280).contains(&method)
+            || method_flags(method) & PLAIN_REGISTER_EXCLUDED_FLAGS != 0
+        {
+            return;
+        }
+        self.plain_registers[index] = 1;
+    }
+
+    pub(crate) fn plain_burst_eligible(
+        &self,
+        method: u32,
+        count: usize,
+        non_incrementing: bool,
+    ) -> bool {
+        if !self.plain_burst || self.shadow_ram_control == 3 || count == 0 {
+            return false;
+        }
+        let first = method as usize;
+        let last = if non_incrementing {
+            first
+        } else {
+            first + count - 1
+        };
+        last < self.plain_registers.len()
+            && self.plain_registers[first..=last]
+                .iter()
+                .all(|&plain| plain != 0)
+    }
+
+    pub(crate) fn cbdata_burst_eligible(
+        &self,
+        method: u32,
+        count: usize,
+        non_incrementing: bool,
+    ) -> bool {
+        if !self.plain_burst || self.shadow_ram_control == 3 || count == 0 {
+            return false;
+        }
+        let last = if non_incrementing {
+            method
+        } else {
+            method + count as u32 - 1
+        };
+        (0x8E4..=0x8F3).contains(&method) && last <= 0x8F3
+    }
+
+    pub(crate) fn write_plain_burst(&mut self, method: u32, args: &[u32], non_incrementing: bool) {
+        let shadow = self.shadow_ram_control <= 1;
+        let mut dirty = DrawStateDirty::NONE;
+        let mut changed = false;
+        for (offset, &arg) in args.iter().enumerate() {
+            let index = if non_incrementing {
+                method as usize
+            } else {
+                method as usize + offset
+            };
+            if shadow && index >= 0x80 && index < self.shadow_regs.len() {
+                self.shadow_regs[index] = arg;
+            }
+            let previous = self.reg_file[index];
+            if previous != arg {
+                dirty = dirty.union(Self::draw_state_categories(index as u32));
+                changed = true;
+            } else if self.reg_file_written[index] == 0 {
+                changed = true;
+            }
+            self.reg_file[index] = arg;
+            self.reg_file_written[index] = 1;
+        }
+        if changed {
+            self.draw_state_dirty_since_last_draw = true;
+        }
+        self.mark_draw_state_categories(dirty);
+    }
+
+    pub(crate) fn write_cbdata_burst(&mut self, method: u32, args: &[u32], non_incrementing: bool) {
+        self.write_cbdata_words(method, non_incrementing, args.len(), |offset| args[offset]);
+    }
+
+    fn replay_macro_output(&mut self, writes: &[(u32, u32)]) {
+        let mut index = 0;
+        while index < writes.len() {
+            let (method, arg) = writes[index];
+            let mut end = index + 1;
+            while end < writes.len() && writes[end].0 == method {
+                end += 1;
+            }
+            let run = end - index;
+            if run >= 2 {
+                if self.cbdata_burst_eligible(method, run, true) {
+                    self.write_cbdata_words(method, true, run, |offset| writes[index + offset].1);
+                    index = end;
+                    continue;
+                }
+                if self.plain_burst_eligible(method, run, true) {
+                    let last = writes[end - 1].1;
+                    self.write_plain_burst(method, &[last], true);
+                    index = end;
+                    continue;
+                }
+            } else if self.plain_burst_eligible(method, 1, true) {
+                self.write_plain_burst(method, &[arg], true);
+                crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::M3D_MACRO_PLAIN, 1);
+                index += 1;
+                continue;
+            }
+            self.write_register(method, arg);
+            index += 1;
+        }
+    }
+
+    fn write_cbdata_words(
+        &mut self,
+        method: u32,
+        non_incrementing: bool,
+        count: usize,
+        mut word: impl FnMut(usize) -> u32,
+    ) {
+        let shadow = self.shadow_ram_control <= 1;
+        let cb_addr = ((self.regs.constbuf_selector_addr_hi as u64) << 32)
+            | self.regs.constbuf_selector_addr_lo as u64;
+        let mut dirty = DrawStateDirty::NONE;
+        if cb_addr != 0 {
+            self.regs.pending_constbuf_writes.reserve(count);
+        }
+        for offset in 0..count {
+            let arg = word(offset);
+            let index = if non_incrementing {
+                method as usize
+            } else {
+                method as usize + offset
+            };
+            if shadow && index < self.shadow_regs.len() {
+                self.shadow_regs[index] = arg;
+            }
+            if self.reg_file[index] != arg {
+                dirty = dirty.union(Self::draw_state_categories(index as u32));
+            }
+            self.reg_file[index] = arg;
+            self.reg_file_written[index] = 1;
+            if cb_addr != 0 {
+                let target = cb_addr + self.regs.constbuf_load_offset as u64;
+                self.regs.pending_constbuf_writes.push((target, arg));
+            }
+            self.regs.constbuf_load_offset = self.regs.constbuf_load_offset.wrapping_add(4);
+        }
+        self.draw_state_dirty_since_last_draw = true;
+        if !self.cbdata_narrow_dirty {
+            dirty = dirty.union(DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS));
+        }
+        self.mark_draw_state_categories(dirty);
     }
 
     fn prepare_register_write(&mut self, method: u32, arg: u32) -> Option<(u32, bool)> {
@@ -2428,6 +2614,7 @@ impl Maxwell3D {
                 }
             }
             _ => {
+                self.note_plain_register(method);
                 log::trace!("maxwell3d: write method {:#x} = {:#x}", method, arg);
                 trace_unknown_method(method);
             }
@@ -2892,6 +3079,69 @@ impl Default for Maxwell3D {
 mod tests {
     use super::*;
     use crate::gpu::GpuMappings;
+
+    fn learn_plain_registers(engine: &mut Maxwell3D, methods: std::ops::Range<u32>) {
+        for method in methods {
+            engine.write_register(method, 0);
+        }
+    }
+
+    #[test]
+    fn plain_burst_matches_per_word_writes() {
+        let mut legacy = Maxwell3D::new();
+        let mut fast = Maxwell3D::new();
+        learn_plain_registers(&mut legacy, 0x288..0x2A0);
+        learn_plain_registers(&mut fast, 0x288..0x2A0);
+        assert!(fast.plain_burst_eligible(0x288, 16, false));
+        assert!(fast.plain_burst_eligible(0x290, 4, true));
+        assert!(!fast.plain_burst_eligible(0x280, 4, false));
+        assert!(!fast.plain_burst_eligible(0x8E4, 4, true));
+        let args: Vec<u32> = (0..16).map(|index| 0x3F80_0000 + index * 0x1000).collect();
+        for (offset, &arg) in args.iter().enumerate() {
+            legacy.write_register(0x288 + offset as u32, arg);
+        }
+        fast.write_plain_burst(0x288, &args[..15], false);
+        fast.write_register(0x288 + 15, args[15]);
+        assert_passive_engines_equal(&mut legacy, &mut fast);
+        for &arg in &[7u32, 7, 9] {
+            legacy.write_register(0x290, arg);
+        }
+        fast.write_plain_burst(0x290, &[7, 7], true);
+        fast.write_register(0x290, 9);
+        assert_passive_engines_equal(&mut legacy, &mut fast);
+    }
+
+    #[test]
+    fn cbdata_burst_matches_per_word_writes() {
+        let mut legacy = Maxwell3D::new();
+        let mut fast = Maxwell3D::new();
+        for engine in [&mut legacy, &mut fast] {
+            engine.write_register(0x8E0, 0x10000);
+            engine.write_register(0x8E1, 0x1);
+            engine.write_register(0x8E2, 0x2000);
+            engine.write_register(0x8E3, 0x40);
+        }
+        let args: Vec<u32> = (0..16).map(|index| index * 7 + 1).collect();
+        for &arg in &args {
+            legacy.write_register(0x8E4, arg);
+        }
+        assert!(fast.cbdata_burst_eligible(0x8E4, 16, true));
+        assert!(fast.cbdata_burst_eligible(0x8E4, 16, false));
+        assert!(!fast.cbdata_burst_eligible(0x8E4, 17, false));
+        fast.write_cbdata_burst(0x8E4, &args[..15], true);
+        fast.write_register(0x8E4, args[15]);
+        assert_eq!(legacy.regs.pending_constbuf_writes, fast.regs.pending_constbuf_writes);
+        assert_eq!(legacy.regs.constbuf_load_offset, fast.regs.constbuf_load_offset);
+        assert_passive_engines_equal(&mut legacy, &mut fast);
+        for (offset, &arg) in args.iter().enumerate() {
+            legacy.write_register(0x8E4 + offset as u32, arg);
+        }
+        fast.write_cbdata_burst(0x8E4, &args[..15], false);
+        fast.write_register(0x8E4 + 15, args[15]);
+        assert_eq!(legacy.regs.pending_constbuf_writes, fast.regs.pending_constbuf_writes);
+        assert_eq!(legacy.regs.constbuf_load_offset, fast.regs.constbuf_load_offset);
+        assert_passive_engines_equal(&mut legacy, &mut fast);
+    }
 
     fn legacy_passive_run(
         engine: &mut Maxwell3D,

@@ -686,6 +686,7 @@ struct PendingComputeWriteback {
     output_targets: Vec<OutputTarget>,
     texel_targets: Vec<TexelTarget>,
     landed: Option<crossbeam::channel::Receiver<()>>,
+    dma: Option<DeferredDma>,
 }
 
 struct LandingRecord {
@@ -695,6 +696,152 @@ struct LandingRecord {
     output_targets: Vec<OutputTarget>,
     texel_targets: Vec<TexelTarget>,
     done: crossbeam::channel::Sender<()>,
+    dma: Option<DeferredDma>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredDmaCopy {
+    pub(crate) src_gpu: u64,
+    pub(crate) src_cpu: u64,
+    pub(crate) dst_gpu: u64,
+    pub(crate) dst_cpu: u64,
+    pub(crate) len: usize,
+    pub(crate) source: Option<DeferredDmaSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredDmaSource {
+    pub(crate) serial: u64,
+    pub(crate) resource_index: u32,
+    pub(crate) src_offset: u64,
+    pub(crate) raw: bool,
+}
+
+#[derive(Clone)]
+struct DeferredDma {
+    copies: Vec<DeferredDmaCopy>,
+    memory: crate::gpu::GuestMemoryAccess,
+    created: std::time::Instant,
+}
+
+pub(crate) fn dma_defer_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_DMA_DEFER").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+pub(crate) fn pending_writeback_covers(cpu_addr: u64, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let pending = pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut ranges: Vec<(u64, u64)> = pending
+        .iter()
+        .flat_map(pending_writeback_record_cpu_ranges)
+        .collect();
+    drop(pending);
+    cpu_ranges_cover(&mut ranges, cpu_addr, cpu_addr.saturating_add(len as u64))
+}
+
+fn pending_writeback_record_cpu_ranges(record: &PendingComputeWriteback) -> Vec<(u64, u64)> {
+    record
+        .output_targets
+        .iter()
+        .map(|target| (target.cpu_addr, target.guest_size))
+        .chain(record.texel_targets.iter().map(|target| (target.cpu_addr, target.guest_size)))
+        .chain(
+            record
+                .dma
+                .iter()
+                .flat_map(|dma| dma.copies.iter().map(|copy| (copy.dst_cpu, copy.len))),
+        )
+        .filter(|&(_, size)| size != 0)
+        .map(|(cpu_addr, size)| (cpu_addr, cpu_addr.saturating_add(size as u64)))
+        .collect()
+}
+
+fn cpu_ranges_cover(ranges: &mut [(u64, u64)], lo: u64, hi: u64) -> bool {
+    ranges.sort_unstable();
+    let mut covered_to = lo;
+    for &(start, end) in ranges.iter() {
+        if covered_to >= hi {
+            break;
+        }
+        if start > covered_to {
+            return false;
+        }
+        covered_to = covered_to.max(end);
+    }
+    covered_to >= hi
+}
+
+pub(crate) fn push_deferred_dma(
+    copies: Vec<DeferredDmaCopy>,
+    memory: crate::gpu::GuestMemoryAccess,
+) {
+    crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::DMA_DEFERRED, 1);
+    push_pending_writeback(PendingComputeWriteback {
+        id: PendingComputeId::Ready(0),
+        program_gpu_va: 0,
+        serial: 0,
+        output_targets: Vec::new(),
+        texel_targets: Vec::new(),
+        landed: None,
+        dma: Some(DeferredDma {
+            copies,
+            memory,
+            created: std::time::Instant::now(),
+        }),
+    });
+}
+
+fn land_deferred_dma(
+    renderer: &nexium_gpu::Renderer,
+    dma: &DeferredDma,
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+) -> Result<(), String> {
+    let reader = dma
+        .memory
+        .reader()
+        .ok_or_else(|| "guest memory reader unavailable for a deferred DMA".to_string())?;
+    let mut bytes = Vec::new();
+    for copy in &dma.copies {
+        let mapped = |gpu_va: u64, cpu_addr: u64| {
+            mapped_range(mappings, gpu_va).is_some_and(|(current, available)| {
+                current == cpu_addr && available >= copy.len as u64
+            })
+        };
+        if !mapped(copy.src_gpu, copy.src_cpu) || !mapped(copy.dst_gpu, copy.dst_cpu) {
+            return Err(format!(
+                "deferred DMA {:#x}->{:#x} lost its guest mapping",
+                copy.src_gpu, copy.dst_gpu
+            ));
+        }
+        bytes.resize(copy.len, 0);
+        if !reader(copy.src_cpu, &mut bytes) {
+            return Err(format!("deferred DMA source read failed at {:#x}", copy.src_cpu));
+        }
+        if !mem_write(copy.dst_cpu, &bytes) {
+            return Err(format!("deferred DMA destination write failed at {:#x}", copy.dst_cpu));
+        }
+        invalidate_guest_write(renderer, mappings, copy.dst_gpu, copy.dst_cpu, copy.len, None);
+    }
+    if compute_sync_trace_enabled() {
+        log::warn!(
+            "[ktl] us={} csync kind=dma-landed copies={} age_ms={:.3}",
+            crate::timeline_us(),
+            dma.copies.len(),
+            dma.created.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok(())
 }
 
 static COMPUTE_WRITEBACK_FAILED: std::sync::atomic::AtomicBool =
@@ -735,6 +882,7 @@ pub(crate) fn schedule_pending_landings(
                     output_targets: record.output_targets.clone(),
                     texel_targets: record.texel_targets.clone(),
                     done,
+                    dma: record.dma.clone(),
                 }
             })
             .collect()
@@ -760,7 +908,13 @@ fn land_records(
     for record in records {
         if let Some(writer) = writer.as_ref() {
             let mem_write = |address: u64, bytes: &[u8]| writer(address, bytes);
-            if let Some(id) = record.id.wait() {
+            if let Some(dma) = record.dma.as_ref() {
+                let mappings = memory.read_mappings();
+                if let Err(error) = land_deferred_dma(renderer, dma, &mappings, &mem_write) {
+                    mark_compute_writeback_failed();
+                    log::error!("[compute-landing] {}", error);
+                }
+            } else if let Some(id) = record.id.wait() {
                 match renderer.take_pending_compute(id) {
                     Ok(result) => {
                         let mappings = memory.read_mappings();
@@ -838,10 +992,31 @@ pub(crate) struct PendingComputeWritebackSpan {
     pub(crate) gpu_va: u64,
     pub(crate) cpu_addr: u64,
     pub(crate) len: usize,
+    pub(crate) source_offset: u64,
 }
 
 thread_local! {
     static RESOLVED_WRITEBACK_SPANS: RefCell<Vec<PendingComputeWritebackSpan>> = RefCell::new(Vec::new());
+    static RESOLVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct ResolveDepthGuard;
+
+impl ResolveDepthGuard {
+    fn enter() -> Self {
+        RESOLVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ResolveDepthGuard {
+    fn drop(&mut self) {
+        RESOLVE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn resolve_depth() -> u32 {
+    RESOLVE_DEPTH.with(|depth| depth.get())
 }
 
 fn report_resolved_writeback_spans(spans: Vec<PendingComputeWritebackSpan>) {
@@ -905,6 +1080,26 @@ fn next_compute_serial() -> u64 {
 pub(crate) fn lazy_compute_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_LAZY_COMPUTE").is_none())
+}
+
+fn vertex_store_offload_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_VERTEX_STORE_OFFLOAD").map_or(true, |value| value != "0")
+    })
+}
+
+fn offload_eligible(code_override: Option<&[u8]>) -> bool {
+    lazy_compute_enabled()
+        && compute_offload_enabled()
+        && (code_override.is_none() || vertex_store_offload_enabled())
+}
+
+pub(crate) fn vertex_store_offloaded() -> bool {
+    lazy_compute_enabled()
+        && compute_offload_enabled()
+        && vertex_store_offload_enabled()
+        && crate::render_thread::maybe_render_thread().is_some()
 }
 
 pub(crate) fn compute_serial_tracked(serial: u64) -> bool {
@@ -983,7 +1178,20 @@ fn pending_writeback_record_overlaps(
                 target.cpu_addr,
                 target.guest_size,
             )
-        }))
+        }) || deferred_dma_overlaps(record, gpu_va, cpu_addr, size))
+}
+
+fn deferred_dma_overlaps(
+    record: &PendingComputeWriteback,
+    gpu_va: u64,
+    cpu_addr: u64,
+    size: usize,
+) -> bool {
+    record.dma.as_ref().is_some_and(|dma| {
+        dma.copies.iter().any(|copy| {
+            mapped_resources_overlap(gpu_va, cpu_addr, size, copy.dst_gpu, copy.dst_cpu, copy.len)
+        })
+    })
 }
 
 fn pending_writeback_prefix_len(
@@ -1046,7 +1254,7 @@ fn pending_writeback_requires_raw_storage_resolution(
                     target.cpu_addr,
                     target.guest_size,
                 ) && !resident_raw_overlap_is_compatible(key, target.raw_storage_key, resident)
-            })
+            }) || deferred_dma_overlaps(record, gpu_va, cpu_addr, size)
         })
 }
 
@@ -1055,10 +1263,40 @@ fn pending_writeback_target_spans(
 ) -> Vec<PendingComputeWritebackSpan> {
     let span_count = records
         .iter()
-        .map(|record| record.output_targets.len() + record.texel_targets.len())
+        .map(|record| {
+            record.output_targets.len()
+                + record.texel_targets.len()
+                + record.dma.as_ref().map_or(0, |dma| dma.copies.len())
+        })
         .sum();
     let mut spans = Vec::with_capacity(span_count);
     for record in records {
+        if let Some(dma) = record.dma.as_ref() {
+            spans.extend(dma.copies.iter().map(|copy| match copy.source {
+                Some(source) => PendingComputeWritebackSpan {
+                    dispatch_id: 0,
+                    serial: source.serial,
+                    resource_index: source.resource_index,
+                    binding: u32::MAX,
+                    raw: source.raw,
+                    gpu_va: copy.dst_gpu,
+                    cpu_addr: copy.dst_cpu,
+                    len: copy.len,
+                    source_offset: source.src_offset,
+                },
+                None => PendingComputeWritebackSpan {
+                    dispatch_id: 0,
+                    serial: 0,
+                    resource_index: u32::MAX,
+                    binding: u32::MAX,
+                    raw: false,
+                    gpu_va: copy.dst_gpu,
+                    cpu_addr: copy.dst_cpu,
+                    len: copy.len,
+                    source_offset: 0,
+                },
+            }));
+        }
         spans.extend(
             record
                 .output_targets
@@ -1072,6 +1310,7 @@ fn pending_writeback_target_spans(
                     gpu_va: target.gpu_va,
                     cpu_addr: target.cpu_addr,
                     len: target.guest_size,
+                    source_offset: 0,
                 }),
         );
         spans.extend(
@@ -1087,6 +1326,7 @@ fn pending_writeback_target_spans(
                     gpu_va: target.gpu_va,
                     cpu_addr: target.cpu_addr,
                     len: target.guest_size,
+                    source_offset: 0,
                 }),
         );
     }
@@ -1133,6 +1373,7 @@ fn resolve_pending_writeback_prefix_report(
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
     overlapping: Option<&[(u64, u64, usize)]>,
 ) -> Vec<PendingComputeWritebackSpan> {
+    let _depth = ResolveDepthGuard::enter();
     let records: Vec<PendingComputeWriteback> = {
         let mut pending = pending_writebacks()
             .lock()
@@ -1159,6 +1400,9 @@ fn resolve_pending_writeback_prefix_report(
         .collect();
     for record in records {
         let wait_started = std::time::Instant::now();
+        if record.dma.is_some() {
+            crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::DMA_DEFER_SYNC, 1);
+        }
         if let Some(landed) = &record.landed {
             if landed
                 .recv_timeout(std::time::Duration::from_secs(3))
@@ -1174,6 +1418,23 @@ fn resolve_pending_writeback_prefix_report(
                     caller.line(),
                     record_count,
                     wait_started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            continue;
+        }
+        if let Some(dma) = record.dma.as_ref() {
+            if let Err(error) = land_deferred_dma(renderer, dma, mappings, mem_write) {
+                mark_compute_writeback_failed();
+                log::error!("[compute-lazy-resolve] {}", error);
+            }
+            if trace {
+                log::warn!(
+                    "[kc-resolve] caller={}:{} records={} deferred-dma copies={} age_ms={:.3}",
+                    caller.file(),
+                    caller.line(),
+                    record_count,
+                    dma.copies.len(),
+                    dma.created.elapsed().as_secs_f64() * 1000.0,
                 );
             }
             continue;
@@ -1278,6 +1539,7 @@ mod prefix_resolve_tests {
                 raw_storage_key: None,
             }],
             landed: None,
+            dma: None,
         }
     }
 
@@ -1298,6 +1560,103 @@ mod prefix_resolve_tests {
             2
         );
         assert_eq!(pending_writeback_prefix_len(&pending, Some(&[(0x1000, 0x8000, 0)])), 0);
+    }
+
+    fn dma_record(copies: Vec<super::DeferredDmaCopy>) -> PendingComputeWriteback {
+        let mappings = std::sync::Arc::new(parking_lot::RwLock::new(crate::gpu::GpuMappings::default()));
+        PendingComputeWriteback {
+            id: PendingComputeId::Ready(0),
+            program_gpu_va: 0,
+            serial: 0,
+            output_targets: Vec::new(),
+            texel_targets: Vec::new(),
+            landed: None,
+            dma: Some(super::DeferredDma {
+                copies,
+                memory: crate::gpu::GuestMemoryAccess::new(mappings),
+                created: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    #[test]
+    fn cpu_range_cover_requires_gapless_union() {
+        assert!(super::cpu_ranges_cover(&mut [(0x100, 0x200)], 0x100, 0x200));
+        assert!(super::cpu_ranges_cover(&mut [(0x180, 0x300), (0x100, 0x180)], 0x120, 0x2f0));
+        assert!(!super::cpu_ranges_cover(&mut [(0x100, 0x180), (0x190, 0x300)], 0x100, 0x200));
+        assert!(!super::cpu_ranges_cover(&mut [(0x110, 0x300)], 0x100, 0x200));
+        assert!(!super::cpu_ranges_cover(&mut [], 0x100, 0x200));
+    }
+
+    #[test]
+    fn deferred_dma_destination_is_pending_but_never_an_overlay_source() {
+        let copy = super::DeferredDmaCopy {
+            src_gpu: 0x1000,
+            src_cpu: 0x8000,
+            dst_gpu: 0x5000,
+            dst_cpu: 0xc000,
+            len: 0x160,
+            source: None,
+        };
+        let pending = [texel_record(1, 0x1000, 0x8000, 0x200), dma_record(vec![copy])];
+        assert!(super::pending_writeback_record_overlaps(&pending[1], 0x5100, 0xc100, 4));
+        assert!(!super::pending_writeback_record_overlaps(&pending[1], 0x1000, 0x8000, 0x200));
+        assert_eq!(pending_writeback_prefix_len(&pending, Some(&[(0x5000, 0xc000, 4)])), 2);
+        assert_eq!(pending_writeback_prefix_len(&pending, Some(&[(0x1000, 0x8000, 4)])), 1);
+        let spans = super::pending_writeback_target_spans(&pending[1..]);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].gpu_va, spans[0].cpu_addr, spans[0].len), (0x5000, 0xc000, 0x160));
+        assert!(!spans[0].raw);
+        assert_eq!(spans[0].serial, 0);
+        assert_eq!(spans[0].resource_index, u32::MAX);
+        let mut ranges: Vec<(u64, u64)> = pending
+            .iter()
+            .flat_map(super::pending_writeback_record_cpu_ranges)
+            .collect();
+        assert!(super::cpu_ranges_cover(&mut ranges, 0xc000, 0xc160));
+        assert!(super::cpu_ranges_cover(&mut ranges, 0x8000, 0x8200));
+    }
+
+    #[test]
+    fn deferred_dma_with_a_compute_source_reports_an_overlay_capable_span() {
+        let sourced = super::DeferredDmaCopy {
+            src_gpu: 0x1050,
+            src_cpu: 0x8050,
+            dst_gpu: 0x5000,
+            dst_cpu: 0xc000,
+            len: 0x160,
+            source: Some(super::DeferredDmaSource {
+                serial: 1,
+                resource_index: 0,
+                src_offset: 0x50,
+                raw: false,
+            }),
+        };
+        let spans = super::pending_writeback_target_spans(&[dma_record(vec![sourced])]);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].gpu_va, spans[0].cpu_addr, spans[0].len), (0x5000, 0xc000, 0x160));
+        assert_eq!(spans[0].serial, 1);
+        assert_eq!(spans[0].resource_index, 0);
+        assert_eq!(spans[0].source_offset, 0x50);
+        assert!(!spans[0].raw);
+        let texel = super::pending_writeback_target_spans(&[texel_record(1, 0x1000, 0x8000, 0x200)]);
+        assert_eq!(texel[0].source_offset, 0);
+        let source = crate::gpu::vk_dispatch::compute_overlay_source_for_range(&texel, 0x8050, 0x160)
+            .expect("the texel output covers the copy");
+        assert_eq!(
+            source,
+            super::DeferredDmaSource {
+                serial: 1,
+                resource_index: 0,
+                src_offset: 0x50,
+                raw: true,
+            }
+        );
+        assert!(crate::gpu::vk_dispatch::compute_overlay_source_for_range(&texel, 0x8100, 0x200).is_none());
+        let chained = crate::gpu::vk_dispatch::compute_overlay_source_for_range(&spans, 0xc100, 0x20)
+            .expect("a sourced DMA destination is itself a source");
+        assert_eq!(chained.src_offset, 0x150);
+        assert_eq!(chained.serial, 1);
     }
 }
 
@@ -1472,7 +1831,9 @@ pub(crate) fn execute_vertex_memory_store(
         Some(code),
     ) {
         Ok(()) => {
-            resolve_pending_writebacks(renderer, mappings, mem_write);
+            if !vertex_store_offloaded() {
+                resolve_pending_writebacks(renderer, mappings, mem_write);
+            }
             MaxwellComputeOutcome::Executed
         }
         Err(ExecuteError::Unsupported(reason)) => {
@@ -2515,9 +2876,7 @@ fn prepare_and_execute(
     }
 
     let program_key = renderer_program_key(code_sha256, module.spirv_hash);
-    let serial = if code_override.is_none()
-        && lazy_compute_enabled()
-        && compute_offload_enabled()
+    let serial = if offload_eligible(code_override)
         && crate::render_thread::maybe_render_thread().is_some()
     {
         next_compute_serial()
@@ -2623,7 +2982,7 @@ fn prepare_and_execute(
     crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_RESOURCES, kp_resources);
     let kp_exec = crate::gpu::pusher::kickprof::start();
     crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::KC_DISPATCH, 1);
-    if code_override.is_none() && lazy_compute_enabled() && compute_offload_enabled() {
+    if offload_eligible(code_override) {
         if let Some(rt) = crate::render_thread::maybe_render_thread() {
             let deferred_id = Arc::new(DeferredComputeId::default());
             let id_tx = DeferredComputeIdSender(Some(Arc::clone(&deferred_id)));
@@ -2660,6 +3019,7 @@ fn prepare_and_execute(
                     output_targets,
                     texel_targets,
                     landed: None,
+                    dma: None,
                 });
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_EXEC, kp_exec);
             return Ok(());
@@ -2706,6 +3066,7 @@ fn prepare_and_execute(
                     output_targets,
                     texel_targets,
                     landed: None,
+                    dma: None,
                 });
             Ok(())
         }
@@ -5457,6 +5818,7 @@ mod tests {
             gpu_va,
             cpu_addr: gpu_va + 0x4000,
             len: 0x40,
+            source_offset: 0,
         }
     }
 
@@ -5654,6 +6016,7 @@ mod tests {
                     raw_storage_key: None,
                 }],
                 landed: None,
+                dma: None,
             },
             PendingComputeWriteback {
                 id: PendingComputeId::Ready(2),
@@ -5670,6 +6033,7 @@ mod tests {
                     raw_storage_key: None,
                 }],
                 landed: None,
+                dma: None,
             },
         ];
 
@@ -5685,6 +6049,7 @@ mod tests {
                     gpu_va: 0x1000,
                     cpu_addr: 0x8000,
                     len: 0x80,
+                    source_offset: 0,
                 },
                 PendingComputeWritebackSpan {
                     dispatch_id: 1,
@@ -5695,6 +6060,7 @@ mod tests {
                     gpu_va: 0x2000,
                     cpu_addr: 0x9000,
                     len: 0x40,
+                    source_offset: 0,
                 },
                 PendingComputeWritebackSpan {
                     dispatch_id: 2,
@@ -5705,6 +6071,7 @@ mod tests {
                     gpu_va: 0x3000,
                     cpu_addr: 0xa000,
                     len: 0x20,
+                    source_offset: 0,
                 },
             ]
         );

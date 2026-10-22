@@ -448,6 +448,104 @@ impl MaxwellDma {
         self.guest_write_range.take()
     }
 
+    pub(crate) fn deferrable_pitch_copies(
+        &self,
+        flags: u32,
+        mappings: &GpuMappings,
+    ) -> Option<Vec<super::maxwell_compute::DeferredDmaCopy>> {
+        const MAX_DEFERRED_LINES: usize = 64;
+        let src_layout = (flags >> LAUNCH_SRC_LAYOUT_BIT) & 1;
+        let dst_layout = (flags >> LAUNCH_DST_LAYOUT_BIT) & 1;
+        if src_layout != LAYOUT_PITCH || dst_layout != LAYOUT_PITCH {
+            return None;
+        }
+        let multi_line = (flags >> LAUNCH_MULTI_LINE_BIT) & 1 != 0;
+        let remap_enable = (flags >> LAUNCH_REMAP_ENABLE_BIT) & 1 != 0;
+        let bytes_per_group = if remap_enable {
+            (((self.remap_components >> 16) & 0x3) as usize + 1)
+                * (((self.remap_components >> 20) & 0x3) as usize + 1)
+        } else {
+            1
+        };
+        let line_length = (self.line_length_in as usize).checked_mul(bytes_per_group)?;
+        let line_count = if multi_line { self.line_count.max(1) as usize } else { 1 };
+        if line_length == 0 {
+            return None;
+        }
+        let src_pitch = (self.pitch_in as usize).max(line_length);
+        let dst_pitch = (self.pitch_out as usize).max(line_length);
+        let (src_gpu, dst_gpu) = (self.src_addr(), self.dst_addr());
+        let (src_cpu, src_limit) = mappings.cpu_range_for(src_gpu)?;
+        let (dst_cpu, dst_limit) = mappings.cpu_range_for(dst_gpu)?;
+        let src_extent = src_pitch.checked_mul(line_count - 1)?.checked_add(line_length)?;
+        let dst_extent = dst_pitch.checked_mul(line_count - 1)?.checked_add(line_length)?;
+        if src_extent as u64 > src_limit
+            || dst_extent as u64 > dst_limit
+            || (src_cpu < dst_cpu.saturating_add(dst_extent as u64)
+                && dst_cpu < src_cpu.saturating_add(src_extent as u64))
+        {
+            return None;
+        }
+        if src_pitch == line_length && dst_pitch == line_length {
+            return Some(vec![super::maxwell_compute::DeferredDmaCopy {
+                src_gpu,
+                src_cpu,
+                dst_gpu,
+                dst_cpu,
+                len: src_extent,
+                source: None,
+            }]);
+        }
+        if line_count > MAX_DEFERRED_LINES {
+            return None;
+        }
+        Some(
+            (0..line_count)
+                .map(|line| super::maxwell_compute::DeferredDmaCopy {
+                    src_gpu: src_gpu + (line * src_pitch) as u64,
+                    src_cpu: src_cpu + (line * src_pitch) as u64,
+                    dst_gpu: dst_gpu + (line * dst_pitch) as u64,
+                    dst_cpu: dst_cpu + (line * dst_pitch) as u64,
+                    len: line_length,
+                    source: None,
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn commit_deferred_pitch_launch(
+        &mut self,
+        flags: u32,
+        mappings: &GpuMappings,
+    ) {
+        self.trace_semaphore_launch(flags, mappings);
+        self.guest_write_range = None;
+        self.pending_rt_source = None;
+        let remap_enable = (flags >> LAUNCH_REMAP_ENABLE_BIT) & 1 != 0;
+        let bytes_per_group = if remap_enable {
+            (((self.remap_components >> 16) & 0x3) as usize + 1)
+                * (((self.remap_components >> 20) & 0x3) as usize + 1)
+        } else {
+            1
+        };
+        let line_length = (self.line_length_in as usize).saturating_mul(bytes_per_group);
+        let line_count = if (flags >> LAUNCH_MULTI_LINE_BIT) & 1 != 0 {
+            self.line_count.max(1) as usize
+        } else {
+            1
+        };
+        let dst_gpu = self.dst_addr();
+        let copied_size = (self.pitch_out as usize)
+            .max(line_length)
+            .saturating_mul(line_count) as u64;
+        nexium_gpu::tex_invalidate::bump_region(dst_gpu, copied_size);
+        if copied_size != 0 {
+            self.invalidate_rt_copy_aliases(mappings, dst_gpu, copied_size);
+        }
+        self.rt_copy_sources.remove(&dst_gpu);
+        self.blit_count = self.blit_count.wrapping_add(1);
+    }
+
     fn rt_copy_record(&self, gpu_va: u64) -> Option<RtCopyRecord> {
         let record = self.rt_copy_sources.get(&gpu_va)?;
         let generation = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, record.size);
@@ -2639,6 +2737,86 @@ mod tests {
         ] {
             dma.dispatch_method(method, value, mappings, mem_read, mem_write, mem_copy);
         }
+    }
+
+    fn pitch_dma(line_length: u32, line_count: u32, pitch_in: u32, pitch_out: u32, components: u32) -> MaxwellDma {
+        let mut dma = MaxwellDma::new();
+        dma.offset_in_lower = SRC_GPU as u32;
+        dma.offset_out_lower = DST_GPU as u32;
+        dma.line_length_in = line_length;
+        dma.line_count = line_count;
+        dma.pitch_in = pitch_in;
+        dma.pitch_out = pitch_out;
+        dma.remap_components = components;
+        dma
+    }
+
+    #[test]
+    fn deferred_pitch_copies_reproduce_the_immediate_launch() {
+        let pitch_pitch = (1 << LAUNCH_SRC_LAYOUT_BIT) | (1 << LAUNCH_DST_LAYOUT_BIT);
+        let multi = 1 << LAUNCH_MULTI_LINE_BIT;
+        let remap = 1 << LAUNCH_REMAP_ENABLE_BIT;
+        let cases: [(u32, u32, u32, u32, u32, u32, usize); 4] = [
+            (pitch_pitch, 0x160, 1, 0, 0, 0, 1),
+            (pitch_pitch | multi, 0x30, 5, 0x40, 0x50, 0, 5),
+            (pitch_pitch | multi, 0x40, 4, 0x40, 0x40, 0, 1),
+            (pitch_pitch | multi | remap, 0x20, 3, 0x100, 0x100, 0x0003_3210, 3),
+        ];
+        let mut mappings = GpuMappings::new();
+        mappings.add(SRC_GPU, 0x1000, SRC_CPU, 1);
+        mappings.add(DST_GPU, 0x1000, DST_CPU, 2);
+        let pattern: Vec<u8> = (0..0x2000).map(|value| (value * 7 + 3) as u8).collect();
+        for &(flags, line_length, line_count, pitch_in, pitch_out, components, copy_count) in &cases {
+            let memory = RefCell::new(pattern.clone());
+            let mem_read = |address: u64, output: &mut [u8]| {
+                let offset = (address - SRC_CPU) as usize;
+                output.copy_from_slice(&memory.borrow()[offset..offset + output.len()]);
+                true
+            };
+            let mem_write = |address: u64, input: &[u8]| {
+                let offset = (address - SRC_CPU) as usize;
+                memory.borrow_mut()[offset..offset + input.len()].copy_from_slice(input);
+                true
+            };
+            let mem_copy = |_: u64, _: u64, _: usize| false;
+            let mut immediate = pitch_dma(line_length, line_count, pitch_in, pitch_out, components);
+            immediate.dispatch_method(M_LAUNCH_DMA, flags, &mappings, &mem_read, &mem_write, &mem_copy);
+            let expected = memory.replace(pattern.clone());
+
+            let mut deferred = pitch_dma(line_length, line_count, pitch_in, pitch_out, components);
+            let copies = deferred.deferrable_pitch_copies(flags, &mappings).unwrap();
+            assert_eq!(copies.len(), copy_count);
+            deferred.commit_deferred_pitch_launch(flags, &mappings);
+            assert_eq!(deferred.blit_count, immediate.blit_count);
+            for copy in copies {
+                let mut bytes = vec![0u8; copy.len];
+                assert!(mem_read(copy.src_cpu, &mut bytes));
+                assert!(mem_write(copy.dst_cpu, &bytes));
+            }
+            assert!(memory.borrow().as_slice() == expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn deferred_pitch_copies_reject_block_linear_overlap_and_unmapped_extents() {
+        let pitch_pitch = (1 << LAUNCH_SRC_LAYOUT_BIT) | (1 << LAUNCH_DST_LAYOUT_BIT);
+        let multi = 1 << LAUNCH_MULTI_LINE_BIT;
+        let mut mappings = GpuMappings::new();
+        mappings.add(SRC_GPU, 0x1000, SRC_CPU, 1);
+        mappings.add(DST_GPU, 0x1000, DST_CPU, 2);
+        let dma = pitch_dma(0x40, 1, 0, 0, 0);
+        assert!(dma.deferrable_pitch_copies(1 << LAUNCH_DST_LAYOUT_BIT, &mappings).is_none());
+        assert!(dma.deferrable_pitch_copies(1 << LAUNCH_SRC_LAYOUT_BIT, &mappings).is_none());
+        assert!(pitch_dma(0x40, 0x41, 0x40, 0x40, 0)
+            .deferrable_pitch_copies(pitch_pitch | multi, &mappings)
+            .is_none());
+        assert!(pitch_dma(0x20, 65, 0x30, 0x30, 0)
+            .deferrable_pitch_copies(pitch_pitch | multi, &mappings)
+            .is_none());
+        assert!(pitch_dma(0, 1, 0, 0, 0).deferrable_pitch_copies(pitch_pitch, &mappings).is_none());
+        let mut overlapping = pitch_dma(0x100, 1, 0, 0, 0);
+        overlapping.offset_out_lower = (SRC_GPU + 0x80) as u32;
+        assert!(overlapping.deferrable_pitch_copies(pitch_pitch, &mappings).is_none());
     }
 
     fn linear_copy_fixture() -> (GpuMappings, RefCell<Vec<u8>>, Vec<u8>) {
