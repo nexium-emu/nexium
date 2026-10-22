@@ -143,6 +143,7 @@ mod sys {
     }
 
     pub fn take_write_watch(ptr: *mut u8, len: usize, addresses: &mut [usize]) -> Option<usize> {
+        let started = std::time::Instant::now();
         let mut count = addresses.len();
         let mut granularity = 0u32;
         let result = unsafe {
@@ -155,6 +156,12 @@ mod sys {
                 &mut granularity,
             )
         };
+        super::WRITE_WATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::WRITE_WATCH_PAGES.fetch_add((len >> 12) as u64, std::sync::atomic::Ordering::Relaxed);
+        super::WRITE_WATCH_NS.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         (result == 0).then_some(count)
     }
 }
@@ -261,6 +268,210 @@ static ARENA: OnceLock<AtomicPtr<u8>> = OnceLock::new();
 static ARENA_WRITE_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static COMMITTED_RANGES: OnceLock<Mutex<Vec<CommittedRange>>> = OnceLock::new();
 static COMMIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_WATCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static WRITE_WATCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_WATCH_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_WATCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn take_write_watch_stats() -> (u64, u64, u64) {
+    (
+        WRITE_WATCH_CALLS.swap(0, Ordering::Relaxed),
+        WRITE_WATCH_PAGES.swap(0, Ordering::Relaxed),
+        WRITE_WATCH_NS.swap(0, Ordering::Relaxed),
+    )
+}
+
+fn write_watch_memo_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_WRITE_WATCH_MEMO").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+thread_local! {
+    static WRITE_WATCH_MEMO_THREAD_OPT_IN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn enable_write_watch_memo_for_thread() {
+    WRITE_WATCH_MEMO_THREAD_OPT_IN.with(|opt_in| opt_in.set(true));
+}
+
+pub fn decode_write_watch_sweep_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_DECODE_WRITE_WATCH_SWEEP").map_or(true, |value| value != "0")
+    })
+}
+
+#[derive(Default)]
+struct WriteWatchMemo {
+    active: bool,
+    epoch: u64,
+    chunks: nexium_common::fast_hash::FastMap<u64, u16>,
+    used: nexium_common::fast_hash::FastMap<u64, u16>,
+}
+
+thread_local! {
+    static WRITE_WATCH_MEMO: std::cell::RefCell<WriteWatchMemo> =
+        std::cell::RefCell::new(WriteWatchMemo::default());
+}
+
+thread_local! {
+    static WRITE_WATCH_EPOCH_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn bump_write_watch_epoch() {
+    WRITE_WATCH_EPOCH.fetch_add(1, Ordering::Release);
+    WRITE_WATCH_EPOCH_SEEN.with(|seen| seen.set(true));
+    if write_watch_memo_enabled() || WRITE_WATCH_MEMO_THREAD_OPT_IN.with(|opt_in| opt_in.get()) {
+        WRITE_WATCH_MEMO.with(|memo| memo.borrow_mut().active = true);
+    }
+}
+
+pub fn write_watch_epoch() -> u64 {
+    WRITE_WATCH_EPOCH.load(Ordering::Acquire)
+}
+
+pub fn write_watch_epoch_active() -> bool {
+    WRITE_WATCH_EPOCH_SEEN.with(|seen| seen.get())
+}
+
+impl WriteWatchMemo {
+    fn sync(&mut self) -> bool {
+        if !self.active {
+            return false;
+        }
+        let epoch = WRITE_WATCH_EPOCH.load(Ordering::Acquire);
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.chunks.clear();
+            self.used.clear();
+        }
+        true
+    }
+
+    fn for_each_chunk(lo: u64, hi: u64, mut visit: impl FnMut(u64, u16) -> bool) -> bool {
+        if hi <= lo {
+            return true;
+        }
+        let mut page = lo >> 12;
+        let last = (hi - 1) >> 12;
+        loop {
+            let chunk = page >> 4;
+            let first_slot = page & 15;
+            let end_page = last.min((chunk << 4) | 15);
+            let count = end_page - page + 1;
+            let mask = (((1u32 << count) - 1) as u16) << first_slot;
+            if !visit(chunk, mask) {
+                return false;
+            }
+            if end_page == last {
+                return true;
+            }
+            page = end_page + 1;
+        }
+    }
+
+    fn covers(&mut self, lo: u64, hi: u64) -> bool {
+        if !self.sync() {
+            return false;
+        }
+        let chunks = &self.chunks;
+        let covered = Self::for_each_chunk(lo, hi, |chunk, mask| {
+            chunks.get(&chunk).is_some_and(|&seen| seen & mask == mask)
+        });
+        if covered {
+            let used = &mut self.used;
+            Self::for_each_chunk(lo, hi, |chunk, mask| {
+                *used.entry(chunk).or_insert(0) |= mask;
+                true
+            });
+        }
+        covered
+    }
+
+    fn insert(&mut self, lo: u64, hi: u64) {
+        if !self.sync() {
+            return;
+        }
+        let chunks = &mut self.chunks;
+        let used = &mut self.used;
+        Self::for_each_chunk(lo, hi, |chunk, mask| {
+            *chunks.entry(chunk).or_insert(0) |= mask;
+            *used.entry(chunk).or_insert(0) |= mask;
+            true
+        });
+    }
+
+    fn adopt(&mut self, lo: u64, hi: u64) {
+        if !self.sync() {
+            return;
+        }
+        let chunks = &mut self.chunks;
+        Self::for_each_chunk(lo, hi, |chunk, mask| {
+            *chunks.entry(chunk).or_insert(0) |= mask;
+            true
+        });
+    }
+
+    fn used_ranges(&mut self) -> Vec<(u64, usize)> {
+        if !self.sync() {
+            return Vec::new();
+        }
+        let mut keys: Vec<(u64, u16)> = self.used.iter().map(|(&key, &mask)| (key, mask)).collect();
+        keys.sort_unstable();
+        let mut ranges: Vec<(u64, usize)> = Vec::with_capacity(keys.len());
+        for (chunk, mask) in keys {
+            let base = chunk << 16;
+            let mut slot = 0u32;
+            while slot < 16 {
+                if mask & (1 << slot) == 0 {
+                    slot += 1;
+                    continue;
+                }
+                let start = slot;
+                while slot < 16 && mask & (1 << slot) != 0 {
+                    slot += 1;
+                }
+                let lo = base + u64::from(start) * 4096;
+                let len = ((slot - start) as usize) * 4096;
+                match ranges.last_mut() {
+                    Some((last_lo, last_len)) if *last_lo + *last_len as u64 == lo => {
+                        *last_len += len;
+                    }
+                    _ => ranges.push((lo, len)),
+                }
+            }
+        }
+        ranges
+    }
+}
+
+pub fn write_watch_memo_adopt(ranges: &[(u64, usize)]) {
+    WRITE_WATCH_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        for &(va, len) in ranges {
+            if let Some((lo, query_len)) = write_watch_query_range(va, len) {
+                memo.adopt(lo, lo + query_len as u64);
+            }
+        }
+    });
+}
+
+pub fn write_watch_memo_used_ranges() -> Vec<(u64, usize)> {
+    WRITE_WATCH_MEMO.with(|memo| memo.borrow_mut().used_ranges())
+}
+
+fn write_watch_memo_covers(lo: u64, query_len: usize) -> bool {
+    WRITE_WATCH_MEMO.with(|memo| memo.borrow_mut().covers(lo, lo + query_len as u64))
+}
+
+fn write_watch_memo_insert(lo: u64, query_len: usize) {
+    WRITE_WATCH_MEMO.with(|memo| memo.borrow_mut().insert(lo, lo + query_len as u64));
+}
 
 const OBSERVED_WRITE_PAGE_SHIFT: u64 = 16;
 const OBSERVED_WRITE_PAGE_MASK: u64 = !((1u64 << OBSERVED_WRITE_PAGE_SHIFT) - 1);
@@ -924,6 +1135,9 @@ pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
         let Some((lo, query_len)) = write_watch_query_range(va, len) else {
             return WriteWatchResult::Unavailable;
         };
+        if write_watch_memo_covers(lo, query_len) {
+            return WriteWatchResult::Clean;
+        }
         let hi = lo + query_len as u64;
         let base = arena();
         if base.is_null() {
@@ -958,6 +1172,9 @@ pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
             }
         });
         drop(ranges);
+        if result != WriteWatchResult::Unavailable {
+            write_watch_memo_insert(lo, query_len);
+        }
         result
     }
 }
@@ -994,6 +1211,9 @@ pub fn take_write_watch_spans(
         let Some((lo, query_len)) = write_watch_query_range(va, len) else {
             return WriteWatchResult::Unavailable;
         };
+        if write_watch_memo_covers(lo, query_len) {
+            return WriteWatchResult::Clean;
+        }
         let hi = lo + query_len as u64;
         let base = arena();
         if base.is_null() {
@@ -1039,6 +1259,9 @@ pub fn take_write_watch_spans(
             }
         });
         drop(ranges);
+        if result != WriteWatchResult::Unavailable {
+            write_watch_memo_insert(lo, query_len);
+        }
         result
     }
 }
@@ -1075,6 +1298,15 @@ pub fn take_write_watch_spans_observed(
         let Some((lo, query_len)) = write_watch_query_range(va, len) else {
             return WriteWatchObservation::unavailable();
         };
+        if write_watch_memo_covers(lo, query_len) {
+            let (serial_after, generation) = observed_write_snapshot_range(lo, query_len);
+            return WriteWatchObservation {
+                result: WriteWatchResult::Clean,
+                serial_after,
+                generation_before: generation,
+                generation_after: generation,
+            };
+        }
         let hi = lo + query_len as u64;
         let base = arena();
         if base.is_null() {
@@ -1122,6 +1354,9 @@ pub fn take_write_watch_spans_observed(
         });
         let (serial_after, generation_after) = observed_write_snapshot_range(lo, query_len);
         drop(ranges);
+        if result != WriteWatchResult::Unavailable {
+            write_watch_memo_insert(lo, query_len);
+        }
         WriteWatchObservation {
             result,
             serial_after,
@@ -1357,6 +1592,30 @@ pub fn watch_write_through(addr: u64, size: usize, value: u64) -> bool {
 #[cfg(all(test, any(windows, all(target_os = "linux", not(target_vendor = "sony")))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_watch_memo_covers_only_queried_pages_within_an_epoch() {
+        let mut memo = WriteWatchMemo {
+            active: true,
+            ..WriteWatchMemo::default()
+        };
+        memo.insert(0x1_0000, 0x1_4000);
+        assert!(memo.covers(0x1_0000, 0x1_4000));
+        assert!(memo.covers(0x1_1000, 0x1_2000));
+        assert!(!memo.covers(0x1_0000, 0x1_5000));
+        assert!(!memo.covers(0x0_f000, 0x1_1000));
+        memo.insert(0x1_f000, 0x3_1000);
+        assert!(memo.covers(0x2_0000, 0x3_0000));
+        assert!(memo.covers(0x1_f000, 0x3_1000));
+        assert!(!memo.covers(0x3_1000, 0x3_2000));
+        let epoch = memo.epoch;
+        bump_write_watch_epoch();
+        assert!(!memo.covers(0x1_0000, 0x1_4000));
+        assert_ne!(memo.epoch, epoch);
+        let mut inactive = WriteWatchMemo::default();
+        inactive.insert(0x1_0000, 0x1_4000);
+        assert!(!inactive.covers(0x1_0000, 0x1_4000));
+    }
 
     /// True when the arena is write-watched. A host that cannot provide it
     /// fails the test loudly unless the skip was requested explicitly.
