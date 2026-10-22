@@ -10307,6 +10307,7 @@ fn igbp_handle_transact(
             if queued % 300 == 0 {
                 log::info!("[guest-present] queued={}", queued);
             }
+            note_guest_present_rate();
             let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
             let flattened_size = reader.read_u32().unwrap_or(0);
             let flattened_size_hi = reader.read_u32().unwrap_or(0);
@@ -13058,6 +13059,23 @@ mod ctrl_wait_event_tests {
             None
         );
     }
+}
+
+fn note_guest_present_rate() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static SECOND: AtomicU64 = AtomicU64::new(0);
+    static PRESENTS: AtomicU64 = AtomicU64::new(0);
+    if !*ENABLED.get_or_init(|| std::env::var("NEXIUM_FPS_LOG").is_ok_and(|value| value != "0")) {
+        return;
+    }
+    let second = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1;
+    let previous = SECOND.swap(second, Ordering::Relaxed);
+    if previous != second && previous != 0 {
+        log::warn!("[fps] second={} presents={}", previous, PRESENTS.swap(0, Ordering::Relaxed));
+    }
+    PRESENTS.fetch_add(1, Ordering::Relaxed);
 }
 
 fn nvdrv_buffer(
