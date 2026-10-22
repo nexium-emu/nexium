@@ -463,9 +463,19 @@ impl Fermi2D {
     ) -> Option<OrderedRegionBlitPreview> {
         let renderer = renderer?;
         let preview = self.ordered_region_backing(terminal_arg, mappings)?;
-        renderer
-            .ordered_rt_copy_region_ready(preview.source, preview.destination, preview.region)
-            .then_some(preview)
+        crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::FERMI_PREVIEW, 1);
+        let ready = renderer.ordered_rt_copy_region_ready(
+            preview.source,
+            preview.destination,
+            preview.region,
+        );
+        if ready {
+            crate::gpu::pusher::kickprof::count(
+                crate::gpu::pusher::kickprof::FERMI_PREVIEW_READY,
+                1,
+            );
+        }
+        ready.then_some(preview)
     }
 
     pub(crate) fn commit_ordered_region_blit(

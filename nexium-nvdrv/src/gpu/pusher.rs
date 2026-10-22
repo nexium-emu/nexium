@@ -101,11 +101,11 @@ fn gs_dump_enabled() -> bool {
 pub(crate) fn async_barrier_segments_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("NEXIUM_ASYNC_BARRIER_SEGMENTS")
                 .ok()
                 .as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("yes")
+            Some("0") | Some("false") | Some("off") | Some("no")
         )
     })
 }
@@ -394,7 +394,12 @@ pub(crate) mod kickprof {
     pub const RESIDENT_CBUF_SCATTER: usize = 231;
     pub const DECODE_SWEEP: usize = 232;
     pub const DECODE_SWEEP_DIRTY: usize = 233;
-    pub const COUNT: usize = 234;
+    pub const KC_INTERLUDE: usize = 234;
+    pub const FLUSH_SOFT_KEPLER_COMPUTE: usize = 235;
+    pub const FERMI_PREVIEW: usize = 236;
+    pub const FERMI_PREVIEW_READY: usize = 237;
+    pub const BARRIER_SEGMENT_PRIMITIVE: usize = 238;
+    pub const COUNT: usize = 239;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -631,6 +636,11 @@ pub(crate) mod kickprof {
         "rcbscatter",
         "decodesweep",
         "decodesweepdirty",
+        "kcinterlude",
+        "flushsoftkcomp",
+        "fermipreview",
+        "fermipreviewready",
+        "barsegprim",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];

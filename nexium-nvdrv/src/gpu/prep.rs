@@ -145,11 +145,6 @@ fn draw_target_ranges_array(
     (ranges, count)
 }
 
-fn draw_target_ranges(draw: &super::engines::maxwell3d::DrawCall) -> Vec<(u64, u64)> {
-    let (ranges, count) = draw_target_ranges_array(draw);
-    ranges[..count].to_vec()
-}
-
 fn draws_write_pending_compute(draws: &[DrawCall], ranges: &[(u64, u64)]) -> bool {
     draws.iter().any(|draw| {
         let (targets, count) = draw_target_ranges_array(draw);
@@ -214,6 +209,20 @@ fn compute_target_fast_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("NEXIUM_COMPUTE_TARGET_FAST").map_or(true, |value| value != "0")
+    })
+}
+
+fn primitive_barrier_segments_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_BARRIER_SEGMENT_PRIMITIVES").map_or(true, |value| value != "0")
+    })
+}
+
+fn kepler_inline_soft_flush_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_KEPLER_INLINE_SOFT_FLUSH").map_or(true, |value| value != "0")
     })
 }
 
@@ -967,6 +976,18 @@ impl PrepState {
                             );
                             texture_invalidates = 0;
                         }
+                    }
+                    if barrier_flushes != 0
+                        && primitive_barrier_segments_enabled()
+                        && !self.vk_batch.is_empty()
+                    {
+                        let call = self.vk_batch.last_mut().unwrap();
+                        call.primitive_barrier_after = true;
+                        kickprof::count(
+                            kickprof::BARRIER_SEGMENT_PRIMITIVE,
+                            barrier_flushes as u64,
+                        );
+                        barrier_flushes = 0;
                     }
                 }
                 if barrier_flushes != 0 || texture_invalidates != 0 {
@@ -1858,9 +1879,19 @@ impl PrepState {
                 super::engines::KEPLER_COMPUTE_CLASS => {
                     let kepler_compute = &mut *engines.kepler_compute;
                     if kepler_compute.method_requires_hard_boundary(method, is_last) {
-                        self.record_flush_reason(kickprof::FLUSH_HARD_KEPLER_COMPUTE);
-                        self.flush_vk(mappings, mem_read, mem_write);
-                        if kepler_compute.method_writes_guest_memory(method, is_last) {
+                        let writes_guest =
+                            kepler_compute.method_writes_guest_memory(method, is_last);
+                        let soft_boundary = nexium_gpu::renderer::compute_interlude_enabled()
+                            && (!writes_guest || kepler_inline_soft_flush_enabled());
+                        if soft_boundary {
+                            self.record_flush_reason(kickprof::FLUSH_SOFT_KEPLER_COMPUTE);
+                            self.flush_vk_soft(mappings, mem_read, mem_write);
+                            let _ = self.prepared_draw_packets.drain_soft();
+                        } else {
+                            self.record_flush_reason(kickprof::FLUSH_HARD_KEPLER_COMPUTE);
+                            self.flush_vk(mappings, mem_read, mem_write);
+                        }
+                        if writes_guest {
                             kickprof::count(kickprof::KC_CACHE_CLEAR, 1);
                             self.ssbo_snapshot_cache.retain_watchable_full_aurora_snapshots();
                         }
