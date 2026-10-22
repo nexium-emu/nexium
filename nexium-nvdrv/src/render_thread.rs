@@ -16,6 +16,142 @@ enum RenderWork {
     Draw(PreparedDrawBatch),
     DrawGroup(Vec<PreparedDrawBatch>),
     RtInvalidation(Arc<nexium_gpu::Renderer>, Vec<(u64, u64, u64)>),
+    Compute(ComputeWork),
+}
+
+pub(crate) struct ComputeWork {
+    pub(crate) renderer: Arc<nexium_gpu::Renderer>,
+    pub(crate) dispatch: nexium_gpu::compute::ComputeDispatch,
+    pub(crate) done: Box<dyn FnOnce(Option<u64>) + Send>,
+}
+
+fn compute_dispatch_id(
+    renderer: &nexium_gpu::Renderer,
+    dispatch: nexium_gpu::compute::ComputeDispatch,
+) -> Option<u64> {
+    use nexium_gpu::compute::ComputeDispatchOutcome;
+    let program = dispatch.program_key;
+    match renderer.dispatch_compute_lazy(dispatch) {
+        ComputeDispatchOutcome::Submitted(id) => Some(id),
+        ComputeDispatchOutcome::Executed(_) => {
+            log::error!("[compute-offload] lazy dispatch executed synchronously; output dropped");
+            None
+        }
+        ComputeDispatchOutcome::Unsupported(reason)
+        | ComputeDispatchOutcome::FailedBeforeSubmit(reason)
+        | ComputeDispatchOutcome::SubmittedFailure(reason) => {
+            log::warn!(
+                "[compute-offload] dispatch failed: program={:#x} {}",
+                program,
+                reason
+            );
+            None
+        }
+    }
+}
+
+fn execute_compute_work(work: ComputeWork, worker_pending: &AtomicUsize) {
+    let busy_started = crate::gpu::pusher::kickprof::rate_start();
+    crate::gpu::watchdog::render_phase("compute-dispatch", 0);
+    let ComputeWork {
+        renderer,
+        dispatch,
+        done,
+    } = work;
+    let id = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compute_dispatch_id(&renderer, dispatch)
+    })) {
+        Ok(id) => id,
+        Err(_) => {
+            log::error!("[render-job] compute dispatch panicked; worker continuing");
+            None
+        }
+    };
+    done(id);
+    crate::gpu::pusher::kickprof::add_render_job(busy_started, "compute-dispatch");
+    worker_pending.fetch_sub(1, Ordering::Release);
+}
+
+const COMPUTE_BATCH_MAX: usize = 32;
+
+fn compute_batch_grace() -> Duration {
+    static GRACE: OnceLock<Duration> = OnceLock::new();
+    *GRACE.get_or_init(|| {
+        let micros = std::env::var("NEXIUM_COMPUTE_BATCH_GRACE_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| value <= 2_000)
+            .unwrap_or(0);
+        Duration::from_micros(micros)
+    })
+}
+
+fn execute_compute_batch(
+    first: ComputeWork,
+    rx: &Receiver<RenderWork>,
+    lookahead: &mut Option<RenderWork>,
+    worker_pending: &AtomicUsize,
+) {
+    if !nexium_gpu::renderer::compute_batch_enabled() {
+        execute_compute_work(first, worker_pending);
+        return;
+    }
+    let mut works = vec![first];
+    let grace = compute_batch_grace();
+    let deadline = (!grace.is_zero()).then(|| Instant::now() + grace);
+    while works.len() < COMPUTE_BATCH_MAX {
+        let next = match rx.try_recv() {
+            Ok(next) => Some(next),
+            Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => match deadline {
+                Some(deadline) => match rx.recv_deadline(deadline) {
+                    Ok(next) => Some(next),
+                    Err(_) => None,
+                },
+                None => None,
+            },
+        };
+        match next {
+            Some(RenderWork::Compute(work))
+                if Arc::ptr_eq(&work.renderer, &works[0].renderer) =>
+            {
+                works.push(work);
+            }
+            Some(other) => {
+                *lookahead = Some(other);
+                break;
+            }
+            None => break,
+        }
+    }
+    if works.len() == 1 {
+        execute_compute_work(works.pop().unwrap(), worker_pending);
+        return;
+    }
+    let busy_started = crate::gpu::pusher::kickprof::rate_start();
+    let count = works.len();
+    crate::gpu::watchdog::render_phase("compute-batch", count as u64);
+    let renderer = Arc::clone(&works[0].renderer);
+    let mut dispatches = Vec::with_capacity(count);
+    let mut dones = Vec::with_capacity(count);
+    for work in works {
+        dispatches.push(work.dispatch);
+        dones.push(work.done);
+    }
+    let ids = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        renderer.dispatch_compute_batch(dispatches)
+    })) {
+        Ok(ids) => ids,
+        Err(_) => {
+            log::error!("[render-job] compute batch panicked; worker continuing");
+            vec![None; count]
+        }
+    };
+    for (done, id) in dones.into_iter().zip(ids) {
+        done(id);
+    }
+    crate::gpu::pusher::kickprof::add_render_job(busy_started, "compute-batch");
+    worker_pending.fetch_sub(count, Ordering::Release);
 }
 
 pub struct RenderThread {
@@ -836,6 +972,11 @@ fn execute_job(label: &'static str, job: RenderJob, worker_pending: &AtomicUsize
 
 fn execute_draw_groups(
     draws: Vec<PreparedDrawBatch>,
+    mut interludes: Vec<nexium_gpu::renderer::ComputeInterlude>,
+    interlude_done: Vec<(
+        Arc<nexium_gpu::Renderer>,
+        Box<dyn FnOnce(Option<u64>) + Send>,
+    )>,
     worker_pending: &AtomicUsize,
     draw_work_budget: &DrawWorkBudget,
 ) {
@@ -852,11 +993,22 @@ fn execute_draw_groups(
     let timeline_started = crate::kick_timeline_enabled().then(std::time::Instant::now);
     crate::gpu::watchdog::render_phase("draw-groups", group_count as u64);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::gpu::vk_dispatch::execute_prepared_draw_batches(draws)
+        crate::gpu::vk_dispatch::execute_prepared_draw_batches(draws, &mut interludes)
     }))
     .is_err()
     {
         log::error!("[render-job] grouped draw batch panicked; worker continuing");
+    }
+    let interlude_count = interlude_done.len();
+    for (interlude, (renderer, done)) in interludes.into_iter().zip(interlude_done) {
+        let id = match interlude.dispatch {
+            Some(dispatch) => compute_dispatch_id(&renderer, dispatch),
+            None => interlude.id,
+        };
+        done(id);
+    }
+    if interlude_count != 0 {
+        worker_pending.fetch_sub(interlude_count, Ordering::Release);
     }
     crate::gpu::pusher::kickprof::add_render_busy(busy_started, group_count as u64);
     if let Some(timeline_started) = timeline_started {
@@ -983,6 +1135,9 @@ fn render_worker(
         };
         match work {
             RenderWork::Job(label, job) => execute_job(label, job, &worker_pending),
+            RenderWork::Compute(work) => {
+                execute_compute_batch(work, &rx, &mut lookahead, &worker_pending)
+            }
             RenderWork::RtInvalidation(renderer, spans) => {
                 apply_rt_invalidations(&renderer, &spans, &worker_pending);
             }
@@ -998,6 +1153,12 @@ fn render_worker(
                 let mut ring_bytes = first.ring_upper_bytes();
                 let mut compatibility = first.compatibility().clone();
                 let mut draws = vec![first];
+                let mut interludes: Vec<nexium_gpu::renderer::ComputeInterlude> = Vec::new();
+                let mut interlude_done: Vec<(
+                    Arc<nexium_gpu::Renderer>,
+                    Box<dyn FnOnce(Option<u64>) + Send>,
+                )> = Vec::new();
+                let gather_interludes = nexium_gpu::renderer::compute_interlude_enabled();
                 let gather_deadline = Instant::now() + draw_gather_grace();
                 let end_reason = loop {
                     if draws.last().is_some_and(PreparedDrawBatch::hard_after) {
@@ -1067,6 +1228,19 @@ fn render_worker(
                             worker_pending.fetch_sub(1, Ordering::Release);
                             continue;
                         }
+                        RenderWork::Compute(work) if gather_interludes => {
+                            crate::gpu::pusher::kickprof::count(
+                                crate::gpu::pusher::kickprof::KC_INTERLUDE,
+                                1,
+                            );
+                            interludes.push(nexium_gpu::renderer::ComputeInterlude {
+                                group: draws.len(),
+                                dispatch: Some(work.dispatch),
+                                id: None,
+                            });
+                            interlude_done.push((work.renderer, work.done));
+                            continue;
+                        }
                         next => {
                             lookahead = Some(next);
                             break DrawGatherEndReason::Job;
@@ -1093,7 +1267,13 @@ fn render_worker(
                     draws.last().is_some_and(PreparedDrawBatch::hard_after),
                     end_reason,
                 );
-                execute_draw_groups(draws, &worker_pending, &draw_work_budget);
+                execute_draw_groups(
+                    draws,
+                    interludes,
+                    interlude_done,
+                    &worker_pending,
+                    &draw_work_budget,
+                );
             }
         }
     }
@@ -1138,6 +1318,15 @@ impl RenderThread {
 
     pub fn submit(&self, job: RenderJob) {
         self.submit_named("unnamed", job);
+    }
+
+    pub(crate) fn submit_compute(&self, work: ComputeWork) -> bool {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        if self.tx.send(RenderWork::Compute(work)).is_err() {
+            self.pending.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+        true
     }
 
     pub fn submit_named(&self, label: &'static str, job: RenderJob) {

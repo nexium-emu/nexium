@@ -2988,30 +2988,43 @@ fn prepare_and_execute(
             let id_tx = DeferredComputeIdSender(Some(Arc::clone(&deferred_id)));
             let job_renderer = std::sync::Arc::clone(renderer_arc);
             let program = qmd[0x08];
-            rt.submit_named(
-                "compute-dispatch",
-                Box::new(move || {
-                    let sent = match job_renderer.dispatch_compute_lazy(dispatch) {
-                        ComputeDispatchOutcome::Submitted(id) => Some(id),
-                        ComputeDispatchOutcome::Executed(_) => {
-                            log::error!("[compute-offload] lazy dispatch executed synchronously; output dropped");
-                            None
-                        }
-                        ComputeDispatchOutcome::Unsupported(reason)
-                        | ComputeDispatchOutcome::FailedBeforeSubmit(reason)
-                        | ComputeDispatchOutcome::SubmittedFailure(reason) => {
-                            log::warn!(
-                                "[compute-offload] dispatch failed: program={:#x} {}",
-                                program,
-                                reason
-                            );
-                            None
-                        }
-                    };
-                    drop(raw_storage_leases);
-                    id_tx.send(sent);
-                }),
-            );
+            if nexium_gpu::renderer::compute_interlude_enabled()
+                || nexium_gpu::renderer::compute_batch_enabled()
+            {
+                rt.submit_compute(crate::render_thread::ComputeWork {
+                    renderer: job_renderer,
+                    dispatch,
+                    done: Box::new(move |sent| {
+                        drop(raw_storage_leases);
+                        id_tx.send(sent);
+                    }),
+                });
+            } else {
+                rt.submit_named(
+                    "compute-dispatch",
+                    Box::new(move || {
+                        let sent = match job_renderer.dispatch_compute_lazy(dispatch) {
+                            ComputeDispatchOutcome::Submitted(id) => Some(id),
+                            ComputeDispatchOutcome::Executed(_) => {
+                                log::error!("[compute-offload] lazy dispatch executed synchronously; output dropped");
+                                None
+                            }
+                            ComputeDispatchOutcome::Unsupported(reason)
+                            | ComputeDispatchOutcome::FailedBeforeSubmit(reason)
+                            | ComputeDispatchOutcome::SubmittedFailure(reason) => {
+                                log::warn!(
+                                    "[compute-offload] dispatch failed: program={:#x} {}",
+                                    program,
+                                    reason
+                                );
+                                None
+                            }
+                        };
+                        drop(raw_storage_leases);
+                        id_tx.send(sent);
+                    }),
+                );
+            }
             push_pending_writeback(PendingComputeWriteback {
                     id: PendingComputeId::Deferred(deferred_id),
                     program_gpu_va: code_gpu,
