@@ -669,6 +669,7 @@ pub struct Maxwell3dDrawCall {
     pub sampled_rt_snapshot_slots: Vec<bool>,
     pub fragment_barrier_after: bool,
     pub texture_cache_invalidate_after: bool,
+    pub primitive_barrier_after: bool,
     pub clear: bool,
     pub clear_color: [f32; 4],
     pub tic_pool_gpu_va: u64,

@@ -40,6 +40,50 @@ pub struct Renderer {
     device: ash::Device,
     submit_timeline: vk::Semaphore,
     submit_state: Arc<SubmitState>,
+    frame_slot_prewait: FrameSlotPrewait,
+}
+
+struct FrameSlotPrewait {
+    next_index: std::sync::atomic::AtomicUsize,
+    generations: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl FrameSlotPrewait {
+    fn new(slot_count: usize) -> Self {
+        Self {
+            next_index: std::sync::atomic::AtomicUsize::new(0),
+            generations: (0..slot_count)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    fn note_submitted(&self, index: usize, generation: u64) {
+        if let Some(slot) = self.generations.get(index) {
+            slot.store(generation, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn note_next(&self, index: usize) {
+        self.next_index
+            .store(index, std::sync::atomic::Ordering::Release);
+    }
+
+    fn pending_generation(&self) -> Option<u64> {
+        let index = self.next_index.load(std::sync::atomic::Ordering::Acquire);
+        let generation = self
+            .generations
+            .get(index)?
+            .load(std::sync::atomic::Ordering::Acquire);
+        (generation != 0).then_some(generation)
+    }
+}
+
+fn frame_slot_prewait_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_FRAME_SLOT_PREWAIT").map_or(true, |value| value != "0")
+    })
 }
 
 pub(crate) struct SubmitState {
@@ -1681,6 +1725,8 @@ struct RendererInner {
     utility_slot: FrameSlot,
     pending_computes: Vec<PendingCompute>,
     compute_slot_pool: Vec<(vk::CommandBuffer, vk::Fence)>,
+    compute_secondary_pool: Vec<vk::CommandBuffer>,
+    compute_batch_primaries: Vec<ComputeBatchPrimary>,
     next_pending_compute_id: u64,
     clear_slots: Vec<ClearSlot>,
     clear_slot_index: usize,
@@ -5524,6 +5570,7 @@ fn note_graphics_storage_bind_failure(error: &str) {
 
 struct PendingCompute {
     id: u64,
+    serial: u64,
     program_key: u64,
     submission_generation: u64,
     fence: vk::Fence,
@@ -5534,6 +5581,7 @@ struct PendingCompute {
     outputs: Vec<PendingComputeOutput>,
     texels: Vec<PendingComputeTexel>,
     resident_raw_storage: Vec<crate::compute::ComputeRawStorageKey>,
+    interlude_transitions: Vec<ComputeSampleTransition>,
     result: Option<Result<crate::compute::ComputeDispatchResult, String>>,
 }
 
@@ -5867,6 +5915,29 @@ impl Renderer {
         execute_compute_dispatch(&mut inner, dispatch, true)
     }
 
+    pub fn dispatch_compute_batch(
+        &self,
+        dispatches: Vec<crate::compute::ComputeDispatch>,
+    ) -> Vec<Option<u64>> {
+        let mut inner = self.inner.lock();
+        let mut interludes: Vec<ComputeInterlude> = dispatches
+            .into_iter()
+            .map(|dispatch| ComputeInterlude {
+                group: 0,
+                dispatch: Some(dispatch),
+                id: None,
+            })
+            .collect();
+        let records = record_compute_interludes(&mut inner, &mut interludes);
+        if !records.is_empty() {
+            if let Err(error) = submit_compute_batch(&mut inner, &records) {
+                log::warn!("[compute-batch] {error}");
+                Self::fail_unsubmitted_interludes_locked(&mut inner);
+            }
+        }
+        interludes.into_iter().map(|interlude| interlude.id).collect()
+    }
+
     pub fn take_pending_compute(
         &self,
         id: u64,
@@ -6054,6 +6125,15 @@ impl Renderer {
                 .get_semaphore_counter_value(self.submit_timeline)
         }
         .ok()
+    }
+
+    fn prewait_frame_slot_unlocked(&self) {
+        if !frame_slot_prewait_enabled() || self.submit_timeline == vk::Semaphore::null() {
+            return;
+        }
+        if let Some(generation) = self.frame_slot_prewait.pending_generation() {
+            self.wait_submit_generation(generation, std::time::Duration::from_secs(2));
+        }
     }
 
     pub fn wait_submit_generation(&self, target: u64, timeout: std::time::Duration) -> bool {
@@ -7465,6 +7545,8 @@ impl Renderer {
                 utility_slot,
                 pending_computes: Vec::new(),
                 compute_slot_pool: Vec::new(),
+                compute_secondary_pool: Vec::new(),
+                compute_batch_primaries: Vec::new(),
                 next_pending_compute_id: 1,
                 clear_slots,
                 clear_slot_index: 0,
@@ -7500,6 +7582,7 @@ impl Renderer {
             device: device_handle,
             submit_timeline,
             submit_state,
+            frame_slot_prewait: FrameSlotPrewait::new(frame_slot_count),
         });
         renderer.prewarm();
         Ok(renderer)
@@ -12815,6 +12898,7 @@ impl Renderer {
         )?;
         frame_slots[cur_idx].in_flight = true;
         frame_slots[cur_idx].submit_generation = submit_generation;
+        self.frame_slot_prewait.note_submitted(cur_idx, submit_generation);
         frame_slots[cur_idx].retired_dsets.push(dset);
 
         for (key, _, _, _, _) in &color_bind {
@@ -12854,6 +12938,7 @@ impl Renderer {
         let next_idx = other_idx;
         ubo_ring.slot_span[cur_idx] = Some((0, ubo_ring.head));
         *frame_index = next_idx;
+        self.frame_slot_prewait.note_next(next_idx);
         pipeline_cache.maybe_save(device);
 
         *tele_in_flight_mask = frame_slots
@@ -12920,6 +13005,7 @@ impl Renderer {
             |_, gpu_va, len| read_guest(gpu_va, len).map(SharedGuestSnapshot::from_vec),
             |_, gpu_va, len| texture_generation(gpu_va, len),
             &[],
+            &mut [],
             GroupTextureReadContract::LiveCallbacks,
         )
         .map(|_| ())
@@ -12964,6 +13050,7 @@ impl Renderer {
             read_guest,
             texture_generation,
             fermi_exact_rt_snapshot_lease_ids,
+            &mut [],
         )
     }
 
@@ -12978,20 +13065,61 @@ impl Renderer {
         read_guest: F,
         texture_generation: G,
         fermi_exact_rt_snapshot_lease_ids: &[u64],
+        interludes: &mut [ComputeInterlude],
     ) -> Result<bool, String>
     where
         F: Fn(usize, u64, usize) -> Option<SharedGuestSnapshot>,
         G: Fn(usize, u64, usize) -> u64,
     {
-        self.execute_draw_groups_with_clears_and_texture_generations_and_fermi_exact_rt_snapshot_leases_impl(
+        self.prewait_frame_slot_unlocked();
+        let result = self.execute_draw_groups_with_clears_and_texture_generations_and_fermi_exact_rt_snapshot_leases_impl(
             groups,
             clear_groups,
             rt_invalidations,
             read_guest,
             texture_generation,
             fermi_exact_rt_snapshot_lease_ids,
+            interludes,
             GroupTextureReadContract::ImmutablePerGroup,
-        )
+        );
+        if result.is_err() {
+            self.fail_unsubmitted_interludes();
+        }
+        result
+    }
+
+    fn fail_unsubmitted_interludes(&self) {
+        let mut inner = self.inner.lock();
+        Self::fail_unsubmitted_interludes_locked(&mut inner);
+    }
+
+    fn fail_unsubmitted_interludes_locked(inner: &mut RendererInner) {
+        let mut index = 0;
+        while index < inner.pending_computes.len() {
+            let unsubmitted = {
+                let pending = &inner.pending_computes[index];
+                pending.fence == vk::Fence::null()
+                    && pending.submission_generation == 0
+                    && pending.result.is_none()
+            };
+            if !unsubmitted {
+                index += 1;
+                continue;
+            }
+            let mut pending = inner.pending_computes.remove(index);
+            if let Some(resources) = pending.resources.take() {
+                resources.destroy(&inner.device);
+            }
+            free_compute_descriptor_set(inner, pending.descriptor_pool, pending.descriptor_set);
+            let _ = reset_command_buffer(&inner.device, pending.cmd);
+            inner.compute_overlay_sources.remove(&pending.serial);
+            recycle_compute_cmd(inner, pending.cmd, pending.fence);
+            pending.result = Some(Err(
+                "compute interlude dropped: graphics batch failed before submission".to_string(),
+            ));
+            inner.pending_computes.insert(index, pending);
+            index += 1;
+        }
     }
 
     fn execute_draw_groups_with_clears_and_texture_generations_and_fermi_exact_rt_snapshot_leases_impl<
@@ -13005,6 +13133,7 @@ impl Renderer {
         read_guest: F,
         texture_generation: G,
         fermi_exact_rt_snapshot_lease_ids: &[u64],
+        interludes: &mut [ComputeInterlude],
         texture_read_contract: GroupTextureReadContract,
     ) -> Result<bool, String>
     where
@@ -13361,6 +13490,8 @@ impl Renderer {
         let rp_t1 = std::time::Instant::now();
         let mut inner = self.inner.lock();
         let rp_lock = rp_t1.elapsed();
+        let interlude_cmds = record_compute_interludes(&mut inner, interludes);
+        let mut interlude_cursor = 0usize;
         let RendererInner {
             device,
             queue,
@@ -13404,6 +13535,7 @@ impl Renderer {
             graphics_storage_batch,
             upload_content_cache,
             gpu_timestamps,
+            pending_computes,
             ..
         } = &mut *inner;
 
@@ -13685,6 +13817,7 @@ impl Renderer {
         let record_detail_profile =
             record_stage_profile || pprof_enabled() || !record_timer_gating_enabled();
         let record_state_dedup = record_state_dedup_enabled();
+        let record_bind_dedup = record_state_dedup && record_bind_dedup_enabled();
         let mut rp_dset_stages = RecordDsetStageProfile::default();
         let mut rp_command_stages = RecordCommandStageProfile::default();
         let mut recorded_graphics_state = RecordedGraphicsState::default();
@@ -13759,6 +13892,15 @@ impl Renderer {
         for (prepared_group_index, (group_index, preps)) in group_preps.iter().enumerate() {
             let group_index = *group_index;
             while next_clear_group <= group_index {
+                while interlude_cursor < interlude_cmds.len()
+                    && interlude_cmds[interlude_cursor].group <= next_clear_group
+                {
+                    execute_compute_interlude(device, cmd, &interlude_cmds[interlude_cursor], rt_cache);
+                    interlude_cursor += 1;
+                    recorded_graphics_state = RecordedGraphicsState::default();
+                    hot_generic_texture_bindings.fill(None);
+                    color_sync_checked.clear();
+                }
                 for clear in clear_groups[next_clear_group] {
                     record_inline_graphics_clear(
                         device,
@@ -16928,10 +17070,22 @@ impl Renderer {
                         &[],
                     );
                     for (binding, vbuf, voff) in &vertex_binds {
-                        device.cmd_bind_vertex_buffers(cmd, *binding, &[*vbuf], &[*voff]);
+                        let needed =
+                            recorded_graphics_state.vertex_bind_needed(*binding, *vbuf, *voff);
+                        if record_stage_profile {
+                            rp_command_stages.vertex_binds += 1;
+                            rp_command_stages.vertex_bind_repeats += (!needed) as u64;
+                        }
+                        if !record_bind_dedup || needed {
+                            device.cmd_bind_vertex_buffers(cmd, *binding, &[*vbuf], &[*voff]);
+                        }
                     }
                     if let Some((wbinding, wbuf, woff)) = white_bind {
-                        device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
+                        let needed =
+                            recorded_graphics_state.vertex_bind_needed(wbinding, wbuf, woff);
+                        if !record_bind_dedup || needed {
+                            device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
+                        }
                     }
                     let cmd_first_vertex = if !vertex_binds.is_empty() {
                         0
@@ -16939,7 +17093,15 @@ impl Renderer {
                         call.first_vertex
                     };
                     if let Some((ibuf, ioff)) = index_bind {
-                        device.cmd_bind_index_buffer(cmd, ibuf, ioff, prep.index_type);
+                        let needed =
+                            recorded_graphics_state.index_bind_needed(ibuf, ioff, prep.index_type);
+                        if record_stage_profile {
+                            rp_command_stages.index_binds += 1;
+                            rp_command_stages.index_bind_repeats += (!needed) as u64;
+                        }
+                        if !record_bind_dedup || needed {
+                            device.cmd_bind_index_buffer(cmd, ibuf, ioff, prep.index_type);
+                        }
                         let vertex_offset = if !vertex_binds.is_empty() {
                             call.first_vertex as i32
                         } else {
@@ -16972,7 +17134,10 @@ impl Renderer {
                     |idx| call_writes_color(call, idx),
                 );
                 pass_trace_calls.push(call);
-                if call.fragment_barrier_after || call.texture_cache_invalidate_after {
+                if call.fragment_barrier_after
+                    || call.texture_cache_invalidate_after
+                    || call.primitive_barrier_after
+                {
                     if pass_open {
                         unsafe {
                             device.cmd_end_rendering(cmd);
@@ -17013,6 +17178,12 @@ impl Renderer {
                                 .extend(rt_reinterpret_cache.drain().map(|(_, image)| image));
                         }
                         barrier_wait_for_idle(device, cmd);
+                    } else if call.primitive_barrier_after {
+                        barrier_wait_for_idle(device, cmd);
+                    }
+                    if call.primitive_barrier_after || call.texture_cache_invalidate_after {
+                        graphics_storage_pass.written_since_barrier = false;
+                        graphics_storage_pass.read_since_barrier = false;
                     }
                 }
             }
@@ -17051,6 +17222,12 @@ impl Renderer {
             post_submit_texture_probes.push(post_submit_texture_probe);
         }
         while next_clear_group < clear_groups.len() {
+            while interlude_cursor < interlude_cmds.len()
+                && interlude_cmds[interlude_cursor].group <= next_clear_group
+            {
+                execute_compute_interlude(device, cmd, &interlude_cmds[interlude_cursor], rt_cache);
+                interlude_cursor += 1;
+            }
             for clear in clear_groups[next_clear_group] {
                 record_inline_graphics_clear(
                     device,
@@ -17064,6 +17241,10 @@ impl Renderer {
             }
             apply_rt_invalidations(rt_cache, rt_invalidations[next_clear_group]);
             next_clear_group += 1;
+        }
+        while interlude_cursor < interlude_cmds.len() {
+            execute_compute_interlude(device, cmd, &interlude_cmds[interlude_cursor], rt_cache);
+            interlude_cursor += 1;
         }
         if !storage_readback_writers.is_empty() {
             for &(key, expected) in &storage_readback_writers {
@@ -17179,6 +17360,12 @@ impl Renderer {
             timestamps.submitted(pair, crate::gpu_timestamps::StampKind::Graphics, submit_generation);
         }
         frame_slots[cur_idx].submit_generation = submit_generation;
+        self.frame_slot_prewait.note_submitted(cur_idx, submit_generation);
+        for id in interlude_cmds.iter().map(|record| record.id) {
+            if let Some(pending) = pending_computes.iter_mut().find(|pending| pending.id == id) {
+                pending.submission_generation = submit_generation;
+            }
+        }
         finish_graphics_storage_batch(
             graphics_storage,
             retired_graphics_storage,
@@ -17269,6 +17456,7 @@ impl Renderer {
         }
         ubo_ring.slot_span[cur_idx] = Some((ring_batch_start, ubo_ring.head));
         *frame_index = next_idx;
+        self.frame_slot_prewait.note_next(next_idx);
         pipeline_cache.maybe_save(device);
         if !storage_readback_writers.is_empty() {
             let wait_started = std::time::Instant::now();
@@ -17345,6 +17533,10 @@ struct RecordCommandStageProfile {
     stencil_commands: u64,
     redundant_stencil_commands: u64,
     pass_begins: u64,
+    vertex_binds: u64,
+    vertex_bind_repeats: u64,
+    index_binds: u64,
+    index_bind_repeats: u64,
 }
 
 #[derive(Default)]
@@ -17388,9 +17580,38 @@ struct RecordedGraphicsState {
     scissor: Option<ScissorRecordKey>,
     stencil: Option<StencilRecordKey>,
     blend_constants: Option<BlendConstantsRecordKey>,
+    vertex: [Option<(vk::Buffer, u64)>; 32],
+    index: Option<(vk::Buffer, u64, vk::IndexType)>,
+}
+
+fn record_bind_dedup_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_RECORD_BIND_DEDUP").map_or(true, |value| value != "0")
+    })
 }
 
 impl RecordedGraphicsState {
+    fn vertex_bind_needed(&mut self, binding: u32, buffer: vk::Buffer, offset: u64) -> bool {
+        let Some(slot) = self.vertex.get_mut(binding as usize) else {
+            return true;
+        };
+        let needed = *slot != Some((buffer, offset));
+        *slot = Some((buffer, offset));
+        needed
+    }
+
+    fn index_bind_needed(
+        &mut self,
+        buffer: vk::Buffer,
+        offset: u64,
+        index_type: vk::IndexType,
+    ) -> bool {
+        let needed = self.index != Some((buffer, offset, index_type));
+        self.index = Some((buffer, offset, index_type));
+        needed
+    }
+
     fn update(
         &mut self,
         pipeline: vk::Pipeline,
@@ -17578,6 +17799,10 @@ fn record_stage_profile_record(
     window.command_stages.stencil_commands += command_stages.stencil_commands;
     window.command_stages.redundant_stencil_commands += command_stages.redundant_stencil_commands;
     window.command_stages.pass_begins += command_stages.pass_begins;
+    window.command_stages.vertex_binds += command_stages.vertex_binds;
+    window.command_stages.vertex_bind_repeats += command_stages.vertex_bind_repeats;
+    window.command_stages.index_binds += command_stages.index_binds;
+    window.command_stages.index_bind_repeats += command_stages.index_bind_repeats;
     window.texture_memo.tic_requests += texture_memo.tic_requests;
     window.texture_memo.tic_misses += texture_memo.tic_misses;
     window.texture_memo.pending_requests += texture_memo.pending_requests;
@@ -17618,7 +17843,22 @@ fn record_stage_profile_record(
         + window.dset_stages.writes
         + window.dset_stages.update;
     log::warn!(
-        "[record-stage] batches={} draws={} us/draw record={:.3} alias={:.3} tex={:.3} vtx={:.3} dset={:.3} other={:.3} | dset alloc={:.3} typed={:.3} sampler={:.3} ssbo={:.3} writes={:.3} update={:.3} other={:.3} | manifest_empty_pct={:.1} manifest_entries/draw={:.2} active_slots/draw={:.2} active_bindings/draw={:.2} resolved_tex/draw={:.2} input_ssbo/draw={:.2} ssbo_bindings/draw={:.2} writes/draw={:.2} descriptor_elements/draw={:.2} sparse_pct={:.1} | repeat_pct pipeline={:.1} viewport={:.1} scissor={:.1} stencil={:.1} stencil_cmds/draw={:.2} redundant_stencil_cmds/draw={:.2} pass_begins/draw={:.3} | texmemo_hit_pct tic={:.1} pending={:.1} tsc={:.1} binding={:.1} binding_lookups/draw={:.2} evictions={}",
+        "[record-stage-tex] us/draw sync={:.3} gen={:.3} upload={:.3} view={:.3} finish={:.3} other={:.3}",
+        per_draw_us(window.texture_sync),
+        per_draw_us(window.texture_gen),
+        per_draw_us(window.texture_upload),
+        per_draw_us(window.texture_view),
+        per_draw_us(window.texture_finish),
+        per_draw_us(window.tex.saturating_sub(
+            window.texture_sync
+                + window.texture_gen
+                + window.texture_upload
+                + window.texture_view
+                + window.texture_finish,
+        )),
+    );
+    log::warn!(
+        "[record-stage] batches={} draws={} us/draw record={:.3} alias={:.3} tex={:.3} vtx={:.3} dset={:.3} other={:.3} | dset alloc={:.3} typed={:.3} sampler={:.3} ssbo={:.3} writes={:.3} update={:.3} other={:.3} | manifest_empty_pct={:.1} manifest_entries/draw={:.2} active_slots/draw={:.2} active_bindings/draw={:.2} resolved_tex/draw={:.2} input_ssbo/draw={:.2} ssbo_bindings/draw={:.2} writes/draw={:.2} descriptor_elements/draw={:.2} sparse_pct={:.1} | repeat_pct pipeline={:.1} viewport={:.1} scissor={:.1} stencil={:.1} stencil_cmds/draw={:.2} redundant_stencil_cmds/draw={:.2} pass_begins/draw={:.3} | texmemo_hit_pct tic={:.1} pending={:.1} tsc={:.1} binding={:.1} binding_lookups/draw={:.2} evictions={} | bind_repeat_pct vertex={:.1} index={:.1}",
         window.batches,
         window.draws,
         per_draw_us(window.record),
@@ -17672,6 +17912,20 @@ fn record_stage_profile_record(
         ),
         count_per_draw(window.texture_memo.binding_lookups),
         window.texture_memo.binding_evictions,
+        hit_pct(
+            window.command_stages.vertex_binds,
+            window
+                .command_stages
+                .vertex_binds
+                .saturating_sub(window.command_stages.vertex_bind_repeats)
+        ),
+        hit_pct(
+            window.command_stages.index_binds,
+            window
+                .command_stages
+                .index_binds
+                .saturating_sub(window.command_stages.index_bind_repeats)
+        ),
     );
     log::warn!(
         "[texture-overlay-reuse] draws={} lookups={} hits={}",
@@ -19755,6 +20009,7 @@ struct PreparedComputeSample {
     descriptor_layout: vk::ImageLayout,
     old_layout: vk::ImageLayout,
     aspects: vk::ImageAspectFlags,
+    alias: Option<(RtKey, bool)>,
 }
 
 enum ComputeSamplePlan {
@@ -19815,6 +20070,7 @@ struct PreparedComputeImage {
     descriptor_layout: vk::ImageLayout,
     old_layout: vk::ImageLayout,
     aspects: vk::ImageAspectFlags,
+    alias: Option<(RtKey, bool)>,
 }
 
 fn compute_sampled_image_alias_extent_matches(
@@ -20500,6 +20756,7 @@ fn prepare_compute_live_sampled_image(
         descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         old_layout: alias.layout,
         aspects: alias.aspects,
+        alias: Some((alias.key, alias.depth)),
     })
 }
 
@@ -20690,6 +20947,7 @@ struct ComputeSampleTransition {
     image: vk::Image,
     old_layout: vk::ImageLayout,
     aspects: vk::ImageAspectFlags,
+    alias: Option<(RtKey, bool)>,
 }
 
 #[derive(Default)]
@@ -21414,6 +21672,356 @@ fn profile_compute_recycle_stages(
     );
 }
 
+pub fn compute_interlude_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_COMPUTE_INTERLUDE").is_ok_and(|value| value == "1")
+    })
+}
+
+pub struct ComputeInterlude {
+    pub group: usize,
+    pub dispatch: Option<crate::compute::ComputeDispatch>,
+    pub id: Option<u64>,
+}
+
+pub fn compute_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_COMPUTE_BATCH").map_or(true, |value| value != "0")
+    })
+}
+
+struct ComputeBatchPrimary {
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    generation: u64,
+}
+
+fn submit_compute_batch(
+    inner: &mut RendererInner,
+    records: &[ComputeInterludeRecord],
+) -> Result<u64, String> {
+    let (cmd, fence) = acquire_compute_slot(inner)?;
+    let device = inner.device.clone();
+    if let Err(error) = begin_one_time(&device, cmd) {
+        recycle_compute_cmd(inner, cmd, fence);
+        return Err(error);
+    }
+    for record in records {
+        execute_compute_interlude(&device, cmd, record, &inner.rt_cache);
+    }
+    if let Err(error) = end_one_time(&device, cmd) {
+        let _ = reset_command_buffer(&device, cmd);
+        recycle_compute_cmd(inner, cmd, fence);
+        return Err(error);
+    }
+    let generation = match submit_with_fence(
+        inner.submit_state.as_ref(),
+        inner.submit_timeline,
+        &device,
+        inner.queue,
+        cmd,
+        fence,
+    ) {
+        Ok(generation) => generation,
+        Err(error) => {
+            let _ = synchronized_device_idle(inner);
+            let _ = reset_command_buffer(&device, cmd);
+            recycle_compute_cmd(inner, cmd, fence);
+            return Err(error);
+        }
+    };
+    for record in records {
+        if let Some(pending) = inner
+            .pending_computes
+            .iter_mut()
+            .find(|pending| pending.id == record.id)
+        {
+            pending.submission_generation = generation;
+        }
+    }
+    inner.compute_batch_primaries.push(ComputeBatchPrimary {
+        cmd,
+        fence,
+        generation,
+    });
+    Ok(generation)
+}
+
+fn reap_compute_batch_primaries(inner: &mut RendererInner) {
+    let mut index = 0;
+    while index < inner.compute_batch_primaries.len() {
+        let fence = inner.compute_batch_primaries[index].fence;
+        let done = (unsafe { inner.device.get_fence_status(fence) }) == Ok(true);
+        if !done {
+            index += 1;
+            continue;
+        }
+        let primary = inner.compute_batch_primaries.swap_remove(index);
+        let _ = wait_fence(&inner.device, primary.fence);
+        let _ = reset_command_buffer(&inner.device, primary.cmd);
+        recycle_compute_cmd(inner, primary.cmd, primary.fence);
+    }
+}
+
+fn acquire_compute_secondary(inner: &mut RendererInner) -> Result<vk::CommandBuffer, String> {
+    if let Some(cmd) = inner.compute_secondary_pool.pop() {
+        return Ok(cmd);
+    }
+    let info = vk::CommandBufferAllocateInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
+        command_pool: inner.cmd_pool,
+        level: vk::CommandBufferLevel::SECONDARY,
+        command_buffer_count: 1,
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let buffers = unsafe {
+        inner
+            .device
+            .allocate_command_buffers(&info)
+            .map_err(|e| format!("allocate_command_buffers(compute secondary): {:?}", e))?
+    };
+    Ok(buffers[0])
+}
+
+fn begin_secondary_one_time(device: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), String> {
+    let inheritance = vk::CommandBufferInheritanceInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_INHERITANCE_INFO,
+        render_pass: vk::RenderPass::null(),
+        subpass: 0,
+        framebuffer: vk::Framebuffer::null(),
+        occlusion_query_enable: vk::FALSE,
+        query_flags: vk::QueryControlFlags::empty(),
+        pipeline_statistics: vk::QueryPipelineStatisticFlags::empty(),
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let begin = vk::CommandBufferBeginInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+        flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+        p_inheritance_info: &inheritance,
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    unsafe {
+        device
+            .begin_command_buffer(cmd, &begin)
+            .map_err(|e| format!("begin_command_buffer(compute secondary): {:?}", e))
+    }
+}
+
+fn recycle_compute_cmd(inner: &mut RendererInner, cmd: vk::CommandBuffer, fence: vk::Fence) {
+    if fence == vk::Fence::null() {
+        inner.compute_secondary_pool.push(cmd);
+    } else {
+        inner.compute_slot_pool.push((cmd, fence));
+    }
+}
+
+fn pending_compute_ready(inner: &RendererInner, pending: &PendingCompute) -> bool {
+    if pending.fence == vk::Fence::null() {
+        frame_slot_submission_complete(
+            &inner.device,
+            inner.submit_timeline,
+            pending.submission_generation,
+        )
+    } else {
+        (unsafe { inner.device.get_fence_status(pending.fence) }) == Ok(true)
+    }
+}
+
+fn wait_compute_generation(inner: &RendererInner, generation: u64) -> Result<(), String> {
+    if generation == 0 {
+        return Ok(());
+    }
+    if inner.submit_timeline == vk::Semaphore::null() {
+        return synchronized_device_idle(inner)
+            .map_err(|e| format!("device_wait_idle(compute interlude): {:?}", e));
+    }
+    let semaphore = inner.submit_timeline;
+    let info = vk::SemaphoreWaitInfo {
+        s_type: vk::StructureType::SEMAPHORE_WAIT_INFO,
+        semaphore_count: 1,
+        p_semaphores: &semaphore,
+        p_values: &generation,
+        ..Default::default()
+    };
+    match unsafe { inner.device.wait_semaphores(&info, 10_000_000_000) } {
+        Ok(()) => Ok(()),
+        Err(vk::Result::TIMEOUT) => Err(format!(
+            "timeline wait for compute interlude generation {generation} timed out"
+        )),
+        Err(error) => {
+            crate::gpu_health::note_result("wait_semaphores", error);
+            Err(format!("wait_semaphores(compute interlude): {:?}", error))
+        }
+    }
+}
+
+fn wait_pending_compute(inner: &RendererInner, pending: &PendingCompute) -> Result<(), String> {
+    if pending.fence == vk::Fence::null() {
+        if pending.submission_generation == 0 {
+            return Err(format!(
+                "compute interlude {} was never submitted with its graphics batch",
+                pending.id
+            ));
+        }
+        wait_compute_generation(inner, pending.submission_generation)
+    } else {
+        wait_fence(&inner.device, pending.fence)
+    }
+}
+
+struct ComputeInterludeRecord {
+    group: usize,
+    cmd: vk::CommandBuffer,
+    id: u64,
+    transitions: Vec<ComputeSampleTransition>,
+}
+
+fn record_compute_interludes(
+    inner: &mut RendererInner,
+    interludes: &mut [ComputeInterlude],
+) -> Vec<ComputeInterludeRecord> {
+    let mut recorded = Vec::with_capacity(interludes.len());
+    for interlude in interludes.iter_mut() {
+        let Some(dispatch) = interlude.dispatch.take() else {
+            continue;
+        };
+        let program = dispatch.program_key;
+        match execute_compute_dispatch_mode(inner, dispatch, true, true) {
+            crate::compute::ComputeDispatchOutcome::Submitted(id) => {
+                let record = inner
+                    .pending_computes
+                    .iter()
+                    .find(|pending| pending.id == id)
+                    .map(|pending| (pending.cmd, pending.interlude_transitions.clone()));
+                match record {
+                    Some((cmd, transitions)) => {
+                        interlude.id = Some(id);
+                        recorded.push(ComputeInterludeRecord {
+                            group: interlude.group,
+                            cmd,
+                            id,
+                            transitions,
+                        });
+                    }
+                    None => log::warn!("[compute-interlude] dispatch {id} has no pending record"),
+                }
+            }
+            crate::compute::ComputeDispatchOutcome::Executed(_) => {
+                log::error!("[compute-interlude] dispatch executed synchronously; output dropped");
+            }
+            crate::compute::ComputeDispatchOutcome::Unsupported(reason)
+            | crate::compute::ComputeDispatchOutcome::FailedBeforeSubmit(reason)
+            | crate::compute::ComputeDispatchOutcome::SubmittedFailure(reason) => {
+                log::warn!(
+                    "[compute-interlude] dispatch failed: program={:#x} {}",
+                    program,
+                    reason
+                );
+            }
+        }
+    }
+    recorded
+}
+
+fn interlude_tracked_layout(rt_cache: &RtCache, transition: &ComputeSampleTransition) -> vk::ImageLayout {
+    let Some((key, depth)) = transition.alias else {
+        return transition.old_layout;
+    };
+    let layout = if depth {
+        rt_cache.depth_layout(key)
+    } else {
+        rt_cache.color_layout(key)
+    };
+    layout.unwrap_or(vk::ImageLayout::UNDEFINED)
+}
+
+fn interlude_image_barrier(
+    transition: &ComputeSampleTransition,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier {
+        s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+        src_access_mask: compute_layout_access(old_layout),
+        dst_access_mask: compute_layout_access(new_layout),
+        old_layout,
+        new_layout,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        image: transition.image,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: transition.aspects,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        ..Default::default()
+    }
+}
+
+fn execute_compute_interlude(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    record: &ComputeInterludeRecord,
+    rt_cache: &RtCache,
+) {
+    let barrier = vk::MemoryBarrier {
+        s_type: vk::StructureType::MEMORY_BARRIER,
+        src_access_mask: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        dst_access_mask: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        ..Default::default()
+    };
+    let tracked: Vec<vk::ImageLayout> = record
+        .transitions
+        .iter()
+        .map(|transition| interlude_tracked_layout(rt_cache, transition))
+        .collect();
+    let before: Vec<vk::ImageMemoryBarrier> = record
+        .transitions
+        .iter()
+        .zip(&tracked)
+        .map(|(transition, &layout)| {
+            interlude_image_barrier(transition, layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        })
+        .collect();
+    let after: Vec<vk::ImageMemoryBarrier> = record
+        .transitions
+        .iter()
+        .zip(&tracked)
+        .filter(|(_, &layout)| layout != vk::ImageLayout::UNDEFINED)
+        .map(|(transition, &layout)| {
+            interlude_image_barrier(transition, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, layout)
+        })
+        .collect();
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[barrier],
+            &[],
+            &before,
+        );
+        device.cmd_execute_commands(cmd, &[record.cmd]);
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[barrier],
+            &[],
+            &after,
+        );
+    }
+}
+
 fn acquire_compute_slot(
     inner: &mut RendererInner,
 ) -> Result<(vk::CommandBuffer, vk::Fence), String> {
@@ -21482,13 +22090,14 @@ fn max_unsettled_generation(entries: impl IntoIterator<Item = (bool, u64)>) -> O
 }
 
 fn settle_ready_pending_computes(inner: &mut RendererInner) {
+    reap_compute_batch_primaries(inner);
     let pending_count = inner.pending_computes.len();
     for index in 0..pending_count {
         let pending = &inner.pending_computes[index];
         if pending.result.is_some() {
             continue;
         }
-        let ready = unsafe { inner.device.get_fence_status(pending.fence) } == Ok(true);
+        let ready = pending_compute_ready(inner, pending);
         if ready {
             settle_pending_compute(inner, index);
         }
@@ -21496,6 +22105,7 @@ fn settle_ready_pending_computes(inner: &mut RendererInner) {
 }
 
 fn settle_all_pending_computes(inner: &mut RendererInner) {
+    reap_compute_batch_primaries(inner);
     let pending_count = inner.pending_computes.len();
     for index in 0..pending_count {
         settle_pending_compute(inner, index);
@@ -21527,6 +22137,7 @@ fn settle_pending_compute_record(
         ));
     };
     let mut foreign_fences = Vec::new();
+    let mut foreign_generation = 0u64;
     for key in pending.texels.iter().filter_map(|meta| {
         resources
             .texels
@@ -21543,24 +22154,28 @@ fn settle_pending_compute_record(
             })
             .max_by_key(|candidate| candidate.id);
         if let Some(latest) = latest {
-            if !foreign_fences.contains(&latest.fence) {
+            if latest.fence == vk::Fence::null() {
+                foreign_generation = foreign_generation.max(latest.submission_generation);
+            } else if !foreign_fences.contains(&latest.fence) {
                 foreign_fences.push(latest.fence);
             }
         }
     }
     let wait_started = settle_started.map(|_| std::time::Instant::now());
-    let wait_result = wait_fence(&inner.device, pending.fence).and_then(|()| {
-        foreign_fences
-            .into_iter()
-            .try_for_each(|fence| wait_fence_no_reset(&inner.device, fence))
-    });
+    let wait_result = wait_pending_compute(inner, pending)
+        .and_then(|()| {
+            foreign_fences
+                .into_iter()
+                .try_for_each(|fence| wait_fence_no_reset(&inner.device, fence))
+        })
+        .and_then(|()| wait_compute_generation(inner, foreign_generation));
     let wait_elapsed = wait_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     if let Err(error) = wait_result {
         match synchronized_device_idle(inner) {
             Ok(()) => {
                 resources.destroy(&inner.device);
                 free_compute_descriptor_set(inner, pending.descriptor_pool, pending.descriptor_set);
-                inner.compute_slot_pool.push((pending.cmd, pending.fence));
+                recycle_compute_cmd(inner, pending.cmd, pending.fence);
                 return Err(error);
             }
             Err(idle_error) => {
@@ -21588,7 +22203,7 @@ fn settle_pending_compute_record(
             Err(error) => {
                 resources.destroy(&inner.device);
                 free_compute_descriptor_set(inner, pending.descriptor_pool, pending.descriptor_set);
-                inner.compute_slot_pool.push((pending.cmd, pending.fence));
+                recycle_compute_cmd(inner, pending.cmd, pending.fence);
                 return Err(error);
             }
         };
@@ -21651,7 +22266,7 @@ fn settle_pending_compute_record(
             Err(error) => {
                 resources.destroy(&inner.device);
                 free_compute_descriptor_set(inner, pending.descriptor_pool, pending.descriptor_set);
-                inner.compute_slot_pool.push((pending.cmd, pending.fence));
+                recycle_compute_cmd(inner, pending.cmd, pending.fence);
                 return Err(error);
             }
         }
@@ -21767,7 +22382,7 @@ fn settle_pending_compute_record(
     let descriptor_elapsed =
         descriptor_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     let slot_started = settle_started.map(|_| std::time::Instant::now());
-    inner.compute_slot_pool.push((pending.cmd, pending.fence));
+    recycle_compute_cmd(inner, pending.cmd, pending.fence);
     let slot_elapsed = slot_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     if let Some(started) = settle_started {
         profile_compute_recycle_stages(
@@ -21840,6 +22455,15 @@ fn execute_compute_dispatch(
     inner: &mut RendererInner,
     dispatch: crate::compute::ComputeDispatch,
     lazy: bool,
+) -> crate::compute::ComputeDispatchOutcome {
+    execute_compute_dispatch_mode(inner, dispatch, lazy, false)
+}
+
+fn execute_compute_dispatch_mode(
+    inner: &mut RendererInner,
+    dispatch: crate::compute::ComputeDispatch,
+    lazy: bool,
+    interlude: bool,
 ) -> crate::compute::ComputeDispatchOutcome {
     use crate::compute::{
         ComputeDispatchOutcome, ComputeDispatchResult, ComputeImageReadback, ComputeTexelReadback,
@@ -22015,6 +22639,7 @@ fn execute_compute_dispatch(
                     descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     old_layout: alias.layout,
                     aspects: alias.aspects,
+                    alias: Some((alias.key, alias.depth)),
                 }),
                 texture_requires_integer_sampler(numeric_type, stencil_alias),
             )
@@ -22487,6 +23112,7 @@ fn execute_compute_dispatch(
                 image: sample.image,
                 old_layout: sample.old_layout,
                 aspects: sample.aspects,
+                alias: sample.alias,
             });
         }
     }
@@ -22510,10 +23136,23 @@ fn execute_compute_dispatch(
                 image: image.image,
                 old_layout: image.old_layout,
                 aspects: image.aspects,
+                alias: image.alias,
             });
         }
     }
 
+    let interlude_transitions: Vec<ComputeSampleTransition> = if interlude {
+        sample_transitions
+            .iter()
+            .filter(|transition| transition.alias.is_some())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if interlude {
+        sample_transitions.retain(|transition| transition.alias.is_none());
+    }
     profile_compute_prep_stage(2, &mut prep_stage_started);
     let descriptor_spec = crate::compute::descriptor_spec(&dispatch);
     let reuse_sets = lazy && !inner.pending_computes.is_empty();
@@ -22880,6 +23519,7 @@ fn execute_compute_dispatch(
                     descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     aspects: vk::ImageAspectFlags::COLOR,
+                    alias: None,
                 }
             }
             ComputeSamplePlan::CrossAccess {
@@ -22898,6 +23538,7 @@ fn execute_compute_dispatch(
                     descriptor_layout: vk::ImageLayout::GENERAL,
                     old_layout: vk::ImageLayout::GENERAL,
                     aspects: vk::ImageAspectFlags::COLOR,
+                    alias: None,
                 }
             }
             ComputeSamplePlan::Guest {
@@ -22920,6 +23561,7 @@ fn execute_compute_dispatch(
                     descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     aspects: vk::ImageAspectFlags::COLOR,
+                    alias: None,
                 }
             }
         })
@@ -22942,6 +23584,7 @@ fn execute_compute_dispatch(
                     descriptor_layout: vk::ImageLayout::GENERAL,
                     old_layout: vk::ImageLayout::GENERAL,
                     aspects: vk::ImageAspectFlags::COLOR,
+                    alias: None,
                 }
             }
             ComputeImagePlan::Guest { binding, .. } => {
@@ -22961,6 +23604,7 @@ fn execute_compute_dispatch(
                     descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     aspects: vk::ImageAspectFlags::COLOR,
+                    alias: None,
                 }
             }
         })
@@ -23205,7 +23849,16 @@ fn execute_compute_dispatch(
     }
 
     profile_compute_prep_stage(4, &mut prep_stage_started);
-    let (cmd, fence) = if lazy {
+    let (cmd, fence) = if lazy && interlude {
+        match acquire_compute_secondary(inner) {
+            Ok(cmd) => (cmd, vk::Fence::null()),
+            Err(error) => {
+                resources.destroy(&inner.device);
+                free_compute_descriptor_set(inner, program.descriptor_pool, program.descriptor_set);
+                return ComputeDispatchOutcome::FailedBeforeSubmit(error);
+            }
+        }
+    } else if lazy {
         match acquire_compute_slot(inner) {
             Ok(slot) => slot,
             Err(error) => {
@@ -23223,11 +23876,19 @@ fn execute_compute_dispatch(
     let mut compute_timestamp_pair = None;
     let command_result = (|| -> Result<(), String> {
         reset_command_buffer(&inner.device, cmd)?;
-        begin_one_time(&inner.device, cmd)?;
-        compute_timestamp_pair = inner
-            .gpu_timestamps
-            .as_mut()
-            .and_then(|timestamps| timestamps.begin(&inner.device, cmd));
+        if interlude {
+            begin_secondary_one_time(&inner.device, cmd)?;
+        } else {
+            begin_one_time(&inner.device, cmd)?;
+        }
+        compute_timestamp_pair = if interlude {
+            None
+        } else {
+            inner
+                .gpu_timestamps
+                .as_mut()
+                .and_then(|timestamps| timestamps.begin(&inner.device, cmd))
+        };
         let has_cached_volume_copy = resources.guest_sources.iter().any(|source| {
             matches!(
                 source,
@@ -23706,13 +24367,15 @@ fn execute_compute_dispatch(
         resources.destroy(&inner.device);
         if lazy {
             free_compute_descriptor_set(inner, program.descriptor_pool, program.descriptor_set);
-            inner.compute_slot_pool.push((cmd, fence));
+            recycle_compute_cmd(inner, cmd, fence);
         }
         return ComputeDispatchOutcome::FailedBeforeSubmit(error);
     }
 
     let submit_started = dispatch_started.map(|_| std::time::Instant::now());
-    let submit_result = if lazy {
+    let submit_result = if lazy && interlude {
+        Ok(0)
+    } else if lazy {
         submit_with_fence(
             inner.submit_state.as_ref(),
             inner.submit_timeline,
@@ -23745,7 +24408,7 @@ fn execute_compute_dispatch(
                         program.descriptor_pool,
                         program.descriptor_set,
                     );
-                    inner.compute_slot_pool.push((cmd, fence));
+                    recycle_compute_cmd(inner, cmd, fence);
                 }
                 return ComputeDispatchOutcome::SubmittedFailure(error);
             }
@@ -23842,6 +24505,7 @@ fn execute_compute_dispatch(
         inner.next_pending_compute_id += 1;
         inner.pending_computes.push(PendingCompute {
             id,
+            serial: dispatch.serial,
             program_key: dispatch.program_key,
             submission_generation,
             fence,
@@ -23852,6 +24516,7 @@ fn execute_compute_dispatch(
             outputs,
             texels,
             resident_raw_storage,
+            interlude_transitions,
             result: None,
         });
         if let Some(started) = dispatch_started {
@@ -34845,6 +35510,17 @@ impl Drop for RendererInner {
                 self.device.free_command_buffers(self.cmd_pool, &[cmd]);
             }
         }
+        for cmd in std::mem::take(&mut self.compute_secondary_pool) {
+            unsafe {
+                self.device.free_command_buffers(self.cmd_pool, &[cmd]);
+            }
+        }
+        for primary in std::mem::take(&mut self.compute_batch_primaries) {
+            unsafe {
+                self.device.destroy_fence(primary.fence, None);
+                self.device.free_command_buffers(self.cmd_pool, &[primary.cmd]);
+            }
+        }
         for (_, d) in self.dummy_images.drain() {
             unsafe {
                 self.device.destroy_image_view(d.view, None);
@@ -36107,6 +36783,7 @@ mod tests {
             sampled_rt_snapshot_slots: Default::default(),
             fragment_barrier_after: Default::default(),
             texture_cache_invalidate_after: Default::default(),
+            primitive_barrier_after: Default::default(),
             clear: Default::default(),
             clear_color: Default::default(),
             tic_pool_gpu_va: 0x1000,
