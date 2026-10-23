@@ -295,6 +295,32 @@ pub struct AddressSpace {
     regions: Mutex<Vec<Arc<Region>>>,
     host_changes: Mutex<Vec<VersionedHostRegionChange>>,
     generation: AtomicU64,
+    arena_user: std::sync::atomic::AtomicBool,
+}
+
+static ARENA_USER_SPACES: AtomicUsize = AtomicUsize::new(0);
+static DIRECT_GUEST_READS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn direct_guest_reads_enabled() -> bool {
+    match DIRECT_GUEST_READS.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let enabled = std::env::var("NEXIUM_DIRECT_GUEST_READ")
+                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            DIRECT_GUEST_READS.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
+            enabled
+        }
+    }
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        if self.arena_user.load(Ordering::Acquire) {
+            ARENA_USER_SPACES.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl AddressSpace {
@@ -306,7 +332,20 @@ impl AddressSpace {
             regions: Mutex::new(Vec::new()),
             host_changes: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
+            arena_user: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn note_arena_region(&self) {
+        if !self.arena_user.swap(true, Ordering::AcqRel) {
+            ARENA_USER_SPACES.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn direct_reads_allowed(&self) -> bool {
+        self.arena_user.load(Ordering::Acquire)
+            && ARENA_USER_SPACES.load(Ordering::Acquire) == 1
+            && direct_guest_reads_enabled()
     }
 
     pub fn generation(&self) -> u64 {
@@ -415,7 +454,11 @@ impl AddressSpace {
             perm: region.perm(),
             host_ptr: region.buf.as_ptr(),
         };
+        let arena_region = region.arena;
         regs.insert(insert_at, region);
+        if arena_region {
+            self.note_arena_region();
+        }
         self.publish_host_change(HostRegionChange::Upsert(host_region));
         Ok(insert_at)
     }
@@ -724,6 +767,9 @@ impl AddressSpace {
     }
 
     pub fn read(&self, va: u64, buf: &mut [u8]) -> Result<()> {
+        if self.direct_reads_allowed() && crate::fastmem::read_committed(va, buf) {
+            return Ok(());
+        }
         let generation = self.generation();
         let len = buf.len();
         let hit = self.with_cached_region(generation, va, len, |region, off| unsafe {
