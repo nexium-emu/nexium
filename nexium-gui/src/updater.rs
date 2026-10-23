@@ -15,6 +15,117 @@ const UPDATE_PAYLOAD_FILES: [(&str, bool); 10] = [
     ("nexium", true),
 ];
 
+#[cfg(any(target_os = "linux", test))]
+fn appimage_path_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let value = value?;
+    if value.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    path.is_absolute().then_some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn appimage_path() -> Option<PathBuf> {
+    appimage_path_from(std::env::var_os("APPIMAGE"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn asset_matches(name: &str, appimage: bool) -> bool {
+    let name = name.to_lowercase();
+    let suffix = if appimage { ".appimage" } else { ".tar.gz" };
+    name.contains("linux") && name.ends_with(suffix)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn appimage_download_path(appimage: &std::path::Path, filename: &str) -> PathBuf {
+    appimage
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!(".{}.update", filename))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn install_appimage(
+    downloaded: &std::path::Path,
+    appimage: &std::path::Path,
+) -> Result<(), String> {
+    let metadata = std::fs::metadata(downloaded)
+        .map_err(|e| format!("could not inspect the downloaded AppImage: {}", e))?;
+    if !metadata.is_file() || metadata.len() < 16 {
+        return Err("the downloaded AppImage is incomplete".into());
+    }
+    let mut header = [0u8; 12];
+    std::fs::File::open(downloaded)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .map_err(|e| format!("could not read the downloaded AppImage: {}", e))?;
+    if &header[..4] != b"\x7fELF" || &header[8..11] != b"AI\x02" {
+        return Err("the downloaded file is not an AppImage".into());
+    }
+    let dir = appimage
+        .parent()
+        .ok_or("the running AppImage has no parent directory")?;
+    let name = appimage
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("the running AppImage has no file name")?;
+    let backups = dir.join("backups");
+    match std::fs::symlink_metadata(&backups) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err("backup path is not a directory".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&backups)
+                .map_err(|e| format!("could not create backup directory: {}", e))?;
+        }
+        Err(error) => return Err(format!("could not inspect backup directory: {}", error)),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(downloaded, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("could not set permissions on the downloaded AppImage: {}", e))?;
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let backup = backups.join(format!("{}-{}", stamp, name));
+    std::fs::copy(appimage, &backup)
+        .map_err(|e| format!("could not back up the current AppImage: {}", e))?;
+    if let Err(error) = std::fs::rename(downloaded, appimage) {
+        let _ = std::fs::remove_file(&backup);
+        return Err(format!("could not install the new AppImage: {}", error));
+    }
+    prune_appimage_backups(&backups, 3);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn prune_appimage_backups(dir: &std::path::Path, keep: usize) {
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if !metadata.file_type().is_file()
+                || !path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("AppImage"))
+            {
+                return None;
+            }
+            Some((metadata.modified().unwrap_or(std::time::UNIX_EPOCH), path))
+        })
+        .collect();
+    if entries.len() <= keep {
+        return;
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in entries.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[derive(Clone)]
 pub struct Release {
     pub tag: String,
@@ -144,8 +255,12 @@ impl Updater {
 
     #[cfg(target_os = "linux")]
     pub fn start_download(&mut self, rel: &Release) {
-        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let path = dir.join(&rel.filename);
+        let path = match appimage_path() {
+            Some(appimage) => appimage_download_path(&appimage, &rel.filename),
+            None => std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(&rel.filename),
+        };
         let dl = Arc::new(Mutex::new(Download {
             total: rel.size,
             path: path.clone(),
@@ -175,6 +290,15 @@ impl Updater {
 
     #[cfg(target_os = "linux")]
     pub fn install_and_relaunch(&self) -> Result<(), String> {
+        if let Some(appimage) = appimage_path() {
+            let downloaded = self.downloaded.clone().ok_or("no download")?;
+            install_appimage(&downloaded, &appimage)?;
+            std::process::Command::new(&appimage)
+                .current_dir(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         let tar = self.downloaded.clone().ok_or("no download")?;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let tmp = std::env::temp_dir().join("nexium_update_extract");
@@ -269,18 +393,26 @@ fn fetch_latest() -> Result<Release, String> {
         .unwrap_or_default();
 
     let assets = json["assets"].as_array().cloned().unwrap_or_default();
-    let asset = assets.iter().find(|a| {
-        let n = a["name"].as_str().unwrap_or("").to_lowercase();
-        n.contains("linux") && n.ends_with(".tar.gz")
-    });
-    let asset = asset.ok_or("no Linux build in latest release")?;
+    let appimage = appimage_path().is_some();
+    let asset = assets
+        .iter()
+        .find(|a| asset_matches(a["name"].as_str().unwrap_or(""), appimage));
+    let asset = asset.ok_or(if appimage {
+        "no Linux AppImage in latest release"
+    } else {
+        "no Linux build in latest release"
+    })?;
     let url = asset["browser_download_url"]
         .as_str()
         .unwrap_or("")
         .to_string();
     let filename = asset["name"]
         .as_str()
-        .unwrap_or("nexium-linux-x86_64.tar.gz")
+        .unwrap_or(if appimage {
+            "nexium-linux-x86_64.AppImage"
+        } else {
+            "nexium-linux-x86_64.tar.gz"
+        })
         .to_string();
     let size = asset["size"].as_u64().unwrap_or(0);
     if url.is_empty() {
@@ -793,6 +925,125 @@ mod tests {
             }
         }
         package_root
+    }
+
+    #[test]
+    fn appimage_assets_are_selected_only_inside_an_appimage() {
+        assert!(asset_matches("nexium-linux-x86_64.AppImage", true));
+        assert!(!asset_matches("nexium-linux-x86_64.AppImage", false));
+        assert!(asset_matches("nexium-linux-x86_64.tar.gz", false));
+        assert!(!asset_matches("nexium-linux-x86_64.tar.gz", true));
+        assert!(!asset_matches("nexium-windows-x86_64.zip", true));
+        assert!(!asset_matches("nexium-windows-x86_64.zip", false));
+    }
+
+    #[test]
+    fn appimage_path_requires_an_absolute_value() {
+        assert_eq!(appimage_path_from(None), None);
+        assert_eq!(appimage_path_from(Some("".into())), None);
+        assert_eq!(appimage_path_from(Some("nexium.AppImage".into())), None);
+        let absolute = if cfg!(windows) {
+            r"C:\Apps\nexium.AppImage"
+        } else {
+            "/home/deck/Applications/nexium.AppImage"
+        };
+        assert_eq!(
+            appimage_path_from(Some(absolute.into())),
+            Some(PathBuf::from(absolute))
+        );
+    }
+
+    #[test]
+    fn appimage_download_lands_next_to_the_running_image() {
+        let path = appimage_download_path(
+            std::path::Path::new("/home/deck/Applications/nexium.AppImage"),
+            "nexium-linux-x86_64.AppImage",
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/home/deck/Applications/.nexium-linux-x86_64.AppImage.update")
+        );
+    }
+
+    #[test]
+    fn appimage_install_replaces_the_image_and_keeps_a_backup() {
+        let tree = TempTree::new("appimage-install");
+        let current = tree.0.join("nexium.AppImage");
+        std::fs::write(&current, b"\x7fELF\0\0\0\0AI\x02\0old-build").unwrap();
+        let downloaded = appimage_download_path(&current, "nexium-linux-x86_64.AppImage");
+        let fresh = b"\x7fELF\0\0\0\0AI\x02\0new-build".to_vec();
+        std::fs::write(&downloaded, &fresh).unwrap();
+
+        install_appimage(&downloaded, &current).unwrap();
+
+        assert_eq!(std::fs::read(&current).unwrap(), fresh);
+        assert!(!downloaded.exists());
+        let backups: Vec<PathBuf> = std::fs::read_dir(tree.0.join("backups"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read(&backups[0]).unwrap(),
+            b"\x7fELF\0\0\0\0AI\x02\0old-build"
+        );
+    }
+
+    #[test]
+    fn appimage_install_rejects_files_that_are_not_appimages() {
+        let tree = TempTree::new("appimage-reject");
+        let current = tree.0.join("nexium.AppImage");
+        std::fs::write(&current, b"\x7fELF\0\0\0\0AI\x02\0old-build").unwrap();
+        let downloaded = appimage_download_path(&current, "nexium-linux-x86_64.AppImage");
+        std::fs::write(&downloaded, b"<html>not found</html>").unwrap();
+
+        let error = install_appimage(&downloaded, &current).unwrap_err();
+
+        assert!(error.contains("not an AppImage"), "{error}");
+        assert_eq!(
+            std::fs::read(&current).unwrap(),
+            b"\x7fELF\0\0\0\0AI\x02\0old-build"
+        );
+        assert!(!tree.0.join("backups").exists());
+    }
+
+    #[test]
+    fn appimage_backups_keep_only_the_newest() {
+        let tree = TempTree::new("appimage-prune");
+        let backups = tree.0.join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        for index in 0..5 {
+            let path = backups.join(format!("2026102{}-nexium.AppImage", index));
+            std::fs::write(&path, b"x").unwrap();
+            let time = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + index * 60);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        }
+        std::fs::write(backups.join("notes.txt"), b"keep").unwrap();
+
+        prune_appimage_backups(&backups, 3);
+
+        let mut names: Vec<String> = std::fs::read_dir(&backups)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "20261022-nexium.AppImage",
+                "20261023-nexium.AppImage",
+                "20261024-nexium.AppImage",
+                "notes.txt"
+            ]
+        );
     }
 
     #[test]

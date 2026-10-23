@@ -4672,20 +4672,32 @@ impl HorizonApp {
         if self.confirm.is_some() || self.updater.available_release().is_none() {
             return;
         }
-        let exe_path = std::env::current_exe()
+        let appimage = std::env::var_os("APPIMAGE")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from);
+        let target = appimage
+            .clone()
+            .or_else(|| std::env::current_exe().ok());
+        let exe_path = target
+            .as_ref()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "the executable location".to_string());
-        let parent_dir = std::env::current_exe()
-            .ok()
+            .unwrap_or_else(|| "the executable location".to_string());
+        let parent_dir = target
+            .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
             .unwrap_or_else(|| "app folder".to_string());
+        let what = if appimage.is_some() {
+            "AppImage"
+        } else {
+            "active binary"
+        };
 
         let body = format!(
             "You are about to install the latest Linux build.\n\n\
-             This will replace the active binary at:\n{}\n\n\
+             This will replace the {} at:\n{}\n\n\
              A backup of the current build will be saved in:\n{}/backups/\n\n\
              Would you like to proceed?",
-            exe_path, parent_dir
+            what, exe_path, parent_dir
         );
 
         self.confirm = Some(ConfirmDialog {
