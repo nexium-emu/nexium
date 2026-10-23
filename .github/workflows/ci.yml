@@ -12,6 +12,7 @@ env:
   FFMPEG_VERSION: 9.0.1
   FFMPEG_SOURCE_SHA256: cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
   FFMPEG_SIGNING_FINGERPRINT: FCF986EA15E6E293A5644F10B4322F04D67658D8
+  APPIMAGE_RUNTIME_SHA256: 617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46
 
 jobs:
   build:
@@ -192,6 +193,52 @@ jobs:
           files=(dist/nexium-${{ matrix.asset }}.*)
           [ ${#files[@]} -gt 0 ] || { echo "::error::no package produced"; exit 1; }
           cp -f "${files[@]}" "$DROP/"
+          ls -l "$DROP"
+
+  appimage:
+    name: NeXium AppImage (x86_64)
+    runs-on: [ self-hosted, Linux, X64, nexium-linux ]
+    steps:
+      - name: Checkout NeXium
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Build packaging image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker version --format 'docker {{.Server.Version}}'
+          docker build --quiet -t nexium-appimage-builder:jammy \
+            -f .github/docker/appimage.Dockerfile .github/docker
+
+      - name: Build AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /opt/nexium-appimage/rust /opt/nexium-appimage/target
+          docker run --rm --init \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -v /opt/nexium-appimage/rust:/opt/rust \
+            -v /opt/nexium-appimage/target:/src/target \
+            -e CARGO_TERM_COLOR -e FFMPEG_VERSION -e FFMPEG_SOURCE_SHA256 -e FFMPEG_SIGNING_FINGERPRINT \
+            -e APPIMAGE_RUNTIME_SHA256 \
+            -w /src nexium-appimage-builder:jammy bash .github/scripts/build-appimage.sh
+          test -f dist/nexium-linux-x86_64.AppImage
+
+      - name: Resolve shared artifact drop
+        shell: bash
+        run: |
+          set -euo pipefail
+          DROP="/mnt/c/nexium-ci-artifacts/${{ github.run_id }}"
+          mkdir -p "$DROP"
+          echo "DROP=$DROP" >> "$GITHUB_ENV"
+
+      - name: Hand off AppImage to shared drop
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -f dist/nexium-linux-x86_64.AppImage "$DROP/"
           ls -l "$DROP"
 
   android:
@@ -426,7 +473,7 @@ jobs:
 
   release:
     name: Pre-release
-    needs: [build, android, ps5]
+    needs: [build, appimage, android, ps5]
     if: github.event_name != 'pull_request'
     runs-on: [ self-hosted, Linux, X64, nexium-linux ]
     permissions:
@@ -442,7 +489,7 @@ jobs:
           test -d "$DROP" || { echo "::error::no drop directory for this run"; exit 1; }
           mkdir -p artifacts
           cp -f "$DROP"/* artifacts/
-          for f in nexium-linux-x86_64.tar.gz nexium-windows-x86_64.zip nexium-android-arm64.apk nexium-ps5.zip; do
+          for f in nexium-linux-x86_64.tar.gz nexium-linux-x86_64.AppImage nexium-windows-x86_64.zip nexium-android-arm64.apk nexium-ps5.zip; do
             test -f "artifacts/$f" || { echo "::error::missing $f"; exit 1; }
           done
           ls -l artifacts
@@ -467,10 +514,13 @@ jobs:
             **Downloads**
             - Windows (x86_64): `nexium-windows-x86_64.zip`
             - Linux (x86_64): `nexium-linux-x86_64.tar.gz`
+            - Linux AppImage (x86_64, Steam Deck): `nexium-linux-x86_64.AppImage`
             - Android (arm64-v8a): `nexium-android-arm64.apk`
             - PS5 homebrew (PPSA99640 folder for `/data/homebrew/`): `nexium-ps5.zip`
 
             > Pre-release / experimental.
+
+            The AppImage is built against glibc 2.35 and runs on SteamOS 3.5 or newer. Run `chmod +x nexium-linux-x86_64.AppImage` after downloading; on a Steam Deck add it in Desktop Mode through "Add a Non-Steam Game" to launch it from Game Mode.
 
             NeXium archives bundle the FFmpeg command-line program under the GNU LGPL v2.1 or later. The corresponding unmodified source, license, signature, and build configuration are included in each archive under `licenses/FFmpeg`.
           files: artifacts/**/*
@@ -485,7 +535,7 @@ jobs:
             embeds: [ {
               title: ("NeXium nightly " + $ver),
               url: $url,
-              description: "A new early-access build is up. Windows and Linux (x86_64) downloads, an Android arm64 APK and a PS5 homebrew build are on the release page.\n\nExperimental — expect bugs.",
+              description: "A new early-access build is up. Windows and Linux (x86_64) downloads, a Linux AppImage for Steam Deck, an Android arm64 APK and a PS5 homebrew build are on the release page.\n\nExperimental — expect bugs.",
               color: 5814783
             } ]
           }')"

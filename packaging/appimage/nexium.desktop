@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NeXium
+GenericName=Nintendo Switch Emulator
+Comment=Open-source Nintendo Switch emulator
+Exec=nexium %f
+Icon=nexium
+Terminal=false
+Categories=Game;Emulator;
+Keywords=Switch;Emulator;Nintendo;
+StartupNotify=true
