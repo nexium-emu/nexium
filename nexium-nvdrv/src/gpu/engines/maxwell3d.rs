@@ -72,7 +72,7 @@ impl PendingSemaphoreWrite {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct RenderTarget {
     pub address_lo: u32,
     pub address_hi: u32,
@@ -85,7 +85,7 @@ pub struct RenderTarget {
     pub base_layer: u32,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct ZetaSurface {
     pub address_lo: u32,
     pub address_hi: u32,
@@ -121,7 +121,7 @@ impl Default for StencilFaceState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
     pub x: f32,
     pub y: f32,
@@ -168,7 +168,7 @@ impl Viewport {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct SurfaceClip {
     pub x: u32,
     pub y: u32,
@@ -195,7 +195,7 @@ impl SurfaceClip {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct ViewportClipControl {
     pub raw: u32,
 }
@@ -210,7 +210,7 @@ impl ViewportClipControl {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct WindowOrigin {
     pub raw: u32,
 }
@@ -225,7 +225,7 @@ impl WindowOrigin {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct ScissorTest {
     pub enabled: bool,
     pub min_x: u32,
@@ -234,7 +234,7 @@ pub struct ScissorTest {
     pub max_y: u32,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct ClearColor {
     pub r: f32,
     pub g: f32,
@@ -242,7 +242,7 @@ pub struct ClearColor {
     pub a: f32,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct VertexAttribute {
     pub buffer: u32,
     pub offset: u32,
@@ -261,7 +261,7 @@ pub struct VertexBuffer {
     pub end_hi: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorBlendState {
     pub blend_enable: [bool; 8],
     pub blend_eq_rgb: u32,
@@ -306,7 +306,7 @@ impl Default for ColorBlendState {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct ShaderProgram {
     pub address_lo: u32,
     pub address_hi: u32,
@@ -819,7 +819,7 @@ pub struct DrawCall {
     pub state_identities: DrawStateIdentities,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawTextureCall {
     pub dst_x: f32,
     pub dst_y: f32,
