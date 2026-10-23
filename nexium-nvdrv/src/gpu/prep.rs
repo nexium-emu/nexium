@@ -1299,7 +1299,7 @@ impl PrepState {
                 kickprof::add(kickprof::DRAWS_PRE, kp_pre);
                 if let Some(r) = self.renderer.clone() {
                     self.ssbo_snapshot_cache.begin_constbuf_write_log();
-                    let mut template_memo = None;
+                    let mut template_memo = super::vk_dispatch::DrawTemplateMemoSet::default();
                     if replay_constbuf_writes.is_empty() {
                         let kp = kickprof::start();
                         let completed = super::vk_dispatch::enqueue_draws(

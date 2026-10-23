@@ -8078,7 +8078,7 @@ pub(crate) fn enqueue_draws<'d>(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
     mut compute_probe: Option<&mut ComputeGraphicsProbe>,
-    template_memo: &mut Option<DrawTemplateMemo<'d>>,
+    template_memo: &mut DrawTemplateMemoSet<'d>,
 ) -> bool {
     ssbo_snapshot_cache.refresh_deferred_writes(mappings);
     ssbo_snapshot_cache.attach_cbuf_pool(renderer);
@@ -16215,7 +16215,7 @@ fn execute_one<'d>(
     derived_state_cache: &mut DrawDerivedStateCache,
     resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
     storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
-    template_memo: &mut Option<DrawTemplateMemo<'d>>,
+    template_memo: &mut DrawTemplateMemoSet<'d>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
@@ -16266,6 +16266,85 @@ pub(crate) struct DrawTemplateMemo<'d> {
     handle_slots: [u32; 2],
     write_log_index: usize,
     template: DrawTemplate,
+    state_key: u64,
+    last_used: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct DrawTemplateMemoSet<'d> {
+    entries: Vec<DrawTemplateMemo<'d>>,
+    clock: u64,
+}
+
+fn draw_template_memo_entries() -> usize {
+    static ENTRIES: OnceLock<usize> = OnceLock::new();
+    *ENTRIES.get_or_init(|| {
+        std::env::var("NEXIUM_DRAW_TEMPLATE_MEMO_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|entries| entries.clamp(1, 256))
+            .unwrap_or(16)
+    })
+}
+
+fn draw_template_state_key(draw: &DrawCall) -> u64 {
+    let mut key = draw.fs_shader_gpu_va ^ draw.program_region_gpu_va.rotate_left(17);
+    let mut fold = |value: u64| {
+        key = key.rotate_left(9) ^ value;
+    };
+    for program in &draw.shader_programs {
+        fold(((program.address_hi as u64) << 32)
+            | program.address_lo as u64
+            | ((program.enabled as u64) << 63));
+    }
+    fold(draw.topology as u64
+        | ((draw.index_format as u64) << 8)
+        | ((draw.indexed as u64) << 16)
+        | ((draw.primitive_restart_enabled as u64) << 17)
+        | ((draw.rt_control as u64) << 32));
+    for attribute in &draw.vertex_attribs[..16] {
+        fold((attribute.format as u64)
+            | ((attribute.buffer as u64) << 32)
+            | ((attribute.offset as u64) << 40)
+            | ((attribute.constant as u64) << 63));
+    }
+    for buffer in &draw.vertex_buffers[..16] {
+        fold((buffer.stride as u64)
+            | ((buffer.frequency as u64) << 32)
+            | ((buffer.enabled as u64) << 63));
+    }
+    for target in &draw.rt[..4] {
+        fold(((target.address_hi as u64) << 32)
+            | target.address_lo as u64
+            | ((target.format as u64) << 48));
+    }
+    fold(((draw.zeta.address_hi as u64) << 32)
+        | draw.zeta.address_lo as u64
+        | ((draw.zeta.format as u64) << 48));
+    fold((draw.zeta_enable as u64)
+        | ((draw.depth_test_enable as u64) << 1)
+        | ((draw.depth_write_enable as u64) << 2)
+        | ((draw.stencil_enable as u64) << 3)
+        | ((draw.cull_test_enable as u64) << 4)
+        | ((draw.alpha_test_enabled as u64) << 5)
+        | ((draw.is_clear as u64) << 6)
+        | ((draw.color_blend.blend_enable[0] as u64) << 7)
+        | ((draw.depth_func as u64) << 8)
+        | ((draw.cull_face as u64) << 16)
+        | ((draw.front_face as u64) << 24)
+        | ((draw.alpha_test_func as u64) << 32)
+        | ((draw.multisample_mode as u64) << 40)
+        | ((draw.tex_cb_index as u64) << 48)
+        | ((draw.bindless_texture_const_buffer_slot as u64) << 56));
+    fold(draw.tic_pool_gpu_va ^ ((draw.sampler_binding as u64) << 48));
+    fold((draw.color_blend.blend_eq_rgb as u64)
+        | ((draw.color_blend.blend_src_rgb as u64) << 8)
+        | ((draw.color_blend.blend_dst_rgb as u64) << 16)
+        | ((draw.color_blend.blend_eq_alpha as u64) << 24)
+        | ((draw.color_blend.blend_src_alpha as u64) << 32)
+        | ((draw.color_blend.blend_dst_alpha as u64) << 40)
+        | ((draw.color_blend.blend_per_target_enabled as u64) << 48));
+    key.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 fn template_handle_watch_enabled() -> bool {
@@ -18692,65 +18771,97 @@ fn execute_one_inner<'d>(
     derived_state_cache: &mut DrawDerivedStateCache,
     resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
     storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
-    template_memo: &mut Option<DrawTemplateMemo<'d>>,
+    template_memo: &mut DrawTemplateMemoSet<'d>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
     let reuse_enabled = draw_template_reuse_enabled();
-    let reused = if reuse_enabled {
-        match template_memo.as_ref() {
-            None => {
-                super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_NOMEMO, 1);
-                None
-            }
-            Some(memo) => {
-                if memo.mapping_generation != mappings.generation()
-                    || memo.meta_generation
-                        != TEX_META_GEN.load(std::sync::atomic::Ordering::Acquire)
+    let state_key = reuse_enabled.then(|| draw_template_state_key(draw));
+    let reused = if let Some(state_key) = state_key {
+        if template_memo.entries.is_empty() {
+            super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_NOMEMO, 1);
+            None
+        } else {
+            let mapping_generation = mappings.generation();
+            let meta_generation = TEX_META_GEN.load(std::sync::atomic::Ordering::Acquire);
+            let mut state_matched = false;
+            let mut generation_miss = false;
+            let mut texture_miss = false;
+            let mut found = None;
+            for (index, memo) in template_memo.entries.iter().enumerate() {
+                if memo.state_key != state_key || !draw_template_state_matches(memo.draw, draw) {
+                    continue;
+                }
+                state_matched = true;
+                if memo.mapping_generation != mapping_generation
+                    || memo.meta_generation != meta_generation
                 {
-                    super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_GEN, 1);
-                    None
-                } else if !draw_template_state_matches(memo.draw, draw) {
-                    super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_STATE, 1);
-                    if super::pusher::kickprof::enabled() {
-                        draw_template_state_mismatch_groups(memo.draw, draw);
+                    generation_miss = true;
+                    continue;
+                }
+                let handles_unchanged = template_handle_watch_enabled()
+                    && template_handles_unchanged(
+                        memo,
+                        draw,
+                        &ssbo_snapshot_cache.constbuf_write_log,
+                    );
+                if handles_unchanged {
+                    super::pusher::kickprof::count(super::pusher::kickprof::TMPL_TEX_SKIP, 1);
+                }
+                if !handles_unchanged
+                    && !draw_template_textures_current(&memo.template, draw, mappings, mem_read)
+                {
+                    texture_miss = true;
+                    continue;
+                }
+                found = Some(index);
+                break;
+            }
+            match found {
+                Some(index) => {
+                    let kp_clone = super::pusher::kickprof::start();
+                    template_memo.clock = template_memo.clock.wrapping_add(1);
+                    let clock = template_memo.clock;
+                    let memo = &mut template_memo.entries[index];
+                    memo.last_used = clock;
+                    memo.write_log_index = ssbo_snapshot_cache.constbuf_write_log.len();
+                    let template = memo.template.clone();
+                    super::pusher::kickprof::add(
+                        super::pusher::kickprof::TMPL_CLONE_REUSE,
+                        kp_clone,
+                    );
+                    Some(template)
+                }
+                None => {
+                    if generation_miss {
+                        template_memo.entries.retain(|memo| {
+                            memo.mapping_generation == mapping_generation
+                                && memo.meta_generation == meta_generation
+                        });
                     }
-                    None
-                } else {
-                    let handles_unchanged = template_handle_watch_enabled()
-                        && template_handles_unchanged(
-                            memo,
-                            draw,
-                            &ssbo_snapshot_cache.constbuf_write_log,
-                        );
-                    if handles_unchanged {
-                        super::pusher::kickprof::count(super::pusher::kickprof::TMPL_TEX_SKIP, 1);
-                    }
-                    if !handles_unchanged
-                        && !draw_template_textures_current(&memo.template, draw, mappings, mem_read)
-                    {
+                    if !state_matched {
+                        super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_STATE, 1);
+                        if super::pusher::kickprof::enabled() {
+                            if let Some(recent) = template_memo
+                                .entries
+                                .iter()
+                                .max_by_key(|memo| memo.last_used)
+                            {
+                                draw_template_state_mismatch_groups(recent.draw, draw);
+                            }
+                        }
+                    } else if texture_miss {
                         super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_TEX, 1);
-                        None
                     } else {
-                        let kp_clone = super::pusher::kickprof::start();
-                        let template = memo.template.clone();
-                        super::pusher::kickprof::add(
-                            super::pusher::kickprof::TMPL_CLONE_REUSE,
-                            kp_clone,
-                        );
-                        Some(template)
+                        super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_GEN, 1);
                     }
+                    None
                 }
             }
         }
     } else {
         None
     };
-    if reused.is_some() {
-        if let Some(memo) = template_memo.as_mut() {
-            memo.write_log_index = ssbo_snapshot_cache.constbuf_write_log.len();
-        }
-    }
     let template = match reused {
         Some(mut template) => {
             super::pusher::kickprof::count(super::pusher::kickprof::TMPL_REUSE, 1);
@@ -18773,12 +18884,13 @@ fn execute_one_inner<'d>(
                 mem_read,
             )?
             else {
-                *template_memo = None;
+                template_memo.entries.clear();
                 return Ok(None);
             };
-            if reuse_enabled {
+            if let Some(state_key) = state_key {
                 let kp_clone = super::pusher::kickprof::start();
-                *template_memo = Some(DrawTemplateMemo {
+                template_memo.clock = template_memo.clock.wrapping_add(1);
+                let entry = DrawTemplateMemo {
                     draw,
                     mapping_generation: mappings.generation(),
                     meta_generation: TEX_META_GEN.load(std::sync::atomic::Ordering::Acquire),
@@ -18788,7 +18900,21 @@ fn execute_one_inner<'d>(
                     ),
                     write_log_index: ssbo_snapshot_cache.constbuf_write_log.len(),
                     template: template.clone(),
-                });
+                    state_key,
+                    last_used: template_memo.clock,
+                };
+                if template_memo.entries.len() >= draw_template_memo_entries() {
+                    let victim = template_memo
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, memo)| memo.last_used)
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    template_memo.entries[victim] = entry;
+                } else {
+                    template_memo.entries.push(entry);
+                }
                 super::pusher::kickprof::add(
                     super::pusher::kickprof::TMPL_CLONE_STORE,
                     kp_clone,
