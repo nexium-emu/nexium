@@ -429,7 +429,9 @@ pub(crate) mod kickprof {
     pub const CBUF_POOL_FALLBACK_COPY: usize = 266;
     pub const TEXLAY_MEMO_VMISS: usize = 267;
     pub const TEXLAY_MEMO_STALE: usize = 268;
-    pub const COUNT: usize = 269;
+    pub const CLEAR_SNAPSHOT_LAZY: usize = 269;
+    pub const CLEAR_SNAPSHOT_READ: usize = 270;
+    pub const COUNT: usize = 271;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -701,6 +703,8 @@ pub(crate) mod kickprof {
         "cbpoolfbcopy",
         "texlaymemovmiss",
         "texlaymemostale",
+        "clearsnaplazy",
+        "clearsnapread",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];

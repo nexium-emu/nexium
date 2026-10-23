@@ -1802,8 +1802,46 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+static LAZY_CLEAR_GUEST_READER: std::sync::Mutex<Option<crate::AsyncMemoryRead>> =
+    std::sync::Mutex::new(None);
+
 pub(crate) fn set_prep_sync_guest_read(reader: crate::AsyncMemoryRead) {
+    if let Ok(mut slot) = LAZY_CLEAR_GUEST_READER.lock() {
+        *slot = Some(reader.clone());
+    }
     PREP_SYNC_GUEST_READ.with(|slot| *slot.borrow_mut() = Some(reader));
+}
+
+fn lazy_clear_guest_reader() -> Option<crate::AsyncMemoryRead> {
+    LAZY_CLEAR_GUEST_READER
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+fn clear_snapshot_lazy_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_CLEAR_SNAPSHOT_LAZY").map_or(true, |value| value != "0")
+    })
+}
+
+fn lazy_clear_guest_read(
+    job: &PreparedDrawBatch,
+    addr: u64,
+    len: usize,
+) -> Option<nexium_gpu::renderer::SharedGuestSnapshot> {
+    let &(_, cpu_addr, _) = job
+        .lazy_guest_ranges
+        .iter()
+        .find(|&&(gpu_va, _, range_len)| gpu_va == addr && range_len >= len)?;
+    let reader = lazy_clear_guest_reader()?;
+    let mut bytes = vec![0u8; len];
+    if !reader(cpu_addr, &mut bytes) {
+        return None;
+    }
+    super::pusher::kickprof::count_sized(super::pusher::kickprof::CLEAR_SNAPSHOT_READ, 1, len);
+    nexium_gpu::renderer::SharedGuestSnapshot::new(Arc::new(bytes), len)
 }
 
 fn draw_template_reg_hash(draw: &DrawCall, map_generation: u64) -> u64 {
@@ -12418,6 +12456,7 @@ pub(crate) struct PreparedDrawBatch {
     rt_invalidations_after: Vec<(u64, u64, u64)>,
     compatibility: DrawBatchCompatibility,
     snapshot: DrawSnapshot,
+    lazy_guest_ranges: Vec<(u64, u64, usize)>,
     snapshot_generations: SnapshotGenerations,
     trusted_texture_snapshot_identities: TrustedSnapshotIdentities,
     tic_summ: Vec<String>,
@@ -13551,6 +13590,7 @@ fn prepare_draw_batch_async(
         rt_invalidations_after: Vec::new(),
         compatibility,
         snapshot,
+        lazy_guest_ranges: Vec::new(),
         snapshot_generations,
         trusted_texture_snapshot_identities,
         tic_summ,
@@ -13630,7 +13670,22 @@ fn prepare_clear_batch(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     snapshot_cache: &mut SsboSnapshotCache,
 ) -> PreparedDrawBatch {
-    let snapshot = snapshot_partial_clear_guest(&clear, mappings, mem_read, snapshot_cache);
+    let mut lazy_guest_ranges = Vec::new();
+    let snapshot = if clear_snapshot_lazy_enabled() && lazy_clear_guest_reader().is_some() {
+        if let Some(color) = clear.color.as_ref() {
+            if let Some((gpu_va, len)) = partial_clear_guest_snapshot_range(color, mappings) {
+                lazy_guest_ranges.push((gpu_va, color.key.cpu_addr, len));
+                super::pusher::kickprof::count_sized(
+                    super::pusher::kickprof::CLEAR_SNAPSHOT_LAZY,
+                    1,
+                    len,
+                );
+            }
+        }
+        DrawSnapshot::default()
+    } else {
+        snapshot_partial_clear_guest(&clear, mappings, mem_read, snapshot_cache)
+    };
     let clear_ops = vec![clear];
     PreparedDrawBatch {
         renderer: Arc::clone(renderer),
@@ -13639,6 +13694,7 @@ fn prepare_clear_batch(
         clear_ops,
         rt_invalidations_after: Vec::new(),
         snapshot,
+        lazy_guest_ranges,
         snapshot_generations: SnapshotGenerations::default(),
         trusted_texture_snapshot_identities: TrustedSnapshotIdentities::default(),
         tic_summ: Vec::new(),
@@ -13707,7 +13763,10 @@ pub(crate) fn execute_prepared_draw_batches(
             &rt_invalidation_groups,
             |group_index: usize, addr: u64, len: usize| {
                 let job = jobs.get(group_index)?;
-                let bytes = job.snapshot.get(&addr).filter(|bytes| bytes.len() >= len)?;
+                let Some(bytes) = job.snapshot.get(&addr).filter(|bytes| bytes.len() >= len)
+                else {
+                    return lazy_clear_guest_read(job, addr, len);
+                };
                 let trusted_identity =
                     job.trusted_texture_snapshot_identities
                         .get(&addr)
