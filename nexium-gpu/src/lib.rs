@@ -5,6 +5,7 @@ mod astc_async;
 mod astc_gpu;
 pub mod bcn_encode;
 pub mod bundle_cache;
+pub mod cbuf_pool;
 pub mod commands;
 pub mod compute;
 mod depth;

@@ -1174,6 +1174,31 @@ fn create_resident_vb_cache(
     })
 }
 
+fn create_cbuf_pool(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    frame_slot_count: usize,
+) -> Result<crate::cbuf_pool::CbufPool, String> {
+    let size = crate::cbuf_pool::cbuf_pool_bytes()
+        .saturating_add(crate::cbuf_pool::CBUF_POOL_DIRECTORY_BYTES);
+    let (buffer, rebar_bytes) = create_stream_upload_buffer_sized(
+        device,
+        mem_props,
+        size,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        "constant buffer pool",
+    )?;
+    crate::cbuf_pool::CbufPool::new(
+        buffer.buffer,
+        buffer.memory,
+        buffer.mapped,
+        buffer.size,
+        rebar_bytes,
+        frame_slot_count,
+    )
+    .ok_or_else(|| "constant buffer pool too small for its directory ring".to_string())
+}
+
 fn resident_cbuf_draw_is_valid(draw: &crate::draw::ResidentCbufDraw, dst_len: usize) -> bool {
     resident_cbuf_draw_layout_is_valid(draw, dst_len)
 }
@@ -1735,6 +1760,7 @@ struct RendererInner {
     ubo_ring: UboRing,
     aurora_resident_ssbos: Option<AuroraResidentSsboCache>,
     resident_vb: Option<ResidentVbCache>,
+    cbuf_pool: Option<crate::cbuf_pool::CbufPool>,
     compute_guest_content_memo: HashMap<(u64, usize), ComputeGuestImageContent>,
     min_storage_buffer_offset_alignment: u64,
     max_storage_buffer_range: u64,
@@ -7498,6 +7524,20 @@ impl Renderer {
         } else {
             None
         };
+        let cbuf_pool = if crate::cbuf_pool::cbuf_pool_enabled() {
+            match create_cbuf_pool(&device, &mem_props, frame_slot_count) {
+                Ok(pool) => Some(pool),
+                Err(error) => {
+                    log::warn!(
+                        "resident constant buffer pool unavailable; using ring uploads: {}",
+                        error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         log::info!("nexium-gpu Renderer init OK: {} (Vulkan via Ash)", name);
 
@@ -7581,6 +7621,7 @@ impl Renderer {
                 ubo_ring,
                 aurora_resident_ssbos,
                 resident_vb,
+                cbuf_pool,
                 compute_guest_content_memo: HashMap::default(),
                 min_storage_buffer_offset_alignment,
                 max_storage_buffer_range,
@@ -9654,6 +9695,10 @@ impl Renderer {
         let key = inner.rt_cache.find_color_key_at_va(nvmap_id, gpu_va)?;
         let stamp = inner.rt_cache.drawn_stamp(key)?;
         Some((key, stamp))
+    }
+
+    pub fn cbuf_pool_shared(&self) -> Option<Arc<crate::cbuf_pool::CbufPoolShared>> {
+        self.inner.lock().cbuf_pool.as_ref().map(|pool| pool.shared())
     }
 
     pub fn render_target_stamp(&self, key: RtKey) -> Option<u64> {
@@ -13565,6 +13610,7 @@ impl Renderer {
             ubo_ring,
             aurora_resident_ssbos,
             resident_vb,
+            cbuf_pool,
             min_storage_buffer_offset_alignment,
             max_storage_buffer_range,
             max_texel_buffer_elements,
@@ -13680,6 +13726,9 @@ impl Renderer {
         if let Some(cache) = resident_vb.as_mut() {
             cache.complete_frame_slot(cur_idx);
         }
+        if let Some(pool) = cbuf_pool.as_mut() {
+            pool.complete_frame_slot(cur_idx);
+        }
         for index in 0..frame_slots.len() {
             if recycled_slots & (1 << index) != 0 {
                 if let Some(cache) = aurora_resident_ssbos.as_mut() {
@@ -13687,6 +13736,9 @@ impl Renderer {
                 }
                 if let Some(cache) = resident_vb.as_mut() {
                     cache.complete_frame_slot(index);
+                }
+                if let Some(pool) = cbuf_pool.as_mut() {
+                    pool.complete_frame_slot(index);
                 }
             }
         }
@@ -13754,9 +13806,38 @@ impl Renderer {
                 batch_ring_upper, ubo_ring.size
             ));
         }
+        let pool_directory_upper = group_preps
+            .iter()
+            .flat_map(|(_, preps)| preps.iter())
+            .filter(|(call, _)| call.pool_cbuf.is_some())
+            .count() as u64
+            * crate::cbuf_pool::CBUF_POOL_DIRECTORY_STRIDE;
+        if let Some(pool) = cbuf_pool.as_mut() {
+            for call in groups.iter().flat_map(|calls| calls.iter()) {
+                if let Some(pool_draw) = call.pool_cbuf.as_ref() {
+                    pool.note_submitted(cur_idx, &pool_draw.regions);
+                }
+            }
+        }
+        if pool_directory_upper != 0 {
+            match cbuf_pool.as_ref() {
+                Some(pool) if pool.directory_fits(pool_directory_upper) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "graphics batch needs {:#x} bytes of constant buffer pool directory",
+                        pool_directory_upper
+                    ));
+                }
+                None => {
+                    return Err(
+                        "pooled graphics cbuf draws without a constant buffer pool".to_string()
+                    );
+                }
+            }
+        }
         let ring_wrapped = ubo_ring.head.saturating_add(batch_ring_upper) > ubo_ring.size;
         let ring_wrap_started = ring_telemetry_enabled().then(std::time::Instant::now);
-        let reserved_slots = reserve_ring_span(
+        let mut reserved_slots = reserve_ring_span(
             device,
             *submit_timeline,
             frame_slots,
@@ -13767,6 +13848,24 @@ impl Renderer {
             fermi_exact_rt_snapshot_leases,
             fermi_exact_rt_snapshot_ids,
         )?;
+        let pool_directory_start = match cbuf_pool.as_mut() {
+            Some(pool) if pool_directory_upper != 0 => {
+                reserved_slots |= reserve_pool_directory_span(
+                    device,
+                    *submit_timeline,
+                    frame_slots,
+                    cur_idx,
+                    descriptor_pool.pool,
+                    pool,
+                    pool_directory_upper,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
+                )?;
+                pool.dir_head
+            }
+            Some(pool) => pool.dir_head,
+            None => 0,
+        };
         for index in 0..frame_slots.len() {
             if reserved_slots & (1 << index) != 0 {
                 if let Some(cache) = aurora_resident_ssbos.as_mut() {
@@ -13774,6 +13873,9 @@ impl Renderer {
                 }
                 if let Some(cache) = resident_vb.as_mut() {
                     cache.complete_frame_slot(index);
+                }
+                if let Some(pool) = cbuf_pool.as_mut() {
+                    pool.complete_frame_slot(index);
                 }
             }
         }
@@ -16185,37 +16287,68 @@ impl Renderer {
                     None
                 };
 
-                let resident_cbuf = prep
-                    .cbuf_data
-                    .is_none()
-                    .then_some(call.resident_cbuf.as_ref())
-                    .flatten();
-                let cbuf_len = resident_cbuf.map_or(prep.cbuf_len, |draw| draw.packed_size);
-                let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
-                    cbuf_len,
-                    cbuf_alignment,
-                    *max_storage_buffer_range,
-                )?;
-                if !ring_allocation_fits(ubo_ring, cbuf_size_aligned, cbuf_alignment) {
-                    return Err(format!(
+                let (ubo_info, cbuf_overlay_source) = if let Some(pool_draw) =
+                    call.pool_cbuf.as_ref()
+                {
+                    let pool = cbuf_pool.as_mut().ok_or_else(|| {
+                        "pooled graphics cbuf without a constant buffer pool".to_string()
+                    })?;
+                    let dir_offset = pool.directory_alloc().ok_or_else(|| {
+                        "constant buffer pool directory ring exhausted".to_string()
+                    })?;
+                    let dir_dst = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            pool.mapped.add(dir_offset as usize),
+                            nexium_spirv::GFX_CBUF_MIN_SIZE as usize,
+                        )
+                    };
+                    if !crate::cbuf_pool::write_pool_cbuf_directory(pool_draw, dir_offset, dir_dst) {
+                        return Err("invalid pooled graphics cbuf layout".to_string());
+                    }
+                    (
+                        vk::DescriptorBufferInfo {
+                            buffer: pool.buffer,
+                            offset: dir_offset,
+                            range: (pool.size - dir_offset).min(*max_storage_buffer_range),
+                        },
+                        None,
+                    )
+                } else {
+                    let resident_cbuf = prep
+                        .cbuf_data
+                        .is_none()
+                        .then_some(call.resident_cbuf.as_ref())
+                        .flatten();
+                    let cbuf_len = resident_cbuf.map_or(prep.cbuf_len, |draw| draw.packed_size);
+                    let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
+                        cbuf_len,
+                        cbuf_alignment,
+                        *max_storage_buffer_range,
+                    )?;
+                    if !ring_allocation_fits(ubo_ring, cbuf_size_aligned, cbuf_alignment) {
+                        return Err(format!(
                                 "batched graphics ring preflight underestimated graphics cbuf upload ({cbuf_size_aligned:#x} bytes, alignment {cbuf_alignment})"
                             ));
-                }
-                let (ubo_buffer, ubo_offset, ubo_ptr) =
-                    ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
-                        .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
-                let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, cbuf_len) };
-                if let Some(draw) = resident_cbuf {
-                    if !write_resident_cbuf_payload(draw, cbuf_dst) {
-                        return Err("invalid batched resident graphics cbuf snapshot".to_string());
                     }
-                } else if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
-                    return Err("invalid batched graphics cbuf snapshot".to_string());
-                }
-                let ubo_info = vk::DescriptorBufferInfo {
-                    buffer: ubo_buffer,
-                    offset: ubo_offset,
-                    range: cbuf_len as u64,
+                    let (ubo_buffer, ubo_offset, ubo_ptr) =
+                        ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
+                            .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
+                    let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, cbuf_len) };
+                    if let Some(draw) = resident_cbuf {
+                        if !write_resident_cbuf_payload(draw, cbuf_dst) {
+                            return Err("invalid batched resident graphics cbuf snapshot".to_string());
+                        }
+                    } else if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
+                        return Err("invalid batched graphics cbuf snapshot".to_string());
+                    }
+                    (
+                        vk::DescriptorBufferInfo {
+                            buffer: ubo_buffer,
+                            offset: ubo_offset,
+                            range: cbuf_len as u64,
+                        },
+                        resident_cbuf.map(|draw| (draw, ubo_buffer, ubo_offset)),
+                    )
                 };
 
                 let mut overlay_copies = collect_compute_overlay_copies(
@@ -16224,7 +16357,7 @@ impl Renderer {
                     &vertex_binds,
                     &aliased_vertex_bindings,
                 );
-                if let Some(draw) = resident_cbuf {
+                if let Some((draw, ubo_buffer, ubo_offset)) = cbuf_overlay_source {
                     collect_cbuf_overlay_copies(
                         compute_overlay_sources,
                         draw,
@@ -17565,6 +17698,9 @@ impl Renderer {
             );
         }
         ubo_ring.slot_span[cur_idx] = Some((ring_batch_start, ubo_ring.head));
+        if let Some(pool) = cbuf_pool.as_mut() {
+            pool.dir_slot_span[cur_idx] = Some((pool_directory_start, pool.dir_head));
+        }
         *frame_index = next_idx;
         self.frame_slot_prewait.note_next(next_idx);
         pipeline_cache.maybe_save(device);
@@ -30779,6 +30915,50 @@ fn reserve_ring_span(
     }
 }
 
+fn reserve_pool_directory_span(
+    device: &ash::Device,
+    submit_timeline: vk::Semaphore,
+    frame_slots: &mut [FrameSlot],
+    cur_idx: usize,
+    pool: vk::DescriptorPool,
+    cbuf_pool: &mut crate::cbuf_pool::CbufPool,
+    upper: u64,
+    fermi_exact_rt_snapshot_leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
+    fermi_exact_rt_snapshot_ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
+) -> Result<u16, String> {
+    let mut retired = 0u16;
+    if cbuf_pool.dir_head.saturating_add(upper) > cbuf_pool.dir_size {
+        cbuf_pool.dir_head = 0;
+    }
+    let end = cbuf_pool.dir_head.saturating_add(upper);
+    loop {
+        let oldest = frame_slots
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| {
+                *index != cur_idx
+                    && slot.in_flight
+                    && ring_span_overlaps(cbuf_pool.dir_slot_span[*index], cbuf_pool.dir_head, end)
+            })
+            .min_by_key(|(_, slot)| slot.submit_generation)
+            .map(|(index, _)| index);
+        let Some(index) = oldest else {
+            return Ok(retired);
+        };
+        retire_frame_slot(
+            device,
+            submit_timeline,
+            &mut frame_slots[index],
+            pool,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
+        )?;
+        cbuf_pool.dir_slot_span[index] = None;
+        cbuf_pool.complete_frame_slot(index);
+        retired |= 1 << index;
+    }
+}
+
 fn ring_wrap_other(
     device: &ash::Device,
     submit_timeline: vk::Semaphore,
@@ -35880,6 +36060,15 @@ impl Drop for RendererInner {
         }
         crate::memory_select::release_stream_rebar_bytes(std::mem::take(&mut self.ubo_ring.rebar_bytes));
         self.ubo_ring.mapped = std::ptr::null_mut();
+        if let Some(mut pool) = self.cbuf_pool.take() {
+            unsafe {
+                self.device.unmap_memory(pool.memory);
+                self.device.destroy_buffer(pool.buffer, None);
+                self.device.free_memory(pool.memory, None);
+            }
+            crate::memory_select::release_stream_rebar_bytes(std::mem::take(&mut pool.rebar_bytes));
+            pool.mapped = std::ptr::null_mut();
+        }
         if let Some(timestamps) = self.gpu_timestamps.as_mut() {
             timestamps.destroy(&self.device);
         }
@@ -36868,6 +37057,7 @@ mod tests {
             cbuf_size: Default::default(),
             cbuf_data: Default::default(),
             resident_cbuf: Default::default(),
+            pool_cbuf: None,
             vertex_addr: Default::default(),
             vertex_bindings: Default::default(),
             resident_vertex: Default::default(),

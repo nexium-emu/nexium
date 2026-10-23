@@ -590,6 +590,20 @@ pub struct ResidentCbufDraw {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolCbufSlot {
+    pub logical_slot: u32,
+    pub word_count: u32,
+    pub pool_offset: u64,
+    pub byte_len: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PoolCbufDraw {
+    pub slots: Vec<PoolCbufSlot>,
+    pub regions: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfiguredColorRt {
     pub raw_slot: u8,
     pub key: RtKey,
@@ -625,6 +639,7 @@ pub struct Maxwell3dDrawCall {
     pub cbuf_size: u32,
     pub cbuf_data: Option<GraphicsCbufPayload>,
     pub resident_cbuf: Option<ResidentCbufDraw>,
+    pub pool_cbuf: Option<PoolCbufDraw>,
     pub vertex_addr: u64,
     pub vertex_bindings: Vec<VertexBufferBinding>,
     pub resident_vertex: Vec<ResidentVertexRange>,
