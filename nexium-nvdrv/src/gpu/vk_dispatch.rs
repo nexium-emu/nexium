@@ -1989,28 +1989,14 @@ impl CensusFoldRing {
 }
 
 const SPH_MEMO_CAPACITY: usize = 64;
-const TEXLAY_MEMO_DEFAULT_SETS: usize = 128;
-const TEXLAY_MEMO_DEFAULT_WAYS: usize = 2;
+const TEXLAY_MEMO_DEFAULT_COMBOS: usize = 256;
+const TEXLAY_MEMO_TRIM_INTERVAL: u64 = 1 << 16;
+const TEXLAY_MEMO_IDLE_CLOCKS: u64 = 2_000_000;
 
-fn texlay_memo_sets() -> usize {
-    static SETS: OnceLock<usize> = OnceLock::new();
-    *SETS.get_or_init(|| {
-        std::env::var("NEXIUM_TEXLAY_MEMO_SETS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(|sets| sets.clamp(16, 65_536).next_power_of_two())
-            .unwrap_or(TEXLAY_MEMO_DEFAULT_SETS)
-    })
-}
-
-fn texlay_memo_ways() -> usize {
-    static WAYS: OnceLock<usize> = OnceLock::new();
-    *WAYS.get_or_init(|| {
-        std::env::var("NEXIUM_TEXLAY_MEMO_WAYS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(|ways| ways.clamp(1, 8))
-            .unwrap_or(TEXLAY_MEMO_DEFAULT_WAYS)
+fn texlay_memo_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_TEXLAY_MEMO_TRACE").is_ok_and(|value| value != "0")
     })
 }
 
@@ -2029,6 +2015,31 @@ struct TexLayoutMemoEntry {
     view_fp: u64,
 }
 
+struct TexLayoutMemoCombo {
+    layout: Arc<GraphicsTextureLayout>,
+    manifest_fp: u64,
+    view_fp: u64,
+    last_used: u64,
+}
+
+struct TexLayoutShaderMemo {
+    meta_generation: u64,
+    fs_meta: Arc<FragmentTextureNumericMetadata>,
+    vs_meta: Arc<FragmentTextureNumericMetadata>,
+    combos: Vec<TexLayoutMemoCombo>,
+}
+
+fn texlay_memo_combo_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("NEXIUM_TEXLAY_MEMO_COMBOS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|cap| cap.clamp(1, 4096))
+            .unwrap_or(TEXLAY_MEMO_DEFAULT_COMBOS)
+    })
+}
+
 struct TexLayoutMemoHit {
     fs_meta: Arc<FragmentTextureNumericMetadata>,
     vs_meta: Arc<FragmentTextureNumericMetadata>,
@@ -2045,28 +2056,6 @@ enum TexLayoutMemoOutcome {
         sampler_ids: Vec<u32>,
     },
     Hit(TexLayoutMemoHit),
-}
-
-fn texlay_memo_fold(
-    vs_addr: u64,
-    fs_addr: u64,
-    bindless_slot: u32,
-    tic_pool_gpu_va: u64,
-    tic_pool_limit: u32,
-    via_header_index: bool,
-) -> u64 {
-    let mut fold = CENSUS_FOLD_SEED;
-    for value in [
-        vs_addr,
-        fs_addr,
-        bindless_slot as u64,
-        tic_pool_gpu_va,
-        tic_pool_limit as u64,
-        via_header_index as u64,
-    ] {
-        fold = census_fold(fold, value);
-    }
-    fold
 }
 
 fn texlay_memo_storable(
@@ -2100,7 +2089,7 @@ fn texlay_memo_storable(
 /// depends on: the texture metadata (via `meta_generation`), the cbuf handle
 /// words and TIC descriptor bytes (re-read and compared on every hit), and the
 /// GPU mappings those reads go through (the reads translate live).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TexLayoutMemoKey {
     vs_addr: u64,
     fs_addr: u64,
@@ -2530,7 +2519,8 @@ pub(crate) struct SsboSnapshotCache {
     sph_cpu_bounds: (u64, u64),
     sph_gpu_pages: FastSet<u64>,
     sph_cpu_pages: FastSet<u64>,
-    texlay_memo: Vec<Option<TexLayoutMemoEntry>>,
+    texlay_memo: FastMap<TexLayoutMemoKey, TexLayoutShaderMemo>,
+    texlay_memo_clock: u64,
     /// RT binding signature of the last draw that went through RT-boundary
     /// prediction, with the mapping generation it was computed under. It lives
     /// here rather than in `enqueue_draws` because the pusher hands draws over
@@ -3399,7 +3389,8 @@ impl SsboSnapshotCache {
             sph_cpu_bounds: (u64::MAX, 0),
             sph_gpu_pages: FastSet::default(),
             sph_cpu_pages: FastSet::default(),
-            texlay_memo: Vec::new(),
+            texlay_memo: FastMap::default(),
+            texlay_memo_clock: 0,
             rt_signature_memo: None,
             cbuf_barrier_mode: cbuf_barrier_sync_enabled(),
             cbuf_window_mode: cbuf_resolve_windows_enabled(),
@@ -4488,56 +4479,28 @@ impl SsboSnapshotCache {
         mappings: &GpuMappings,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> TexLayoutMemoOutcome {
-        if self.texlay_memo.is_empty() {
-            return TexLayoutMemoOutcome::Miss;
-        }
-        let fold = texlay_memo_fold(
+        let key = TexLayoutMemoKey {
             vs_addr,
             fs_addr,
             bindless_slot,
             tic_pool_gpu_va,
             tic_pool_limit,
             via_header_index,
-        );
-        let ways = texlay_memo_ways();
-        let base = (fold as usize & (texlay_memo_sets() - 1)) * ways;
-        let mut found = None;
-        for way in 0..ways {
-            if let Some(entry) = self.texlay_memo[base + way].as_ref() {
-                if entry.vs_addr == vs_addr
-                    && entry.fs_addr == fs_addr
-                    && entry.bindless_slot == bindless_slot
-                    && entry.tic_pool_gpu_va == tic_pool_gpu_va
-                    && entry.tic_pool_limit == tic_pool_limit
-                    && entry.via_header_index == via_header_index
-                {
-                    found = Some(way);
-                    break;
-                }
-            }
-        }
-        let Some(way) = found else {
+        };
+        let Some(shader) = self.texlay_memo.get(&key) else {
             return TexLayoutMemoOutcome::Miss;
         };
-        if self.texlay_memo[base + way]
-            .as_ref()
-            .is_some_and(|entry| entry.meta_generation != meta_generation)
-        {
-            self.texlay_memo[base + way] = None;
+        if shader.meta_generation != meta_generation {
+            self.texlay_memo.remove(&key);
             return TexLayoutMemoOutcome::GenerationMiss;
         }
-        let entry = self.texlay_memo[base + way].as_ref().unwrap();
-        let fs_ids = &entry.fs_meta.descriptor_ids;
-        let vs_ids = &entry.vs_meta.descriptor_ids;
+        let fs_ids = &shader.fs_meta.descriptor_ids;
+        let vs_ids = &shader.vs_meta.descriptor_ids;
         let total = fs_ids.len() + vs_ids.len();
         let mut tics = [u32::MAX; nexium_gpu::descriptor::MAX_TEXTURE_DESCRIPTORS as usize];
         let mut tscs = [0u32; nexium_gpu::descriptor::MAX_TEXTURE_DESCRIPTORS as usize];
-        if total > tics.len()
-            || entry.layout.resolved_tic_ids.len() != total
-            || entry.layout.resolved_sampler_ids.len() != total
-            || entry.layout.resolved_tics.len() != total
-        {
-            self.texlay_memo[base + way] = None;
+        if total > tics.len() {
+            self.texlay_memo.remove(&key);
             return TexLayoutMemoOutcome::Miss;
         }
         if tic_pool_gpu_va == 0 {
@@ -4548,8 +4511,8 @@ impl SsboSnapshotCache {
         } else {
             let mut slot = 0usize;
             for (ids, group, partners) in [
-                (fs_ids, fs_cbuf_group, &entry.fs_meta.or_partners),
-                (vs_ids, vs_cbuf_group, &entry.vs_meta.or_partners),
+                (fs_ids, fs_cbuf_group, &shader.fs_meta.or_partners),
+                (vs_ids, vs_cbuf_group, &shader.vs_meta.or_partners),
             ] {
                 for &shader_id in ids.iter() {
                     let resolution = resolve_texture_handle_words(
@@ -4573,109 +4536,136 @@ impl SsboSnapshotCache {
                 }
             }
         }
-        let same_key = |candidate: &TexLayoutMemoEntry| {
-            candidate.vs_addr == vs_addr
-                && candidate.fs_addr == fs_addr
-                && candidate.bindless_slot == bindless_slot
-                && candidate.tic_pool_gpu_va == tic_pool_gpu_va
-                && candidate.tic_pool_limit == tic_pool_limit
-                && candidate.via_header_index == via_header_index
+        let position = shader.combos.iter().position(|combo| {
+            combo.layout.resolved_tic_ids.len() == total
+                && combo.layout.resolved_sampler_ids.len() == total
+                && combo.layout.resolved_tics.len() == total
+                && tics[..total] == combo.layout.resolved_tic_ids[..]
+                && tscs[..total] == combo.layout.resolved_sampler_ids[..]
+        });
+        let Some(position) = position else {
+            super::pusher::kickprof::count(super::pusher::kickprof::TEXLAY_MEMO_VMISS, 1);
+            if texlay_memo_trace_enabled() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static LINES: AtomicU64 = AtomicU64::new(0);
+                if LINES.fetch_add(1, Ordering::Relaxed) < 48 {
+                    log::warn!(
+                        "[texlay-memo-vmiss] vs={:#x} fs={:#x} slot={} pool={:#x} total={} tics={:x?} tscs={:x?} combos={}",
+                        vs_addr,
+                        fs_addr,
+                        bindless_slot,
+                        tic_pool_gpu_va,
+                        total,
+                        &tics[..total],
+                        &tscs[..total],
+                        shader.combos.len(),
+                    );
+                }
+            }
+            return TexLayoutMemoOutcome::ValidationMiss {
+                tic_ids: tics[..total].to_vec(),
+                sampler_ids: tscs[..total].to_vec(),
+            };
         };
-        let tics_current = |candidate: &TexLayoutMemoEntry| {
-            candidate.layout.resolved_tics.iter().all(|resolved| {
+        let current = shader.combos[position]
+            .layout
+            .resolved_tics
+            .iter()
+            .all(|resolved| {
                 let Some(resolved) = resolved else {
                     return true;
                 };
                 let tic_addr =
                     tic_pool_gpu_va.wrapping_add((resolved.id as u64).saturating_mul(32));
                 read_tic_raw(tic_addr, mappings, mem_read).is_some_and(|raw| raw == resolved.raw)
-            })
-        };
-        let mut matched = None;
-        let mut stale = None;
-        for candidate_way in 0..ways {
-            let Some(candidate) = self.texlay_memo[base + candidate_way].as_ref() else {
-                continue;
-            };
-            if !same_key(candidate)
-                || candidate.meta_generation != meta_generation
-                || candidate.layout.resolved_tic_ids.len() != total
-                || candidate.layout.resolved_sampler_ids.len() != total
-                || tics[..total] != candidate.layout.resolved_tic_ids[..]
-                || tscs[..total] != candidate.layout.resolved_sampler_ids[..]
-            {
-                continue;
-            }
-            if tics_current(candidate) {
-                matched = Some(candidate_way);
-            } else {
-                stale = Some(candidate_way);
-            }
-            break;
-        }
-        if let Some(stale) = stale {
-            self.texlay_memo[base + stale] = None;
-        }
-        if let Some(matched) = matched {
-            if matched != 0 {
-                self.texlay_memo.swap(base, base + matched);
-            }
-            let entry = self.texlay_memo[base].as_ref().unwrap();
-            return TexLayoutMemoOutcome::Hit(TexLayoutMemoHit {
-                fs_meta: entry.fs_meta.clone(),
-                vs_meta: entry.vs_meta.clone(),
-                layout: entry.layout.clone(),
-                manifest_fp: entry.manifest_fp,
-                view_fp: entry.view_fp,
             });
+        self.texlay_memo_clock = self.texlay_memo_clock.wrapping_add(1);
+        let clock = self.texlay_memo_clock;
+        let shader = self.texlay_memo.get_mut(&key).unwrap();
+        if !current {
+            shader.combos.swap_remove(position);
+            super::pusher::kickprof::count(super::pusher::kickprof::TEXLAY_MEMO_STALE, 1);
+            return TexLayoutMemoOutcome::ValidationMiss {
+                tic_ids: tics[..total].to_vec(),
+                sampler_ids: tscs[..total].to_vec(),
+            };
         }
-        TexLayoutMemoOutcome::ValidationMiss {
-            tic_ids: tics[..total].to_vec(),
-            sampler_ids: tscs[..total].to_vec(),
-        }
+        let combo = &mut shader.combos[position];
+        combo.last_used = clock;
+        TexLayoutMemoOutcome::Hit(TexLayoutMemoHit {
+            fs_meta: shader.fs_meta.clone(),
+            vs_meta: shader.vs_meta.clone(),
+            layout: combo.layout.clone(),
+            manifest_fp: combo.manifest_fp,
+            view_fp: combo.view_fp,
+        })
     }
 
     fn texlay_memo_store(&mut self, entry: TexLayoutMemoEntry) {
-        if self.texlay_memo.is_empty() {
-            self.texlay_memo
-                .resize_with(texlay_memo_sets() * texlay_memo_ways(), || None);
+        self.texlay_memo_clock = self.texlay_memo_clock.wrapping_add(1);
+        let clock = self.texlay_memo_clock;
+        if clock % TEXLAY_MEMO_TRIM_INTERVAL == 0 {
+            self.texlay_memo_trim(clock);
         }
-        let fold = texlay_memo_fold(
-            entry.vs_addr,
-            entry.fs_addr,
-            entry.bindless_slot,
-            entry.tic_pool_gpu_va,
-            entry.tic_pool_limit,
-            entry.via_header_index,
-        );
-        let base = (fold as usize & (texlay_memo_sets() - 1)) * texlay_memo_ways();
-        let same_key = |candidate: &TexLayoutMemoEntry| {
-            candidate.vs_addr == entry.vs_addr
-                && candidate.fs_addr == entry.fs_addr
-                && candidate.bindless_slot == entry.bindless_slot
-                && candidate.tic_pool_gpu_va == entry.tic_pool_gpu_va
-                && candidate.tic_pool_limit == entry.tic_pool_limit
-                && candidate.via_header_index == entry.via_header_index
+        let key = TexLayoutMemoKey {
+            vs_addr: entry.vs_addr,
+            fs_addr: entry.fs_addr,
+            bindless_slot: entry.bindless_slot,
+            tic_pool_gpu_va: entry.tic_pool_gpu_va,
+            tic_pool_limit: entry.tic_pool_limit,
+            via_header_index: entry.via_header_index,
         };
-        let ways = texlay_memo_ways();
-        let set = &mut self.texlay_memo[base..base + ways];
-        let replace = set.iter().position(|slot| {
-            slot.as_ref().is_some_and(|candidate| {
-                same_key(candidate)
-                    && candidate.layout.resolved_tic_ids == entry.layout.resolved_tic_ids
-                    && candidate.layout.resolved_sampler_ids == entry.layout.resolved_sampler_ids
-            })
+        let shader = self
+            .texlay_memo
+            .entry(key)
+            .or_insert_with(|| TexLayoutShaderMemo {
+                meta_generation: entry.meta_generation,
+                fs_meta: entry.fs_meta.clone(),
+                vs_meta: entry.vs_meta.clone(),
+                combos: Vec::new(),
+            });
+        if shader.meta_generation != entry.meta_generation {
+            shader.meta_generation = entry.meta_generation;
+            shader.combos.clear();
+        }
+        shader.fs_meta = entry.fs_meta;
+        shader.vs_meta = entry.vs_meta;
+        let combo = TexLayoutMemoCombo {
+            layout: entry.layout,
+            manifest_fp: entry.manifest_fp,
+            view_fp: entry.view_fp,
+            last_used: clock,
+        };
+        let position = shader.combos.iter().position(|candidate| {
+            candidate.layout.resolved_tic_ids == combo.layout.resolved_tic_ids
+                && candidate.layout.resolved_sampler_ids == combo.layout.resolved_sampler_ids
         });
-        match replace {
-            Some(index) => {
-                set[index] = Some(entry);
-                set.swap(0, index);
-            }
+        match position {
+            Some(index) => shader.combos[index] = combo,
             None => {
-                set.rotate_right(1);
-                set[0] = Some(entry);
+                if shader.combos.len() >= texlay_memo_combo_cap() {
+                    if let Some(victim) = shader
+                        .combos
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, candidate)| candidate.last_used)
+                        .map(|(index, _)| index)
+                    {
+                        shader.combos.swap_remove(victim);
+                    }
+                }
+                shader.combos.push(combo);
             }
         }
+    }
+
+    fn texlay_memo_trim(&mut self, clock: u64) {
+        self.texlay_memo.retain(|_, shader| {
+            shader
+                .combos
+                .retain(|combo| clock.wrapping_sub(combo.last_used) < TEXLAY_MEMO_IDLE_CLOCKS);
+            !shader.combos.is_empty()
+        });
     }
 
     fn invalidate_cbuf_slot_states(&mut self, spans: &[InputInvalidationSpan]) {
