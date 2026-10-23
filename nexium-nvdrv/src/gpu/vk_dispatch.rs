@@ -5090,11 +5090,12 @@ impl SsboSnapshotCache {
             observed_ranges.extend(
                 self.input_entries.values().map(|entry| (entry.observed_write_serial, entry.watch_range)),
             );
-            observed_ranges.extend(
-                self.cbuf_pool_entries
-                    .values()
-                    .map(|entry| (entry.observed_write_serial, entry.watch_range)),
-            );
+            observed_ranges.extend(self.cbuf_pool_entries.values().flat_map(|entry| {
+                entry
+                    .watch_ranges
+                    .iter()
+                    .map(move |&watch_range| (entry.observed_write_serial, watch_range))
+            }));
             observed_ranges.sort_unstable_by_key(|&(_, range)| range);
             ranges.extend(observed_ranges.iter().map(|&(_, range)| range));
             coalesce_sorted_host_watch_ranges(&mut ranges);
@@ -26285,10 +26286,78 @@ const CBUF_POOL_IDLE_KICKS: u64 = 6;
 struct CbufPoolEntry {
     region: u32,
     pool_offset: u64,
-    watch_range: HostWatchRange,
+    pieces: Box<[(u64, usize)]>,
+    watch_ranges: Box<[HostWatchRange]>,
     observed_write_serial: u64,
     last_used_kick: u64,
     stale: bool,
+}
+
+const CBUF_POOL_MAX_PIECES: usize = 16;
+const CBUF_POOL_SCATTER_TAG: u64 = 1 << 63;
+
+#[derive(Default)]
+struct CbufPoolPieces {
+    items: [(u64, usize); CBUF_POOL_MAX_PIECES],
+    len: usize,
+}
+
+impl CbufPoolPieces {
+    fn push(&mut self, cpu_addr: u64, len: usize) -> bool {
+        if let Some(last) = self.items[..self.len].last_mut() {
+            if last.0.saturating_add(last.1 as u64) == cpu_addr {
+                last.1 += len;
+                return true;
+            }
+        }
+        if self.len == CBUF_POOL_MAX_PIECES {
+            return false;
+        }
+        self.items[self.len] = (cpu_addr, len);
+        self.len += 1;
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_slice(&self) -> &[(u64, usize)] {
+        &self.items[..self.len]
+    }
+}
+
+fn cbuf_pool_scatter_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_CBUF_POOL_SCATTER").map_or(true, |value| value != "0")
+    })
+}
+
+fn cbuf_pool_resolve_pieces(
+    mappings: &GpuMappings,
+    gpu_addr: u64,
+    len: usize,
+    pieces: &mut CbufPoolPieces,
+) -> bool {
+    let mut offset = 0usize;
+    while offset < len {
+        let Some(gpu) = gpu_addr.checked_add(offset as u64) else {
+            return false;
+        };
+        let Some((cpu_addr, available)) = mappings.cpu_range_for(gpu) else {
+            return false;
+        };
+        if available == 0 {
+            return false;
+        }
+        let piece = (len - offset).min(usize::try_from(available).unwrap_or(usize::MAX));
+        if !pieces.push(cpu_addr, piece) {
+            return false;
+        }
+        offset += piece;
+    }
+    true
 }
 
 impl SsboSnapshotCache {
@@ -26317,30 +26386,58 @@ impl SsboSnapshotCache {
         for request in requests {
             let len = request.byte_len;
             if request.logical_slot as usize >= PACKED_CBUF_SLOTS
+                || len == 0
                 || len > nexium_spirv::GFX_CBUF_MAX_SIZE as usize
                 || request.word_count as usize != len.div_ceil(4)
             {
                 super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_FALLBACK, 1);
+                super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_FALLBACK_SHAPE, 1);
                 return None;
             }
             let Some((cpu_addr, available)) = mappings.cpu_range_for(request.gpu_addr) else {
                 super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_FALLBACK, 1);
+                super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_FALLBACK_MAP, 1);
                 return None;
             };
-            if len == 0 || available < len as u64 {
-                super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_FALLBACK, 1);
-                return None;
-            }
-            let end = cpu_addr.saturating_add(len as u64);
-            if self
-                .compute_pending_cpu_ranges
-                .iter()
-                .any(|&(base, size)| base < end && cpu_addr < base.saturating_add(size))
+            let mut pieces = CbufPoolPieces::default();
+            if available >= len as u64 {
+                pieces.push(cpu_addr, len);
+            } else if !cbuf_pool_scatter_enabled()
+                || !input_multi_segment_enabled()
+                || !cbuf_pool_resolve_pieces(mappings, request.gpu_addr, len, &mut pieces)
+                || (pieces.len() > 1 && !cbuf_scatter_enabled())
             {
                 super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_FALLBACK, 1);
+                super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_FALLBACK_MAP, 1);
                 return None;
             }
-            let key = (cpu_addr, len);
+            if pieces.as_slice().iter().any(|&(piece_addr, piece_len)| {
+                let end = piece_addr.saturating_add(piece_len as u64);
+                self.compute_pending_cpu_ranges
+                    .iter()
+                    .any(|&(base, size)| base < end && piece_addr < base.saturating_add(size))
+            }) {
+                super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_FALLBACK, 1);
+                super::pusher::kickprof::count(
+                    super::pusher::kickprof::CBUF_POOL_FALLBACK_COMPUTE,
+                    1,
+                );
+                return None;
+            }
+            let scatter = pieces.len() > 1;
+            let key = if scatter {
+                (request.gpu_addr | CBUF_POOL_SCATTER_TAG, len)
+            } else {
+                (pieces.as_slice()[0].0, len)
+            };
+            if scatter
+                && self
+                    .cbuf_pool_entries
+                    .get(&key)
+                    .is_some_and(|entry| &entry.pieces[..] != pieces.as_slice())
+            {
+                self.remove_cbuf_pool_entry(key);
+            }
             let cached = self.cbuf_pool_entries.get_mut(&key).map(|entry| {
                 entry.last_used_kick = self.input_sweep_kick;
                 (entry.stale, entry.region, entry.pool_offset)
@@ -26350,27 +26447,44 @@ impl SsboSnapshotCache {
                     super::pusher::kickprof::count(super::pusher::kickprof::CBUF_POOL_HIT, 1);
                     (region, pool_offset)
                 }
-                Some((true, _, _)) => match self.cbuf_pool_recopy(&pool, key, mem_read) {
-                    Some(copied) => copied,
-                    None => {
-                        super::pusher::kickprof::count(
-                            super::pusher::kickprof::CBUF_POOL_FALLBACK,
-                            1,
-                        );
-                        return None;
+                Some((true, _, _)) => {
+                    match self.cbuf_pool_recopy(&pool, key, pieces.as_slice(), mem_read) {
+                        Some(copied) => copied,
+                        None => {
+                            super::pusher::kickprof::count(
+                                super::pusher::kickprof::CBUF_POOL_FALLBACK,
+                                1,
+                            );
+                            super::pusher::kickprof::count(
+                                super::pusher::kickprof::CBUF_POOL_FALLBACK_COPY,
+                                1,
+                            );
+                            return None;
+                        }
                     }
-                },
-                None => match self.cbuf_pool_upload(&pool, key, mem_read) {
+                }
+                None => match self.cbuf_pool_upload(&pool, key, pieces.as_slice(), mem_read) {
                     Some(uploaded) => uploaded,
                     None => {
                         super::pusher::kickprof::count(
                             super::pusher::kickprof::CBUF_POOL_FALLBACK,
                             1,
                         );
+                        super::pusher::kickprof::count(
+                            super::pusher::kickprof::CBUF_POOL_FALLBACK_COPY,
+                            1,
+                        );
                         return None;
                     }
                 },
             };
+            if scatter {
+                super::pusher::kickprof::count_sized(
+                    super::pusher::kickprof::CBUF_POOL_SCATTER,
+                    1,
+                    len,
+                );
+            }
             slots.push(nexium_gpu::draw::PoolCbufSlot {
                 logical_slot: request.logical_slot,
                 word_count: request.word_count,
@@ -26386,7 +26500,7 @@ impl SsboSnapshotCache {
 
     fn cbuf_pool_copy_region(
         pool: &Arc<nexium_gpu::cbuf_pool::CbufPoolShared>,
-        cpu_addr: u64,
+        pieces: &[(u64, usize)],
         len: usize,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> Option<(u32, u64)> {
@@ -26394,7 +26508,18 @@ impl SsboSnapshotCache {
         let aligned_len = len.div_ceil(16) * 16;
         let copied = pool.fill(offset, aligned_len, |dst| {
             dst[len..].fill(0);
-            Self::read_input_bytes(cpu_addr, len, mem_read, &mut dst[..len])
+            let mut written = 0usize;
+            for &(piece_addr, piece_len) in pieces {
+                let Some(end) = written.checked_add(piece_len).filter(|end| *end <= len) else {
+                    return false;
+                };
+                if !Self::read_input_bytes(piece_addr, piece_len, mem_read, &mut dst[written..end])
+                {
+                    return false;
+                }
+                written = end;
+            }
+            written == len
         });
         if !copied {
             pool.release(&[region]);
@@ -26407,15 +26532,16 @@ impl SsboSnapshotCache {
         &mut self,
         pool: &Arc<nexium_gpu::cbuf_pool::CbufPoolShared>,
         key: CbufPoolKey,
+        pieces: &[(u64, usize)],
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> Option<(u32, u64)> {
-        let (cpu_addr, len) = key;
+        let (_, len) = key;
         let observed_before = nexium_memory::fastmem::observed_write_serial();
-        let (region, offset) = match Self::cbuf_pool_copy_region(pool, cpu_addr, len, mem_read) {
+        let (region, offset) = match Self::cbuf_pool_copy_region(pool, pieces, len, mem_read) {
             Some(copied) => copied,
             None => {
                 self.evict_cbuf_pool_idle(0);
-                Self::cbuf_pool_copy_region(pool, cpu_addr, len, mem_read)?
+                Self::cbuf_pool_copy_region(pool, pieces, len, mem_read)?
             }
         };
         let entry = self.cbuf_pool_entries.get_mut(&key)?;
@@ -26432,36 +26558,45 @@ impl SsboSnapshotCache {
         &mut self,
         pool: &Arc<nexium_gpu::cbuf_pool::CbufPoolShared>,
         key: CbufPoolKey,
+        pieces: &[(u64, usize)],
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> Option<(u32, u64)> {
-        let (cpu_addr, len) = key;
-        let watch_range = HostWatchRange::write_watch(cpu_addr, len)?;
+        let (_, len) = key;
+        let watch_ranges = pieces
+            .iter()
+            .map(|&(piece_addr, piece_len)| HostWatchRange::write_watch(piece_addr, piece_len))
+            .collect::<Option<Vec<HostWatchRange>>>()?;
         let mut dirty_spans = std::mem::take(&mut self.mirror.span_scratch);
         dirty_spans.clear();
-        let pre_watch = nexium_memory::fastmem::take_write_watch_spans(
-            watch_range.cpu_addr,
-            watch_range.len,
-            &mut dirty_spans,
-        );
-        if pre_watch == nexium_memory::fastmem::WriteWatchResult::Unavailable {
-            dirty_spans.clear();
-            self.mirror.span_scratch = dirty_spans;
-            return None;
+        let mut watch_ok = true;
+        for watch_range in &watch_ranges {
+            let pre_watch = nexium_memory::fastmem::take_write_watch_spans(
+                watch_range.cpu_addr,
+                watch_range.len,
+                &mut dirty_spans,
+            );
+            if pre_watch == nexium_memory::fastmem::WriteWatchResult::Unavailable {
+                watch_ok = false;
+                break;
+            }
         }
         if !dirty_spans.is_empty() {
             self.invalidate_cpu_spans_inner(&dirty_spans);
             dirty_spans.clear();
         }
         self.mirror.span_scratch = dirty_spans;
+        if !watch_ok {
+            return None;
+        }
         let observed_before = nexium_memory::fastmem::observed_write_serial();
-        let (region, offset) = match Self::cbuf_pool_copy_region(pool, cpu_addr, len, mem_read) {
+        let (region, offset) = match Self::cbuf_pool_copy_region(pool, pieces, len, mem_read) {
             Some(copied) => copied,
             None => {
                 self.evict_cbuf_pool_idle(0);
-                Self::cbuf_pool_copy_region(pool, cpu_addr, len, mem_read)?
+                Self::cbuf_pool_copy_region(pool, pieces, len, mem_read)?
             }
         };
-        self.insert_cbuf_pool_entry(key, region, offset, watch_range, observed_before);
+        self.insert_cbuf_pool_entry(key, region, offset, pieces, watch_ranges, observed_before);
         super::pusher::kickprof::count_sized(super::pusher::kickprof::CBUF_POOL_UPLOAD, 1, len);
         Some((region, offset))
     }
@@ -26477,43 +26612,49 @@ impl SsboSnapshotCache {
         key: CbufPoolKey,
         region: u32,
         pool_offset: u64,
-        watch_range: HostWatchRange,
+        pieces: &[(u64, usize)],
+        watch_ranges: Vec<HostWatchRange>,
         observed_write_serial: u64,
     ) {
         if let Some(previous) = self.cbuf_pool_entries.remove(&key) {
-            self.unindex_cbuf_pool_entry(key, previous.watch_range);
+            self.unindex_cbuf_pool_entry(key, &previous.watch_ranges);
             if let Some(pool) = self.cbuf_pool.as_ref() {
                 pool.release(&[previous.region]);
             }
+        }
+        for watch_range in &watch_ranges {
+            for page in cbuf_pool_pages_of(*watch_range) {
+                self.cbuf_pool_pages.entry(page).or_default().push(key);
+            }
+            self.input_sweep_new.push((observed_write_serial, *watch_range));
         }
         self.cbuf_pool_entries.insert(
             key,
             CbufPoolEntry {
                 region,
                 pool_offset,
-                watch_range,
+                pieces: pieces.into(),
+                watch_ranges: watch_ranges.into_boxed_slice(),
                 observed_write_serial,
                 last_used_kick: self.input_sweep_kick,
                 stale: false,
             },
         );
-        for page in cbuf_pool_pages_of(watch_range) {
-            self.cbuf_pool_pages.entry(page).or_default().push(key);
-        }
-        self.input_sweep_new.push((observed_write_serial, watch_range));
     }
 
-    fn unindex_cbuf_pool_entry(&mut self, key: CbufPoolKey, watch_range: HostWatchRange) {
-        for page in cbuf_pool_pages_of(watch_range) {
-            let remove_page = match self.cbuf_pool_pages.get_mut(&page) {
-                Some(keys) => {
-                    keys.retain(|candidate| *candidate != key);
-                    keys.is_empty()
+    fn unindex_cbuf_pool_entry(&mut self, key: CbufPoolKey, watch_ranges: &[HostWatchRange]) {
+        for watch_range in watch_ranges {
+            for page in cbuf_pool_pages_of(*watch_range) {
+                let remove_page = match self.cbuf_pool_pages.get_mut(&page) {
+                    Some(keys) => {
+                        keys.retain(|candidate| *candidate != key);
+                        keys.is_empty()
+                    }
+                    None => false,
+                };
+                if remove_page {
+                    self.cbuf_pool_pages.remove(&page);
                 }
-                None => false,
-            };
-            if remove_page {
-                self.cbuf_pool_pages.remove(&page);
             }
         }
     }
@@ -26522,7 +26663,7 @@ impl SsboSnapshotCache {
         let Some(entry) = self.cbuf_pool_entries.remove(&key) else {
             return;
         };
-        self.unindex_cbuf_pool_entry(key, entry.watch_range);
+        self.unindex_cbuf_pool_entry(key, &entry.watch_ranges);
         if let Some(pool) = self.cbuf_pool.as_ref() {
             pool.release(&[entry.region]);
         }
@@ -26546,11 +26687,14 @@ impl SsboSnapshotCache {
                     continue;
                 };
                 for key in keys {
-                    if !byte_ranges_overlap(key.0, key.1, cpu, span.len) {
-                        continue;
-                    }
                     if let Some(entry) = self.cbuf_pool_entries.get_mut(key) {
-                        entry.stale = true;
+                        if !entry.stale
+                            && entry.pieces.iter().any(|&(piece_addr, piece_len)| {
+                                byte_ranges_overlap(piece_addr, piece_len, cpu, span.len)
+                            })
+                        {
+                            entry.stale = true;
+                        }
                     }
                 }
             }

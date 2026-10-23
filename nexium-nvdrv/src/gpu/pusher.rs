@@ -422,7 +422,12 @@ pub(crate) mod kickprof {
     pub const CBUF_POOL_EVICT: usize = 259;
     pub const CBUF_POOL_DRAW: usize = 260;
     pub const CBUF_POOL_RECOPY: usize = 261;
-    pub const COUNT: usize = 262;
+    pub const CBUF_POOL_SCATTER: usize = 262;
+    pub const CBUF_POOL_FALLBACK_SHAPE: usize = 263;
+    pub const CBUF_POOL_FALLBACK_MAP: usize = 264;
+    pub const CBUF_POOL_FALLBACK_COMPUTE: usize = 265;
+    pub const CBUF_POOL_FALLBACK_COPY: usize = 266;
+    pub const COUNT: usize = 267;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -687,6 +692,11 @@ pub(crate) mod kickprof {
         "cbpoolevict",
         "cbpooldraw",
         "cbpoolrecopy",
+        "cbpoolscatter",
+        "cbpoolfbshape",
+        "cbpoolfbmap",
+        "cbpoolfbcompute",
+        "cbpoolfbcopy",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
