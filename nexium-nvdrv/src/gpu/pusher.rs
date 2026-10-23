@@ -416,7 +416,13 @@ pub(crate) mod kickprof {
     pub const TMPL_CLONE_REUSE: usize = 253;
     pub const PREP_TEX_REPEAT: usize = 254;
     pub const TMPL_TEX_SKIP: usize = 255;
-    pub const COUNT: usize = 256;
+    pub const CBUF_POOL_HIT: usize = 256;
+    pub const CBUF_POOL_UPLOAD: usize = 257;
+    pub const CBUF_POOL_FALLBACK: usize = 258;
+    pub const CBUF_POOL_EVICT: usize = 259;
+    pub const CBUF_POOL_DRAW: usize = 260;
+    pub const CBUF_POOL_RECOPY: usize = 261;
+    pub const COUNT: usize = 262;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -675,6 +681,12 @@ pub(crate) mod kickprof {
         "tmplclonereuse",
         "preptexrepeat",
         "tmpltexskip",
+        "cbpoolhit",
+        "cbpoolupload",
+        "cbpoolfallback",
+        "cbpoolevict",
+        "cbpooldraw",
+        "cbpoolrecopy",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
