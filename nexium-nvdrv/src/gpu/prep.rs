@@ -1298,6 +1298,8 @@ impl PrepState {
                 let mut draws_completed = true;
                 kickprof::add(kickprof::DRAWS_PRE, kp_pre);
                 if let Some(r) = self.renderer.clone() {
+                    self.ssbo_snapshot_cache.begin_constbuf_write_log();
+                    let mut template_memo = None;
                     if replay_constbuf_writes.is_empty() {
                         let kp = kickprof::start();
                         let completed = super::vk_dispatch::enqueue_draws(
@@ -1314,6 +1316,7 @@ impl PrepState {
                             mem_read,
                             mem_write,
                             compute_probe.as_mut(),
+                            &mut template_memo,
                         );
                         self.vk_flush_completed &= completed;
                         draws_completed &= completed;
@@ -1354,6 +1357,7 @@ impl PrepState {
                                 mem_read,
                                 mem_write,
                                 compute_probe.as_mut(),
+                                &mut template_memo,
                             );
                             self.vk_flush_completed &= completed;
                             draws_completed &= completed;
@@ -2661,6 +2665,7 @@ impl PrepState {
                     run_bytes.extend_from_slice(&dword.to_le_bytes());
                 }
                 let written = mem_write(cpu, &run_bytes);
+                self.ssbo_snapshot_cache.note_constbuf_write(gpu_va, run_len);
                 if written
                     && self.renderer.is_some()
                     && self
@@ -2676,6 +2681,10 @@ impl PrepState {
                     run.iter()
                         .map(|&(gpu_va, _)| (gpu_va, std::mem::size_of::<u32>())),
                 );
+                for &(write_gpu_va, _) in run {
+                    self.ssbo_snapshot_cache
+                        .note_constbuf_write(write_gpu_va, std::mem::size_of::<u32>());
+                }
                 for &(write_gpu_va, dword) in run {
                     if let Some(cpu) = mappings.cpu_address_for(write_gpu_va) {
                         trace_constbuf_upload(trace, write_gpu_va, cpu, dword);

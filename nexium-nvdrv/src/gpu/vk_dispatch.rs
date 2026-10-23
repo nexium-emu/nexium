@@ -1754,7 +1754,18 @@ struct TemplateProbeEntry {
     tex_hash: u64,
 }
 
-const TEMPLATE_PROBE_CAPACITY: usize = 128;
+const TEMPLATE_PROBE_DEFAULT_CAPACITY: usize = 128;
+
+fn template_probe_capacity() -> usize {
+    static CAPACITY: OnceLock<usize> = OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        std::env::var("NEXIUM_DRAW_TEMPLATE_PROBE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|capacity| capacity.clamp(16, 65_536))
+            .unwrap_or(TEMPLATE_PROBE_DEFAULT_CAPACITY)
+    })
+}
 
 struct TemplateFold(u64);
 
@@ -2435,6 +2446,7 @@ pub(crate) struct SsboSnapshotCache {
     cbuf_slot_states: [Vec<CbufSlotState>; PACKED_CBUF_SLOTS],
     input_mutation_epoch: u64,
     resource_mutation_epoch: u64,
+    constbuf_write_log: Vec<(u64, u64)>,
     last_packed_cbuf: Option<(CbufPackKey, nexium_gpu::draw::GraphicsCbufPayload)>,
     entries: FastMap<SsboSnapshotCacheKey, Arc<Vec<u8>>>,
     full_watch_ranges: SerialMap<SsboSnapshotCacheKey, HostWatchRange>,
@@ -3299,6 +3311,7 @@ impl SsboSnapshotCache {
             cbuf_slot_states: std::array::from_fn(|_| Vec::new()),
             input_mutation_epoch: 0,
             resource_mutation_epoch: 0,
+            constbuf_write_log: Vec::new(),
             last_packed_cbuf: None,
             entries: FastMap::default(),
             full_watch_ranges: SerialMap::default(),
@@ -3418,7 +3431,7 @@ impl SsboSnapshotCache {
             self.template_probe.remove(index);
         } else {
             kickprof::count(kickprof::TMPL_MISS, 1);
-            if self.template_probe.len() >= TEMPLATE_PROBE_CAPACITY {
+            if self.template_probe.len() >= template_probe_capacity() {
                 self.template_probe.pop_back();
             }
         }
@@ -4552,20 +4565,52 @@ impl SsboSnapshotCache {
                 }
             }
         }
-        let arrays_match = tics[..total] == entry.layout.resolved_tic_ids[..]
-            && tscs[..total] == entry.layout.resolved_sampler_ids[..];
-        let content_current = arrays_match
-            && entry.layout.resolved_tics.iter().all(|resolved| {
+        let same_key = |candidate: &TexLayoutMemoEntry| {
+            candidate.vs_addr == vs_addr
+                && candidate.fs_addr == fs_addr
+                && candidate.bindless_slot == bindless_slot
+                && candidate.tic_pool_gpu_va == tic_pool_gpu_va
+                && candidate.tic_pool_limit == tic_pool_limit
+                && candidate.via_header_index == via_header_index
+        };
+        let tics_current = |candidate: &TexLayoutMemoEntry| {
+            candidate.layout.resolved_tics.iter().all(|resolved| {
                 let Some(resolved) = resolved else {
                     return true;
                 };
                 let tic_addr =
                     tic_pool_gpu_va.wrapping_add((resolved.id as u64).saturating_mul(32));
                 read_tic_raw(tic_addr, mappings, mem_read).is_some_and(|raw| raw == resolved.raw)
-            });
-        if content_current {
-            if way != 0 {
-                self.texlay_memo.swap(base, base + way);
+            })
+        };
+        let mut matched = None;
+        let mut stale = None;
+        for candidate_way in 0..ways {
+            let Some(candidate) = self.texlay_memo[base + candidate_way].as_ref() else {
+                continue;
+            };
+            if !same_key(candidate)
+                || candidate.meta_generation != meta_generation
+                || candidate.layout.resolved_tic_ids.len() != total
+                || candidate.layout.resolved_sampler_ids.len() != total
+                || tics[..total] != candidate.layout.resolved_tic_ids[..]
+                || tscs[..total] != candidate.layout.resolved_sampler_ids[..]
+            {
+                continue;
+            }
+            if tics_current(candidate) {
+                matched = Some(candidate_way);
+            } else {
+                stale = Some(candidate_way);
+            }
+            break;
+        }
+        if let Some(stale) = stale {
+            self.texlay_memo[base + stale] = None;
+        }
+        if let Some(matched) = matched {
+            if matched != 0 {
+                self.texlay_memo.swap(base, base + matched);
             }
             let entry = self.texlay_memo[base].as_ref().unwrap();
             return TexLayoutMemoOutcome::Hit(TexLayoutMemoHit {
@@ -4576,7 +4621,6 @@ impl SsboSnapshotCache {
                 view_fp: entry.view_fp,
             });
         }
-        self.texlay_memo[base + way] = None;
         TexLayoutMemoOutcome::ValidationMiss {
             tic_ids: tics[..total].to_vec(),
             sampler_ids: tscs[..total].to_vec(),
@@ -4605,13 +4649,25 @@ impl SsboSnapshotCache {
                 && candidate.tic_pool_limit == entry.tic_pool_limit
                 && candidate.via_header_index == entry.via_header_index
         };
-        if !self.texlay_memo[base].as_ref().is_some_and(same_key) {
-            if self.texlay_memo[base + 1].as_ref().is_some_and(same_key) {
-                self.texlay_memo[base + 1] = None;
+        let ways = texlay_memo_ways();
+        let set = &mut self.texlay_memo[base..base + ways];
+        let replace = set.iter().position(|slot| {
+            slot.as_ref().is_some_and(|candidate| {
+                same_key(candidate)
+                    && candidate.layout.resolved_tic_ids == entry.layout.resolved_tic_ids
+                    && candidate.layout.resolved_sampler_ids == entry.layout.resolved_sampler_ids
+            })
+        });
+        match replace {
+            Some(index) => {
+                set[index] = Some(entry);
+                set.swap(0, index);
             }
-            self.texlay_memo[base + 1] = self.texlay_memo[base].take();
+            None => {
+                set.rotate_right(1);
+                set[0] = Some(entry);
+            }
         }
-        self.texlay_memo[base] = Some(entry);
     }
 
     fn invalidate_cbuf_slot_states(&mut self, spans: &[InputInvalidationSpan]) {
@@ -6830,6 +6886,17 @@ impl SsboSnapshotCache {
         self.deferred_gpu_writes.extend_from_slice(writes);
     }
 
+    pub(crate) fn begin_constbuf_write_log(&mut self) {
+        self.constbuf_write_log.clear();
+    }
+
+    pub(crate) fn note_constbuf_write(&mut self, gpu_va: u64, len: usize) {
+        if template_handle_watch_enabled() {
+            self.constbuf_write_log
+                .push((gpu_va, gpu_va.saturating_add(len as u64)));
+        }
+    }
+
     pub(crate) fn refresh_deferred_writes(&mut self, mappings: &GpuMappings) {
         if !self.deferred_gpu_writes.is_empty() {
             let writes = std::mem::take(&mut self.deferred_gpu_writes);
@@ -7987,8 +8054,8 @@ pub(crate) fn publish_pending_storage_readbacks(
     ok
 }
 
-pub(crate) fn enqueue_draws(
-    draws: &[DrawCall],
+pub(crate) fn enqueue_draws<'d>(
+    draws: &'d [DrawCall],
     batch: &mut PendingDrawBatch,
     packetizer: &mut PreparedDrawPacketizer,
     ssbo_snapshot_cache: &mut SsboSnapshotCache,
@@ -8001,6 +8068,7 @@ pub(crate) fn enqueue_draws(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
     mut compute_probe: Option<&mut ComputeGraphicsProbe>,
+    template_memo: &mut Option<DrawTemplateMemo<'d>>,
 ) -> bool {
     ssbo_snapshot_cache.refresh_deferred_writes(mappings);
     batch.reserve(draws.len());
@@ -8221,6 +8289,7 @@ pub(crate) fn enqueue_draws(
                     &mut derived_state_cache,
                     &mut batch.resident_cbuf_arena,
                     &mut storage_writeback_targets,
+                    template_memo,
                     mem_read,
                     mem_write,
                 );
@@ -8284,6 +8353,7 @@ pub(crate) fn enqueue_draws(
             &mut derived_state_cache,
             &mut batch.resident_cbuf_arena,
             &mut storage_writeback_targets,
+            template_memo,
             mem_read,
             mem_write,
         ) {
@@ -8338,6 +8408,7 @@ pub(crate) fn enqueue_draws(
                         &mut derived_state_cache,
                         &mut batch.resident_cbuf_arena,
                         &mut storage_writeback_targets,
+                        template_memo,
                         mem_read,
                         mem_write,
                     ) {
@@ -9250,7 +9321,7 @@ impl RtBatchUsage {
             if call.color_rt_keys.is_empty() {
                 push_unique_rt_key(&mut usage.attachments, call.rt_key);
             } else {
-                for key in &call.color_rt_keys {
+                for key in call.color_rt_keys.iter() {
                     push_unique_rt_key(&mut usage.attachments, *key);
                 }
             }
@@ -9260,7 +9331,7 @@ impl RtBatchUsage {
             for key in call.sampled_rt_slots.iter().flatten() {
                 push_unique_rt_key(&mut usage.sampled, *key);
             }
-            for key in &call.sampled_rt_keys {
+            for key in call.sampled_rt_keys.iter() {
                 push_unique_rt_key(&mut usage.sampled, *key);
             }
             if let Some(key) = call.sampled_rt_key {
@@ -9372,7 +9443,7 @@ impl RtBindingSignature {
                 &call.configured_color_rts,
             )
             && same_live_rt_key_lists(&self.color_rt_keys, &call.color_rt_keys)
-            && self.color_rt_formats == call.color_rt_formats
+            && self.color_rt_formats[..] == call.color_rt_formats[..]
             && same_live_optional_rt_key(self.depth_key, call.depth_key)
             && self.depth_format == call.depth_format
             && self.depth_aspects == call.depth_aspects
@@ -12899,7 +12970,10 @@ fn prepare_draw_batch_async(
         super::pusher::kickprof::add(super::pusher::kickprof::PREP_READ, kp);
         result
     };
+    let mut previous_texture_serial = 0u64;
+    let mut previous_fermi_snapshot_slots: Vec<Option<u64>> = Vec::new();
     for call in &mut calls {
+        let repeat_texture_serial = std::mem::replace(&mut previous_texture_serial, 0);
         let movie_present_key = recent_present_keys.iter().copied().find(|present_key| {
             call.rt_key.same_live_identity(*present_key)
                 || call
@@ -12907,7 +12981,7 @@ fn prepare_draw_batch_async(
                     .iter()
                     .any(|color_key| color_key.same_live_identity(*present_key))
         });
-        for target in &call.configured_color_rts {
+        for target in call.configured_color_rts.iter() {
             let key = target.key;
             if key.gpu_va == 0
                 || key.guest_size_bytes == 0
@@ -12954,7 +13028,16 @@ fn prepare_draw_batch_async(
                 n,
             );
         }
-        if !call.fs_tex_ids.is_empty() && call.tic_pool_gpu_va != 0 {
+        let texture_repeat = prep_texture_repeat_enabled()
+            && call.template_serial != 0
+            && repeat_texture_serial == call.template_serial
+            && previous_fermi_snapshot_slots.len() == call.sampled_rt_fermi_snapshot_slots.len();
+        if texture_repeat {
+            call.sampled_rt_fermi_snapshot_slots
+                .copy_from_slice(&previous_fermi_snapshot_slots);
+            super::pusher::kickprof::count(super::pusher::kickprof::PREP_TEX_REPEAT, 1);
+        }
+        if !texture_repeat && !call.fs_tex_ids.is_empty() && call.tic_pool_gpu_va != 0 {
             for (slot, &tex_id) in call.fs_tex_ids.iter().enumerate() {
                 if tex_id > call.tic_pool_limit {
                     continue;
@@ -13409,8 +13492,8 @@ fn prepare_draw_batch_async(
                 }
             }
         }
-        if !call.fs_sampler_ids.is_empty() && call.tsc_pool_gpu_va != 0 {
-            for &tsc_id in &call.fs_sampler_ids {
+        if !texture_repeat && !call.fs_sampler_ids.is_empty() && call.tsc_pool_gpu_va != 0 {
+            for &tsc_id in call.fs_sampler_ids.iter() {
                 if tsc_id > call.tsc_pool_limit {
                     continue;
                 }
@@ -13425,6 +13508,8 @@ fn prepare_draw_batch_async(
                 );
             }
         }
+        previous_texture_serial = call.template_serial;
+        previous_fermi_snapshot_slots.clone_from(&call.sampled_rt_fermi_snapshot_slots);
     }
     let snapshot_ms = if profile { elapsed_ms(t_snapshot) } else { 0.0 };
     trace_vertex_input_batch(&calls, &snapshot, mappings, mem_read);
@@ -16105,8 +16190,8 @@ pub fn sync_render_thread_until(interrupted: impl Fn() -> bool) -> bool {
     finished
 }
 
-fn execute_one(
-    draw: &DrawCall,
+fn execute_one<'d>(
+    draw: &'d DrawCall,
     mappings: &GpuMappings,
     gs_debug: Option<&GsDebugRegs>,
     maxwell_dma: &super::engines::MaxwellDma,
@@ -16116,6 +16201,7 @@ fn execute_one(
     derived_state_cache: &mut DrawDerivedStateCache,
     resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
     storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
+    template_memo: &mut Option<DrawTemplateMemo<'d>>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
@@ -16132,6 +16218,7 @@ fn execute_one(
         derived_state_cache,
         resident_cbuf_arena,
         storage_writeback_targets,
+        template_memo,
         mem_read,
         mem_write,
     );
@@ -16139,7 +16226,383 @@ fn execute_one(
     result
 }
 
-fn execute_one_inner(
+fn next_template_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+fn prep_texture_repeat_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_PREP_TEXTURE_REPEAT").map_or(true, |value| value != "0")
+    })
+}
+
+fn draw_template_reuse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_DRAW_TEMPLATE_REUSE").map_or(true, |value| value != "0")
+    })
+}
+
+pub(crate) struct DrawTemplateMemo<'d> {
+    draw: &'d DrawCall,
+    mapping_generation: u64,
+    meta_generation: u64,
+    handle_slots: [u32; 2],
+    write_log_index: usize,
+    template: DrawTemplate,
+}
+
+fn template_handle_watch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_TEMPLATE_HANDLE_WATCH").map_or(true, |value| value != "0")
+    })
+}
+
+fn template_handle_slots(template: &DrawTemplate, bindless_slot: u32) -> [u32; 2] {
+    let mut masks = [0u32; 2];
+    let metadata = [
+        &template.cached_fs_texture_metadata,
+        &template.cached_vs_texture_metadata,
+    ];
+    for (index, meta) in metadata.into_iter().enumerate() {
+        let Some(meta) = meta else {
+            continue;
+        };
+        for &shader_id in meta.descriptor_ids.iter() {
+            let (cb_index, _, _) = graphics_texture_cbuf_origin(shader_id, bindless_slot);
+            if cb_index < 32 {
+                masks[index] |= 1 << cb_index;
+            }
+            if let Some(&partner) = meta.or_partners.get(&shader_id) {
+                let partner_cb = match nexium_shader::decode_bindless_texture_id(partner) {
+                    Some((binding, _, None)) => binding as usize,
+                    _ => cb_index,
+                };
+                if partner_cb < 32 {
+                    masks[index] |= 1 << partner_cb;
+                }
+            }
+        }
+    }
+    masks
+}
+
+fn template_handles_unchanged(
+    memo: &DrawTemplateMemo<'_>,
+    draw: &DrawCall,
+    write_log: &[(u64, u64)],
+) -> bool {
+    let groups = [memo.template.fs_cbuf_group, memo.template.vs_cbuf_group];
+    let pending = write_log.get(memo.write_log_index..).unwrap_or(&[]);
+    for (index, group) in groups.into_iter().enumerate() {
+        let mut mask = memo.handle_slots[index];
+        while mask != 0 {
+            let slot = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let (Some(current), Some(source)) = (
+                draw.cbuf_binds.get(group).and_then(|binds| binds.get(slot)),
+                memo.draw.cbuf_binds.get(group).and_then(|binds| binds.get(slot)),
+            ) else {
+                return false;
+            };
+            if current != source {
+                return false;
+            }
+            let (addr, size) = *current;
+            if addr == 0 {
+                continue;
+            }
+            let end = addr.saturating_add(u64::from(size));
+            if pending.iter().any(|&(lo, hi)| lo < end && addr < hi) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn draw_template_state_matches(a: &DrawCall, b: &DrawCall) -> bool {
+    a.topology == b.topology
+        && a.point_size.to_bits() == b.point_size.to_bits()
+        && a.primitive_restart_enabled == b.primitive_restart_enabled
+        && a.primitive_restart_index == b.primitive_restart_index
+        && a.rt == b.rt
+        && a.rt_control == b.rt_control
+        && a.vertex_stream_instances == b.vertex_stream_instances
+        && a.vertex_attribs == b.vertex_attribs
+        && a
+            .vertex_buffers
+            .iter()
+            .zip(b.vertex_buffers.iter())
+            .all(|(x, y)| x.stride == y.stride && x.enabled == y.enabled && x.frequency == y.frequency)
+        && a.viewport == b.viewport
+        && a.depth_mode == b.depth_mode
+        && a.viewport_transform_en == b.viewport_transform_en
+        && a.viewport_clip_control == b.viewport_clip_control
+        && a.surface_clip == b.surface_clip
+        && a.window_origin == b.window_origin
+        && a.scissor == b.scissor
+        && a.clear_control == b.clear_control
+        && a.clear_color == b.clear_color
+        && a.color_blend == b.color_blend
+        && a.is_clear == b.is_clear
+        && a.draw_texture == b.draw_texture
+        && a.tic_pool_gpu_va == b.tic_pool_gpu_va
+        && a.tic_pool_limit == b.tic_pool_limit
+        && a.tsc_pool_gpu_va == b.tsc_pool_gpu_va
+        && a.tsc_pool_limit == b.tsc_pool_limit
+        && a.shader_programs == b.shader_programs
+        && a.program_region_gpu_va == b.program_region_gpu_va
+        && a.sampler_binding == b.sampler_binding
+        && a.bindless_texture_const_buffer_slot == b.bindless_texture_const_buffer_slot
+        && a.tex_cb_index == b.tex_cb_index
+        && a.fs_shader_gpu_va == b.fs_shader_gpu_va
+        && a.render_enable_addr == b.render_enable_addr
+        && a.render_enable_mode == b.render_enable_mode
+        && a.render_enable_override == b.render_enable_override
+        && a.cull_test_enable == b.cull_test_enable
+        && a.alpha_test_enabled == b.alpha_test_enabled
+        && a.alpha_test_ref == b.alpha_test_ref
+        && a.alpha_test_func == b.alpha_test_func
+        && a.cull_face == b.cull_face
+        && a.front_face == b.front_face
+        && a.poly_offset_fill_enable == b.poly_offset_fill_enable
+        && a.poly_offset_units.to_bits() == b.poly_offset_units.to_bits()
+        && a.poly_offset_factor.to_bits() == b.poly_offset_factor.to_bits()
+        && a.zeta == b.zeta
+        && a.zeta_enable == b.zeta_enable
+        && a.depth_test_enable == b.depth_test_enable
+        && a.depth_write_enable == b.depth_write_enable
+        && a.depth_func == b.depth_func
+        && a.stencil_enable == b.stencil_enable
+        && a.stencil_two_side_enable == b.stencil_two_side_enable
+        && a.stencil_front == b.stencil_front
+        && a.stencil_back == b.stencil_back
+        && a.multisample_mode == b.multisample_mode
+        && a.clear_depth.to_bits() == b.clear_depth.to_bits()
+        && a.clear_stencil == b.clear_stencil
+        && a.clear_mask == b.clear_mask
+        && a.indexed == b.indexed
+        && a.index_format == b.index_format
+}
+
+fn draw_template_state_mismatch_groups(a: &DrawCall, b: &DrawCall) {
+    use super::pusher::kickprof;
+    let rt = a.rt == b.rt
+        && a.rt_control == b.rt_control
+        && a.zeta == b.zeta
+        && a.zeta_enable == b.zeta_enable;
+    let shader = a.shader_programs == b.shader_programs
+        && a.program_region_gpu_va == b.program_region_gpu_va
+        && a.fs_shader_gpu_va == b.fs_shader_gpu_va;
+    let vtx = a.topology == b.topology
+        && a.vertex_stream_instances == b.vertex_stream_instances
+        && a.vertex_attribs == b.vertex_attribs
+        && a
+            .vertex_buffers
+            .iter()
+            .zip(b.vertex_buffers.iter())
+            .all(|(x, y)| x.stride == y.stride && x.enabled == y.enabled && x.frequency == y.frequency)
+        && a.indexed == b.indexed
+        && a.index_format == b.index_format
+        && a.primitive_restart_enabled == b.primitive_restart_enabled
+        && a.primitive_restart_index == b.primitive_restart_index;
+    let ff = a.point_size.to_bits() == b.point_size.to_bits()
+        && a.viewport == b.viewport
+        && a.depth_mode == b.depth_mode
+        && a.viewport_transform_en == b.viewport_transform_en
+        && a.viewport_clip_control == b.viewport_clip_control
+        && a.surface_clip == b.surface_clip
+        && a.window_origin == b.window_origin
+        && a.scissor == b.scissor
+        && a.color_blend == b.color_blend
+        && a.cull_test_enable == b.cull_test_enable
+        && a.alpha_test_enabled == b.alpha_test_enabled
+        && a.alpha_test_ref == b.alpha_test_ref
+        && a.alpha_test_func == b.alpha_test_func
+        && a.cull_face == b.cull_face
+        && a.front_face == b.front_face
+        && a.poly_offset_fill_enable == b.poly_offset_fill_enable
+        && a.poly_offset_units.to_bits() == b.poly_offset_units.to_bits()
+        && a.poly_offset_factor.to_bits() == b.poly_offset_factor.to_bits()
+        && a.depth_test_enable == b.depth_test_enable
+        && a.depth_write_enable == b.depth_write_enable
+        && a.depth_func == b.depth_func
+        && a.stencil_enable == b.stencil_enable
+        && a.stencil_two_side_enable == b.stencil_two_side_enable
+        && a.stencil_front == b.stencil_front
+        && a.stencil_back == b.stencil_back
+        && a.multisample_mode == b.multisample_mode;
+    let clear = a.clear_control == b.clear_control
+        && a.clear_color == b.clear_color
+        && a.is_clear == b.is_clear
+        && a.draw_texture == b.draw_texture
+        && a.clear_depth.to_bits() == b.clear_depth.to_bits()
+        && a.clear_stencil == b.clear_stencil
+        && a.clear_mask == b.clear_mask;
+    let texpool = a.tic_pool_gpu_va == b.tic_pool_gpu_va
+        && a.tic_pool_limit == b.tic_pool_limit
+        && a.tsc_pool_gpu_va == b.tsc_pool_gpu_va
+        && a.tsc_pool_limit == b.tsc_pool_limit
+        && a.sampler_binding == b.sampler_binding
+        && a.bindless_texture_const_buffer_slot == b.bindless_texture_const_buffer_slot
+        && a.tex_cb_index == b.tex_cb_index;
+    let other = a.render_enable_addr == b.render_enable_addr
+        && a.render_enable_mode == b.render_enable_mode
+        && a.render_enable_override == b.render_enable_override;
+    for (same, counter) in [
+        (rt, kickprof::TMPL_MS_RT),
+        (shader, kickprof::TMPL_MS_SHADER),
+        (vtx, kickprof::TMPL_MS_VTX),
+        (ff, kickprof::TMPL_MS_FF),
+        (clear, kickprof::TMPL_MS_CLEAR),
+        (texpool, kickprof::TMPL_MS_TEXPOOL),
+        (other, kickprof::TMPL_MS_OTHER),
+    ] {
+        if !same {
+            kickprof::count(counter, 1);
+        }
+    }
+}
+
+fn draw_template_textures_current(
+    template: &DrawTemplate,
+    draw: &DrawCall,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> bool {
+    let (Some(layout), Some(fs_meta), Some(vs_meta)) = (
+        template.texture_layout.as_ref(),
+        template.cached_fs_texture_metadata.as_ref(),
+        template.cached_vs_texture_metadata.as_ref(),
+    ) else {
+        return template.texture_layout.is_none();
+    };
+    let fs_ids = &fs_meta.descriptor_ids;
+    let vs_ids = &vs_meta.descriptor_ids;
+    let total = fs_ids.len() + vs_ids.len();
+    if total > nexium_gpu::descriptor::MAX_TEXTURE_DESCRIPTORS as usize
+        || layout.resolved_tic_ids.len() != total
+        || layout.resolved_sampler_ids.len() != total
+        || layout.resolved_tics.len() != total
+    {
+        return false;
+    }
+    let via_header_index = draw.sampler_binding == 1;
+    let mut slot = 0usize;
+    for (ids, group, partners) in [
+        (fs_ids, template.fs_cbuf_group, &fs_meta.or_partners),
+        (vs_ids, template.vs_cbuf_group, &vs_meta.or_partners),
+    ] {
+        for &shader_id in ids.iter() {
+            let (tic, tsc) = if draw.tic_pool_gpu_va == 0 {
+                (shader_id, 0)
+            } else {
+                let resolution = resolve_texture_handle_words(
+                    shader_id,
+                    &draw.cbuf_binds[group],
+                    draw.bindless_texture_const_buffer_slot,
+                    draw.tic_pool_limit,
+                    via_header_index,
+                    partners,
+                    mappings,
+                    mem_read,
+                );
+                if resolution.accepted {
+                    (resolution.tic, resolution.tsc)
+                } else {
+                    (u32::MAX, 0)
+                }
+            };
+            if layout.resolved_tic_ids[slot] != tic || layout.resolved_sampler_ids[slot] != tsc {
+                return false;
+            }
+            slot += 1;
+        }
+    }
+    layout.resolved_tics.iter().all(|resolved| {
+        let Some(resolved) = resolved else {
+            return true;
+        };
+        let tic_addr = draw
+            .tic_pool_gpu_va
+            .wrapping_add((resolved.id as u64).saturating_mul(32));
+        read_tic_raw(tic_addr, mappings, mem_read).is_some_and(|raw| raw == resolved.raw)
+    })
+}
+
+#[derive(Clone)]
+struct DrawTemplate {
+    cached_fs_texture_metadata: Option<Arc<FragmentTextureNumericMetadata>>,
+    cached_vs_texture_metadata: Option<Arc<FragmentTextureNumericMetadata>>,
+    texture_layout: Option<Arc<GraphicsTextureLayout>>,
+    bundle: Arc<ShaderBundle>,
+    color_rt_formats: Arc<[vk::Format]>,
+    color_rt_keys: Arc<[RtKey]>,
+    color_rt_locations: Arc<[usize]>,
+    configured_color_rts: Arc<[ConfiguredColorRt]>,
+    depth_compare_2d_mask: u32,
+    depth_compare_cube_array_mask: u32,
+    depth_compare_cube_mask: u32,
+    derived_state: Option<DrawDerivedStateValue>,
+    derived_state_source: Option<DrawDerivedStateSource>,
+    derived_state_write_serial: Option<u64>,
+    fs_addr: u64,
+    fs_cbuf_group: usize,
+    fs_cbuf_mask: u64,
+    fs_hash: u64,
+    fs_input_map: [u8; 32],
+    fs_output_map: u32,
+    fs_sampler_arrayed: bool,
+    fs_sampler_ids: Arc<[u32]>,
+    fs_sph: Option<[u8; SPH_SIZE]>,
+    fs_spirv: Arc<Vec<u32>>,
+    fs_tex_ids: Arc<[u32]>,
+    fs_tex_remap: Arc<[String]>,
+    fs_writes_depth: bool,
+    graphics_cbuf_requirements: PackedCbufReadRequirements,
+    gs_cbuf_group: usize,
+    gs_spirv: Arc<Vec<u32>>,
+    gs_storage_writer: bool,
+    layout: Arc<VertexLayout>,
+    mask_all_mrt_outputs: bool,
+    no_depth: bool,
+    nvmap_id: u32,
+    raster_effects: RasterStageEffects,
+    rt_format: vk::Format,
+    rt_key: RtKey,
+    rt_slot: usize,
+    sampled_rt_copy_sources: Arc<[Option<RtKey>]>,
+    sampled_rt_fermi_exact_slots: Arc<[Option<FermiExactRtToken>]>,
+    sampled_rt_key: Option<RtKey>,
+    sampled_rt_keys: Arc<[RtKey]>,
+    sampled_rt_slots: Arc<[Option<RtKey>]>,
+    shader_fs_tex_ids: Arc<[u32]>,
+    small_color_rt_writebacks: Arc<[SmallColorRtWriteback]>,
+    spirv_environment_fingerprint: u128,
+    ssbo_descs: Arc<[nexium_shader::StorageBufferAddr]>,
+    ssbo_writes: GraphicsSsboWrites,
+    texel_buffer_mask: u32,
+    texture_numeric_manifest: Arc<[TextureNumericBinding]>,
+    texture_sampled_only_mask: u32,
+    topology: vk::PrimitiveTopology,
+    vs_addr: u64,
+    vs_cbuf_group: usize,
+    vs_cbuf_mask: u64,
+    vs_sampler_arrayed: bool,
+    vs_spirv: Arc<Vec<u32>>,
+    vs_tex_base: u32,
+    vs_tex_count: u32,
+    zero_viewport_hw: bool,
+    zeta_key: Option<RtKey>,
+    serial: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_draw_template(
     draw: &DrawCall,
     mappings: &GpuMappings,
     gs_debug: Option<&GsDebugRegs>,
@@ -16148,11 +16611,8 @@ fn execute_one_inner(
     renderer: &Arc<nexium_gpu::Renderer>,
     ssbo_snapshot_cache: &mut SsboSnapshotCache,
     derived_state_cache: &mut DrawDerivedStateCache,
-    resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
-    storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-    mem_write: &dyn Fn(u64, &[u8]) -> bool,
-) -> Result<Option<Maxwell3dDrawCall>, String> {
+) -> Result<Option<DrawTemplate>, String> {
     let mut enq_phase_started = super::pusher::kickprof::start();
     let mut enq_pre_sub = enq_phase_started;
     let fermi_provenance_profile = enq_phase_started.is_some() || fermi_rt_snapshot_lease_enabled();
@@ -17729,7 +18189,7 @@ fn execute_one_inner(
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX_A, enq_tex_sub);
     enq_tex_sub = super::pusher::kickprof::start();
     let layout = build_vertex_layout(draw, &bundle.vs_input_locations)?;
-    let mut topology = map_topology(draw.topology)
+    let topology = map_topology(draw.topology)
         .ok_or_else(|| format!("unsupported topology {}", draw.topology))?;
 
     let (cbuf_addr, cbuf_size) = resolve_cbuf(draw, cbuf_binds);
@@ -18137,7 +18597,265 @@ fn execute_one_inner(
     let sampled_rt_key = sampled_rt_keys.first().copied();
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX_D, enq_tex_sub);
     super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX, enq_phase_started);
-    enq_phase_started = super::pusher::kickprof::start();
+    let ssbo_descs = ssbo_descs.into_owned();
+    let color_rt_locations = color_rt_locations.to_vec();
+    Ok(Some(DrawTemplate {
+        cached_fs_texture_metadata,
+        cached_vs_texture_metadata,
+        texture_layout,
+        bundle,
+        color_rt_formats: color_rt_formats.into(),
+        color_rt_keys: color_rt_keys.into(),
+        color_rt_locations: color_rt_locations.into(),
+        configured_color_rts: configured_color_rts.into(),
+        depth_compare_2d_mask,
+        depth_compare_cube_array_mask,
+        depth_compare_cube_mask,
+        derived_state,
+        derived_state_source,
+        derived_state_write_serial,
+        fs_addr,
+        fs_cbuf_group,
+        fs_cbuf_mask,
+        fs_hash,
+        fs_input_map,
+        fs_output_map,
+        fs_sampler_arrayed,
+        fs_sampler_ids: fs_sampler_ids.into(),
+        fs_sph,
+        fs_spirv,
+        fs_tex_ids: fs_tex_ids.into(),
+        fs_tex_remap: fs_tex_remap.into(),
+        fs_writes_depth,
+        graphics_cbuf_requirements,
+        gs_cbuf_group,
+        gs_spirv,
+        gs_storage_writer,
+        layout: Arc::new(layout),
+        mask_all_mrt_outputs,
+        no_depth,
+        nvmap_id,
+        raster_effects,
+        rt_format,
+        rt_key,
+        rt_slot,
+        sampled_rt_copy_sources: sampled_rt_copy_sources.into(),
+        sampled_rt_fermi_exact_slots: sampled_rt_fermi_exact_slots.into(),
+        sampled_rt_key,
+        sampled_rt_keys: sampled_rt_keys.into(),
+        sampled_rt_slots: sampled_rt_slots.into(),
+        shader_fs_tex_ids: shader_fs_tex_ids.into(),
+        small_color_rt_writebacks: small_color_rt_writebacks.into(),
+        spirv_environment_fingerprint,
+        ssbo_descs: ssbo_descs.into(),
+        ssbo_writes,
+        texel_buffer_mask,
+        texture_numeric_manifest: texture_numeric_manifest.into(),
+        texture_sampled_only_mask,
+        topology,
+        vs_addr,
+        vs_cbuf_group,
+        vs_cbuf_mask,
+        vs_sampler_arrayed,
+        vs_spirv,
+        vs_tex_base,
+        vs_tex_count,
+        zero_viewport_hw,
+        zeta_key,
+        serial: next_template_serial(),
+    }))
+}
+
+
+fn execute_one_inner<'d>(
+    draw: &'d DrawCall,
+    mappings: &GpuMappings,
+    gs_debug: Option<&GsDebugRegs>,
+    maxwell_dma: &super::engines::MaxwellDma,
+    fermi_2d: &super::engines::Fermi2D,
+    renderer: &Arc<nexium_gpu::Renderer>,
+    ssbo_snapshot_cache: &mut SsboSnapshotCache,
+    derived_state_cache: &mut DrawDerivedStateCache,
+    resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
+    storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
+    template_memo: &mut Option<DrawTemplateMemo<'d>>,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+) -> Result<Option<Maxwell3dDrawCall>, String> {
+    let reuse_enabled = draw_template_reuse_enabled();
+    let reused = if reuse_enabled {
+        match template_memo.as_ref() {
+            None => {
+                super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_NOMEMO, 1);
+                None
+            }
+            Some(memo) => {
+                if memo.mapping_generation != mappings.generation()
+                    || memo.meta_generation
+                        != TEX_META_GEN.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_GEN, 1);
+                    None
+                } else if !draw_template_state_matches(memo.draw, draw) {
+                    super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_STATE, 1);
+                    if super::pusher::kickprof::enabled() {
+                        draw_template_state_mismatch_groups(memo.draw, draw);
+                    }
+                    None
+                } else {
+                    let handles_unchanged = template_handle_watch_enabled()
+                        && template_handles_unchanged(
+                            memo,
+                            draw,
+                            &ssbo_snapshot_cache.constbuf_write_log,
+                        );
+                    if handles_unchanged {
+                        super::pusher::kickprof::count(super::pusher::kickprof::TMPL_TEX_SKIP, 1);
+                    }
+                    if !handles_unchanged
+                        && !draw_template_textures_current(&memo.template, draw, mappings, mem_read)
+                    {
+                        super::pusher::kickprof::count(super::pusher::kickprof::TMPL_MISS_TEX, 1);
+                        None
+                    } else {
+                        let kp_clone = super::pusher::kickprof::start();
+                        let template = memo.template.clone();
+                        super::pusher::kickprof::add(
+                            super::pusher::kickprof::TMPL_CLONE_REUSE,
+                            kp_clone,
+                        );
+                        Some(template)
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+    if reused.is_some() {
+        if let Some(memo) = template_memo.as_mut() {
+            memo.write_log_index = ssbo_snapshot_cache.constbuf_write_log.len();
+        }
+    }
+    let template = match reused {
+        Some(mut template) => {
+            super::pusher::kickprof::count(super::pusher::kickprof::TMPL_REUSE, 1);
+            template.derived_state = None;
+            template.derived_state_source = None;
+            template.derived_state_write_serial = None;
+            template
+        }
+        None => {
+            super::pusher::kickprof::count(super::pusher::kickprof::TMPL_DERIVE, 1);
+            let Some(template) = derive_draw_template(
+                draw,
+                mappings,
+                gs_debug,
+                maxwell_dma,
+                fermi_2d,
+                renderer,
+                ssbo_snapshot_cache,
+                derived_state_cache,
+                mem_read,
+            )?
+            else {
+                *template_memo = None;
+                return Ok(None);
+            };
+            if reuse_enabled {
+                let kp_clone = super::pusher::kickprof::start();
+                *template_memo = Some(DrawTemplateMemo {
+                    draw,
+                    mapping_generation: mappings.generation(),
+                    meta_generation: TEX_META_GEN.load(std::sync::atomic::Ordering::Acquire),
+                    handle_slots: template_handle_slots(
+                        &template,
+                        draw.bindless_texture_const_buffer_slot,
+                    ),
+                    write_log_index: ssbo_snapshot_cache.constbuf_write_log.len(),
+                    template: template.clone(),
+                });
+                super::pusher::kickprof::add(
+                    super::pusher::kickprof::TMPL_CLONE_STORE,
+                    kp_clone,
+                );
+            }
+            template
+        }
+    };
+    let DrawTemplate {
+        cached_fs_texture_metadata,
+        cached_vs_texture_metadata,
+        texture_layout,
+        bundle,
+        color_rt_formats,
+        color_rt_keys,
+        color_rt_locations: template_color_rt_locations,
+        configured_color_rts,
+        depth_compare_2d_mask,
+        depth_compare_cube_array_mask,
+        depth_compare_cube_mask,
+        derived_state,
+        derived_state_source,
+        derived_state_write_serial,
+        fs_addr,
+        fs_cbuf_group,
+        fs_cbuf_mask,
+        fs_hash,
+        fs_input_map,
+        fs_output_map,
+        fs_sampler_arrayed,
+        fs_sampler_ids,
+        fs_sph,
+        fs_spirv,
+        fs_tex_ids,
+        fs_tex_remap,
+        fs_writes_depth,
+        graphics_cbuf_requirements,
+        gs_cbuf_group,
+        gs_spirv,
+        gs_storage_writer,
+        layout,
+        mask_all_mrt_outputs,
+        no_depth,
+        nvmap_id,
+        raster_effects,
+        rt_format,
+        rt_key,
+        rt_slot,
+        sampled_rt_copy_sources,
+        sampled_rt_fermi_exact_slots,
+        sampled_rt_key,
+        sampled_rt_keys,
+        sampled_rt_slots,
+        shader_fs_tex_ids,
+        small_color_rt_writebacks,
+        spirv_environment_fingerprint,
+        ssbo_descs: template_ssbo_descs,
+        ssbo_writes,
+        texel_buffer_mask,
+        texture_numeric_manifest,
+        texture_sampled_only_mask,
+        mut topology,
+        vs_addr,
+        vs_cbuf_group,
+        vs_cbuf_mask,
+        vs_sampler_arrayed,
+        vs_spirv,
+        vs_tex_base,
+        vs_tex_count,
+        zero_viewport_hw,
+        zeta_key,
+        serial,
+    } = template;
+    let rt = &draw.rt[rt_slot];
+    let cbuf_binds = &draw.cbuf_binds;
+    let (cbuf_addr, cbuf_size) = resolve_cbuf(draw, cbuf_binds);
+    let gs_prog = &draw.shader_programs[4];
+    let color_rt_locations: &[usize] = &template_color_rt_locations;
+    let ssbo_descs: std::borrow::Cow<'_, [nexium_shader::StorageBufferAddr]> =
+        std::borrow::Cow::Borrowed(&template_ssbo_descs[..]);
+    let mut enq_phase_started = super::pusher::kickprof::start();
 
     let vertex_bindings = vertex_buffer_bindings(&draw.vertex_buffers, &layout);
     let vertex_addr = vertex_bindings.first().map(|b| b.addr).unwrap_or(0);
@@ -19144,13 +19862,13 @@ fn execute_one_inner(
         let bundle_hash = fold.0;
         let layout_hash = layout.hash();
         let mut fold = TemplateFold::new();
-        for id in &fs_tex_ids {
+        for id in fs_tex_ids.iter() {
             fold.u32(*id);
         }
-        for id in &fs_sampler_ids {
+        for id in fs_sampler_ids.iter() {
             fold.u32(*id);
         }
-        for binding in &texture_numeric_manifest {
+        for binding in texture_numeric_manifest.iter() {
             fold.u32(binding.shader_id);
             fold.u32(binding.descriptor_slot);
             fold.u32(binding.numeric_type as u32);
@@ -19320,6 +20038,7 @@ fn execute_one_inner(
         tsc_pool_gpu_va: draw.tsc_pool_gpu_va,
         tsc_pool_limit: draw.tsc_pool_limit,
         fs_sampler_ids,
+        template_serial: serial,
         fs_sampler_arrayed,
         vs_sampler_arrayed,
         depth_compare_2d_mask,

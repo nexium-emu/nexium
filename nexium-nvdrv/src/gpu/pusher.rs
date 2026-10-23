@@ -399,7 +399,24 @@ pub(crate) mod kickprof {
     pub const FERMI_PREVIEW: usize = 236;
     pub const FERMI_PREVIEW_READY: usize = 237;
     pub const BARRIER_SEGMENT_PRIMITIVE: usize = 238;
-    pub const COUNT: usize = 239;
+    pub const TMPL_REUSE: usize = 239;
+    pub const TMPL_DERIVE: usize = 240;
+    pub const TMPL_MISS_NOMEMO: usize = 241;
+    pub const TMPL_MISS_GEN: usize = 242;
+    pub const TMPL_MISS_STATE: usize = 243;
+    pub const TMPL_MISS_TEX: usize = 244;
+    pub const TMPL_MS_RT: usize = 245;
+    pub const TMPL_MS_SHADER: usize = 246;
+    pub const TMPL_MS_VTX: usize = 247;
+    pub const TMPL_MS_FF: usize = 248;
+    pub const TMPL_MS_CLEAR: usize = 249;
+    pub const TMPL_MS_TEXPOOL: usize = 250;
+    pub const TMPL_MS_OTHER: usize = 251;
+    pub const TMPL_CLONE_STORE: usize = 252;
+    pub const TMPL_CLONE_REUSE: usize = 253;
+    pub const PREP_TEX_REPEAT: usize = 254;
+    pub const TMPL_TEX_SKIP: usize = 255;
+    pub const COUNT: usize = 256;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -641,6 +658,23 @@ pub(crate) mod kickprof {
         "fermipreview",
         "fermipreviewready",
         "barsegprim",
+        "tmplreuse",
+        "tmplderive",
+        "tmplnomemo",
+        "tmplgen",
+        "tmplstate",
+        "tmpltex",
+        "tmplmsrt",
+        "tmplmsshader",
+        "tmplmsvtx",
+        "tmplmsff",
+        "tmplmsclear",
+        "tmplmstexpool",
+        "tmplmsother",
+        "tmplclonestore",
+        "tmplclonereuse",
+        "preptexrepeat",
+        "tmpltexskip",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
