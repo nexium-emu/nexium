@@ -895,6 +895,7 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
     crate::soft_watch::mark_dirty_host(ptr, len);
     let fresh = !is_committed(&ranges, va, end);
     update_commit_refs(&mut ranges, va, end, true);
+    mark_committed_pages(va, end, true);
     if fresh {
         note_commit_changes(&[(va, end)]);
     }
@@ -939,6 +940,10 @@ pub fn decommit(ptr: *mut u8, len: usize) {
     if released.is_empty() {
         return;
     }
+    for &(released_lo, released_hi) in &released {
+        mark_committed_pages(released_lo, released_hi, false);
+    }
+    wait_for_direct_readers();
     note_commit_changes(&released);
     for &(released_lo, released_hi) in &released {
         let released_ptr = unsafe { base.add(released_lo as usize) };
@@ -1370,6 +1375,124 @@ fn committed_ranges() -> &'static Mutex<Vec<CommittedRange>> {
     COMMITTED_RANGES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+const COMMIT_PAGE_SHIFT: u32 = 12;
+const DIRECT_READER_SLOTS: usize = 64;
+
+static COMMIT_BITMAP: OnceLock<Box<[std::sync::atomic::AtomicU64]>> = OnceLock::new();
+#[repr(align(128))]
+struct DirectReaderSlot(std::sync::atomic::AtomicU32);
+
+static DIRECT_READERS: [DirectReaderSlot; DIRECT_READER_SLOTS] =
+    [const { DirectReaderSlot(std::sync::atomic::AtomicU32::new(0)) }; DIRECT_READER_SLOTS];
+static NEXT_DIRECT_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    static DIRECT_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+fn commit_bitmap() -> &'static [std::sync::atomic::AtomicU64] {
+    COMMIT_BITMAP.get_or_init(|| {
+        let pages = (arena_size() >> COMMIT_PAGE_SHIFT) as usize;
+        let words = pages.div_ceil(64).max(1);
+        std::iter::repeat_with(|| std::sync::atomic::AtomicU64::new(0))
+            .take(words)
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
+
+fn mark_committed_pages(lo: u64, hi: u64, committed: bool) {
+    if hi <= lo {
+        return;
+    }
+    let bitmap = commit_bitmap();
+    let first = lo >> COMMIT_PAGE_SHIFT;
+    let last = (hi - 1) >> COMMIT_PAGE_SHIFT;
+    for page in first..=last {
+        let Some(word) = bitmap.get((page / 64) as usize) else {
+            break;
+        };
+        let bit = 1u64 << (page % 64);
+        if committed {
+            word.fetch_or(bit, Ordering::SeqCst);
+        } else {
+            word.fetch_and(!bit, Ordering::SeqCst);
+        }
+    }
+}
+
+fn pages_committed(lo: u64, hi: u64) -> bool {
+    if hi <= lo {
+        return false;
+    }
+    let bitmap = commit_bitmap();
+    let first = lo >> COMMIT_PAGE_SHIFT;
+    let last = (hi - 1) >> COMMIT_PAGE_SHIFT;
+    for page in first..=last {
+        let Some(word) = bitmap.get((page / 64) as usize) else {
+            return false;
+        };
+        if word.load(Ordering::SeqCst) & (1u64 << (page % 64)) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn direct_reader_slot() -> &'static std::sync::atomic::AtomicU32 {
+    let index = DIRECT_SLOT.with(|slot| {
+        let current = slot.get();
+        if current != usize::MAX {
+            return current;
+        }
+        let assigned = NEXT_DIRECT_SLOT.fetch_add(1, Ordering::Relaxed) % DIRECT_READER_SLOTS;
+        slot.set(assigned);
+        assigned
+    });
+    &DIRECT_READERS[index].0
+}
+
+fn wait_for_direct_readers() {
+    let mut spins = 0u32;
+    while DIRECT_READERS
+        .iter()
+        .any(|slot| slot.0.load(Ordering::SeqCst) != 0)
+    {
+        spins = spins.wrapping_add(1);
+        if spins % 64 == 0 {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+pub fn read_committed(va: u64, buf: &mut [u8]) -> bool {
+    let base = arena();
+    if base.is_null() || buf.is_empty() {
+        return false;
+    }
+    let Some(lo) = va_offset(va) else {
+        return false;
+    };
+    let Some(hi) = lo.checked_add(buf.len() as u64) else {
+        return false;
+    };
+    if hi > arena_size() {
+        return false;
+    }
+    let slot = direct_reader_slot();
+    slot.fetch_add(1, Ordering::SeqCst);
+    let committed = pages_committed(lo, hi);
+    if committed {
+        unsafe {
+            std::ptr::copy_nonoverlapping(base.add(lo as usize), buf.as_mut_ptr(), buf.len());
+        }
+    }
+    slot.fetch_sub(1, Ordering::SeqCst);
+    committed
+}
+
 fn push_commit_segment(segments: &mut Vec<CommittedRange>, lo: u64, hi: u64, refs: u32) {
     if hi <= lo || refs == 0 {
         return;
@@ -1592,6 +1715,27 @@ pub fn watch_write_through(addr: u64, size: usize, value: u64) -> bool {
 #[cfg(all(test, any(windows, all(target_os = "linux", not(target_vendor = "sony")))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_reads_follow_commit_state() {
+        let va = 0xD_EAD0_0000u64;
+        let len = 0x3000usize;
+        let Some(ptr) = commit(va, len) else {
+            return;
+        };
+        let pattern: Vec<u8> = (0..len).map(|index| (index * 7 % 251) as u8).collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), ptr, len);
+        }
+        let mut out = vec![0u8; 0x1800];
+        assert!(read_committed(va + 0x800, &mut out));
+        assert_eq!(out, pattern[0x800..0x2000]);
+        let mut past_end = vec![0u8; 0x1000];
+        assert!(!read_committed(va + len as u64 - 0x800, &mut past_end));
+        decommit(ptr, len);
+        let mut after = vec![0u8; 16];
+        assert!(!read_committed(va, &mut after));
+    }
 
     #[test]
     fn write_watch_memo_covers_only_queried_pages_within_an_epoch() {
