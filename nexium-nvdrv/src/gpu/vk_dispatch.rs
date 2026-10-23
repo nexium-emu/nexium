@@ -5095,7 +5095,9 @@ impl SsboSnapshotCache {
         let before = self.input_entries.len();
         self.input_sweep_kick = self.input_sweep_kick.wrapping_add(1);
         let kick = self.input_sweep_kick;
-        self.evict_cbuf_pool_idle(CBUF_POOL_IDLE_KICKS);
+        if kick % CBUF_POOL_EVICT_INTERVAL == 0 {
+            self.evict_cbuf_pool_idle(CBUF_POOL_IDLE_KICKS);
+        }
         let rebuild_due = !input_sweep_incremental_enabled()
             || self.input_sweep_rebuilt_len == 0
             || kick.wrapping_sub(self.input_sweep_rebuild_kick) >= INPUT_SWEEP_REBUILD_KICKS
@@ -26457,6 +26459,7 @@ fn resident_cbuf_prep_enabled() -> bool {
 type CbufPoolKey = (u64, usize);
 
 const CBUF_POOL_IDLE_KICKS: u64 = 6;
+const CBUF_POOL_EVICT_INTERVAL: u64 = 8;
 
 struct CbufPoolEntry {
     region: u32,
