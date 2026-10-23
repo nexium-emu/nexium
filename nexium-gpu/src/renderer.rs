@@ -2822,7 +2822,7 @@ struct DummyViewSignature {
 
 struct DummyViewSet {
     signature: DummyViewSignature,
-    manifest: Vec<TextureNumericBinding>,
+    manifest: Arc<[TextureNumericBinding]>,
     numeric_types: [nexium_spirv::TextureNumericType; MAX_TEXTURE_DESCRIPTOR_COUNT],
     views_2d: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT],
     views_cube: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT],
@@ -2854,7 +2854,7 @@ impl DummyViewSet {
     ) -> Self {
         let mut numeric_types =
             [nexium_spirv::TextureNumericType::Float; MAX_TEXTURE_DESCRIPTOR_COUNT];
-        for binding in &call.texture_numeric_manifest {
+        for binding in call.texture_numeric_manifest.iter() {
             if let Some(numeric_type) = numeric_types.get_mut(binding.descriptor_slot as usize) {
                 *numeric_type = binding.spirv_type();
             }
@@ -3810,6 +3810,26 @@ struct CachedComputeGuestImage {
     key: ComputeGuestImagePoolKey,
     content: Option<ComputeGuestImageContent>,
     resource: crate::compute::ComputeGuestImageResource,
+}
+
+struct TextureRepeatState {
+    serial: u64,
+    source_index: usize,
+    required_rt_layout: vk::ImageLayout,
+    bound_tex_views: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_tex_views_3d: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_tex_views_cube: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_tex_views_cube_array: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_texel_views: [vk::BufferView; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    stencil_alias_bound: [bool; MAX_TEXTURE_DESCRIPTOR_COUNT],
+    bound_tex_layouts: [vk::ImageLayout; MAX_TEXTURE_DESCRIPTOR_COUNT],
+}
+
+fn render_template_repeat_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_RENDER_TEMPLATE_REPEAT").map_or(true, |value| value != "0")
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -5956,7 +5976,9 @@ impl Renderer {
         };
         let timeline_started = started.map(|_| std::time::Instant::now());
         if let Some(generation) = unsettled_generation {
+            let wait_started = rprof_wait_start();
             let _ = self.wait_submit_generation(generation, std::time::Duration::from_secs(2));
+            rprof_wait_add(0, wait_started);
         }
         let timeline_elapsed = timeline_started.map_or(std::time::Duration::ZERO, |s| s.elapsed());
         let second_lock_started = started.map(|_| std::time::Instant::now());
@@ -6004,7 +6026,9 @@ impl Renderer {
             unsettled_pending_compute_generation(&inner.pending_computes)
         };
         if let Some(target) = target {
+            let wait_started = rprof_wait_start();
             let _ = self.wait_submit_generation(target, std::time::Duration::from_secs(2));
+            rprof_wait_add(1, wait_started);
         }
     }
 
@@ -6132,7 +6156,9 @@ impl Renderer {
             return;
         }
         if let Some(generation) = self.frame_slot_prewait.pending_generation() {
+            let wait_started = rprof_wait_start();
             self.wait_submit_generation(generation, std::time::Duration::from_secs(2));
+            rprof_wait_add(2, wait_started);
         }
     }
 
@@ -12169,7 +12195,7 @@ impl Renderer {
             );
         }
         if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
-            for binding in &call.texture_numeric_manifest {
+            for binding in call.texture_numeric_manifest.iter() {
                 let slot = binding.descriptor_slot as usize;
                 if slot < tex_pendings.len() || slot >= max_texture_descriptors() {
                     continue;
@@ -13227,6 +13253,8 @@ impl Renderer {
             let mut texture_memo = GroupTexturePrepMemo::default();
             let mut texture_memo_invalidate_before_call = false;
             let mut texture_memo_epoch = 0u64;
+            let mut pipeline_memo: Option<(u64, vk::Format, vk::ImageAspectFlags, bool, vk::Pipeline)> =
+                None;
             let batch_color_formats = calls
                 .iter()
                 .find(|call| call_writes_any_color(call))
@@ -13269,8 +13297,19 @@ impl Renderer {
                 } else {
                     pipeline_mode
                 };
-                let mut pipeline = self
-                    .compile_call_pipeline(
+                let memo_pipeline = pipeline_memo
+                    .filter(|(serial, memo_depth_format, memo_depth_aspects, memo_storage_only, _)| {
+                        call.template_serial != 0
+                            && *serial == call.template_serial
+                            && *memo_depth_format == depth_format
+                            && *memo_depth_aspects == depth_aspects
+                            && *memo_storage_only == storage_only
+                    })
+                    .map(|(_, _, _, _, pipeline)| pipeline);
+                let mut pipeline = if memo_pipeline.is_some() {
+                    memo_pipeline
+                } else {
+                    self.compile_call_pipeline(
                         call,
                         call_color_formats,
                         depth_format,
@@ -13279,7 +13318,8 @@ impl Renderer {
                     )
                     .map_err(|error| {
                         graphics_draw_call_error(call_index, call, "pipeline", error)
-                    })?;
+                    })?
+                };
                 if pipeline.is_none() && mode == PipelineCompileMode::Probe {
                     pipeline_mode = PipelineCompileMode::Build;
                     self.queue_draw_group_pipelines(groups, group_index, call_index + 1);
@@ -13305,6 +13345,8 @@ impl Renderer {
                         continue;
                     }
                 };
+                pipeline_memo = (render_template_repeat_enabled() && call.template_serial != 0)
+                    .then_some((call.template_serial, depth_format, depth_aspects, storage_only, pipeline));
                 let (vertex_bindings, draw_vertex_count) =
                     match prepare_vertex_bindings_shared(call, &read_group) {
                         Ok(v) => v,
@@ -14051,6 +14093,7 @@ impl Renderer {
             let mut group_color_sync_clean = Vec::<(RtKey, vk::Format)>::new();
             let mut recorded_texture_memo_epoch = None;
             let mut dummy_view_memo = DummyViewMemo::default();
+            let mut texture_repeat: Option<TextureRepeatState> = None;
             for (draw_index, (call, prep)) in preps.iter().enumerate() {
                 let call = *call;
                 let storage_readback_key = std::ptr::from_ref(call) as usize;
@@ -14099,6 +14142,51 @@ impl Renderer {
                 } else {
                     vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
                 };
+                let dummy_set = dummy_view_memo.resolve(call, &graphics_dummies);
+                let texture_numeric_types = dummy_set.numeric_types;
+                let dummy_views_2d: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    &dummy_set.views_2d;
+                let dummy_views_3d = [graphics_dummies.image_3d; MAX_TEXTURE_DESCRIPTOR_COUNT];
+                let dummy_views_cube: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    &dummy_set.views_cube;
+                let dummy_views_cube_array: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    &dummy_set.views_cube_array;
+                let texture_repeat_hit = texture_repeat.as_ref().filter(|state| {
+                    call.template_serial != 0
+                        && state.serial == call.template_serial
+                        && call.storage_readback.is_none()
+                        && !storage_only
+                        && {
+                            let source = &preps[state.source_index].1;
+                            source.texture_memo_epoch == prep.texture_memo_epoch
+                                && source.tex_pendings == prep.tex_pendings
+                                && source.tsc_entries == prep.tsc_entries
+                        }
+                });
+                let (
+                    required_rt_layout,
+                    bound_tex_views,
+                    bound_tex_views_3d,
+                    bound_tex_views_cube,
+                    bound_tex_views_cube_array,
+                    bound_texel_views,
+                    stencil_alias_bound,
+                    bound_tex_layouts,
+                    texture_repeat_eligible,
+                ) = if let Some(state) = texture_repeat_hit {
+                    rp_command_stages.texture_repeats += 1;
+                    (
+                        state.required_rt_layout,
+                        state.bound_tex_views,
+                        state.bound_tex_views_3d,
+                        state.bound_tex_views_cube,
+                        state.bound_tex_views_cube_array,
+                        state.bound_texel_views,
+                        state.stencil_alias_bound,
+                        state.bound_tex_layouts,
+                        true,
+                    )
+                } else {
                 let rp_a0 = record_detail_profile.then(std::time::Instant::now);
                 debug_assert!(prep.tex_pendings.len() <= MAX_TEXTURE_DESCRIPTOR_COUNT);
                 debug_assert!(prep.tsc_entries.len() <= MAX_TEXTURE_DESCRIPTOR_COUNT);
@@ -14304,15 +14392,6 @@ impl Renderer {
                     }
                 }
 
-                let dummy_set = dummy_view_memo.resolve(call, &graphics_dummies);
-                let texture_numeric_types = dummy_set.numeric_types;
-                let dummy_views_2d: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    &dummy_set.views_2d;
-                let dummy_views_3d = [graphics_dummies.image_3d; MAX_TEXTURE_DESCRIPTOR_COUNT];
-                let dummy_views_cube: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    &dummy_set.views_cube;
-                let dummy_views_cube_array: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
-                    &dummy_set.views_cube_array;
                 let mut bound_tex_views = dummy_set.bound_2d;
                 let mut bound_tex_views_3d = dummy_set.bound_3d;
                 let mut bound_tex_views_cube = dummy_set.bound_cube;
@@ -15951,6 +16030,37 @@ impl Renderer {
                 }
 
                 rp_tex += profile_elapsed(rp_tx0);
+                    let texture_repeat_eligible =
+                        rt_aliases.iter().all(Option::is_none) && !feedback_loop;
+                    (
+                        required_rt_layout,
+                        bound_tex_views,
+                        bound_tex_views_3d,
+                        bound_tex_views_cube,
+                        bound_tex_views_cube_array,
+                        bound_texel_views,
+                        stencil_alias_bound,
+                        bound_tex_layouts,
+                        texture_repeat_eligible,
+                    )
+                };
+                texture_repeat = (render_template_repeat_enabled()
+                    && texture_repeat_eligible
+                    && call.template_serial != 0
+                    && call.storage_readback.is_none()
+                    && !storage_only)
+                .then(|| TextureRepeatState {
+                    serial: call.template_serial,
+                    source_index: draw_index,
+                    required_rt_layout,
+                    bound_tex_views,
+                    bound_tex_views_3d,
+                    bound_tex_views_cube,
+                    bound_tex_views_cube_array,
+                    bound_texel_views,
+                    stencil_alias_bound,
+                    bound_tex_layouts,
+                });
                 let rp_vx0 = record_detail_profile.then(std::time::Instant::now);
                 let mut vertex_binds = upload_vertex_bindings(
                     device,
@@ -16147,7 +16257,7 @@ impl Renderer {
                 }
 
                 if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
-                    for binding in &call.texture_numeric_manifest {
+                    for binding in call.texture_numeric_manifest.iter() {
                         let slot = binding.descriptor_slot as usize;
                         if slot < prep.tex_pendings.len() || slot >= max_texture_descriptors() {
                             continue;
@@ -16239,7 +16349,7 @@ impl Renderer {
                 sparse_sampled_image_infos.clear();
                 sparse_texel_views.clear();
                 if sparse_texture_descriptors {
-                    for binding in &call.texture_numeric_manifest {
+                    for binding in call.texture_numeric_manifest.iter() {
                         let slot = binding.descriptor_slot as usize;
                         if binding.image_kind == GraphicsTextureImageKind::Buffer {
                             sparse_texel_views.push(bound_texel_views[slot]);
@@ -16283,7 +16393,7 @@ impl Renderer {
                         .filter(|active| **active)
                         .count() as u64;
                     let mut active_slots = [false; MAX_TEXTURE_DESCRIPTOR_COUNT];
-                    for binding in &call.texture_numeric_manifest {
+                    for binding in call.texture_numeric_manifest.iter() {
                         let slot = binding.descriptor_slot as usize;
                         if slot < active_slots.len() {
                             active_slots[slot] = true;
@@ -16669,7 +16779,7 @@ impl Renderer {
                 if sparse_texture_descriptors {
                     let mut sampled_index = 0usize;
                     let mut texel_index = 0usize;
-                    for binding in &call.texture_numeric_manifest {
+                    for binding in call.texture_numeric_manifest.iter() {
                         let (descriptor_binding, descriptor_type) =
                             graphics_texture_descriptor_target(*binding);
                         let mut write = vk::WriteDescriptorSet {
@@ -17537,6 +17647,7 @@ struct RecordCommandStageProfile {
     vertex_bind_repeats: u64,
     index_binds: u64,
     index_bind_repeats: u64,
+    texture_repeats: u64,
 }
 
 #[derive(Default)]
@@ -17803,6 +17914,7 @@ fn record_stage_profile_record(
     window.command_stages.vertex_bind_repeats += command_stages.vertex_bind_repeats;
     window.command_stages.index_binds += command_stages.index_binds;
     window.command_stages.index_bind_repeats += command_stages.index_bind_repeats;
+    window.command_stages.texture_repeats += command_stages.texture_repeats;
     window.texture_memo.tic_requests += texture_memo.tic_requests;
     window.texture_memo.tic_misses += texture_memo.tic_misses;
     window.texture_memo.pending_requests += texture_memo.pending_requests;
@@ -17858,7 +17970,7 @@ fn record_stage_profile_record(
         )),
     );
     log::warn!(
-        "[record-stage] batches={} draws={} us/draw record={:.3} alias={:.3} tex={:.3} vtx={:.3} dset={:.3} other={:.3} | dset alloc={:.3} typed={:.3} sampler={:.3} ssbo={:.3} writes={:.3} update={:.3} other={:.3} | manifest_empty_pct={:.1} manifest_entries/draw={:.2} active_slots/draw={:.2} active_bindings/draw={:.2} resolved_tex/draw={:.2} input_ssbo/draw={:.2} ssbo_bindings/draw={:.2} writes/draw={:.2} descriptor_elements/draw={:.2} sparse_pct={:.1} | repeat_pct pipeline={:.1} viewport={:.1} scissor={:.1} stencil={:.1} stencil_cmds/draw={:.2} redundant_stencil_cmds/draw={:.2} pass_begins/draw={:.3} | texmemo_hit_pct tic={:.1} pending={:.1} tsc={:.1} binding={:.1} binding_lookups/draw={:.2} evictions={} | bind_repeat_pct vertex={:.1} index={:.1}",
+        "[record-stage] batches={} draws={} us/draw record={:.3} alias={:.3} tex={:.3} vtx={:.3} dset={:.3} other={:.3} | dset alloc={:.3} typed={:.3} sampler={:.3} ssbo={:.3} writes={:.3} update={:.3} other={:.3} | manifest_empty_pct={:.1} manifest_entries/draw={:.2} active_slots/draw={:.2} active_bindings/draw={:.2} resolved_tex/draw={:.2} input_ssbo/draw={:.2} ssbo_bindings/draw={:.2} writes/draw={:.2} descriptor_elements/draw={:.2} sparse_pct={:.1} | repeat_pct pipeline={:.1} viewport={:.1} scissor={:.1} stencil={:.1} stencil_cmds/draw={:.2} redundant_stencil_cmds/draw={:.2} pass_begins/draw={:.3} | texmemo_hit_pct tic={:.1} pending={:.1} tsc={:.1} binding={:.1} binding_lookups/draw={:.2} evictions={} | bind_repeat_pct vertex={:.1} index={:.1} | tex_repeat_pct={:.1}",
         window.batches,
         window.draws,
         per_draw_us(window.record),
@@ -17926,6 +18038,7 @@ fn record_stage_profile_record(
                 .index_binds
                 .saturating_sub(window.command_stages.index_bind_repeats)
         ),
+        100.0 * count_per_draw(window.command_stages.texture_repeats),
     );
     log::warn!(
         "[texture-overlay-reuse] draws={} lookups={} hits={}",
@@ -18001,6 +18114,25 @@ fn record_stage_profile_record(
 fn pprof_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some())
+}
+
+static RPROF_WAIT_NS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static RPROF_WAIT_N: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn rprof_wait_start() -> Option<std::time::Instant> {
+    pprof_enabled().then(std::time::Instant::now)
+}
+
+fn rprof_wait_add(site: usize, started: Option<std::time::Instant>) {
+    if let Some(started) = started {
+        RPROF_WAIT_NS[site].fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        RPROF_WAIT_N[site].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn volume_identity_enabled() -> bool {
@@ -18146,7 +18278,7 @@ fn rprof_record(
     if n % 64 == 0 {
         let ms = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / n as f64 / 1_000_000.0;
         log::warn!(
-            "[rprof] batches={} draws={} avg_ms prep={:.2} lock={:.2} fence={:.2} fence_wait={:.2} record={:.2} submit={:.2} total={:.2}",
+            "[rprof] batches={} draws={} avg_ms prep={:.2} lock={:.2} fence={:.2} fence_wait={:.2} record={:.2} submit={:.2} total={:.2} | waits_ms compute={:.3} pending={:.3} slot={:.3} waits={}/{}/{}",
             n,
             DRAWS.load(Ordering::Relaxed),
             ms(&PREP),
@@ -18155,7 +18287,13 @@ fn rprof_record(
             ms(&FENCE_WAIT),
             ms(&RECORD),
             ms(&SUBMIT),
-            ms(&TOTAL)
+            ms(&TOTAL),
+            ms(&RPROF_WAIT_NS[0]),
+            ms(&RPROF_WAIT_NS[1]),
+            ms(&RPROF_WAIT_NS[2]),
+            RPROF_WAIT_N[0].load(Ordering::Relaxed),
+            RPROF_WAIT_N[1].load(Ordering::Relaxed),
+            RPROF_WAIT_N[2].load(Ordering::Relaxed)
         );
     }
 }
@@ -19130,7 +19268,7 @@ fn active_color_keys_for_call(call: &crate::draw::Maxwell3dDrawCall) -> Vec<RtKe
     } else if call.color_rt_keys.is_empty() {
         vec![call.rt_key]
     } else {
-        call.color_rt_keys.clone()
+        call.color_rt_keys.to_vec()
     }
 }
 
@@ -19212,7 +19350,7 @@ fn draw_group_attachment_uses(
                 } else if call.color_rt_keys.is_empty() {
                     std::slice::from_ref(&call.rt_key)
                 } else {
-                    call.color_rt_keys.as_slice()
+                    &call.color_rt_keys[..]
                 };
                 let color_formats = &call.color_rt_formats[..call.color_rt_formats.len().min(8)];
                 for (index, &key) in color_keys.iter().enumerate() {
@@ -33148,7 +33286,7 @@ fn color_formats_for_call(
     let mut formats = if call.color_rt_formats.is_empty() {
         vec![call.rt_format]
     } else {
-        call.color_rt_formats.clone()
+        call.color_rt_formats.to_vec()
     };
     let count = attachment_count.min(8);
     if formats.len() < count {
@@ -35858,15 +35996,16 @@ mod tests {
         let keys = (0..9).map(|index| RtKey::new(10 + index, 64, 64, 0x10000 + u64::from(index) * 4096))
             .collect::<Vec<_>>();
         call.rt_key = keys[0];
-        call.color_rt_keys = vec![keys[0], keys[1]];
+        call.color_rt_keys = vec![keys[0], keys[1]].into();
         call.configured_color_rts = vec![crate::draw::ConfiguredColorRt {
             raw_slot: 0, key: keys[2], format: vk::Format::R8G8B8A8_UNORM,
-        }];
+        }]
+        .into();
         call.depth_key = Some(keys[3]);
         call.sampled_rt_key = Some(keys[4]);
-        call.sampled_rt_keys = vec![keys[5]];
-        call.sampled_rt_slots = vec![None, Some(keys[6])];
-        call.sampled_rt_copy_sources = vec![Some(keys[7])];
+        call.sampled_rt_keys = vec![keys[5]].into();
+        call.sampled_rt_slots = vec![None, Some(keys[6])].into();
+        call.sampled_rt_copy_sources = vec![Some(keys[7])].into();
         let clear = super::GraphicsClearOp {
             color: Some(super::GraphicsColorClear {
                 key: keys[8], format: vk::Format::R8G8B8A8_UNORM,
@@ -36709,7 +36848,7 @@ mod tests {
             fs_hash: 0x3b38_6fb5_5028_d8b4,
             vs_cbuf_mask: Default::default(),
             fs_cbuf_mask: Default::default(),
-            fs_tex_ids: vec![0, 1, 2],
+            fs_tex_ids: vec![0, 1, 2].into(),
             sprite_batch_mirror: Default::default(),
             texture_numeric_manifest: vec![
                 TextureNumericBinding::new(0, 0, nexium_spirv::TextureNumericType::Float)
@@ -36718,12 +36857,13 @@ mod tests {
                     .with_image_kind(GraphicsTextureImageKind::Cube),
                 TextureNumericBinding::new(2, 2, nexium_spirv::TextureNumericType::Float)
                     .with_image_kind(GraphicsTextureImageKind::D2),
-            ],
+            ]
+            .into(),
             texture_sampled_only_mask: Default::default(),
             texel_buffer_mask: Default::default(),
             vs_tex_base: Default::default(),
             vs_tex_count: Default::default(),
-            vertex_layout: crate::draw::VertexLayout { bindings: Vec::new(), attrs: Vec::new() },
+            vertex_layout: std::sync::Arc::new(crate::draw::VertexLayout { bindings: Vec::new(), attrs: Vec::new() }),
             cbuf_addr: Default::default(),
             cbuf_size: Default::default(),
             cbuf_data: Default::default(),
@@ -36776,7 +36916,7 @@ mod tests {
             clear_stencil_hint: Default::default(),
             sampled_rt_key: Default::default(),
             sampled_rt_keys: Default::default(),
-            sampled_rt_slots: vec![Some(RtKey::new(2, 64, 64, 0x10000)), None, None],
+            sampled_rt_slots: vec![Some(RtKey::new(2, 64, 64, 0x10000)), None, None].into(),
             sampled_rt_copy_sources: Default::default(),
             sampled_rt_fermi_exact_slots: Default::default(),
             sampled_rt_fermi_snapshot_slots: Default::default(),
@@ -36790,7 +36930,8 @@ mod tests {
             tic_pool_limit: 2,
             tsc_pool_gpu_va: Default::default(),
             tsc_pool_limit: Default::default(),
-            fs_sampler_ids: vec![0, 1, 2],
+            fs_sampler_ids: vec![0, 1, 2].into(),
+            template_serial: 0,
             fs_sampler_arrayed: true,
             vs_sampler_arrayed: Default::default(),
             depth_compare_2d_mask: Default::default(),
@@ -36881,9 +37022,11 @@ mod tests {
         assert_eq!(profile.pending_misses, 3);
         assert_eq!(profile.pending_requests, 6);
         let mut next_draw = call.clone();
-        next_draw.texture_numeric_manifest[1] = TextureNumericBinding::new(
+        let mut next_manifest = next_draw.texture_numeric_manifest.to_vec();
+        next_manifest[1] = TextureNumericBinding::new(
             1, 1, nexium_spirv::TextureNumericType::Float,
         ).with_image_kind(GraphicsTextureImageKind::D2Array);
+        next_draw.texture_numeric_manifest = next_manifest.into();
         let pendings = super::collect_tex_pendings_with_group_memo(
             &next_draw, &read, &mut memo, &mut profile, true,
         ).unwrap();
