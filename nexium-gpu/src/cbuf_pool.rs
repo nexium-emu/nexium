@@ -228,6 +228,7 @@ pub struct CbufPool {
     pub(crate) dir_slot_span: Vec<Option<(u64, u64)>>,
     slot_regions: Vec<Vec<u32>>,
     shared: Arc<CbufPoolShared>,
+    padded: bool,
 }
 
 unsafe impl Send for CbufPool {}
@@ -241,23 +242,30 @@ impl CbufPool {
         size: u64,
         rebar_bytes: u64,
         frame_slots: usize,
+        padded: bool,
     ) -> Option<Self> {
         let dir_size = CBUF_POOL_DIRECTORY_BYTES.min(size / 4);
-        if dir_size < CBUF_POOL_DIRECTORY_STRIDE || size <= dir_size {
+        let data_end = if padded { size.checked_sub(dir_size)? } else { size };
+        if dir_size < CBUF_POOL_DIRECTORY_STRIDE || data_end <= dir_size {
             return None;
         }
         Some(Self {
             buffer,
             memory,
             mapped,
-            size,
+            size: data_end,
             rebar_bytes,
             dir_head: 0,
             dir_size,
             dir_slot_span: vec![None; frame_slots.max(1)],
             slot_regions: vec![Vec::new(); frame_slots.max(1)],
-            shared: Arc::new(CbufPoolShared::new(mapped, size, dir_size)),
+            shared: Arc::new(CbufPoolShared::new(mapped, data_end, dir_size)),
+            padded,
         })
+    }
+
+    pub(crate) fn dynamic_window(&self) -> Option<u64> {
+        self.padded.then_some(self.size)
     }
 
     pub fn shared(&self) -> Arc<CbufPoolShared> {

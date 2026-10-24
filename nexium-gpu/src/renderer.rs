@@ -1178,9 +1178,12 @@ fn create_cbuf_pool(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     frame_slot_count: usize,
+    padded: bool,
 ) -> Result<crate::cbuf_pool::CbufPool, String> {
+    let directory_bytes = crate::cbuf_pool::CBUF_POOL_DIRECTORY_BYTES;
     let size = crate::cbuf_pool::cbuf_pool_bytes()
-        .saturating_add(crate::cbuf_pool::CBUF_POOL_DIRECTORY_BYTES);
+        .saturating_add(directory_bytes)
+        .saturating_add(if padded { directory_bytes } else { 0 });
     let (buffer, rebar_bytes) = create_stream_upload_buffer_sized(
         device,
         mem_props,
@@ -1195,6 +1198,7 @@ fn create_cbuf_pool(
         buffer.size,
         rebar_bytes,
         frame_slot_count,
+        padded,
     )
     .ok_or_else(|| "constant buffer pool too small for its directory ring".to_string())
 }
@@ -7525,7 +7529,12 @@ impl Renderer {
             None
         };
         let cbuf_pool = if crate::cbuf_pool::cbuf_pool_enabled() {
-            match create_cbuf_pool(&device, &mem_props, frame_slot_count) {
+            match create_cbuf_pool(
+                &device,
+                &mem_props,
+                frame_slot_count,
+                descriptor_layout.cbuf_dynamic,
+            ) {
                 Ok(pool) => Some(pool),
                 Err(error) => {
                     log::warn!(
@@ -12545,7 +12554,11 @@ impl Renderer {
             dst_binding: crate::descriptor::CBUF_BINDING,
             dst_array_element: 0,
             descriptor_count: 1,
-            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_type: if descriptor_layout.cbuf_dynamic {
+                vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+            } else {
+                vk::DescriptorType::STORAGE_BUFFER
+            },
             p_buffer_info: &ubo_info,
             p_image_info: std::ptr::null(),
             p_texel_buffer_view: std::ptr::null(),
@@ -12898,7 +12911,7 @@ impl Renderer {
                 pipeline_cache.layout,
                 0,
                 &[dset],
-                &[],
+                if descriptor_layout.cbuf_dynamic { &[0] } else { &[] },
             );
             for (binding, vbuf, voff) in &vertex_binds {
                 device.cmd_bind_vertex_buffers(cmd, *binding, &[*vbuf], &[*voff]);
@@ -14026,6 +14039,14 @@ impl Renderer {
         let mut storage_readback_staging_ranges = Vec::<(u64, usize, u64)>::new();
         let mut storage_readback_staging_mapped: *mut u8 = std::ptr::null_mut();
         let mut descriptor_writes = Vec::with_capacity(17 + crate::descriptor::MAX_SSBO as usize);
+        let dset_reuse_enabled = descriptor_set_reuse_enabled();
+        let mut dset_reuse = DescriptorSetReuseCache::default();
+        let mut dset_reuse_key = Vec::<u64>::with_capacity(64);
+        let cbuf_descriptor_type = if descriptor_layout.cbuf_dynamic {
+            vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+        } else {
+            vk::DescriptorType::STORAGE_BUFFER
+        };
         let mut sparse_sampled_image_infos =
             Vec::<vk::DescriptorImageInfo>::with_capacity(MAX_TEXTURE_DESCRIPTOR_COUNT);
         let mut sparse_texel_views =
@@ -16287,7 +16308,7 @@ impl Renderer {
                     None
                 };
 
-                let (ubo_info, cbuf_overlay_source) = if let Some(pool_draw) =
+                let (ubo_info, cbuf_overlay_source, cbuf_dynamic_offset) = if let Some(pool_draw) =
                     call.pool_cbuf.as_ref()
                 {
                     let pool = cbuf_pool.as_mut().ok_or_else(|| {
@@ -16305,14 +16326,31 @@ impl Renderer {
                     if !crate::cbuf_pool::write_pool_cbuf_directory(pool_draw, dir_offset, dir_dst) {
                         return Err("invalid pooled graphics cbuf layout".to_string());
                     }
-                    (
-                        vk::DescriptorBufferInfo {
-                            buffer: pool.buffer,
-                            offset: dir_offset,
-                            range: (pool.size - dir_offset).min(*max_storage_buffer_range),
-                        },
-                        None,
-                    )
+                    let dynamic_window = pool.dynamic_window().filter(|window| {
+                        descriptor_layout.cbuf_dynamic
+                            && *window <= *max_storage_buffer_range
+                            && dir_offset <= u64::from(u32::MAX)
+                    });
+                    match dynamic_window {
+                        Some(window) => (
+                            vk::DescriptorBufferInfo {
+                                buffer: pool.buffer,
+                                offset: 0,
+                                range: window,
+                            },
+                            None,
+                            dir_offset as u32,
+                        ),
+                        None => (
+                            vk::DescriptorBufferInfo {
+                                buffer: pool.buffer,
+                                offset: dir_offset,
+                                range: (pool.size - dir_offset).min(*max_storage_buffer_range),
+                            },
+                            None,
+                            0,
+                        ),
+                    }
                 } else {
                     let resident_cbuf = prep
                         .cbuf_data
@@ -16348,6 +16386,7 @@ impl Renderer {
                             range: cbuf_len as u64,
                         },
                         resident_cbuf.map(|draw| (draw, ubo_buffer, ubo_offset)),
+                        0u32,
                     )
                 };
 
@@ -16420,20 +16459,6 @@ impl Renderer {
                 }
 
                 let rp_ds0 = record_detail_profile.then(std::time::Instant::now);
-                let rp_ds_alloc_t0 = record_stage_profile.then(std::time::Instant::now);
-                let dset = match dset_pools.allocate_set(descriptor_layout.layout) {
-                    Ok(set) => set,
-                    Err(error) => {
-                        unsafe {
-                            let _ = device.end_command_buffer(cmd);
-                        }
-                        let _ = reset_command_buffer(device, cmd);
-                        return Err(error);
-                    }
-                };
-                if let Some(start) = rp_ds_alloc_t0 {
-                    rp_dset_stages.allocate += start.elapsed();
-                }
                 let sparse_texture_descriptors = descriptor_layout.texture_arrays_partially_bound
                     && sparse_texture_descriptors_enabled()
                     && sparse_texture_manifest_eligible(&call.texture_numeric_manifest);
@@ -16852,11 +16877,11 @@ impl Renderer {
                 let writes = &mut descriptor_writes;
                 writes.push(vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: dset,
+                    dst_set: vk::DescriptorSet::null(),
                     dst_binding: crate::descriptor::CBUF_BINDING,
                     dst_array_element: 0,
                     descriptor_count: 1,
-                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                    descriptor_type: cbuf_descriptor_type,
                     p_buffer_info: &ubo_info,
                     p_image_info: std::ptr::null(),
                     p_texel_buffer_view: std::ptr::null(),
@@ -16867,7 +16892,7 @@ impl Renderer {
                     if let Some((first, count)) = sparse_sampler_span {
                         writes.push(vk::WriteDescriptorSet {
                             s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                            dst_set: dset,
+                            dst_set: vk::DescriptorSet::null(),
                             dst_binding: crate::descriptor::SAMPLER_BINDING,
                             dst_array_element: first,
                             descriptor_count: count,
@@ -16882,7 +16907,7 @@ impl Renderer {
                 } else {
                     writes.push(vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                        dst_set: dset,
+                        dst_set: vk::DescriptorSet::null(),
                         dst_binding: crate::descriptor::SAMPLER_BINDING,
                         dst_array_element: 0,
                         descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
@@ -16897,7 +16922,7 @@ impl Renderer {
                 for (i, binding) in ssbo_bindings.iter().enumerate() {
                     writes.push(vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                        dst_set: dset,
+                        dst_set: vk::DescriptorSet::null(),
                         dst_binding: crate::descriptor::SSBO_BINDING_BASE + *binding,
                         dst_array_element: 0,
                         descriptor_count: 1,
@@ -16917,7 +16942,7 @@ impl Renderer {
                             graphics_texture_descriptor_target(*binding);
                         let mut write = vk::WriteDescriptorSet {
                             s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                            dst_set: dset,
+                            dst_set: vk::DescriptorSet::null(),
                             dst_binding: descriptor_binding,
                             dst_array_element: binding.descriptor_slot,
                             descriptor_count: 1,
@@ -16974,7 +16999,7 @@ impl Renderer {
                         }
                         writes.push(vk::WriteDescriptorSet {
                             s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                            dst_set: dset,
+                            dst_set: vk::DescriptorSet::null(),
                             dst_binding: binding,
                             dst_array_element: 0,
                             descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
@@ -17002,7 +17027,7 @@ impl Renderer {
                         }
                         writes.push(vk::WriteDescriptorSet {
                             s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                            dst_set: dset,
+                            dst_set: vk::DescriptorSet::null(),
                             dst_binding: binding,
                             dst_array_element: 0,
                             descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
@@ -17024,13 +17049,51 @@ impl Renderer {
                         .sum::<u64>();
                     rp_dset_stages.sparse_draws += sparse_texture_descriptors as u64;
                 }
-                let rp_ds_update_t0 = record_stage_profile.then(std::time::Instant::now);
-                unsafe {
-                    device.update_descriptor_sets(writes, &[]);
-                }
-                if let Some(start) = rp_ds_update_t0 {
-                    rp_dset_stages.update += start.elapsed();
-                }
+                let reuse_hash = (dset_reuse_enabled
+                    && descriptor_layout.cbuf_dynamic
+                    && sparse_texture_descriptors)
+                    .then(|| descriptor_set_content_key(writes, &mut dset_reuse_key))
+                    .flatten();
+                let reused_dset =
+                    reuse_hash.and_then(|hash| dset_reuse.find(hash, &dset_reuse_key));
+                let dset = match reused_dset {
+                    Some(set) => {
+                        if record_stage_profile {
+                            rp_dset_stages.reused += 1;
+                        }
+                        set
+                    }
+                    None => {
+                        let rp_ds_alloc_t0 = record_stage_profile.then(std::time::Instant::now);
+                        let set = match dset_pools.allocate_set(descriptor_layout.layout) {
+                            Ok(set) => set,
+                            Err(error) => {
+                                unsafe {
+                                    let _ = device.end_command_buffer(cmd);
+                                }
+                                let _ = reset_command_buffer(device, cmd);
+                                return Err(error);
+                            }
+                        };
+                        if let Some(start) = rp_ds_alloc_t0 {
+                            rp_dset_stages.allocate += start.elapsed();
+                        }
+                        for write in writes.iter_mut() {
+                            write.dst_set = set;
+                        }
+                        let rp_ds_update_t0 = record_stage_profile.then(std::time::Instant::now);
+                        unsafe {
+                            device.update_descriptor_sets(writes, &[]);
+                        }
+                        if let Some(start) = rp_ds_update_t0 {
+                            rp_dset_stages.update += start.elapsed();
+                        }
+                        if let Some(hash) = reuse_hash {
+                            dset_reuse.insert(hash, &dset_reuse_key, set);
+                        }
+                        set
+                    }
+                };
                 rp_dset += profile_elapsed(rp_ds0);
 
                 let need_depth = prep.use_depth;
@@ -17310,7 +17373,11 @@ impl Renderer {
                         pipeline_cache.layout,
                         0,
                         &[dset],
-                        &[],
+                        if descriptor_layout.cbuf_dynamic {
+                            std::slice::from_ref(&cbuf_dynamic_offset)
+                        } else {
+                            &[]
+                        },
                     );
                     for (binding, vbuf, voff) in &vertex_binds {
                         let needed =
@@ -17747,8 +17814,103 @@ impl Renderer {
 }
 
 #[derive(Default)]
+struct DescriptorSetReuseCache {
+    entries: Vec<(u64, Vec<u64>, vk::DescriptorSet)>,
+    cursor: usize,
+}
+
+const DESCRIPTOR_SET_REUSE_ENTRIES: usize = 32;
+
+impl DescriptorSetReuseCache {
+    fn find(&self, hash: u64, key: &[u64]) -> Option<vk::DescriptorSet> {
+        self.entries
+            .iter()
+            .find(|(entry_hash, entry_key, _)| *entry_hash == hash && entry_key.as_slice() == key)
+            .map(|(_, _, set)| *set)
+    }
+
+    fn insert(&mut self, hash: u64, key: &[u64], set: vk::DescriptorSet) {
+        if self.entries.len() < DESCRIPTOR_SET_REUSE_ENTRIES {
+            self.entries.push((hash, key.to_vec(), set));
+            return;
+        }
+        let slot = self.cursor % DESCRIPTOR_SET_REUSE_ENTRIES;
+        self.cursor = self.cursor.wrapping_add(1);
+        let entry = &mut self.entries[slot];
+        entry.0 = hash;
+        entry.1.clear();
+        entry.1.extend_from_slice(key);
+        entry.2 = set;
+    }
+}
+
+fn descriptor_set_reuse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_DSET_REUSE").map_or(true, |value| value != "0")
+    })
+}
+
+fn descriptor_set_content_key(
+    writes: &[vk::WriteDescriptorSet<'_>],
+    key: &mut Vec<u64>,
+) -> Option<u64> {
+    key.clear();
+    for write in writes {
+        let count = write.descriptor_count as usize;
+        key.push(
+            u64::from(write.dst_binding)
+                | (u64::from(write.dst_array_element) << 16)
+                | (u64::from(write.descriptor_count) << 32)
+                | (u64::from(write.descriptor_type.as_raw() as u32) << 48),
+        );
+        match write.descriptor_type {
+            vk::DescriptorType::STORAGE_BUFFER
+            | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+            | vk::DescriptorType::UNIFORM_BUFFER
+            | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
+                if write.p_buffer_info.is_null() {
+                    return None;
+                }
+                let infos = unsafe { std::slice::from_raw_parts(write.p_buffer_info, count) };
+                for info in infos {
+                    key.push(info.buffer.as_raw());
+                    key.push(info.offset);
+                    key.push(info.range);
+                }
+            }
+            vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::SAMPLER => {
+                if write.p_image_info.is_null() {
+                    return None;
+                }
+                let infos = unsafe { std::slice::from_raw_parts(write.p_image_info, count) };
+                for info in infos {
+                    key.push(info.sampler.as_raw());
+                    key.push(info.image_view.as_raw());
+                    key.push(u64::from(info.image_layout.as_raw() as u32));
+                }
+            }
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER => {
+                if write.p_texel_buffer_view.is_null() {
+                    return None;
+                }
+                let views = unsafe { std::slice::from_raw_parts(write.p_texel_buffer_view, count) };
+                key.extend(views.iter().map(|view| view.as_raw()));
+            }
+            _ => return None,
+        }
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &word in key.iter() {
+        hash = (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(hash)
+}
+
+#[derive(Default)]
 struct RecordDsetStageProfile {
     draws: u64,
+    reused: u64,
     allocate: std::time::Duration,
     typed_arrays: std::time::Duration,
     samplers: std::time::Duration,
@@ -18038,6 +18200,7 @@ fn record_stage_profile_record(
     window.dset_stages.write_count += dset_stages.write_count;
     window.dset_stages.descriptor_elements += dset_stages.descriptor_elements;
     window.dset_stages.sparse_draws += dset_stages.sparse_draws;
+    window.dset_stages.reused += dset_stages.reused;
     window.command_stages.draws += command_stages.draws;
     window.command_stages.pipeline_repeats += command_stages.pipeline_repeats;
     window.command_stages.viewport_repeats += command_stages.viewport_repeats;
@@ -18106,7 +18269,7 @@ fn record_stage_profile_record(
         )),
     );
     log::warn!(
-        "[record-stage] batches={} draws={} us/draw record={:.3} alias={:.3} tex={:.3} vtx={:.3} dset={:.3} other={:.3} | dset alloc={:.3} typed={:.3} sampler={:.3} ssbo={:.3} writes={:.3} update={:.3} other={:.3} | manifest_empty_pct={:.1} manifest_entries/draw={:.2} active_slots/draw={:.2} active_bindings/draw={:.2} resolved_tex/draw={:.2} input_ssbo/draw={:.2} ssbo_bindings/draw={:.2} writes/draw={:.2} descriptor_elements/draw={:.2} sparse_pct={:.1} | repeat_pct pipeline={:.1} viewport={:.1} scissor={:.1} stencil={:.1} stencil_cmds/draw={:.2} redundant_stencil_cmds/draw={:.2} pass_begins/draw={:.3} | texmemo_hit_pct tic={:.1} pending={:.1} tsc={:.1} binding={:.1} binding_lookups/draw={:.2} evictions={} | bind_repeat_pct vertex={:.1} index={:.1} | tex_repeat_pct={:.1}",
+        "[record-stage] batches={} draws={} us/draw record={:.3} alias={:.3} tex={:.3} vtx={:.3} dset={:.3} other={:.3} | dset alloc={:.3} typed={:.3} sampler={:.3} ssbo={:.3} writes={:.3} update={:.3} other={:.3} | manifest_empty_pct={:.1} manifest_entries/draw={:.2} active_slots/draw={:.2} active_bindings/draw={:.2} resolved_tex/draw={:.2} input_ssbo/draw={:.2} ssbo_bindings/draw={:.2} writes/draw={:.2} descriptor_elements/draw={:.2} sparse_pct={:.1} dset_reuse_pct={:.1} | repeat_pct pipeline={:.1} viewport={:.1} scissor={:.1} stencil={:.1} stencil_cmds/draw={:.2} redundant_stencil_cmds/draw={:.2} pass_begins/draw={:.3} | texmemo_hit_pct tic={:.1} pending={:.1} tsc={:.1} binding={:.1} binding_lookups/draw={:.2} evictions={} | bind_repeat_pct vertex={:.1} index={:.1} | tex_repeat_pct={:.1}",
         window.batches,
         window.draws,
         per_draw_us(window.record),
@@ -18132,6 +18295,7 @@ fn record_stage_profile_record(
         count_per_draw(window.dset_stages.write_count),
         count_per_draw(window.dset_stages.descriptor_elements),
         100.0 * count_per_draw(window.dset_stages.sparse_draws),
+        100.0 * count_per_draw(window.dset_stages.reused),
         100.0 * count_per_draw(window.command_stages.pipeline_repeats),
         100.0 * count_per_draw(window.command_stages.viewport_repeats),
         100.0 * count_per_draw(window.command_stages.scissor_repeats),

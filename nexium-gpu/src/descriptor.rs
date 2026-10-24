@@ -42,17 +42,29 @@ pub const TEXEL_BUFFER_BINDINGS: [u32; 3] = [
 pub struct DescriptorSetLayout {
     pub layout: vk::DescriptorSetLayout,
     pub texture_arrays_partially_bound: bool,
+    pub cbuf_dynamic: bool,
 }
 
 pub struct DescriptorPool {
     pub pool: vk::DescriptorPool,
 }
 
-fn graphics_layout_bindings() -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
+pub fn cbuf_dynamic_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_CBUF_DYNAMIC").map_or(true, |value| value != "0")
+    })
+}
+
+fn graphics_layout_bindings(cbuf_dynamic: bool) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
     let mut bindings = vec![
         vk::DescriptorSetLayoutBinding {
             binding: CBUF_BINDING,
-            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_type: if cbuf_dynamic {
+                vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+            } else {
+                vk::DescriptorType::STORAGE_BUFFER
+            },
             descriptor_count: 1,
             stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::GEOMETRY,
             p_immutable_samplers: std::ptr::null(),
@@ -133,7 +145,7 @@ fn graphics_layout_binding_flags(
         .collect()
 }
 
-fn graphics_pool_sizes(max_sets: u32) -> [vk::DescriptorPoolSize; 4] {
+fn graphics_pool_sizes(max_sets: u32) -> [vk::DescriptorPoolSize; 5] {
     [
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::SAMPLED_IMAGE,
@@ -150,6 +162,10 @@ fn graphics_pool_sizes(max_sets: u32) -> [vk::DescriptorPoolSize; 4] {
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
             descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS * 3),
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+            descriptor_count: max_sets,
         },
     ]
 }
@@ -191,7 +207,8 @@ fn graphics_write_specs() -> Vec<(u32, vk::DescriptorType, u32)> {
 
 impl DescriptorSetLayout {
     pub fn new(device: &ash::Device, texture_arrays_partially_bound: bool) -> Result<Self, String> {
-        let bindings = graphics_layout_bindings();
+        let cbuf_dynamic = cbuf_dynamic_enabled();
+        let bindings = graphics_layout_bindings(cbuf_dynamic);
         let binding_flags =
             graphics_layout_binding_flags(&bindings, texture_arrays_partially_bound);
         let binding_flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
@@ -224,6 +241,7 @@ impl DescriptorSetLayout {
         Ok(Self {
             layout,
             texture_arrays_partially_bound,
+            cbuf_dynamic,
         })
     }
 }
@@ -296,7 +314,16 @@ mod tests {
                 && !(*binding >= SSBO_BINDING_BASE && *binding < SSBO_BINDING_BASE + MAX_SSBO)
         }));
 
-        let layout = graphics_layout_bindings();
+        let dynamic_layout = graphics_layout_bindings(true);
+        assert_eq!(
+            dynamic_layout[CBUF_BINDING as usize].descriptor_type,
+            vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+        );
+        assert!(dynamic_layout
+            .iter()
+            .filter(|binding| binding.binding != CBUF_BINDING)
+            .all(|binding| binding.descriptor_type != vk::DescriptorType::STORAGE_BUFFER_DYNAMIC));
+        let layout = graphics_layout_bindings(false);
         assert_eq!(layout.len(), 25);
         assert_eq!(
             layout
@@ -326,7 +353,7 @@ mod tests {
         assert_eq!(cbuf.descriptor_count, 1);
 
         let pool = graphics_pool_sizes(7);
-        assert_eq!(pool.len(), 4);
+        assert_eq!(pool.len(), 5);
         let count = |ty| {
             pool.iter()
                 .find(|size| size.ty == ty)
@@ -339,6 +366,7 @@ mod tests {
         );
         assert_eq!(count(vk::DescriptorType::SAMPLER), Some(7 * 32));
         assert_eq!(count(vk::DescriptorType::STORAGE_BUFFER), Some(7 * 9));
+        assert_eq!(count(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC), Some(7));
         assert_eq!(count(vk::DescriptorType::UNIFORM_BUFFER), None);
 
         let writes = graphics_write_specs();
