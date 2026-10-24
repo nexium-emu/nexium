@@ -3862,6 +3862,17 @@ fn render_template_repeat_enabled() -> bool {
     })
 }
 
+fn render_template_repeat_ways() -> usize {
+    static WAYS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WAYS.get_or_init(|| {
+        std::env::var("NEXIUM_RENDER_TEMPLATE_REPEAT_WAYS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|ways| ways.clamp(1, 16))
+            .unwrap_or(8)
+    })
+}
+
 #[derive(Clone, Copy)]
 struct RtAlias {
     key: RtKey,
@@ -14040,6 +14051,7 @@ impl Renderer {
         let mut storage_readback_staging_mapped: *mut u8 = std::ptr::null_mut();
         let mut descriptor_writes = Vec::with_capacity(17 + crate::descriptor::MAX_SSBO as usize);
         let dset_reuse_enabled = descriptor_set_reuse_enabled();
+        let texture_repeat_ways = render_template_repeat_ways();
         let mut dset_reuse = DescriptorSetReuseCache::default();
         let mut dset_reuse_key = Vec::<u64>::with_capacity(64);
         let cbuf_descriptor_type = if descriptor_layout.cbuf_dynamic {
@@ -14216,7 +14228,9 @@ impl Renderer {
             let mut group_color_sync_clean = Vec::<(RtKey, vk::Format)>::new();
             let mut recorded_texture_memo_epoch = None;
             let mut dummy_view_memo = DummyViewMemo::default();
-            let mut texture_repeat: Option<TextureRepeatState> = None;
+            let mut texture_repeat: Vec<TextureRepeatState> =
+                Vec::with_capacity(texture_repeat_ways);
+            let mut texture_repeat_cursor = 0usize;
             for (draw_index, (call, prep)) in preps.iter().enumerate() {
                 let call = *call;
                 let storage_readback_key = std::ptr::from_ref(call) as usize;
@@ -14274,7 +14288,7 @@ impl Renderer {
                     &dummy_set.views_cube;
                 let dummy_views_cube_array: &[[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
                     &dummy_set.views_cube_array;
-                let texture_repeat_hit = texture_repeat.as_ref().filter(|state| {
+                let texture_repeat_hit = texture_repeat.iter().find(|state| {
                     call.template_serial != 0
                         && state.serial == call.template_serial
                         && call.storage_readback.is_none()
@@ -16167,7 +16181,7 @@ impl Renderer {
                         texture_repeat_eligible,
                     )
                 };
-                texture_repeat = (render_template_repeat_enabled()
+                let texture_repeat_state = (render_template_repeat_enabled()
                     && texture_repeat_eligible
                     && call.template_serial != 0
                     && call.storage_readback.is_none()
@@ -16184,6 +16198,25 @@ impl Renderer {
                     stencil_alias_bound,
                     bound_tex_layouts,
                 });
+                if graphics_storage_call_access(call).1
+                    || (texture_repeat_ways == 1 && texture_repeat_state.is_none())
+                {
+                    texture_repeat.clear();
+                }
+                if let Some(state) = texture_repeat_state {
+                    if let Some(existing) = texture_repeat
+                        .iter_mut()
+                        .find(|existing| existing.serial == state.serial)
+                    {
+                        *existing = state;
+                    } else if texture_repeat.len() < texture_repeat_ways {
+                        texture_repeat.push(state);
+                    } else {
+                        let slot = texture_repeat_cursor % texture_repeat_ways;
+                        texture_repeat_cursor = texture_repeat_cursor.wrapping_add(1);
+                        texture_repeat[slot] = state;
+                    }
+                }
                 let rp_vx0 = record_detail_profile.then(std::time::Instant::now);
                 let mut vertex_binds = upload_vertex_bindings(
                     device,
