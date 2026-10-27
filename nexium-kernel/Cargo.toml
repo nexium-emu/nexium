@@ -35,7 +35,7 @@ thiserror.workspace = true
 once_cell.workspace = true
 memmap2.workspace = true
 getrandom = "0.4"
-opusic-sys = "=0.7.5"
+opusic-sys = "=0.7.6"
 
 directories.workspace = true
 socket2 = "0.6"
