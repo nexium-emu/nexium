@@ -74,7 +74,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.14", default-features = false, features = ["allow-unsafe-code", "dl-libxcb", "shape"] }
 
-[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+[target.'cfg(all(any(windows, target_os = "linux"), target_arch = "x86_64"))'.dependencies]
 mimalloc = "0.1.52"
 
 [features]
