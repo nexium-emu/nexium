@@ -10,6 +10,14 @@ const LLE_PROFILE_SAMPLE_MASK: u64 = 63;
 const LLE_PROFILE_REPORT_MASK: u64 = 1_048_575;
 const LLE_PROFILE_HASH_LIMIT: usize = 128;
 const DEFAULT_LLE_STEP_BUDGET: u32 = 8192;
+const DRAW_ARRAYS_LLE_HASH: u64 = 0x0D61_FC9F_AAC9_FCAD;
+const DRAW_ARRAYS_LLE_CODE: [u32; 18] = [
+    0x0346_c215, 0x0000_0401, 0x0000_0301, 0x0014_d310,
+    0x00d7_4061, 0x0002_d807, 0x0143_8061, 0x0161_8021,
+    0x0000_0841, 0x00d7_8021, 0x0000_2041, 0x0161_4071,
+    0xffff_db11, 0x0000_4211, 0xfffe_5817, 0xd080_8912,
+    0x0143_80f1, 0x0000_0011,
+];
 const DRAW_INDEXED_LLE_HASH: u64 = 0x771B_B18C_6244_4DA0;
 const DRAW_INDEXED_MAX_EXTENDED_INSTANCES: u32 = 4096;
 const DRAW_INDEXED_LLE_CODE: [u32; 23] = [
@@ -79,7 +87,12 @@ fn macro_hash(code: &[u32]) -> u64 {
 }
 
 fn lle_step_budget(code: &[u32], hash: u64, params: &[u32], reg_reader: &dyn Fn(u32) -> u32) -> (u32, Option<u32>) {
-    if hash != DRAW_INDEXED_LLE_HASH || code != DRAW_INDEXED_LLE_CODE || params.len() != 6 {
+    let instanced_draw = match hash {
+        DRAW_INDEXED_LLE_HASH => code == DRAW_INDEXED_LLE_CODE && params.len() == 6,
+        DRAW_ARRAYS_LLE_HASH => code == DRAW_ARRAYS_LLE_CODE && params.len() == 5,
+        _ => false,
+    };
+    if !instanced_draw {
         return (DEFAULT_LLE_STEP_BUDGET, None);
     }
     let instances = reg_reader(REG_DRAW_INSTANCE_COUNT) & params[2];
@@ -1811,6 +1824,35 @@ mod tests {
             assert!(hle_macro(kind, &[3, 12, u32::MAX, 5, 7, 11], &|_| 129, Vec::new()).is_none());
         }
         assert!(hle_macro_kind(0x8a4d_173e_b99a_8603).is_none());
+    }
+
+    #[test]
+    fn draw_arrays_lle_budget_covers_large_instance_counts() {
+        assert_eq!(macro_hash(&DRAW_ARRAYS_LLE_CODE), DRAW_ARRAYS_LLE_HASH);
+        let reg_reader = |reg| if reg == REG_DRAW_INSTANCE_COUNT { u32::MAX } else { 0 };
+        for instances in [129, 1040, DRAW_INDEXED_MAX_EXTENDED_INSTANCES] {
+            let params = [5, 4, instances, 0, 0];
+            assert!(hle_macro(HleMacro::DrawArrays, &params, &reg_reader, Vec::new()).is_none());
+            let (budget, extended) =
+                lle_step_budget(&DRAW_ARRAYS_LLE_CODE, DRAW_ARRAYS_LLE_HASH, &params, &reg_reader);
+            assert_eq!(extended, (budget > DEFAULT_LLE_STEP_BUDGET).then_some(instances));
+            let mut legacy = Interpreter::new(&DRAW_ARRAYS_LLE_CODE, &params, &reg_reader)
+                .with_step_budget(budget);
+            legacy.run();
+            let decoded = decoded(&DRAW_ARRAYS_LLE_CODE);
+            let mut fast = FastInterpreter::new(&decoded, &params, &reg_reader, Vec::new())
+                .with_step_budget(budget);
+            fast.run();
+            assert_eq!(legacy.cap_writes, None, "instances={instances}");
+            assert_eq!(fast.cap_writes, None, "instances={instances}");
+            assert_eq!(fast.writes, legacy.writes);
+            assert_eq!(fast.writes.len(), 3 + instances as usize * 3);
+        }
+        let too_many = [5, 4, DRAW_INDEXED_MAX_EXTENDED_INSTANCES + 1, 0, 0];
+        assert_eq!(
+            lle_step_budget(&DRAW_ARRAYS_LLE_CODE, DRAW_ARRAYS_LLE_HASH, &too_many, &reg_reader),
+            (DEFAULT_LLE_STEP_BUDGET, None)
+        );
     }
 
     #[test]
