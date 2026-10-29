@@ -392,9 +392,9 @@ fn build(preferred_device: Option<&str>) -> Option<Engine> {
     let cfg = device
         .supported_output_configs()
         .ok()?
-        .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
-        .max_by_key(|c| c.max_sample_rate())
-        .map(|c| c.with_max_sample_rate())
+        .filter(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() >= 2)
+        .filter_map(|c| c.try_with_sample_rate(SR as u32))
+        .min_by_key(|c| c.channels())
         .or_else(|| device.default_output_config().ok())?;
     if cfg.sample_format() != cpal::SampleFormat::F32 {
         return None;
