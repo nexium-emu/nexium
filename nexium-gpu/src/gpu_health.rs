@@ -1,6 +1,5 @@
 use ash::vk;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
 
 const BUDGET_LOG_INTERVAL_NS: u64 = 60_000_000_000;
 const BUDGET_PRESSURE_LOG_INTERVAL_NS: u64 = 10_000_000_000;
@@ -14,7 +13,7 @@ struct GpuHealth {
     fault_info: Option<vk::PFN_vkGetDeviceFaultInfoEXT>,
 }
 
-static HEALTH: OnceLock<GpuHealth> = OnceLock::new();
+static HEALTH: parking_lot::RwLock<Option<GpuHealth>> = parking_lot::RwLock::new(None);
 static DEVICE_LOST_REPORTED: AtomicBool = AtomicBool::new(false);
 static LAST_BUDGET_LOG_NS: AtomicU64 = AtomicU64::new(0);
 static VRAM_HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -47,13 +46,20 @@ pub(crate) fn install(
         .max()
         .unwrap_or(0);
     VRAM_HEAP_BYTES.store(vram_bytes, Ordering::Relaxed);
-    let _ = HEALTH.set(GpuHealth {
+    *HEALTH.write() = Some(GpuHealth {
         instance: instance.clone(),
         physical_device,
         device: device.handle(),
         memory_budget,
         fault_info,
     });
+}
+
+pub(crate) fn uninstall(instance: vk::Instance) {
+    let mut health = HEALTH.write();
+    if health.as_ref().is_some_and(|health| health.instance.handle() == instance) {
+        *health = None;
+    }
 }
 
 pub(crate) fn vram_heap_bytes() -> u64 {
@@ -72,7 +78,8 @@ pub(crate) fn take_vram_pressure(now_ns: u64) -> bool {
         return false;
     }
     HEALTH
-        .get()
+        .read()
+        .as_ref()
         .and_then(query_budget)
         .is_some_and(|heaps| heaps.iter().any(HeapBudget::under_pressure))
 }
@@ -92,7 +99,8 @@ fn report_device_lost(context: &str) {
         return;
     }
     log::error!("[device-lost] first detected in {context}");
-    let Some(health) = HEALTH.get() else {
+    let health = HEALTH.read();
+    let Some(health) = health.as_ref() else {
         return;
     };
     if let Some(heaps) = query_budget(health) {
@@ -220,7 +228,8 @@ pub(crate) fn log_memory_budget_periodically(now_ns: u64) {
     if last != 0 && now_ns.saturating_sub(last) < BUDGET_PRESSURE_LOG_INTERVAL_NS {
         return;
     }
-    let Some(health) = HEALTH.get() else {
+    let health = HEALTH.read();
+    let Some(health) = health.as_ref() else {
         return;
     };
     let Some(heaps) = query_budget(health) else {
