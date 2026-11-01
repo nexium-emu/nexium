@@ -959,10 +959,13 @@ impl EmulationHandle {
                 stats_clone.lock().cpu_backend = None;
                 log::info!("Booting NRO: {}", cur_nro_path);
 
-                if let Some(stem) = Path::new(&cur_nro_path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                {
+                let loose_name = nexium_core::loader::LooseTitle::resolve(Path::new(&cur_nro_path))
+                    .map(|title| title.name());
+                if let Some(stem) = loose_name.as_deref().or_else(|| {
+                    Path::new(&cur_nro_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                }) {
                     nexium_common::title::set_title_key(stem);
                 }
 
@@ -991,8 +994,19 @@ impl EmulationHandle {
                     repaint.clone(),
                     Arc::clone(&stop_flag_clone),
                 )?;
-                let title_id = boot_ctx.kernel.lock().title_id;
+                let (title_id, switch2) = {
+                    let kernel = boot_ctx.kernel.lock();
+                    (kernel.title_id, kernel.nx2.is_some())
+                };
                 nexium_gpu::presentation::announce_title(title_id);
+                let reference = if switch2 {
+                    None
+                } else if nexium_core::hid_state::is_docked() {
+                    Some((1920, 1080))
+                } else {
+                    Some((1280, 720))
+                };
+                nexium_common::render_scale::begin_title(title_id, reference);
                 nexium_nvdrv::gpu::configure_fast_gpu_time(title_id == SWITCH_SPORTS_TITLE_ID);
                 nexium_nvdrv::gpu::configure_gpu_accuracy();
                 nexium_nvdrv::gpu::configure_retained_ssbos(
@@ -1469,6 +1483,27 @@ impl EmulationHandle {
                     Arc::clone(&vsync_stop),
                     Arc::clone(&vsync_wake),
                     vsync_handle,
+                );
+                let nx2_poll_handle = if boot_ctx.kernel.lock().nx2.is_some() {
+                    let kernel_p = Arc::clone(&boot_ctx.kernel);
+                    let stop_p = Arc::clone(&vsync_stop);
+                    thread::Builder::new()
+                        .name("nexium-nx2-poll".into())
+                        .spawn(move || {
+                            const PERIOD: std::time::Duration = std::time::Duration::from_micros(500);
+                            while !stop_p.load(Ordering::Relaxed) {
+                                thread::sleep(PERIOD);
+                                nexium_core::services::nx2::poll(&mut kernel_p.lock());
+                            }
+                        })
+                        .ok()
+                } else {
+                    None
+                };
+                let _nx2_poll_guard = VsyncGuard(
+                    Arc::clone(&vsync_stop),
+                    Arc::clone(&vsync_wake),
+                    nx2_poll_handle,
                 );
 
                 log::info!("Starting emulation loop");

@@ -2345,6 +2345,7 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
         0x7d => svc_create_resource_limit(kernel),
         0x7e => svc_set_resource_limit_limit_value(kernel),
         0x7f => svc_guest_probe(kernel),
+        0x80 if kernel.nx2.is_some() => crate::kernel::nx2::svc_set_gpu_memory_attribute(kernel),
         _ => {
             log::warn!("unknown SVC: {:#04x}", imm);
             if let Some(cpu) = cpu_mut() {
@@ -6799,6 +6800,18 @@ fn dispatch_service_v2(
         return response;
     }
 
+    if let Some(response) = crate::kernel::nx2::dispatch_ipc(kernel, ctx, session_handle, port_name, cmd_id) {
+        return response;
+    }
+
+    if let Some(response) = crate::services::chat::dispatch(kernel, ctx, session_handle, port_name, cmd_id) {
+        return response;
+    }
+
+    if let Some(response) = crate::services::ntc::dispatch(kernel, ctx, session_handle, port_name, cmd_id) {
+        return response;
+    }
+
     if let Some(sub_service) = crate::services::am::proxy_subsession(port_name, cmd_id) {
         log::debug!(
             "{} cmd={} â†’ returning {} sub-session",
@@ -6865,6 +6878,17 @@ fn dispatch_service_v2(
             log::info!("sfdnsres cmd {} lookup of '{}' reported as host not found", cmd_id, host);
             return build_ipc_response(ctx, 0, &data, &[]);
         }
+    }
+
+    if matches!(port_name, "nsd:a" | "nsd:u") && cmd_id == 11 {
+        if let Some(buffer) = first_ipc_buffer(&ctx.recv_buffers, &ctx.recv_statics) {
+            let mut identifier = vec![0u8; (buffer.size as usize).min(8)];
+            let retail = b"lp1";
+            let len = retail.len().min(identifier.len());
+            identifier[..len].copy_from_slice(&retail[..len]);
+            let _ = kernel.address_space.write(buffer.addr, &identifier);
+        }
+        return build_ipc_response(ctx, 0, &[], &[]);
     }
 
     if matches!(port_name, "nsd:a" | "nsd:u") && matches!(cmd_id, 20 | 21) {
@@ -13143,7 +13167,7 @@ fn gate_gpu_drain(kernel: &mut Kernel, req: &nexium_nvdrv::IoctlRequest) -> Drai
     DrainGate::Retry
 }
 
-fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name: &str) -> Vec<u8> {
+pub(crate) fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name: &str) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
     log::trace!("nvdrv:{}.cmd_{}", port_name, cmd_id);
 
@@ -13302,6 +13326,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                     if let Some(buf) = nvdrv_buffer(&ctx.recv_buffers, &ctx.recv_statics, 1) {
                         let inline = match ioctl_cmd {
                             0x4705 if outcome.data.len() > 16 => &outcome.data[16..],
+                            0x471F if outcome.data.len() > 16 => &outcome.data[16..],
                             0x4706 if outcome.data.len() >= 20 => &outcome.data[16..20],
                             0x4713 if outcome.data.len() > 8 => &outcome.data[8..],
                             _ => &[],
@@ -15006,9 +15031,9 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
                 }
                 return KERNEL_INVALID_HANDLE;
             }
-            0xF
+            kernel.nx2.map_or(0xF, |nx2| nx2.core_mask)
         }
-        1 => 0x0001_0000_0000,
+        1 => kernel.nx2.map_or(0x0001_0000_0000, |nx2| nx2.priority_mask),
         2 => kernel.alias_base,
         3 => kernel.alias_size,
         4 => kernel.heap_base,
@@ -15071,6 +15096,8 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
 
         28 => 0x1000,
 
+        29..=33 if kernel.nx2.is_some() => crate::kernel::nx2::info(kernel, info_type).unwrap_or(0),
+
         29 => kernel.cycle_count,
 
         30 => 1,
@@ -15118,7 +15145,7 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
 
 #[cfg(all(test, feature = "backend-rustarmic"))]
 mod process_info_tests {
-    use super::{svc_get_info, HandleType, Kernel, KERNEL_INVALID_HANDLE, SUCCESS};
+    use super::{svc_get_info, HandleType, Kernel, KERNEL_INVALID_ENUM_VALUE, KERNEL_INVALID_HANDLE, SUCCESS};
     use crate::kernel::cpu_local::set_current_cpu;
     use nexium_cpu::Cpu;
     use nexium_memory::AddressSpace;
@@ -15176,6 +15203,42 @@ mod process_info_tests {
         cpu.set_register(3, 0);
         assert_eq!(svc_get_info(&mut kernel), SUCCESS);
         assert_eq!(cpu.get_register(1), 0x0100_FF50_0E34_A000);
+    }
+
+    #[test]
+    fn switch2_info_reports_npdm_cores_and_its_extra_kinds() {
+        let mut kernel = Kernel::new(
+            Arc::new(AddressSpace::new()),
+            0x8000000, 0x1000, 0x20000000, 0x200000,
+            0x30000000, 0x1000, 0x40000000, 0x40001000,
+        );
+        kernel.alias_base = 0x1_0800_0000;
+        kernel.alias_size = 0x10_0000_0000;
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        let _guard = set_current_cpu(&mut cpu, 0);
+        let mut get = |kernel: &mut Kernel, kind: u64| {
+            cpu.set_register(1, kind);
+            cpu.set_register(2, 0xffff8001);
+            cpu.set_register(3, 0);
+            (svc_get_info(kernel), cpu.get_register(1))
+        };
+        assert_eq!(get(&mut kernel, 0), (SUCCESS, 0xF));
+        assert_eq!(get(&mut kernel, 33).0, KERNEL_INVALID_ENUM_VALUE);
+        kernel.nx2 = Some(crate::kernel::nx2::Nx2Process {
+            core_mask: 0x3F,
+            priority_mask: 0x0FFF_FFFF_F000_0000,
+        });
+        for (kind, expected) in [
+            (0, 0x3F),
+            (1, 0x0FFF_FFFF_F000_0000),
+            (29, 0x9_0800_0000),
+            (30, 0x8_0000_0000),
+            (31, 0),
+            (32, 0),
+            (33, 0x1000),
+        ] {
+            assert_eq!(get(&mut kernel, kind), (SUCCESS, expected), "GetInfo({kind})");
+        }
     }
 
     #[test]
@@ -15606,7 +15669,7 @@ fn resolve_thread_pseudo_handle(kernel: &Kernel, handle: u32) -> u32 {
 }
 
 fn svc_create_thread(kernel: &mut Kernel) -> u32 {
-    let (entry, arg, sp, priority, core) = if let Some(cpu) = cpu_ref() {
+    let (entry, arg, sp, priority, requested_core) = if let Some(cpu) = cpu_ref() {
         (
             cpu.get_register(1),
             cpu.get_register(2),
@@ -15616,6 +15679,11 @@ fn svc_create_thread(kernel: &mut Kernel) -> u32 {
         )
     } else {
         return 1;
+    };
+    let core = if kernel.nx2.is_some() {
+        crate::kernel::nx2::fold_core_id(requested_core)
+    } else {
+        requested_core
     };
 
     let ideal_core =
@@ -15660,12 +15728,21 @@ fn svc_create_thread(kernel: &mut Kernel) -> u32 {
     ctx.pc = entry;
     ctx.tpidrro_el0 = tls_va;
 
+    let guest_cores = kernel.nx2.map(|_| {
+        let guest_ideal = if requested_core == crate::kernel::threads::IDEAL_CORE_USE_PROCESS_VALUE {
+            kernel.process_ideal_core
+        } else {
+            requested_core
+        };
+        (guest_ideal, 1u64 << guest_ideal)
+    });
     kernel.threads.add_thread(handle, ctx, tls_va, sp, arg);
     if let Some(t) = kernel.threads.threads.get_mut(&handle) {
         t.priority = priority;
         t.ideal_core = ideal_core;
         t.affinity_mask = 1u64 << ideal_core;
         t.core = ideal_core.min(active_core_count() - 1);
+        t.guest_cores = guest_cores;
     }
 
     log::debug!(
@@ -15861,7 +15938,7 @@ fn svc_get_thread_core_mask(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_set_thread_core_mask(kernel: &mut Kernel) -> u32 {
-    let (handle, core_id, affinity_mask) = if let Some(cpu) = cpu_ref() {
+    let (handle, requested_core, requested_mask) = if let Some(cpu) = cpu_ref() {
         (
             cpu.get_register(0) as u32,
             cpu.get_register(1) as u32 as i32,
@@ -15869,6 +15946,14 @@ fn svc_set_thread_core_mask(kernel: &mut Kernel) -> u32 {
         )
     } else {
         return 1;
+    };
+    let (core_id, affinity_mask) = if kernel.nx2.is_some() {
+        (
+            crate::kernel::nx2::fold_core_id(requested_core),
+            crate::kernel::nx2::fold_core_mask(requested_mask),
+        )
+    } else {
+        (requested_core, requested_mask)
     };
     let target = resolve_thread_pseudo_handle(kernel, handle);
     let mut result = kernel.threads.set_thread_core_mask(
@@ -15878,6 +15963,18 @@ fn svc_set_thread_core_mask(kernel: &mut Kernel) -> u32 {
         kernel.process_ideal_core,
         active_core_count(),
     );
+    if result.is_ok() && kernel.nx2.is_some() {
+        let process_ideal_core = kernel.process_ideal_core;
+        if let Some(t) = kernel.threads.threads.get_mut(&target) {
+            let current = t.guest_cores.unwrap_or((t.ideal_core, t.affinity_mask));
+            t.guest_cores = Some(crate::kernel::nx2::guest_core_mask(
+                current,
+                requested_core,
+                requested_mask,
+                process_ideal_core,
+            ));
+        }
+    }
     if result == Err(KERNEL_INVALID_HANDLE) {
         if let Some(t) = kernel.exited_thread_handles.get(&target) {
             result = if core_id == crate::kernel::threads::IDEAL_CORE_NO_UPDATE
@@ -15907,9 +16004,16 @@ fn svc_set_thread_core_mask(kernel: &mut Kernel) -> u32 {
     code
 }
 
-fn svc_get_current_processor_number(_kernel: &mut Kernel) -> u32 {
+fn svc_get_current_processor_number(kernel: &mut Kernel) -> u32 {
+    let physical = crate::kernel::cpu_local::current_core() as i32;
+    let core = kernel
+        .threads
+        .current_handle()
+        .and_then(|handle| kernel.threads.threads.get(&handle))
+        .and_then(|thread| thread.guest_cores)
+        .map_or(physical, |(_, mask)| crate::kernel::nx2::guest_current_core(mask, physical));
     if let Some(cpu) = cpu_mut() {
-        cpu.set_register(0, crate::kernel::cpu_local::current_core() as u64);
+        cpu.set_register(0, core as u64);
     }
     0
 }

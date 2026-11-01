@@ -183,6 +183,11 @@ fn apply_nce_patch(
 
 impl BootContext {
     pub fn new(config: BootConfig) -> Result<Self, String> {
+        if let Some(title) = nexium_loader::LooseTitle::resolve(std::path::Path::new(&config.nro_path)) {
+            let mut app = Application::load_loose(&title)?;
+            add_installed_firmware(&mut app.system_romfs);
+            return Self::new_application(config, app);
+        }
         let file = std::fs::File::open(&config.nro_path)
             .map_err(|error| format!("open {}: {error}", config.nro_path))?;
         let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }
@@ -422,6 +427,10 @@ impl BootContext {
         let a32 = !app.npdm.is_64bit;
         let bits: u32 = match app.npdm.address_space {
             nexium_loader::npdm::AddressSpaceType::Is39Bit => 39,
+            nexium_loader::npdm::AddressSpaceType::Is42Bit => {
+                log::warn!("42-bit address space requested; using the 39-bit layout");
+                39
+            }
             nexium_loader::npdm::AddressSpaceType::Is36Bit => 36,
             nexium_loader::npdm::AddressSpaceType::Is32Bit
             | nexium_loader::npdm::AddressSpaceType::Is32BitNoMap => 32,
@@ -471,7 +480,11 @@ impl BootContext {
                 } else {
                     0x1_8000_0000
                 };
-                let heap_size: u64 = 0xCC00_0000;
+                let heap_size: u64 = if app.npdm.is_switch2() {
+                    crate::kernel::nx2::HEAP_REGION_SIZE
+                } else {
+                    0xCC00_0000
+                };
                 let stack_region_size: u64 = 0x8000_0000;
                 let code_base: u64 = direct_base + 0x800_0000;
                 let code_span: u64 = 0x1_0000_0000;
@@ -656,6 +669,18 @@ impl BootContext {
             nexium_cpu::GuestIsa::AArch64
         };
         kernel.total_memory = 0xCD50_0000;
+        kernel.nx2 = crate::kernel::nx2::Nx2Process::from_npdm(&app.npdm);
+        if let Some(nx2) = kernel.nx2 {
+            kernel.total_memory = crate::kernel::nx2::APPLICATION_POOL_SIZE;
+            kernel.nvdrv.enable_switch2();
+            log::info!(
+                "[nx2] Switch 2 application: core_mask={:#x} priority_mask={:#x} total_memory={:#x} (cores past {} fold onto the low cores)",
+                nx2.core_mask,
+                nx2.priority_mask,
+                kernel.total_memory,
+                crate::kernel::threads::NUM_CORES
+            );
+        }
         kernel.system_resource_size = app.npdm.system_resource_size as u64;
         log::info!(
             "npdm system_resource_size={:#x} (VAMM {})",

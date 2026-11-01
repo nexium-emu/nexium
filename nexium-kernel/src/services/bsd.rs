@@ -493,7 +493,7 @@ impl BsdService {
             25 => self.recv_command(memory, ctx, false),
             26 => self.close_command(ctx),
             27 => self.duplicate_command(ctx),
-            31 => self.event_fd_command(ctx),
+            31 | 36 => self.event_fd_command(ctx),
             _ => {
                 log::warn!("bsd:u cmd_{} unsupported", cmd_id);
                 done(-1, EINVAL)

@@ -16,6 +16,7 @@ pub mod bcat;
 pub mod binder_driver;
 pub mod bsd;
 pub mod btm;
+pub mod chat;
 pub mod caps;
 pub mod clkrst_manager;
 pub mod clkrst_session;
@@ -69,7 +70,9 @@ pub mod nextendo_token {
 pub mod nifm;
 pub mod nim;
 pub mod ns;
+pub mod ntc;
 pub mod nvnflinger;
+pub mod nx2;
 pub mod olsc;
 pub mod omm;
 pub mod pcielm;
@@ -250,7 +253,7 @@ impl Services {
             "ns:am2" | "ns:am" | "ns" => self.ns.dispatch(cmd_id),
             "acc:u0" | "acc:u1" | "acc:aa" => self.acc.dispatch(cmd_id),
             "pctl:a" | "pctl:r" | "pctl:s" => self.pctl.dispatch(cmd_id),
-            "ssl" => self.ssl.dispatch(cmd_id),
+            "ssl" | "ssl:s" => self.ssl.dispatch(cmd_id),
             "spl:" => self.spl.dispatch(cmd_id),
             "pl:u" | "pl:s" => self.pl.dispatch(cmd_id),
             "psc:m" => self.psc.dispatch(cmd_id),

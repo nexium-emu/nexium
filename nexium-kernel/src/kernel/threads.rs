@@ -143,6 +143,7 @@ pub struct Thread {
     pub core: i32,
     pub ideal_core: i32,
     pub affinity_mask: u64,
+    pub guest_cores: Option<(i32, u64)>,
     pub wait_cancelled: bool,
     user_preemption_pending: bool,
     /// True while the handle sits in `Threads::ready`. Maintained by every
@@ -304,6 +305,7 @@ impl Threads {
                 core: 0,
                 ideal_core: 0,
                 affinity_mask: 1,
+                guest_cores: None,
                 wait_cancelled: false,
                 user_preemption_pending: false,
                 in_ready: false,
@@ -400,6 +402,7 @@ impl Threads {
                 core: -2,
                 ideal_core: IDEAL_CORE_USE_PROCESS_VALUE,
                 affinity_mask: 0,
+                guest_cores: None,
                 wait_cancelled: false,
                 user_preemption_pending: false,
                 in_ready: false,
@@ -877,7 +880,7 @@ impl Threads {
     pub fn thread_core_mask(&self, handle: u32) -> Option<(i32, u64)> {
         self.threads
             .get(&handle)
-            .map(|t| (t.ideal_core, t.affinity_mask))
+            .map(|t| t.guest_cores.unwrap_or((t.ideal_core, t.affinity_mask)))
     }
 
     pub fn set_thread_core_mask(

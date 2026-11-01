@@ -2,6 +2,7 @@ pub mod cpu_context;
 pub mod cpu_local;
 pub mod handles;
 pub mod hid;
+pub mod nx2;
 pub mod profile;
 pub mod session;
 pub mod stall_watch;
@@ -122,6 +123,8 @@ pub struct Kernel {
     pub process_handle: u32,
     pub main_thread_handle: u32,
     pub process_ideal_core: i32,
+    pub nx2: Option<nx2::Nx2Process>,
+    pub nx2_graphics: crate::services::nx2::Graphics,
 
     pub applet_messages: VecDeque<u32>,
     pub applet_message_event: Option<u32>,
@@ -345,19 +348,34 @@ impl Kernel {
         let mut nvdrv = Nvdrv::new();
         let gpu_address_space = Arc::clone(&address_space);
         nvdrv.set_guest_memory_writer(move |addr, bytes| {
+            gpu_write_stats(addr, bytes.len(), false);
             gpu_address_space.write(addr, bytes).is_ok()
         });
         let gpu_reader_space = Arc::clone(&address_space);
         nvdrv.set_guest_memory_reader(move |addr, buf| {
+            if buf.len() >= 256 << 20 && std::env::var_os("NEXIUM_GPU_WRITE_STATS").is_some() {
+                log::warn!("[gpu-read-huge] sync addr={addr:#x} len={:#x}\n{}", buf.len(), std::backtrace::Backtrace::force_capture());
+            }
             gpu_reader_space.read(addr, buf).is_ok()
         });
         let gpu_read_space = Arc::clone(&address_space);
         let gpu_write_space = Arc::clone(&address_space);
         let gpu_copy_space = Arc::clone(&address_space);
         nvdrv.set_gpu_async_memory(
-            Arc::new(move |addr, buf| gpu_read_space.read(addr, buf).is_ok()),
-            Arc::new(move |addr, buf| gpu_write_space.write(addr, buf).is_ok()),
-            Arc::new(move |src, dst, len| gpu_copy_space.copy(src, dst, len).is_ok()),
+            Arc::new(move |addr, buf| {
+                if buf.len() >= 256 << 20 && std::env::var_os("NEXIUM_GPU_WRITE_STATS").is_some() {
+                    log::warn!("[gpu-read-huge] addr={addr:#x} len={:#x}\n{}", buf.len(), std::backtrace::Backtrace::force_capture());
+                }
+                gpu_read_space.read(addr, buf).is_ok()
+            }),
+            Arc::new(move |addr, buf| {
+                gpu_write_stats(addr, buf.len(), false);
+                gpu_write_space.write(addr, buf).is_ok()
+            }),
+            Arc::new(move |src, dst, len| {
+                gpu_write_stats(dst, len, true);
+                gpu_copy_space.copy(src, dst, len).is_ok()
+            }),
         );
 
         let docked = crate::hid_state::is_docked();
@@ -408,6 +426,8 @@ impl Kernel {
             process_handle,
             main_thread_handle,
             process_ideal_core: 0,
+            nx2: None,
+            nx2_graphics: Default::default(),
             applet_messages: VecDeque::new(),
             applet_message_event: None,
             vsync_handles: HashSet::new(),
@@ -502,7 +522,7 @@ impl Kernel {
             .map(|_| u32::from_le_bytes(bytes))
     }
 
-    fn debug_read_u64(&self, addr: u64) -> Option<u64> {
+    pub(crate) fn debug_read_u64(&self, addr: u64) -> Option<u64> {
         let mut bytes = [0u8; 8];
         self.address_space
             .read(addr, &mut bytes)
@@ -2910,5 +2930,29 @@ mod guest_mutex_sim_tests {
             sim.kernel.threads.threads[&me].state,
             threads::ThreadState::WaitingMutex { owner_handle, tag, .. } if owner_handle == other && tag == me
         ));
+    }
+}
+
+fn gpu_write_stats(addr: u64, len: usize, copy: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_GPU_WRITE_STATS").is_some()) {
+        return;
+    }
+    static BUCKETS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let private = addr >= 0x80_0000_0000;
+    let size = if len >= 1 << 20 { 2 } else if len >= 4096 { 1 } else { 0 };
+    let index = usize::from(private) * 3 + size;
+    BUCKETS[index].fetch_add(len as u64, Ordering::Relaxed);
+    if copy && private && len >= 1 << 20 {
+        log::warn!("[gpu-write] big copy into private {addr:#x} len={len:#x}");
+    }
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    if now >= LAST.load(Ordering::Relaxed) + 5 {
+        LAST.store(now, Ordering::Relaxed);
+        let mb = |i: usize| BUCKETS[i].load(Ordering::Relaxed) >> 20;
+        log::warn!("[gpu-write] t={now}s shared small/page/big MiB={}/{}/{} private small/page/big MiB={}/{}/{}", mb(0), mb(1), mb(2), mb(3), mb(4), mb(5));
     }
 }

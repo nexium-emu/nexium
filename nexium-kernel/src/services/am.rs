@@ -237,7 +237,7 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         }
         ("IGeneralService", 2) => Some("IScanRequest"),
         ("IGeneralService", 4) => Some("IRequest"),
-        ("ssl", 0) => Some("ISslContext"),
+        ("ssl" | "ssl:s", 0) => Some("ISslContext"),
         ("ISslContext" | "ISslContextForSystem", 2 | 100) => Some("ISslConnection"),
         ("lm", 0) => Some("ILogService"),
         _ => None,
@@ -1111,7 +1111,7 @@ fn manager_for_application(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         0 => ok(vec![0u8]),
         1 => ok(0x0102_0304_0506_0708u64.to_le_bytes().to_vec()),
-        3 => ok(0u64.to_le_bytes().to_vec()),
+        3 | 4 => ok(0u64.to_le_bytes().to_vec()),
         160 => ok_empty(),
         _ => {
             log::warn!(
