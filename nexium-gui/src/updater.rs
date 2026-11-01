@@ -359,7 +359,7 @@ fn fetch_latest() -> Result<Release, String> {
             "Accept: application/vnd.github+json",
             "-H",
             "User-Agent: nexium-updater",
-            "https://api.github.com/repos/nexium-emu/nexium-nightly/releases?per_page=10",
+            "https://api.github.com/repos/nexium-emu/nexium-2-nightly/releases?per_page=10",
         ])
         .output()
         .map_err(|e| e.to_string())?;

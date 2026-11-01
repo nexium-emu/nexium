@@ -4,7 +4,7 @@
 
 # NeXium
 
-A Nintendo Switch emulator written in Rust.
+A Nintendo Switch 1 & 2 emulator written in Rust.
 
 [nexium-emu.org](https://nexium-emu.org)
 
@@ -15,7 +15,7 @@ A Nintendo Switch emulator written in Rust.
 
 </div>
 
-NeXium runs Switch homebrew (and some commercial software) on a custom AArch64-to-x86-64 recompiler and a Maxwell-to-Vulkan graphics layer. It's early. Plenty of things don't work yet, and the ones that do tend to break in new and interesting ways.
+NeXium runs Switch homebrew and some commercial software, and loads decrypted Nintendo Switch 2 titles, on a custom AArch64-to-x86-64 recompiler and a Maxwell-to-Vulkan graphics layer. It's early. Plenty of things don't work yet, and the ones that do tend to break in new and interesting ways.
 
 Website: https://nexium-emu.org
 
@@ -23,7 +23,7 @@ Discord: https://discord.gg/HmhB4BBrv9
 
 ## Legal
 
-NeXium ships no Nintendo code, firmware, or keys, and it never will. Bring your own dumps from hardware you own. It's for homebrew and for software you're allowed to run.
+NeXium ships no Nintendo code, firmware, or keys, and it never will. Bring your own dumps from hardware you own, Switch or Switch 2. NeXium only reads already-decrypted content and has no decryption code. It's for homebrew and for software you're allowed to run.
 
 Official release archives bundle the FFmpeg command-line program under the GNU LGPL v2.1 or later. FFmpeg remains separately licensed from NeXium. Its exact unmodified source, upstream signature, license, and build configuration are included under `licenses/FFmpeg` in each archive. See `THIRD_PARTY_NOTICES.txt` for details.
 
@@ -31,12 +31,15 @@ Official release archives bundle the FFmpeg command-line program under the GNU L
 
 Work in progress and rough. Homebrew is the main focus right now; commercial titles are hit and miss. Expect crashes.
 
+Switch 2 support is brand new. Decrypted NS2 titles are supported as loose ExeFS + RomFS folders and boot through system and file system initialization, but the Switch 2 graphics stack (NVN2 on Ampere) isn't emulated yet, so they don't render anything so far.
+
 ## What's here
 
 - Two CPU JITs you can switch between at runtime: Rustarmic (Rust, written for this project) and Dynarmic (C++, through bindings).
 - Maxwell GPU emulation on wgpu/Vulkan, with a SPIR-V shader path.
 - A Horizon OS kernel: syscalls, IPC, and enough services to get things booting.
 - `.nro` homebrew loading.
+- Decrypted Nintendo Switch 2 titles as a loose title folder with `exefs/` (`main`, `main.npdm`, `rtld`, `sdk`, `subsdk*`) and `romfs/`. Open the title folder or its `exefs/main`, or add the folder to the library, where it shows up as "Switch 2 (loose ExeFS + RomFS)". The Switch 2 NPDM layout, six-core thread masks, the new kernel info kinds, and the first Switch 2 applet services are handled.
 - Firmware installation from your own decrypted dumps: opening a `.dxci` whose update partition carries firmware offers to install it, and dropping a `.dxci` or an NXDecrypt firmware `.dnsp` on the window installs it on its own. Settings → Emulation shows the installed version and has Install Firmware / Remove Firmware. Installed firmware supplies system archives (fonts and other system data) to games that don't bundle them.
 - Audio through cpal, controllers through SDL3, and a 60 Hz frame pacer.
 - A desktop UI (egui) for picking titles and settings.
@@ -70,7 +73,7 @@ Video playback in source builds uses `ffmpeg` from beside the NeXium executable 
 | nexium-nvdrv | nvdrv and GPU submission |
 | nexium-gpu | Maxwell command stream to Vulkan |
 | nexium-shader, nexium-spirv | Maxwell shaders to SPIR-V |
-| nexium-loader | NRO/NSO loading |
+| nexium-loader | NRO/NSO loading, containers, and loose Switch 2 ExeFS/RomFS folders |
 | nexium-core | Boot |
 | nexium-gui | Front end: UI, audio, input |
 | nexium-common | Shared utilities |

@@ -9,13 +9,18 @@
       <stop offset="50%" stop-color="#3dbeff"/>
       <stop offset="100%" stop-color="#0d6fbb"/>
     </linearGradient>
-    <radialGradient id="core" cx="50%" cy="40%" r="60%">
-      <stop offset="0%" stop-color="#ffffff"/>
-      <stop offset="45%" stop-color="#5cf2ff"/>
-      <stop offset="100%" stop-color="#0d6fbb"/>
+    <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#5cf2ff" stop-opacity="0.45"/>
+      <stop offset="60%" stop-color="#3dbeff" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#3dbeff" stop-opacity="0"/>
     </radialGradient>
-    <filter id="core-glow" x="-100%" y="-100%" width="300%" height="300%">
-      <feGaussianBlur stdDeviation="6" result="blur"/>
+    <linearGradient id="digit" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="55%" stop-color="#b8f8ff"/>
+      <stop offset="100%" stop-color="#5cf2ff"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
       <feMerge>
         <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
@@ -25,10 +30,13 @@
 
   <rect width="256" height="256" rx="56" fill="url(#bg)"/>
 
-  <g transform="translate(128 128)" fill="none" stroke="url(#ring)" stroke-width="5" stroke-linecap="round">
-    <ellipse rx="100" ry="32" transform="rotate(30)"/>
-    <ellipse rx="100" ry="32" transform="rotate(-30)"/>
+  <g transform="translate(128 128)" fill="none" stroke="url(#ring)" stroke-width="5" stroke-linecap="round" filter="url(#glow)">
+    <ellipse rx="104" ry="44" transform="rotate(45)"/>
+    <ellipse rx="104" ry="44" transform="rotate(-45)"/>
   </g>
 
-  <circle cx="128" cy="128" r="16" fill="url(#core)" filter="url(#core-glow)"/>
+  <circle cx="128" cy="128" r="40" fill="url(#halo)"/>
+
+  <path d="M 111.7 118.4 C 112.4 109.3 119.2 104 128 104 C 137.5 104 144.3 110.7 144.3 119.4 C 144.3 128 138.2 132.8 128.7 140 C 121.2 145.3 113 149.1 111 152 L 145 152"
+        fill="none" stroke="url(#digit)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
 </svg>

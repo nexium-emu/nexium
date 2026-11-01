@@ -159,12 +159,8 @@ fn paint_scene(p: &egui::Painter, rect: egui::Rect, e: f32, ga: f32) {
     if dt >= 0.0 {
         let core = smoothstep(CONV_END, CONV_END + 0.4, e) * ga;
         let pulse = 1.0 + 0.05 * (e * 7.0).sin();
-        orb(
-            p,
-            center,
-            r * (0.13 + flash * 0.14) * pulse,
-            (core + flash * 0.7).min(1.0),
-        );
+        orb(p, center, r * flash * 0.27 * pulse, (flash * 0.7).min(1.0) * ga);
+        nucleus(p, center, rx * pulse, core);
     }
 
     let text_a = smoothstep(TEXT_START, TEXT_START + 0.6, e) * ga;
@@ -265,6 +261,48 @@ fn orb(p: &egui::Painter, c: Pos2, r: f32, a: f32) {
         p.circle_filled(c, rr, alpha(RING, al));
     }
     p.circle_filled(c, r * 0.5, alpha(Color32::WHITE, (a * 255.0) as u8));
+}
+
+fn nucleus(p: &egui::Painter, c: Pos2, rx: f32, a: f32) {
+    if a <= 0.0 {
+        return;
+    }
+    for i in 0..5 {
+        let rr = rx * (0.12 + i as f32 * 0.07);
+        p.circle_filled(c, rr, alpha(RING, (a * 34.0 / (i as f32 + 1.0)) as u8));
+    }
+    let h = rx * 0.46;
+    let w = h * 34.0 / 48.0;
+    let origin = c - Vec2::new(w / 2.0, h / 2.0);
+    let at = |x: f32, y: f32| origin + Vec2::new(x * w, y * h);
+    let curves = [
+        [at(0.02, 0.30), at(0.04, 0.11), at(0.24, 0.0), at(0.50, 0.0)],
+        [at(0.50, 0.0), at(0.78, 0.0), at(0.98, 0.14), at(0.98, 0.32)],
+        [at(0.98, 0.32), at(0.98, 0.50), at(0.80, 0.60), at(0.52, 0.75)],
+        [at(0.52, 0.75), at(0.30, 0.86), at(0.06, 0.94), at(0.0, 1.0)],
+    ];
+    let mut points: Vec<Pos2> = curves
+        .iter()
+        .flat_map(|&[p0, p1, p2, p3]| (0..16).map(move |i| cubic(p0, p1, p2, p3, i as f32 / 16.0)))
+        .collect();
+    points.extend([at(0.0, 1.0), at(1.0, 1.0)]);
+    let width = h * 9.0 / 48.0;
+    p.add(Shape::line(points.clone(), Stroke::new(width * 2.4, alpha(RING_DIM, (a * 50.0) as u8))));
+    p.add(Shape::line(points.clone(), Stroke::new(width * 1.6, alpha(RING, (a * 90.0) as u8))));
+    let main = Color32::from_rgba_unmultiplied(0xE6, 0xFC, 0xFF, (a * 255.0) as u8);
+    for cap in [points[0], at(0.0, 1.0), at(1.0, 1.0)] {
+        p.circle_filled(cap, width / 2.0, main);
+    }
+    p.add(Shape::line(points, Stroke::new(width, main)));
+}
+
+fn cubic(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, t: f32) -> Pos2 {
+    let u = 1.0 - t;
+    (p0.to_vec2() * (u * u * u)
+        + p1.to_vec2() * (3.0 * u * u * t)
+        + p2.to_vec2() * (3.0 * u * t * t)
+        + p3.to_vec2() * (t * t * t))
+        .to_pos2()
 }
 
 fn title(p: &egui::Painter, cx: f32, y: f32, size: f32, a: f32) {

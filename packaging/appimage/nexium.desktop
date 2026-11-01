@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=NeXium
-GenericName=Nintendo Switch Emulator
-Comment=Open-source Nintendo Switch emulator
+Name=NeXium-2
+GenericName=Nintendo Switch 1 & 2 Emulator
+Comment=Open-source Nintendo Switch 1 & 2 emulator
 Exec=nexium %f
 Icon=nexium
 Terminal=false
