@@ -975,6 +975,8 @@ pub struct HorizonApp {
     pending_quick: Option<String>,
     modal_active_frame_start: bool,
     game_info_path: Option<std::path::PathBuf>,
+    game_info_title: Option<(std::path::PathBuf, Option<u64>)>,
+    game_profiles: crate::game_profiles::GameProfiles,
     mod_manager: Option<crate::mods::ModManager>,
     content_manager: Option<crate::content_manager::ContentManager>,
     dump_job: Option<crate::dump::DumpJob>,
@@ -1625,6 +1627,8 @@ impl HorizonApp {
             pending_quick: None,
             modal_active_frame_start: false,
             game_info_path: None,
+            game_info_title: None,
+            game_profiles: crate::game_profiles::GameProfiles::load(),
             mod_manager: None,
             content_manager: None,
             dump_job: None,
@@ -1649,6 +1653,7 @@ impl HorizonApp {
         if !nro_path.is_empty() {
             let backend = app.app_settings.effective_cpu_backend().to_cpu_kind();
             let repaint_ctx = cc.egui_ctx.clone();
+            app.game_profiles.apply(&app.app_settings);
             let target = app.native_game.as_mut().map(|window| window.begin_game(&cc.egui_ctx));
             if let Ok(handle) = EmulationHandle::new_with_presentation(
                 &nro_path,
@@ -1755,6 +1760,9 @@ impl HorizonApp {
     }
 
     fn open_game_file(&mut self, path: std::path::PathBuf, then: crate::firmware_prompt::Then, ctx: &egui::Context) {
+        let path = nexium_loader::LooseTitle::resolve(&path)
+            .map(|title| title.root().to_path_buf())
+            .unwrap_or(path);
         if crate::firmware_prompt::may_contain_firmware(&path) {
             self.game_info_path = None;
             let accent = self.theme_accent();
@@ -1838,11 +1846,24 @@ impl HorizonApp {
             self.game_info_path = None;
             return None;
         };
+        if self.game_info_title.as_ref().map(|(known, _)| known) != Some(&path) {
+            let title_id = nexium_loader::read_application_title_id(&path).ok().flatten();
+            self.game_info_title = Some((path.clone(), title_id));
+        }
+        let title_id = self.game_info_title.as_ref().and_then(|(_, id)| *id);
+        let mut profile = title_id.map(|id| self.game_profiles.get(id)).unwrap_or_default();
+        let mut profile_changed = false;
+        let global_scale = self
+            .app_settings
+            .resolution_scale
+            .display(self.app_settings.custom_resolution_scale);
+        let global_custom = self.app_settings.custom_resolution_scale;
 
         let game = &self.library.games[game_idx];
         let title = game.title.clone();
         let author = game.author.clone();
         let format = game.format.to_string();
+        let format_label = game.format_label().to_string();
         let size = game.size;
         let dominant = game.dominant_color;
         let favorite = self.app_settings.favorites.iter().any(|item| *item == path);
@@ -1852,7 +1873,7 @@ impl HorizonApp {
             .map(|texture| texture.id());
         let metadata = std::fs::metadata(&path).ok();
         let exists = metadata.is_some();
-        let file_size = metadata.as_ref().map(|item| item.len()).unwrap_or(size);
+        let file_size = metadata.as_ref().filter(|item| item.is_file()).map(|item| item.len()).unwrap_or(size);
         let modified = metadata.and_then(|item| item.modified().ok());
         let path_text = path.to_string_lossy().to_string();
         let modified_text = modified
@@ -1910,7 +1931,7 @@ impl HorizonApp {
                         }
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&format).strong().color(ACCENT_HV));
+                            ui.label(egui::RichText::new(&format_label).strong().color(ACCENT_HV));
                             ui.label(egui::RichText::new("  |  ").color(BORDER));
                             ui.label(egui::RichText::new(format_file_size(file_size)).color(MUTED));
                         });
@@ -1949,7 +1970,7 @@ impl HorizonApp {
                             ui.label(egui::RichText::new(value).color(TEXT));
                             ui.end_row();
                         };
-                        detail(ui, "Format", &format);
+                        detail(ui, "Format", &format_label);
                         detail(ui, "Size", &format_file_size(file_size));
                         detail(ui, "Status", status_text);
                         detail(ui, "Last modified", &modified_text);
@@ -1964,6 +1985,59 @@ impl HorizonApp {
                         });
                         ui.end_row();
                     });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Game Settings")
+                        .size(15.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.add_space(4.0);
+                if title_id.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Internal Resolution").color(MUTED));
+                        let custom = profile.custom_resolution_scale.unwrap_or(global_custom);
+                        egui::ComboBox::from_id_salt("game_resolution_scale")
+                            .selected_text(match profile.resolution_scale {
+                                None => format!("Use global ({global_scale})"),
+                                Some(scale) => scale.display(custom),
+                            })
+                            .show_ui(ui, |ui| {
+                                profile_changed |= ui
+                                    .selectable_value(&mut profile.resolution_scale, None, "Use global")
+                                    .changed();
+                                for option in crate::app_settings::ResolutionScale::all() {
+                                    profile_changed |= ui
+                                        .selectable_value(
+                                            &mut profile.resolution_scale,
+                                            Some(*option),
+                                            option.label(),
+                                        )
+                                        .changed();
+                                }
+                            });
+                        if profile.resolution_scale == Some(crate::app_settings::ResolutionScale::Custom) {
+                            let mut custom = custom;
+                            if custom_scale_slider(ui, &mut custom) {
+                                profile.custom_resolution_scale = Some(custom);
+                                profile_changed = true;
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("Applies the next time this game boots.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Per-game settings need an application title ID, which this file does not have.")
+                            .color(MUTED),
+                    );
+                }
 
                 ui.add_space(12.0);
                 ui.separator();
@@ -2000,6 +2074,12 @@ impl HorizonApp {
                 ui.colored_label(status_color, status_text);
             });
 
+        if let (Some(id), true) = (title_id, profile_changed) {
+            if profile.resolution_scale.is_none() {
+                profile.custom_resolution_scale = None;
+            }
+            self.game_profiles.set(id, profile);
+        }
         if close_requested || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             open = false;
         }
@@ -2030,6 +2110,7 @@ impl HorizonApp {
                 if pill_button(ui, "Open file…", true).clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("Switch games", &["nro", "dxci", "dnsp"])
+                        .add_filter("All files (Switch 2 exefs/main)", &["*"])
                         .pick_file()
                     {
                         self.open_game_file(p, crate::firmware_prompt::Then::Boot, ctx);
@@ -2099,7 +2180,7 @@ impl HorizonApp {
                                     .favorites
                                     .iter()
                                     .any(|path| *path == game_path);
-                                let dumpable = self.library.games[idx].format != "NRO";
+                                let dumpable = self.library.games[idx].is_dumpable();
                                 let resp =
                                     game_tile(ui, &self.library.games[idx], tex.as_ref(), selected);
                                 if resp.clicked() {
@@ -5052,7 +5133,7 @@ impl HorizonApp {
         }
         if self.settings_tab == SettingsTab::General {
             let backends = crate::app_settings::CpuBackend::all();
-            let rows: [(&str, String, bool); 3] = [
+            let rows: [(&str, String, bool); 2] = [
                 (
                     "CPU Backend",
                     self.app_settings.cpu_backend.label().to_string(),
@@ -5061,11 +5142,6 @@ impl HorizonApp {
                 (
                     "GPU Backend",
                     self.app_settings.gpu_backend.label().to_string(),
-                    true,
-                ),
-                (
-                    "Resolution",
-                    self.app_settings.resolution_preset.label().to_string(),
                     true,
                 ),
             ];
@@ -5217,13 +5293,6 @@ impl HorizonApp {
                             self.app_settings.gpu_backend.next()
                         } else {
                             self.app_settings.gpu_backend.prev()
-                        };
-                    }
-                    2 => {
-                        self.app_settings.resolution_preset = if dir >= 0 {
-                            self.app_settings.resolution_preset.next()
-                        } else {
-                            self.app_settings.resolution_preset.prev()
                         };
                     }
                     _ => {}
@@ -5403,9 +5472,15 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 15] = [
+            let rows: [(&str, String); 16] = [
                 ("GPU", self.app_settings.gpu_device_label()),
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
+                (
+                    "Internal Resolution",
+                    self.app_settings
+                        .resolution_scale
+                        .display(self.app_settings.custom_resolution_scale),
+                ),
                 ("Output Scale", format!("{}x", scale)),
                 (
                     "Texture Filter",
@@ -5570,10 +5645,14 @@ impl HorizonApp {
                             all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
                     }
                     2 => {
+                        self.app_settings.resolution_scale =
+                            self.app_settings.resolution_scale.cycle(dir);
+                    }
+                    3 => {
                         self.app_settings.output_scale =
                             (((scale as i32 - 1 + dir).rem_euclid(3)) + 1) as u8;
                     }
-                    3 => {
+                    4 => {
                         let all = crate::app_settings::FilterMode::all();
                         let idx = all
                             .iter()
@@ -5582,35 +5661,35 @@ impl HorizonApp {
                         self.app_settings.filter =
                             all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
                     }
-                    4 => {
+                    5 => {
                         self.app_settings.fsr_sharpness =
                             (i32::from(self.app_settings.fsr_sharpness) + dir * 5).clamp(0, 100) as u8;
                     }
-                    5 => self.app_settings.dpi_aware = !self.app_settings.dpi_aware,
-                    6 => self.app_settings.vsync = !self.app_settings.vsync,
-                    7 => {
+                    6 => self.app_settings.dpi_aware = !self.app_settings.dpi_aware,
+                    7 => self.app_settings.vsync = !self.app_settings.vsync,
+                    8 => {
                         self.app_settings.async_shaders = !self.app_settings.async_shaders;
                         nexium_common::async_compile::set_enabled(self.app_settings.async_shaders);
                     }
-                    8 => {
+                    9 => {
                         self.app_settings.fast_gpu_time = !self.app_settings.fast_gpu_time;
                         nexium_common::fast_gpu_time::set_enabled(self.app_settings.fast_gpu_time);
                     }
-                    9 => {
+                    10 => {
                         self.app_settings.force_max_clocks = !self.app_settings.force_max_clocks;
                         nexium_common::force_max_clocks::set_enabled(
                             self.app_settings.force_max_clocks,
                         );
                     }
-                    10 => {
+                    11 => {
                         self.app_settings.normal_gpu_accuracy = !self.app_settings.normal_gpu_accuracy;
                         nexium_common::gpu_accuracy::set_normal(self.app_settings.normal_gpu_accuracy);
                     }
-                    11 => {
+                    12 => {
                         self.app_settings.depth_share = !self.app_settings.depth_share;
                         nexium_common::depth_share::set_enabled(self.app_settings.depth_share);
                     }
-                    12 => {
+                    13 => {
                         let all = crate::app_settings::AstcDecodeMethod::all();
                         let idx = all
                             .iter()
@@ -5620,7 +5699,7 @@ impl HorizonApp {
                             all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
                         nexium_common::astc::set_decode_mode(self.app_settings.astc_decode.mode());
                     }
-                    13 => {
+                    14 => {
                         let all = crate::app_settings::AstcRecompressionMethod::all();
                         let idx = all
                             .iter()
@@ -5632,7 +5711,7 @@ impl HorizonApp {
                             self.app_settings.astc_recompression.recompression(),
                         );
                     }
-                    14 => {
+                    15 => {
                         self.app_settings.sync_video_framerate =
                             !self.app_settings.sync_video_framerate;
                         nexium_common::speed_limit::set_sync_to_video(
@@ -8644,6 +8723,8 @@ impl HorizonApp {
             .unwrap_or_default();
         let meta = if ext == "nro" {
             nexium_loader::read_nro_metadata(path)
+        } else if let Some(title) = nexium_loader::LooseTitle::resolve(path) {
+            Some(title.metadata())
         } else {
             nexium_loader::read_container_metadata(path)
         };
@@ -8672,7 +8753,7 @@ impl HorizonApp {
                 }
             }
         }
-        let mut title = format!("NeXium {} | {}", env!("CARGO_PKG_VERSION"), game);
+        let mut title = format!("NeXium 2 v{} | {}", env!("CARGO_PKG_VERSION"), game);
         if !version.is_empty() {
             title.push_str(&format!(" {}", version));
         }
@@ -8702,6 +8783,7 @@ impl HorizonApp {
         self.stop_anim = None;
         self.resume_anim = None;
         let repaint_ctx = ctx.clone();
+        self.game_profiles.apply(&self.app_settings);
         let target = self.native_game.as_mut().map(|window| window.begin_game(ctx));
         match EmulationHandle::new_with_presentation(
             &self.nro_path,
@@ -8734,10 +8816,10 @@ impl HorizonApp {
 
     fn stop_emulation(&mut self) {
         self.egui_ctx
-            .send_viewport_cmd(egui::ViewportCommand::Title("NeXium".to_string()));
+            .send_viewport_cmd(egui::ViewportCommand::Title("NeXium 2".to_string()));
         self.title_cpu_backend = None;
         if let Some(window) = &self.native_game {
-            window.set_title("NeXium");
+            window.set_title("NeXium 2");
         }
         self.play_times.save_if_dirty();
         self.carousel.boot_stage = crate::carousel::BootStage::None;
@@ -9932,7 +10014,7 @@ fn game_tile(
     );
 
     let sub = if game.author.is_empty() {
-        game.format.to_string()
+        elide(game.format_label(), 30)
     } else {
         elide(&game.author, 22)
     };
@@ -10807,6 +10889,7 @@ impl eframe::App for HorizonApp {
                             if ui.button("Open game…").clicked() {
                                 if let Some(p) = rfd::FileDialog::new()
                                     .add_filter("Switch games", &["nro", "dxci", "dnsp"])
+                                    .add_filter("All files (Switch 2 exefs/main)", &["*"])
                                     .pick_file()
                                 {
                                     self.open_game_file(p, crate::firmware_prompt::Then::Select, ctx);
@@ -12812,6 +12895,38 @@ fn gpu_selection_status(
     (format!("Active GPU: {active}\n{message}"), restart_pending)
 }
 
+fn resolution_scale_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    scale: &mut crate::app_settings::ResolutionScale,
+    custom: &mut f32,
+) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(scale.display(*custom))
+        .show_ui(ui, |ui| {
+            for option in crate::app_settings::ResolutionScale::all() {
+                changed |= ui.selectable_value(scale, *option, option.label()).changed();
+            }
+        });
+    if *scale == crate::app_settings::ResolutionScale::Custom {
+        changed |= custom_scale_slider(ui, custom);
+    }
+    changed
+}
+
+fn custom_scale_slider(ui: &mut egui::Ui, custom: &mut f32) -> bool {
+    ui.add(
+        egui::Slider::new(
+            custom,
+            nexium_common::render_scale::MIN_FACTOR..=nexium_common::render_scale::MAX_FACTOR,
+        )
+        .step_by(0.05)
+        .suffix("x"),
+    )
+    .changed()
+}
+
 fn graphics_settings_content(
     ui: &mut egui::Ui,
     cfg: &mut AppSettings,
@@ -12839,6 +12954,23 @@ fn graphics_settings_content(
             .size(11.0)
             .color(if restart_pending { AMBER } else { MUTED }),
     );
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new("Internal Resolution")
+            .size(13.0)
+            .strong()
+            .color(TEXT),
+    );
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Renders the game's own framebuffers at a scaled size, then fits the result to the window. Lower values save GPU time on Steam Deck and smaller GPUs. 720p and 1080p are relative to the console output. Applies the next time a game boots; per-game overrides live in Game Information.").size(11.0).color(MUTED));
+    ui.add_space(6.0);
+    *save_needed |= resolution_scale_picker(
+        ui,
+        "graphics_resolution_scale",
+        &mut cfg.resolution_scale,
+        &mut cfg.custom_resolution_scale,
+    );
+
     ui.add_space(12.0);
     ui.label(
         egui::RichText::new("Aspect Mode")

@@ -17,6 +17,7 @@ mod depth_emit;
 mod dump;
 mod firmware_prompt;
 mod frame_scaler;
+mod game_profiles;
 mod game_title;
 mod hd_rumble;
 mod homebrew;
@@ -237,7 +238,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("NeXium")
+            .with_title("NeXium 2")
             .with_app_id("NeXium")
             .with_icon(icon)
             .with_inner_size([1280.0, 720.0])

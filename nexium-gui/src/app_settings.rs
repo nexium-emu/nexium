@@ -192,53 +192,77 @@ impl GpuBackend {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResolutionPreset {
+pub enum ResolutionScale {
+    Native,
+    Half,
+    ThreeQuarters,
+    OneAndQuarter,
+    OneAndHalf,
+    Double,
     P720,
     P1080,
-    P1440,
-    P2160,
+    Custom,
 }
 
-impl Default for ResolutionPreset {
+impl Default for ResolutionScale {
     fn default() -> Self {
-        ResolutionPreset::P720
+        ResolutionScale::Native
     }
 }
 
-impl ResolutionPreset {
-    pub fn all() -> &'static [ResolutionPreset] {
+impl ResolutionScale {
+    pub fn all() -> &'static [ResolutionScale] {
         &[
-            ResolutionPreset::P720,
-            ResolutionPreset::P1080,
-            ResolutionPreset::P1440,
-            ResolutionPreset::P2160,
+            ResolutionScale::Native,
+            ResolutionScale::Half,
+            ResolutionScale::ThreeQuarters,
+            ResolutionScale::OneAndQuarter,
+            ResolutionScale::OneAndHalf,
+            ResolutionScale::Double,
+            ResolutionScale::P720,
+            ResolutionScale::P1080,
+            ResolutionScale::Custom,
         ]
     }
     pub fn label(&self) -> &'static str {
         match self {
-            ResolutionPreset::P720 => "1280 \u{00D7} 720",
-            ResolutionPreset::P1080 => "1920 \u{00D7} 1080",
-            ResolutionPreset::P1440 => "2560 \u{00D7} 1440",
-            ResolutionPreset::P2160 => "3840 \u{00D7} 2160",
+            ResolutionScale::Native => "Native (1.0x)",
+            ResolutionScale::Half => "0.5x",
+            ResolutionScale::ThreeQuarters => "0.75x",
+            ResolutionScale::OneAndQuarter => "1.25x",
+            ResolutionScale::OneAndHalf => "1.5x",
+            ResolutionScale::Double => "2.0x",
+            ResolutionScale::P720 => "720p",
+            ResolutionScale::P1080 => "1080p",
+            ResolutionScale::Custom => "Custom",
         }
     }
-    pub fn scale(&self) -> u32 {
+    pub fn display(&self, custom: f32) -> String {
         match self {
-            ResolutionPreset::P720 => 1,
-            ResolutionPreset::P1080 => 2,
-            ResolutionPreset::P1440 => 2,
-            ResolutionPreset::P2160 => 3,
+            ResolutionScale::Custom => format!("Custom ({custom:.2}x)"),
+            other => other.label().to_string(),
         }
     }
-    pub fn next(&self) -> ResolutionPreset {
-        let all = Self::all();
-        let i = all.iter().position(|x| x == self).unwrap_or(0);
-        all[(i + 1) % all.len()]
+    pub fn setting(&self, custom: f32) -> nexium_common::render_scale::Setting {
+        use nexium_common::render_scale::Setting;
+        match self {
+            ResolutionScale::Native => Setting::NATIVE,
+            ResolutionScale::Half => Setting::Factor(0.5),
+            ResolutionScale::ThreeQuarters => Setting::Factor(0.75),
+            ResolutionScale::OneAndQuarter => Setting::Factor(1.25),
+            ResolutionScale::OneAndHalf => Setting::Factor(1.5),
+            ResolutionScale::Double => Setting::Factor(2.0),
+            ResolutionScale::P720 => Setting::Height(720),
+            ResolutionScale::P1080 => Setting::Height(1080),
+            ResolutionScale::Custom => {
+                Setting::Factor(nexium_common::render_scale::clamp_factor(custom))
+            }
+        }
     }
-    pub fn prev(&self) -> ResolutionPreset {
+    pub fn cycle(&self, dir: i32) -> ResolutionScale {
         let all = Self::all();
-        let i = all.iter().position(|x| x == self).unwrap_or(0);
-        all[(i + all.len() - 1) % all.len()]
+        let i = all.iter().position(|x| x == self).unwrap_or(0) as i32;
+        all[((i + dir).rem_euclid(all.len() as i32)) as usize]
     }
 }
 
@@ -447,6 +471,9 @@ fn default_output_scale() -> u8 {
 }
 fn default_fsr_sharpness() -> u8 {
     87
+}
+pub fn default_custom_resolution_scale() -> f32 {
+    0.6
 }
 fn default_vsync() -> bool {
     true
@@ -684,7 +711,9 @@ pub struct AppSettings {
     #[serde(default)]
     pub gpu_device: Option<String>,
     #[serde(default)]
-    pub resolution_preset: ResolutionPreset,
+    pub resolution_scale: ResolutionScale,
+    #[serde(default = "default_custom_resolution_scale")]
+    pub custom_resolution_scale: f32,
     #[serde(default)]
     pub audio_output_device: Option<String>,
     #[serde(default = "default_audio_volume")]
@@ -1010,7 +1039,8 @@ impl Default for AppSettings {
             cpu_backend: CpuBackend::default(),
             gpu_backend: GpuBackend::default(),
             gpu_device: None,
-            resolution_preset: ResolutionPreset::default(),
+            resolution_scale: ResolutionScale::default(),
+            custom_resolution_scale: default_custom_resolution_scale(),
             audio_output_device: None,
             audio_volume: default_audio_volume(),
             multicore: default_multicore(),
@@ -1103,6 +1133,8 @@ impl AppSettings {
             Self::default()
         };
         cfg.fsr_sharpness = cfg.fsr_sharpness.min(100);
+        cfg.custom_resolution_scale =
+            nexium_common::render_scale::clamp_factor(cfg.custom_resolution_scale);
         cfg.vibration_strength = cfg.vibration_strength.clamp(10, 100);
         cfg.log_viewer.ring_lines = cfg.log_viewer.ring_lines.clamp(LOG_RING_MIN, LOG_RING_MAX);
         if cfg.performance_debug.sanitize_unsafe_gpu_overrides() {

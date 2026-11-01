@@ -2890,7 +2890,7 @@ pub fn carousel_view(
             let path_string = lib.games[gi].path.to_string_lossy().to_string();
             let favd = favorites.iter().any(|p| *p == lib.games[gi].path);
             let is_playing_card = playing == Some(gi);
-            let dumpable = lib.games[gi].format != "NRO";
+            let dumpable = lib.games[gi].is_dumpable();
             resp.context_menu(|ui| {
                 if !is_playing_card && ui.button("Launch").clicked() {
                     want_launch = Some(path_string.clone());
@@ -3526,7 +3526,7 @@ pub fn carousel_view(
             } else {
                 &selected_game.author
             },
-            selected_game.format,
+            selected_game.format_label(),
             selected_game.size as f32 / (1024.0 * 1024.0),
         );
         (title, sub)

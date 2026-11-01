@@ -21,6 +21,20 @@ pub struct GameEntry {
     pub download: Option<Arc<Mutex<DownloadInfo>>>,
 }
 
+impl GameEntry {
+    pub fn format_label(&self) -> &'static str {
+        match self.format {
+            "NX2" => "Switch 2 (loose ExeFS + RomFS)",
+            "ExeFS" => "Loose ExeFS + RomFS",
+            format => format,
+        }
+    }
+
+    pub fn is_dumpable(&self) -> bool {
+        matches!(self.format, "XCI" | "NSP")
+    }
+}
+
 pub struct Library {
     pub games: Vec<GameEntry>,
     pub textures: Vec<Option<egui::TextureHandle>>,
@@ -193,7 +207,10 @@ fn scan(extra_dirs: &[PathBuf]) -> Vec<GameEntry> {
         &mut out,
     );
     for dir in extra_dirs {
-        collect(dir, 0, &mut out);
+        match read_loose_entry(dir) {
+            Some(game) => out.push(game),
+            None => collect(dir, 0, &mut out),
+        }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
@@ -225,7 +242,9 @@ fn collect(dir: &Path, depth: usize, out: &mut Vec<GameEntry>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if depth < 2 {
+            if let Some(game) = read_loose_entry(&path) {
+                out.push(game);
+            } else if depth < 2 {
                 collect(&path, depth + 1, out);
             }
             continue;
@@ -293,6 +312,30 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
             .unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF)),
         icon,
         download: None,
+    })
+}
+
+fn read_loose_entry(path: &Path) -> Option<GameEntry> {
+    let loose = nexium_loader::LooseTitle::resolve(path)?;
+    let root = loose.root().to_path_buf();
+    let meta = loose.metadata();
+    let icon = custom_icon_path(&root)
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read(&p).ok())
+        .and_then(|b| decode_jpeg(&b))
+        .or_else(|| meta.icon_jpeg.as_deref().and_then(decode_jpeg));
+    Some(GameEntry {
+        title: meta.title,
+        author: meta.author,
+        format: if loose.is_switch2() { "NX2" } else { "ExeFS" },
+        size: loose.content_size(),
+        dominant_color: icon
+            .as_ref()
+            .map(sample_dominant)
+            .unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF)),
+        icon,
+        download: None,
+        path: root,
     })
 }
 
@@ -428,4 +471,50 @@ fn sample_dominant(img: &egui::ColorImage) -> egui::Color32 {
     let fg = hue_to_rgb(hue);
     let fb = hue_to_rgb(hue - 1.0 / 3.0);
     egui::Color32::from_rgb((fr * 255.0) as u8, (fg * 255.0) as u8, (fb * 255.0) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn switch2_npdm() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x800];
+        bytes[..4].copy_from_slice(b"META");
+        bytes[0x0C] = 0x37;
+        for (offset, value) in [(0x70usize, 0x600u32), (0x74, 0x40), (0x78, 0x80), (0x7C, 0x340)] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[0x380..0x384].copy_from_slice(b"ACID");
+        bytes[0x600..0x604].copy_from_slice(b"ACI0");
+        bytes[0x610..0x618].copy_from_slice(&0x0400_C3F0_0006_E000u64.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn loose_title_folders_become_one_switch2_entry() {
+        let root = std::env::temp_dir().join(format!("nexium-library-loose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let title = root.join("Games/MKW");
+        std::fs::create_dir_all(title.join("exefs")).unwrap();
+        std::fs::create_dir_all(title.join("romfs/Data/nested.dnsp")).unwrap();
+        std::fs::write(title.join("exefs/main"), [0u8; 16]).unwrap();
+        std::fs::write(title.join("exefs/main.npdm"), switch2_npdm()).unwrap();
+        std::fs::write(title.join("romfs/Data/file.bin"), [0u8; 100]).unwrap();
+
+        let mut found = Vec::new();
+        collect(&root, 0, &mut found);
+        assert_eq!(found.len(), 1);
+        let game = &found[0];
+        assert_eq!(game.path, title);
+        assert_eq!(game.title, "MKW");
+        assert_eq!(game.format, "NX2");
+        assert_eq!(game.format_label(), "Switch 2 (loose ExeFS + RomFS)");
+        assert!(!game.is_dumpable());
+        assert_eq!(game.size, 16 + switch2_npdm().len() as u64 + 100);
+
+        for path in [title.clone(), title.join("exefs"), title.join("exefs/main")] {
+            assert_eq!(read_loose_entry(&path).map(|game| game.path), Some(title.clone()));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
