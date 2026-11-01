@@ -833,6 +833,26 @@ fn bra_target(pc: usize, raw: u64) -> usize {
     (pc as i64 + signed as i64 + 8) as usize
 }
 
+fn follow_jumps(bytes: &[u8], mut target: usize) -> usize {
+    for _ in 0..4 {
+        let Some(raw) = bytes
+            .get(target..target + 8)
+            .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+        else {
+            break;
+        };
+        let jump = decode_one(raw).is_some_and(|decoded| decoded.opcode == Opcode::BRA)
+            && raw & 0x1f == 0xf
+            && decoded_pred(raw).is_none()
+            && !pred_negate(raw);
+        if !jump || target % 8 != 0 || is_schedule(target) {
+            break;
+        }
+        target = bra_target(target, raw);
+    }
+    target
+}
+
 fn bra_flow_conditional(raw: u64) -> bool {
     !matches!(raw & 0x1f, 0 | 15)
 }
@@ -949,11 +969,11 @@ where
         };
         let selector = base.wrapping_add(table_value);
         let raw_target = selector as usize;
-        let target = if is_schedule(raw_target) {
+        let target = follow_jumps(bytes, if is_schedule(raw_target) {
             raw_target.saturating_add(8)
         } else {
             raw_target
-        };
+        });
         if target <= pc || target + 8 > bytes.len() || target % 8 != 0 {
             if std::env::var_os("NEXIUM_BRX_TRACE").is_some() {
                 log::warn!(

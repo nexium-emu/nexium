@@ -1,3 +1,4 @@
+pub mod ampere;
 pub mod cfg;
 mod decode;
 mod disasm;

@@ -65,6 +65,13 @@ fn compiled_table() -> &'static [CompiledEntry] {
     })
 }
 
+pub(crate) fn opcode_bits(opcode: Opcode) -> Option<u64> {
+    OPCODE_TABLE
+        .iter()
+        .find(|entry| entry.opcode == opcode)
+        .map(|entry| mask_value_from_encoding(entry.encoding).1)
+}
+
 pub fn decode_one(insn: u64) -> Option<Decoded> {
     let table = compiled_table();
     for e in table {
