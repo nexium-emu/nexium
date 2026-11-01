@@ -441,6 +441,7 @@ pub struct Application {
     pub patch_romfs: Option<LazyRomfs>,
     pub add_on_content: std::collections::BTreeMap<u64, Option<LazyRomfs>>,
     pub exefs_files: Vec<crate::dump::ExefsFile>,
+    pub loose: Option<crate::loose::LooseTitle>,
 }
 
 pub(crate) const MODULE_ORDER: &[&str] = &[
@@ -452,6 +453,9 @@ impl Application {
     pub fn load_with_content(path: &str, content_root: &std::path::Path) -> Result<Self, String> {
         use crate::content::{ContentKind, Package};
         let mut application = Self::load_impl(path, true)?;
+        if application.loose.is_some() {
+            return Ok(application);
+        }
         let base_title_id = application.title_id;
         let installed = crate::content::list_game_content(content_root, base_title_id)?;
         if let Some(entry) = installed.entries.iter().find(|entry| entry.enabled && entry.kind == ContentKind::Update) {
@@ -535,6 +539,9 @@ impl Application {
     }
 
     fn load_impl(path: &str, allow_missing_code: bool) -> Result<Self, String> {
+        if let Some(title) = crate::loose::LooseTitle::resolve(std::path::Path::new(path)) {
+            return Self::load_loose(&title);
+        }
         let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
         let mmap =
             Arc::new(unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {}: {}", path, e))?);
@@ -768,6 +775,7 @@ impl Application {
             patch_romfs: None,
             add_on_content: Default::default(),
             exefs_files,
+            loose: None,
         })
     }
 
@@ -803,27 +811,7 @@ impl Application {
         let mut load_offset: u64 = 0;
         for name in MODULE_ORDER {
             if let Some(entry) = exefs.find(name) {
-                let region = &mmap[exefs.entry_range(entry)?];
-                let nso = Nso::parse(region).map_err(|e| format!("{}: {}", name, e))?;
-                let image_size = nso.image_size as u64;
-                log::info!(
-                    "module {} @ +{:#x} image={:#x} text={:#x} ro={:#x} data={:#x} bss={:#x}",
-                    name,
-                    load_offset,
-                    image_size,
-                    nso.text.decompressed_size,
-                    nso.ro.decompressed_size,
-                    nso.data.decompressed_size,
-                    nso.bss_size
-                );
-                modules.push(LoadedModule {
-                    name: name.to_string(),
-                    nso,
-                    load_offset,
-                });
-                load_offset = load_offset
-                    .checked_add(page_align(image_size))
-                    .ok_or("code layout overflow")?;
+                place_module(&mut modules, &mut load_offset, name, &mmap[exefs.entry_range(entry)?])?;
             }
         }
         if modules.is_empty() {
@@ -834,7 +822,39 @@ impl Application {
 }
 
 
+pub(crate) fn place_module(
+    modules: &mut Vec<LoadedModule>,
+    load_offset: &mut u64,
+    name: &str,
+    region: &[u8],
+) -> Result<(), String> {
+    let nso = Nso::parse(region).map_err(|e| format!("{}: {}", name, e))?;
+    let image_size = nso.image_size as u64;
+    log::info!(
+        "module {} @ +{:#x} image={:#x} text={:#x} ro={:#x} data={:#x} bss={:#x}",
+        name,
+        *load_offset,
+        image_size,
+        nso.text.decompressed_size,
+        nso.ro.decompressed_size,
+        nso.data.decompressed_size,
+        nso.bss_size
+    );
+    modules.push(LoadedModule {
+        name: name.to_string(),
+        nso,
+        load_offset: *load_offset,
+    });
+    *load_offset = load_offset
+        .checked_add(page_align(image_size))
+        .ok_or("code layout overflow")?;
+    Ok(())
+}
+
 pub fn read_application_title_id(path: &std::path::Path) -> Result<Option<u64>, String> {
+    if let Some(title) = crate::loose::LooseTitle::resolve(path) {
+        return title.npdm().map(|npdm| Some(npdm.title_id).filter(|id| *id != 0));
+    }
     let file = std::fs::File::open(path).map_err(|error| format!("Open {}: {error}", path.display()))?;
     let mmap = Arc::new(unsafe { Mmap::map(&file) }
         .map_err(|error| format!("Map {}: {error}", path.display()))?);

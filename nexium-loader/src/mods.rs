@@ -89,15 +89,24 @@ pub fn set_mod_enabled(path: &Path, enabled: bool) -> Result<(), String> {
 }
 
 pub fn build_mod_romfs(app: &Application, mods: &[ModEntry]) -> Result<Option<AppRomfs>, String> {
+    let loose = app.loose.as_ref().and_then(|title| title.romfs.clone());
     let overlays = mods.iter().filter(|entry| entry.enabled && entry.has_romfs)
         .map(|entry| entry.path.join("romfs")).collect::<Vec<_>>();
-    if overlays.is_empty() {
+    if overlays.is_empty() && loose.is_none() {
         return Ok(app.romfs.clone().map(AppRomfs::Plain));
     }
-    let layered = LayeredRomfs::build_many(app.romfs.as_ref(), &overlays)?;
-    log::info!("[mods] RomFS overlays={} base_files={} overlay_files={} replacements={} virtual_bytes={}",
-        overlays.len(), layered.base_file_count, layered.overlay_file_count,
-        layered.replaced_file_count, layered.len());
+    let started = std::time::Instant::now();
+    let layers = loose.iter().cloned().chain(overlays.iter().cloned()).collect::<Vec<_>>();
+    let layered = LayeredRomfs::build_many(app.romfs.as_ref(), &layers)?;
+    if let Some(loose) = &loose {
+        log::info!("loose RomFS {} files={} virtual_bytes={} built in {:?}",
+            loose.display(), layered.file_count(), layered.len(), started.elapsed());
+    }
+    if !overlays.is_empty() {
+        log::info!("[mods] RomFS overlays={} base_files={} overlay_files={} replacements={} virtual_bytes={}",
+            overlays.len(), layered.base_file_count, layered.overlay_file_count,
+            layered.replaced_file_count, layered.len());
+    }
     Ok(Some(AppRomfs::Layered(std::sync::Arc::new(layered))))
 }
 
@@ -273,6 +282,7 @@ mod tests {
             patch_romfs: None,
             add_on_content: Default::default(),
             exefs_files: Vec::new(),
+            loose: None,
             title_id: 0x0100_0000_0000_00ab,
         }
     }

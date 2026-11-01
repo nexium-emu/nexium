@@ -6,7 +6,7 @@ fn main() {
     let path = match std::env::args().nth(1) {
         Some(p) => p,
         None => {
-            eprintln!("usage: inspect <file.dxci|file.dnsp|file.nro>");
+            eprintln!("usage: inspect <file.dxci|file.dnsp|file.nro|loose title folder|exefs/main>");
             std::process::exit(2);
         }
     };
@@ -28,10 +28,35 @@ fn main() {
                 app.npdm.main_stack_size,
                 app.npdm.system_resource_size
             );
+            let caps = app.npdm.kernel_caps();
             println!(
-                "  code_size={:#x} modules={}",
+                "  acid={:?} switch2={} fs_permissions={:#018x} kernel={:?} handles={:?}",
+                app.npdm.acid_layout(),
+                app.npdm.is_switch2(),
+                app.npdm.fs_permissions(),
+                caps.kernel_version,
+                caps.handle_table_size
+            );
+            if let Some(thread) = caps.thread_info {
+                println!(
+                    "  cores {}..={} (mask {:#x}) priorities {}..={} (mask {:#x})",
+                    thread.min_core,
+                    thread.max_core,
+                    thread.core_mask(),
+                    thread.highest_priority,
+                    thread.lowest_priority,
+                    thread.priority_mask()
+                );
+            }
+            println!(
+                "  svcs {}",
+                caps.svc_ids().map(|id| format!("{id:02x}")).collect::<Vec<_>>().join(" ")
+            );
+            println!(
+                "  code_size={:#x} modules={} version={:?}",
                 app.total_code_size,
-                app.modules.len()
+                app.modules.len(),
+                app.display_version
             );
             let needle = b"__nnDetailInitLibc0";
             for m in &app.modules {
@@ -60,6 +85,19 @@ fn main() {
                     );
                 }
                 None => println!("  romfs: none"),
+            }
+            if let Some(title) = &app.loose {
+                let started = std::time::Instant::now();
+                match nexium_loader::mods::build_mod_romfs(&app, &[]) {
+                    Ok(Some(romfs)) => println!(
+                        "  loose romfs {} -> {} virtual bytes in {:?}",
+                        title.romfs.as_deref().map_or("-".into(), |dir| dir.display().to_string()),
+                        romfs.len(),
+                        started.elapsed()
+                    ),
+                    Ok(None) => println!("  loose romfs: none"),
+                    Err(error) => println!("  loose romfs failed: {error}"),
+                }
             }
         }
         Err(e) => {

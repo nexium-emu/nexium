@@ -10,6 +10,7 @@ pub mod dump;
 pub mod env;
 pub mod firmware;
 pub mod layered;
+pub mod loose;
 pub mod mods;
 pub mod patch;
 pub mod nca;
@@ -20,6 +21,7 @@ pub mod romfs;
 
 pub use application::{detect, read_application_title_id, Application, ContainerKind, LazyRomfs, LoadedModule};
 pub use layered::{find_overlay_dir, AppRomfs, LayeredRomfs};
+pub use loose::LooseTitle;
 pub use control::read_container_metadata;
 pub use env::EnvBlockBuilder;
 pub use nro::{read_nro_metadata, Nro, NroMetadata};
@@ -41,6 +43,9 @@ impl Loader {
     }
 
     pub fn load_any(path: &str) -> Result<LoadedProgram, String> {
+        if let Some(title) = LooseTitle::resolve(std::path::Path::new(path)) {
+            return Application::load_loose(&title).map(LoadedProgram::Application);
+        }
         let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
         let mmap =
             unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("mmap {}: {}", path, e))?;
