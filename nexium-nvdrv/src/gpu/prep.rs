@@ -1074,8 +1074,13 @@ impl PrepState {
                     let renderer = self.renderer.as_ref().unwrap().clone();
                     let memory = self.guest_memory.as_ref().unwrap().clone();
                     let count = writes.len();
-                    let scheduled = super::completion::submit_renderer_completion(
+                    let ranges: Vec<(u64, u64)> = writes
+                        .iter()
+                        .map(|write| (write.gpu_va, if write.long { 16 } else { 4 }))
+                        .collect();
+                    let scheduled = super::completion::submit_renderer_completion_for_ranges(
                         renderer,
+                        &ranges,
                         move || {
                             for write in writes {
                                 let written = if write.long {
@@ -1143,8 +1148,11 @@ impl PrepState {
                         let async_memory = memory.clone();
                         let verify_renderer = semrel_verify().then(|| renderer.clone());
                         let kp = kickprof::start();
-                        let scheduled = super::completion::submit_renderer_completion(
+                        let ranges: Vec<(u64, u64)> =
+                            pending.iter().map(|&(gpu_va, _)| (gpu_va, 4)).collect();
+                        let scheduled = super::completion::submit_renderer_completion_for_ranges(
                             renderer,
+                            &ranges,
                             move || {
                                 if let Some(renderer) = verify_renderer {
                                     if !renderer.wait_idle_checked() {

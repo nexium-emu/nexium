@@ -316,6 +316,10 @@ pub struct ShaderProgram {
 }
 
 impl ShaderProgram {
+    pub fn gpu_va(self, region: u64) -> u64 {
+        region.wrapping_add((u64::from(self.address_hi) << 32) | u64::from(self.address_lo))
+    }
+
     pub fn is_enabled(self, stage: usize) -> bool {
         stage == 1 || self.enabled
     }
@@ -842,6 +846,7 @@ pub struct Maxwell3D {
     pub shadow_ram_control: u32,
     pub shadow_regs: Vec<u32>,
     pub macro_engine: super::MacroEngine,
+    pub mme64: Option<Box<super::mme64::Mme64>>,
     pub method_freq: std::collections::HashMap<u32, u64>,
     method_profile_enabled: bool,
 
@@ -1224,6 +1229,7 @@ impl Maxwell3D {
             shadow_ram_control: 0,
             shadow_regs,
             macro_engine: super::MacroEngine::new(),
+            mme64: None,
             method_freq: std::collections::HashMap::new(),
             method_profile_enabled: std::env::var("NEXIUM_GPU_METHOD_PROFILE")
                 .map(|v| v != "0")
@@ -1341,10 +1347,26 @@ impl Maxwell3D {
         }
     }
 
+    pub(crate) fn enable_mme64(&mut self, memory: crate::gpu::GuestMemoryAccess) {
+        self.mme64 = Some(Box::new(super::mme64::Mme64::new(Some(memory))));
+    }
+
     pub fn dispatch_method(&mut self, method: u32, arg: u32, is_last: bool) {
         if method >= super::MACRO_REGISTERS_START {
             self.dispatch_macro_methods(method, std::slice::from_ref(&arg), is_last);
             return;
+        }
+
+        if let Some(mme) = self.mme64.as_mut() {
+            if super::mme64::Mme64::handles(method) {
+                mme.method(method, arg);
+                return;
+            }
+            if method == super::mme64::METHOD_FALCON_3D {
+                self.write_register(method, arg);
+                self.write_register(super::mme64::METHOD_SCRATCH, 1);
+                return;
+            }
         }
 
         match method {
@@ -1389,6 +1411,10 @@ impl Maxwell3D {
     pub fn dispatch_macro_methods(&mut self, method: u32, args: &[u32], is_last: bool) {
         debug_assert!(method >= super::MACRO_REGISTERS_START);
         debug_assert!(!args.is_empty());
+        if self.mme64.is_some() {
+            self.dispatch_mme64(method, args, is_last);
+            return;
+        }
         if mme_trace() {
             for (index, &arg) in args.iter().enumerate() {
                 if self.macro_invocations >= 1024 {
@@ -1438,6 +1464,66 @@ impl Maxwell3D {
             self.mme_active = false;
             self.macro_draw_instance_count = None;
             self.macro_engine.recycle_output(out);
+        }
+    }
+
+    pub(crate) fn compute_macro(&mut self, method: u32, arg: u32, is_last: bool) -> Option<Vec<(u32, u32)>> {
+        let mme = self.mme64.as_mut()?;
+        let run = mme.call_compute(method, arg, is_last)?;
+        static LISTED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let listed = *LISTED.get_or_init(|| std::env::var("NEXIUM_MME64_LIST").ok().and_then(|value| value.parse().ok()));
+        if listed == Some(run.entry) {
+            log::info!("maxwell3d: MME64 listing for macro {}:\n{}", run.entry, mme.listing(run.entry, 160));
+        }
+        if mme_trace() && self.macro_writes_logged < 512 {
+            self.macro_writes_logged += 1;
+            log::info!(
+                "maxwell3d: MME64 compute macro {} ran {} steps, {} writes: {:x?}",
+                run.entry,
+                run.steps,
+                run.writes.len(),
+                run.writes.iter().take(24).collect::<Vec<_>>()
+            );
+        }
+        Some(run.writes)
+    }
+
+    fn dispatch_mme64(&mut self, method: u32, args: &[u32], is_last: bool) {
+        let reg_file = &self.reg_file;
+        let Some(run) = self.mme64.as_mut().and_then(|mme| {
+            mme.call(method, args, is_last, &|index: u32| {
+                reg_file.get(index as usize).copied().unwrap_or(0)
+            })
+        }) else {
+            return;
+        };
+        static LISTED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        static PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let listed = *LISTED.get_or_init(|| std::env::var("NEXIUM_MME64_LIST").ok().and_then(|value| value.parse().ok()));
+        if listed == Some(run.entry) && !PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(mme) = self.mme64.as_mut() {
+                log::info!("maxwell3d: MME64 listing for macro {}:\n{}", run.entry, mme.listing(run.entry, 160));
+            }
+        }
+        if mme_trace() && self.macro_writes_logged < 512 {
+            self.macro_writes_logged += 1;
+            log::info!(
+                "maxwell3d: MME64 macro {} args={:x?} ran {} steps, {} writes: {:x?}",
+                run.entry,
+                run.params,
+                run.steps,
+                run.writes.len(),
+                run.writes.iter().take(8).collect::<Vec<_>>()
+            );
+        }
+        self.mme_active = true;
+        self.mme_entry = run.entry;
+        for &(method, value) in &run.writes {
+            self.write_register(method, value);
+        }
+        self.mme_active = false;
+        if let Some(mme) = self.mme64.as_mut() {
+            mme.recycle(run.writes);
         }
     }
 
@@ -1906,6 +1992,9 @@ impl Maxwell3D {
                         );
                     }
                 }
+                if crate::gpu::pusher::semaphore_watch().is_some_and(|range| range.contains(&gpu_va)) {
+                    log::warn!("[sem-watch] 3d report arg={arg:#x} gpu_va={gpu_va:#x} payload={payload:#x}");
+                }
                 if let Some(ordering) = report_semaphore_write_ordering(arg, raw_counter_reports())
                 {
                     let long = ((arg >> 28) & 1) == 0;
@@ -2045,11 +2134,11 @@ impl Maxwell3D {
                         [self.regs.shader_programs[5].cbuf_group(4)][15]
                         .1,
                     fs_shader_gpu_va: {
-                        let fs = &self.regs.shader_programs[5];
+                        let fs = self.regs.shader_programs[5];
                         let region = ((self.regs.program_region_va_hi as u64) << 32)
                             | self.regs.program_region_va_lo as u64;
-                        if fs.address_lo != 0 {
-                            region.wrapping_add(fs.address_lo as u64)
+                        if fs.address_lo != 0 || fs.address_hi != 0 {
+                            fs.gpu_va(region)
                         } else {
                             0
                         }
@@ -2594,9 +2683,10 @@ impl Maxwell3D {
 
             0x800..=0x85F => {
                 let idx = ((method - 0x800) / 0x10) as usize;
+                let field = (method - 0x800) % 0x10;
+                let absolute = self.mme64.is_some();
                 if idx < 6 {
                     let sp = &mut self.regs.shader_programs[idx];
-                    let field = (method - 0x800) % 0x10;
                     log::trace!(
                         "maxwell3d: SetProgram[stage={}] field={} = {:#x}",
                         idx,
@@ -2606,7 +2696,9 @@ impl Maxwell3D {
                     match field {
                         0 => sp.enabled = (arg & 1) != 0,
 
-                        1 => sp.address_lo = arg,
+                        1 if !absolute => sp.address_lo = arg,
+                        5 if absolute => sp.address_hi = arg & 0xFF,
+                        6 if absolute => sp.address_lo = arg,
                         3 => sp.gpr_count = arg,
                         4 => sp.binding_group = Some(arg & 0x7),
                         _ => {}
@@ -2738,8 +2830,8 @@ impl Maxwell3D {
 
         let program_region =
             ((self.regs.program_region_va_hi as u64) << 32) | self.regs.program_region_va_lo as u64;
-        let fs_shader_gpu_va = if fs.address_lo != 0 {
-            program_region.wrapping_add(fs.address_lo as u64)
+        let fs_shader_gpu_va = if fs.address_lo != 0 || fs.address_hi != 0 {
+            fs.gpu_va(program_region)
         } else {
             0
         };

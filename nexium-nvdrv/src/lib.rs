@@ -317,6 +317,7 @@ fn decode_host1x_methods(
 
 pub mod bufferqueue;
 pub mod gpu;
+pub mod nx2;
 pub mod render_thread;
 pub mod video_decode;
 pub mod video_decode_thread;
@@ -723,6 +724,7 @@ pub enum NvDevice {
     NvhostNvjpg,
     NvhostVic,
     NvhostNvenc,
+    NvhostTsgGpu,
     Other,
 }
 
@@ -741,6 +743,7 @@ impl NvDevice {
             "/dev/nvhost-nvjpg" => NvDevice::NvhostNvjpg,
             "/dev/nvhost-vic" => NvDevice::NvhostVic,
             "/dev/nvhost-nvenc" => NvDevice::NvhostNvenc,
+            "/dev/nvhost-tsg-gpu" => NvDevice::NvhostTsgGpu,
             _ => return None,
         })
     }
@@ -932,6 +935,7 @@ struct AsyncGpuCompletion {
 
 enum AsyncGpuSubmission {
     Inline {
+        channel: u32,
         entries: Vec<gpu::CommandListHeader>,
         completion: Option<AsyncGpuCompletion>,
     },
@@ -1452,6 +1456,7 @@ impl AsyncGpuQueue {
                         || match (submission, pending) {
                         (
                             AsyncGpuSubmission::Inline {
+                                channel,
                                 entries,
                                 completion,
                             },
@@ -1459,6 +1464,7 @@ impl AsyncGpuQueue {
                         ) => {
                             let on_complete =
                                 Some(make_on_complete(completion, pending_guard));
+                            worker_gpu.select_channel(channel);
                             gpu::watchdog::phase(gpu::watchdog::Phase::Kick, entries.len() as u64);
                             if hard_kicks {
                                 worker_gpu.process_inline_gpfifo(
@@ -2033,6 +2039,7 @@ pub struct Nvdrv {
     sync_prep_thread: bool,
     async_present_pending: Arc<std::sync::atomic::AtomicUsize>,
     drain_already_done: bool,
+    pub switch2: bool,
 }
 
 impl Nvdrv {
@@ -2069,6 +2076,7 @@ impl Nvdrv {
             sync_prep_thread: false,
             async_present_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             drain_already_done: false,
+            switch2: false,
         }
     }
 
@@ -2571,7 +2579,9 @@ impl Nvdrv {
     }
 
     pub fn open(&mut self, path: &str) -> Result<u32, ()> {
-        let device = NvDevice::from_path(path).ok_or(())?;
+        let device = NvDevice::from_path(path)
+            .or_else(|| (self.switch2 && nx2::is_stub_device(path)).then_some(NvDevice::Other))
+            .ok_or(())?;
         let fd = self.next_fd;
         self.next_fd = self.next_fd.wrapping_add(1);
         self.files.insert(
@@ -2841,12 +2851,12 @@ impl Nvdrv {
         eager || flags & (1 << 1) != 0
     }
 
-    fn submit_emits_increments(flags: u32) -> bool {
+    fn submit_emits_increments(&self, flags: u32) -> bool {
         static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         Self::submit_emits_increments_value(
             flags,
             *EAGER.get_or_init(|| std::env::var_os("NEXIUM_EAGER_SUBMIT_FENCE").is_some()),
-        )
+        ) || (self.switch2 && flags & nx2::SUBMIT_INCREMENT_VALUE != 0)
     }
 
     fn channel_submit_completion(
@@ -3122,6 +3132,9 @@ impl Nvdrv {
             NvDevice::NvhostCtrl => self.nvhost_ctrl_ioctl(cmd, &req),
             NvDevice::NvhostNvdec | NvDevice::NvhostVic => {
                 self.nvhost_channel_ioctl_with_mem(device, cmd, &req, mem_read, mem_write)
+            }
+            NvDevice::NvhostTsgGpu | NvDevice::Other if self.switch2 => {
+                IoctlOutcome::ok(nx2::echo(&req.in_data, req.out_size))
             }
             _ => IoctlOutcome::ok(vec![0u8; req.out_size]),
         }
@@ -4495,7 +4508,20 @@ impl Nvdrv {
                 }
                 let chipname: u64 = 0x6230326d67;
                 out[gc_off + 0x90..gc_off + 0x98].copy_from_slice(&chipname.to_le_bytes());
-                log::debug!("nvhost-ctrl-gpu:GetCharacteristics → GM20B");
+                if self.switch2 {
+                    if out.len() < gc_off + nx2::CHARACTERISTICS_SIZE {
+                        out.resize(gc_off + nx2::CHARACTERISTICS_SIZE, 0);
+                    }
+                    out[0..8].copy_from_slice(&(nx2::CHARACTERISTICS_SIZE as u64).to_le_bytes());
+                    nx2::apply_characteristics(&mut out[gc_off..]);
+                    log::info!("nvhost-ctrl-gpu:GetCharacteristics → Switch 2 Ampere");
+                } else {
+                    log::debug!("nvhost-ctrl-gpu:GetCharacteristics → GM20B");
+                }
+            }
+            0x471F if self.switch2 => {
+                nx2::engine_info(&req.in_data, &mut out);
+                log::info!("nvhost-ctrl-gpu:GetEngineInfo → {} bytes", out.len());
             }
             0x4703 => {
                 log::debug!("nvhost-ctrl-gpu:ZbcSetTable (ack)");
@@ -4945,6 +4971,10 @@ impl Nvdrv {
                     }
                 }
             }
+            0x410B if self.switch2 => {
+                out = nx2::syncpoint_shim(req.out_size);
+                log::info!("nvhost-as-gpu:GetSyncpointShim base={:#x}", nx2::SYNCPOINT_SHIM_VA);
+            }
             0x4108 => {
                 let small_offset: u64 = 0x0400_0000;
                 let small_page: u32 = 0x1000;
@@ -4986,7 +5016,8 @@ impl Nvdrv {
                 let supported_range = (va_start == 0 && va_end == 0 && va_split == 0)
                     || (va_start == 0x0400_0000
                         && va_end == 1u64 << 37
-                        && va_split == 1u64 << 34);
+                        && va_split == 1u64 << 34)
+                    || (self.switch2 && nx2::is_user_partition(va_start, va_end, va_split));
                 if !state.allocations.is_empty()
                     || !supported_range
                     || (big_page_size != 0
@@ -5344,8 +5375,9 @@ impl Nvdrv {
                         let async_enabled = self.gpu_async.is_some();
                         let queued = self.gpu_async.as_ref().is_some_and(|queue| {
                             queue.submit(AsyncGpuSubmission::Inline {
+                                channel: req.fd,
                                 entries: entries.clone(),
-                                completion: Self::submit_emits_increments(submit_flags).then_some(
+                                completion: self.submit_emits_increments(submit_flags).then_some(
                                     AsyncGpuCompletion {
                                         fd: req.fd,
                                         syncpt_id,
@@ -5360,9 +5392,10 @@ impl Nvdrv {
                         }
                         if !queued {
                             let on_complete =
-                                Self::submit_emits_increments(submit_flags).then(|| {
+                                self.submit_emits_increments(submit_flags).then(|| {
                                     self.channel_submit_completion(req.fd, syncpt_id, syncpt_value)
                                 });
+                            self.gpu.select_channel(req.fd);
                             let _ = self.gpu.process_inline_gpfifo(
                                 &entries,
                                 mem_read,
@@ -5498,8 +5531,9 @@ impl Nvdrv {
                         let async_enabled = self.gpu_async.is_some();
                         let queued = self.gpu_async.as_ref().is_some_and(|queue| {
                             queue.submit(AsyncGpuSubmission::Inline {
+                                channel: req.fd,
                                 entries: entries.clone(),
-                                completion: Self::submit_emits_increments(submit_flags).then_some(
+                                completion: self.submit_emits_increments(submit_flags).then_some(
                                     AsyncGpuCompletion {
                                         fd: req.fd,
                                         syncpt_id,
@@ -5514,9 +5548,10 @@ impl Nvdrv {
                         }
                         if !queued {
                             let on_complete =
-                                Self::submit_emits_increments(submit_flags).then(|| {
+                                self.submit_emits_increments(submit_flags).then(|| {
                                     self.channel_submit_completion(req.fd, syncpt_id, syncpt_value)
                                 });
+                            self.gpu.select_channel(req.fd);
                             let _ = self.gpu.process_inline_gpfifo(
                                 &entries,
                                 mem_read,
@@ -5563,8 +5598,9 @@ impl Nvdrv {
                             .zip(async_entries.as_ref())
                             .is_some_and(|(queue, entries)| {
                                 queue.submit(AsyncGpuSubmission::Inline {
+                                    channel: req.fd,
                                     entries: entries.clone(),
-                                    completion: Self::submit_emits_increments(submit_flags)
+                                    completion: self.submit_emits_increments(submit_flags)
                                         .then_some(AsyncGpuCompletion {
                                             fd: req.fd,
                                             syncpt_id,
@@ -5578,10 +5614,11 @@ impl Nvdrv {
                         }
                         if !queued {
                             let on_complete =
-                                Self::submit_emits_increments(submit_flags).then(|| {
+                                self.submit_emits_increments(submit_flags).then(|| {
                                     self.channel_submit_completion(req.fd, syncpt_id, syncpt_value)
                                 });
                             if let Some(entries) = async_entries.as_ref() {
+                                self.gpu.select_channel(req.fd);
                                 let _ = self.gpu.process_inline_gpfifo(
                                     entries,
                                     mem_read,
@@ -5590,6 +5627,7 @@ impl Nvdrv {
                                     on_complete,
                                 );
                             } else {
+                                self.gpu.select_channel(req.fd);
                                 let _ = self.gpu.submit_gpfifo(
                                     address,
                                     num_entries,
@@ -6467,6 +6505,7 @@ mod tests {
         let (guard, _) = AsyncGpuPendingGuard::reserve(Arc::clone(&pending), Arc::clone(&failed));
         let queued = QueuedAsyncGpuSubmission::tracked(
             AsyncGpuSubmission::Inline {
+                channel: 0,
                 entries: Vec::new(),
                 completion: None,
             },
@@ -6682,6 +6721,7 @@ mod tests {
             true,
         );
         assert!(queue.submit(AsyncGpuSubmission::Inline {
+            channel: 0,
             entries: vec![gpu::CommandListHeader {
                 address_lo: 0x5000,
                 address_hi_and_count: 1 << 10,
@@ -6697,6 +6737,7 @@ mod tests {
             .unwrap();
         for _ in 0..queue.capacity {
             assert!(queue.submit(AsyncGpuSubmission::Inline {
+                channel: 0,
                 entries: Vec::new(),
                 completion: None,
             }));
@@ -6707,6 +6748,7 @@ mod tests {
             scope.spawn(|| {
                 result_tx
                     .send(queue.submit(AsyncGpuSubmission::Inline {
+                        channel: 0,
                         entries: Vec::new(),
                         completion: Some(AsyncGpuCompletion {
                             fd: 99,
@@ -6793,6 +6835,7 @@ mod tests {
         let queue = AsyncGpuQueue::new(gpu, Arc::new(FrameQueueState::new()), read, write, copy);
 
         assert!(queue.submit(AsyncGpuSubmission::Inline {
+            channel: 0,
             entries: Vec::new(),
             completion: None,
         }));
@@ -6859,6 +6902,7 @@ mod tests {
         assert!(!queue.defer_small_rts);
 
         assert!(queue.submit(AsyncGpuSubmission::Inline {
+            channel: 0,
             entries: Vec::new(),
             completion: None,
         }));

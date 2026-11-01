@@ -38,6 +38,7 @@ pub(super) struct ComputeTextureState {
 }
 
 pub struct KeplerCompute {
+    pub(crate) qmd3: Option<super::qmd3::Qmd3Scheduler>,
     regs: Vec<u32>,
     upload: ComputeUpload,
     launch_description: [u32; LAUNCH_WORDS],
@@ -48,6 +49,7 @@ pub struct KeplerCompute {
 impl KeplerCompute {
     pub fn new() -> Self {
         Self {
+            qmd3: None,
             regs: vec![0; NUM_REGS],
             upload: ComputeUpload::default(),
             launch_description: [0; LAUNCH_WORDS],
@@ -57,7 +59,15 @@ impl KeplerCompute {
     }
 
     pub(crate) fn method_requires_hard_boundary(&self, method: u32, is_last_call: bool) -> bool {
-        Self::method_is_launch(method) || self.method_writes_guest_memory(method, is_last_call)
+        Self::method_is_launch(method)
+            || self.method_writes_guest_memory(method, is_last_call)
+            || (self.qmd3.is_some()
+                && matches!(
+                    method,
+                    super::qmd3::METHOD_SIGNALING_PCAS_B
+                        | super::qmd3::METHOD_SIGNALING_PCAS2_B
+                        | super::qmd3::METHOD_INLINE_LAUNCH
+                ))
     }
 
     pub(crate) fn method_is_launch(method: u32) -> bool {
@@ -117,6 +127,44 @@ impl KeplerCompute {
         }
 
         self.regs[index] = arg;
+
+        if let Some(mut scheduler) = self.qmd3.take() {
+            let memory = super::qmd3::Memory {
+                mappings,
+                read: mem_read,
+                write: mem_write,
+            };
+            let handled = if method == super::qmd3::METHOD_INLINE_LAUNCH {
+                let address = ((u64::from(self.regs[super::qmd3::METHOD_INLINE_ADDRESS_HIGH as usize]) << 32)
+                    | u64::from(self.regs[super::qmd3::METHOD_INLINE_ADDRESS_LOW as usize]))
+                    << 8;
+                let first = super::qmd3::METHOD_INLINE_FIRST as usize;
+                scheduler.launch_inline(
+                    address,
+                    &self.regs[first..=index],
+                    self.regs[super::qmd3::METHOD_INLINE_CONTROL as usize],
+                    &memory,
+                );
+                true
+            } else if matches!(method, super::qmd3::METHOD_SIGNALING_PCAS_B | super::qmd3::METHOD_SIGNALING_PCAS2_B) {
+                scheduler.method(super::qmd3::METHOD_PCAS_A, self.regs[M_LAUNCH_DESC_LOC as usize], &memory);
+                scheduler.method(method, arg, &memory);
+                true
+            } else {
+                false
+            };
+            let launches = std::mem::take(&mut scheduler.launches);
+            self.qmd3 = Some(scheduler);
+            static EXECUTE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *EXECUTE.get_or_init(|| std::env::var("NEXIUM_NX2_COMPUTE").map_or(true, |value| value != "0")) {
+                for qmd in &launches {
+                    self.launch_qmd3(qmd, renderer, mappings, mem_read, mem_write, content_key);
+                }
+            }
+            if handled {
+                return super::KeplerMemoryWriteOutcome::NoWrite;
+            }
+        }
 
         match method {
             M_EXEC_UPLOAD => {
@@ -183,6 +231,48 @@ impl KeplerCompute {
 
         let code_base =
             ((self.reg(M_CODE_LOC_UPPER) as u64) << 32) | self.reg(M_CODE_LOC_LOWER) as u64;
+        self.execute_launch(launch_gpu, code_base, renderer, mappings, mem_read, mem_write, content_key);
+        crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_LAUNCH, kp);
+    }
+
+    fn launch_qmd3(
+        &mut self,
+        qmd: &[u32; super::qmd3::QMD_WORDS],
+        renderer: Option<&std::sync::Arc<nexium_gpu::Renderer>>,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        content_key: &dyn Fn(u64, usize) -> Option<u64>,
+    ) {
+        let mut launch = [0u32; LAUNCH_WORDS];
+        launch[0x0c] = qmd[12];
+        launch[0x0d] = (qmd[13] & 0xFFFF) | (qmd[14] << 16);
+        launch[0x11] = qmd[17] & 0x3_FFFF;
+        launch[0x12] = qmd[18] & 0xFFFF_0000;
+        launch[0x13] = qmd[19];
+        launch[0x14] = qmd[20] & 0xFF;
+        for slot in 0..8 {
+            let high = qmd[33 + slot * 2];
+            launch[0x1d + slot * 2] = qmd[32 + slot * 2];
+            launch[0x1e + slot * 2] = (high & 0xFF) | ((((high >> 19) & 0x1FFF) << 4) << 15);
+        }
+        launch[0x2d] = qmd[23] & 0xFF_FFFF;
+        launch[0x2f] = qmd[50] & 0xFF_FFFF;
+        self.launch_description = launch;
+        let code_base = (u64::from(qmd[49] & 0x1_FFFF) << 32) | u64::from(qmd[48]);
+        self.execute_launch(0, code_base, renderer, mappings, mem_read, mem_write, content_key);
+    }
+
+    fn execute_launch(
+        &mut self,
+        launch_gpu: u64,
+        code_base: u64,
+        renderer: Option<&std::sync::Arc<nexium_gpu::Renderer>>,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        content_key: &dyn Fn(u64, usize) -> Option<u64>,
+    ) {
         let texture = ComputeTextureState {
             tic_pool_gpu_va: ((self.reg(M_TIC_ADDRESS_HIGH) as u64) << 32)
                 | self.reg(M_TIC_ADDRESS_LOW) as u64,
@@ -332,7 +422,6 @@ impl KeplerCompute {
             self.target_dumped |= target_dump;
         }
         self.launch_count = self.launch_count.wrapping_add(1);
-        crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_LAUNCH, kp);
     }
 
     fn dump_launch(

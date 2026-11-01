@@ -6,6 +6,8 @@ pub mod macro_engine;
 pub mod maxwell3d;
 pub(crate) mod maxwell_compute;
 pub mod maxwell_dma;
+pub mod mme64;
+pub mod qmd3;
 pub mod sw_renderer;
 pub use fermi_2d::{Fermi2D, FERMI_2D_CLASS};
 pub use kepler_compute::{KeplerCompute, KEPLER_COMPUTE_CLASS};

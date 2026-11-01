@@ -1181,6 +1181,24 @@ pub(crate) fn profile_method_if_slow(
 }
 
 #[derive(Default)]
+struct ChannelContext {
+    bound_classes: [u32; 8],
+    state: DmaState,
+    puller: PullerState,
+}
+
+const DEFAULT_BOUND_CLASSES: [u32; 8] = [
+    0xB197,
+    KEPLER_COMPUTE_CLASS,
+    KEPLER_MEMORY_CLASS,
+    FERMI_2D_CLASS,
+    MAXWELL_DMA_CLASS,
+    0,
+    0,
+    0,
+];
+
+#[derive(Default)]
 struct DmaState {
     method: u32,
     subchannel: u32,
@@ -1227,6 +1245,8 @@ pub struct Pusher {
     bound_classes: [u32; 8],
     state: DmaState,
     puller: PullerState,
+    channel: u32,
+    parked_channels: std::collections::HashMap<u32, ChannelContext>,
     entries_logged: u32,
     active_entry_gpu_va: u64,
     active_entry_cpu_va: u64,
@@ -1252,18 +1272,11 @@ impl Pusher {
         Self {
             syncpt_value: 0,
             pending_syncpt_incrs: Vec::new(),
-            bound_classes: [
-                0xB197,
-                KEPLER_COMPUTE_CLASS,
-                KEPLER_MEMORY_CLASS,
-                FERMI_2D_CLASS,
-                MAXWELL_DMA_CLASS,
-                0,
-                0,
-                0,
-            ],
+            bound_classes: DEFAULT_BOUND_CLASSES,
             state: DmaState::default(),
             puller: PullerState::default(),
+            channel: 0,
+            parked_channels: std::collections::HashMap::new(),
             entries_logged: 0,
             active_entry_gpu_va: 0,
             active_entry_cpu_va: 0,
@@ -1283,6 +1296,22 @@ impl Pusher {
             #[cfg(test)]
             passive_bulk_words: 0,
         }
+    }
+
+    pub fn select_channel(&mut self, channel: u32) {
+        if channel == self.channel {
+            return;
+        }
+        let next = self.parked_channels.remove(&channel).unwrap_or(ChannelContext {
+            bound_classes: DEFAULT_BOUND_CLASSES,
+            ..ChannelContext::default()
+        });
+        let parked = ChannelContext {
+            bound_classes: std::mem::replace(&mut self.bound_classes, next.bound_classes),
+            state: std::mem::replace(&mut self.state, next.state),
+            puller: std::mem::replace(&mut self.puller, next.puller),
+        };
+        self.parked_channels.insert(std::mem::replace(&mut self.channel, channel), parked);
     }
 
     #[cfg(test)]
@@ -2128,6 +2157,16 @@ impl Pusher {
                 entry.address_lo,
                 entry.address_hi_and_count
             );
+            if let Some(cpu) = mappings.cpu_address_for(address) {
+                let mut bytes = vec![0u8; word_count.min(512) as usize * 4];
+                if mem_read(cpu, &mut bytes) {
+                    let words: Vec<u32> = bytes
+                        .chunks_exact(4)
+                        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                        .collect();
+                    log::info!("gpfifo[{}] words={:08x?}", self.entries_logged, words);
+                }
+            }
             self.entries_logged += 1;
         }
 
@@ -3082,10 +3121,49 @@ impl Pusher {
                 mem_write,
                 mem_copy,
             );
+        } else if bound_class == KEPLER_COMPUTE_CLASS
+            && method >= MACRO_REGISTERS_START
+            && maxwell.mme64.is_some()
+        {
+            let is_last = self.state.method_count <= 1;
+            if let Some(writes) = maxwell.compute_macro(method, arg, is_last) {
+                let (saved_method, saved_count) = (self.state.method, self.state.method_count);
+                for (index, &(write_method, value)) in writes.iter().enumerate() {
+                    let last = writes.get(index + 1).is_none_or(|next| next.0 != write_method);
+                    self.state.method = write_method;
+                    self.state.method_count = if last { 1 } else { 2 };
+                    self.dispatch_method(
+                        value,
+                        None,
+                        None,
+                        defer_constbuf_writeback,
+                        mappings,
+                        maxwell,
+                        maxwell_dma,
+                        fermi_2d,
+                        kepler_compute,
+                        kepler_memory,
+                        stats,
+                        mem_read,
+                        mem_write,
+                        mem_copy,
+                    );
+                }
+                self.state.method = saved_method;
+                self.state.method_count = saved_count;
+            }
         } else if matches!(
             bound_class,
             MAXWELL_DMA_CLASS | FERMI_2D_CLASS | KEPLER_MEMORY_CLASS | KEPLER_COMPUTE_CLASS
         ) {
+            if bound_class == KEPLER_COMPUTE_CLASS {
+                if std::env::var_os("NEXIUM_COMPUTE_METHOD_TRACE").is_some() {
+                    log::warn!("[compute-method] channel={} method={method:#x} arg={arg:#x} last={}", self.channel, self.state.method_count <= 1);
+                }
+                if let Some(mme) = maxwell.mme64.as_mut() {
+                    mme.note_compute(method, arg);
+                }
+            }
             if !maxwell.pending_draws.is_empty() {
                 self.flush_pending_3d(
                     maxwell,
@@ -3242,6 +3320,42 @@ impl Pusher {
             METHOD_SEMAPHORE_ADDR_LOW => self.puller.semaphore_addr_low = arg,
             METHOD_SEMAPHORE_PAYLOAD => self.puller.semaphore_payload = arg,
             METHOD_SEMAPHORE_OPERATION => {
+                let watched = ((self.puller.semaphore_addr_high as u64) << 32)
+                    | (self.puller.semaphore_addr_low as u64);
+                if semaphore_watch().is_some_and(|range| range.contains(&watched)) {
+                    log::warn!(
+                        "[sem-watch] channel={} op={arg:#x} gpu_va={watched:#x} payload={:#x} entry_gpu={:#x} word={}",
+                        self.channel,
+                        self.puller.semaphore_payload,
+                        self.active_entry_gpu_va,
+                        self.active_word_index
+                    );
+                }
+                if matches!(arg & 0xF, 0x1 | 0x4 | 0x8) {
+                    let gpu_va = ((self.puller.semaphore_addr_high as u64) << 32)
+                        | (self.puller.semaphore_addr_low as u64);
+                    let payload = self.puller.semaphore_payload;
+                    let mut bytes = [0u8; 4];
+                    let value = mappings
+                        .cpu_address_for(gpu_va)
+                        .filter(|cpu| mem_read(*cpu, &mut bytes))
+                        .map(|_| u32::from_le_bytes(bytes));
+                    let met = value.is_some_and(|value| match arg & 0xF {
+                        0x1 => value == payload,
+                        0x4 => value.wrapping_sub(payload) as i32 >= 0,
+                        _ => value & payload != 0,
+                    });
+                    static UNMET: AtomicU64 = AtomicU64::new(0);
+                    if !met && UNMET.fetch_add(1, Ordering::Relaxed) < 256 {
+                        log::warn!(
+                            "[puller-acquire] unmet op={:#x} gpu_va={gpu_va:#x} payload={payload:#x} value={value:x?} channel={} entry_gpu={:#x} word={}",
+                            arg & 0xF,
+                            self.channel,
+                            self.active_entry_gpu_va,
+                            self.active_word_index
+                        );
+                    }
+                }
                 if arg & 0xF == 0x2 {
                     let payload = self.puller.semaphore_payload;
                     let gpu_va = ((self.puller.semaphore_addr_high as u64) << 32)
@@ -3250,7 +3364,7 @@ impl Pusher {
                         super::prep::PrepEvent::PullerSemWrite {
                             gpu_va,
                             payload,
-                            long: true,
+                            long: arg & (1 << 24) == 0,
                         },
                         engines,
                         mappings,
@@ -3530,6 +3644,18 @@ fn is_known_gpu_class(class: u32) -> bool {
         class,
         0xB197 | MAXWELL_DMA_CLASS | FERMI_2D_CLASS | KEPLER_MEMORY_CLASS | KEPLER_COMPUTE_CLASS
     )
+}
+
+pub(crate) fn semaphore_watch() -> Option<std::ops::Range<u64>> {
+    static WATCH: std::sync::OnceLock<Option<std::ops::Range<u64>>> = std::sync::OnceLock::new();
+    WATCH
+        .get_or_init(|| {
+            let spec = std::env::var("NEXIUM_SEM_WATCH").ok()?;
+            let (va, len) = spec.trim().split_once(':')?;
+            let va = parse_u64ish(va.trim())?;
+            Some(va..va + parse_u64ish(len.trim())?)
+        })
+        .clone()
 }
 
 pub(crate) fn constbuf_upload_watch() -> Option<(u64, u64)> {

@@ -63,7 +63,7 @@ fn input_invalidation_max_candidates() -> usize {
 const RECENT_CBUF_REQUEST_CAPACITY: usize = 64;
 const PREPARED_INDEX_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PREPARED_INDEX_CACHE_MAX_ENTRIES: usize = 4096;
-const TEXTURE_SNAPSHOT_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const TEXTURE_SNAPSHOT_CACHE_MAX_BYTES: usize = 3 * 1024 * 1024 * 1024;
 const TEXTURE_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4096;
 const PREPARED_TIC_PLAN_CAPACITY: usize = 4096;
 type GraphicsStageCbufBinds = [(u64, u32); GRAPHICS_CBUF_SLOTS];
@@ -8141,7 +8141,8 @@ pub(crate) fn enqueue_draws<'d>(
         if let Some(probe) = compute_probe.as_deref_mut() {
             probe.record_request(draw);
         }
-        if render_enable_needs_ordered_read(draw) {
+        let ordered_render_enable = render_enable_needs_ordered_read(draw, pending_storage_readbacks);
+        if ordered_render_enable {
             derived_state_cache.clear();
             record_enqueue_flush_reason(
                 batch,
@@ -8158,7 +8159,7 @@ pub(crate) fn enqueue_draws<'d>(
             );
             finish_ssbo_flush_boundary(ssbo_snapshot_cache);
         }
-        if !render_enabled(draw, mappings, mem_read) {
+        if !render_enabled(draw, mappings, mem_read, ordered_render_enable) {
             derived_state_cache.clear();
             bump_draw_drop(
                 0,
@@ -8170,9 +8171,7 @@ pub(crate) fn enqueue_draws<'d>(
             continue;
         }
         if vertex_memory_store_candidate(draw) {
-            let address = draw
-                .program_region_gpu_va
-                .wrapping_add(draw.shader_programs[1].address_lo as u64);
+            let address = draw.shader_programs[1].gpu_va(draw.program_region_gpu_va);
             if let Some(sph) = fetch_sph(address, mappings, mem_read)
                 .filter(|sph| sph[0x32..].iter().all(|byte| *byte == 0) && sph[3] & 0xf0 == 0)
             {
@@ -8776,11 +8775,24 @@ fn prepare_graphics_clear_op(
     Ok(Some(clear))
 }
 
-fn render_enable_needs_ordered_read(draw: &DrawCall) -> bool {
+const RENDER_ENABLE_PREDICATE_LEN: u64 = 24;
+
+fn render_enable_needs_ordered_read(
+    draw: &DrawCall,
+    pending_storage_readbacks: &[PendingStorageReadback],
+) -> bool {
     strict_cond_render()
         && draw.render_enable_override == 0
         && matches!(draw.render_enable_mode, 2 | 3 | 4)
         && render_enable_waits_for_guest_writes()
+        && (super::completion::pending_guest_write_overlaps(
+            draw.render_enable_addr,
+            RENDER_ENABLE_PREDICATE_LEN,
+        ) || pending_storage_readbacks_overlap(
+            pending_storage_readbacks,
+            draw.render_enable_addr,
+            RENDER_ENABLE_PREDICATE_LEN,
+        ))
 }
 
 fn render_enable_waits_for_guest_writes() -> bool {
@@ -8844,8 +8856,8 @@ fn trace_depth_target_request(draw: &DrawCall, mappings: &GpuMappings) {
         draw.zeta.width, draw.zeta.height, zeta_va, draw.zeta.format, draw.zeta.block_size,
         draw.zeta_enable, mappings.nvmap_id_for(zeta_va).is_some(),
         draw.depth_test_enable, draw.depth_write_enable, draw.depth_func, draw.depth_mode,
-        draw.clear_depth, draw.program_region_gpu_va.wrapping_add(u64::from(fs.address_lo)),
-        fs.enabled, draw.program_region_gpu_va.wrapping_add(u64::from(vs.address_lo)),
+        draw.clear_depth, fs.gpu_va(draw.program_region_gpu_va),
+        fs.enabled, vs.gpu_va(draw.program_region_gpu_va),
         vs.enabled, draw.vertex_count, draw.index_count, draw.indexed,
         draw.viewport_transform_en, draw.viewport,
         draw.scissor.enabled, draw.scissor.min_x, draw.scissor.min_y,
@@ -8883,21 +8895,23 @@ fn bump_draw_drop(kind: usize, detail: &str) {
 fn skip_failed_shader_draw(error: &str) -> bool {
     static SW_FALLBACK: OnceLock<bool> = OnceLock::new();
     !*SW_FALLBACK.get_or_init(|| std::env::var_os("NEXIUM_SHADER_FAIL_SW_FALLBACK").is_some())
-        && [
-            "shader previously failed to emit",
-            "unsupported graphics shader operation rejected",
-            "graphics varying link failed",
-            "FS SPIR-V emit panicked",
-            "VS SPIR-V emit panicked",
-        ]
-        .iter()
-        .any(|prefix| error.starts_with(prefix))
+        && (nexium_shader::ampere::enabled()
+            || [
+                "shader previously failed to emit",
+                "unsupported graphics shader operation rejected",
+                "graphics varying link failed",
+                "FS SPIR-V emit panicked",
+                "VS SPIR-V emit panicked",
+            ]
+            .iter()
+            .any(|prefix| error.starts_with(prefix)))
 }
 
 fn render_enabled(
     draw: &DrawCall,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    wait_for_guest_writes: bool,
 ) -> bool {
     let mut predicate_values = None;
     let enabled = match draw.render_enable_override {
@@ -8911,7 +8925,7 @@ fn render_enabled(
                     log_render_enable_miss(draw, "conditional-fail-open");
                     return true;
                 }
-                if render_enable_waits_for_guest_writes()
+                if wait_for_guest_writes
                     && !super::completion::wait_for_pending_guest_writes(
                         std::time::Duration::from_millis(250),
                     )
@@ -8922,7 +8936,7 @@ fn render_enabled(
                     log_render_enable_miss(draw, "unmapped");
                     return true;
                 };
-                let mut b = [0u8; 24];
+                let mut b = [0u8; RENDER_ENABLE_PREDICATE_LEN as usize];
                 if !mem_read(cpu, &mut b) {
                     log_render_enable_miss(draw, "read-failed");
                     return true;
@@ -9006,9 +9020,7 @@ fn trace_render_enable_skipped_draw(draw: &DrawCall, predicate_values: Option<(u
         })
         .collect::<Vec<_>>()
         .join(",");
-    let vs = draw
-        .program_region_gpu_va
-        .wrapping_add(u64::from(draw.shader_programs[1].address_lo));
+    let vs = draw.shader_programs[1].gpu_va(draw.program_region_gpu_va);
     let depth = (u64::from(draw.zeta.address_hi) << 32) | u64::from(draw.zeta.address_lo);
     log::warn!(
         "[render-enable-skip] #{} mode={} override={} addr={:#x} initial_current={} vs={:#x} fs={:#x} v={} i={} indexed={} instances={} rtctl={:#x} rts=[{}] depth={:#x}/{}x{}/fmt{:#x}/enabled{}",
@@ -9651,7 +9663,7 @@ fn draw_rt_binding_signature(
         .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
     let program_region = draw.program_region_gpu_va;
     let fs_prog = &draw.shader_programs[5];
-    let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
+    let fs_addr = fs_prog.gpu_va(program_region);
     let fs_output_map = fetch_sph(fs_addr, mappings, mem_read)
         .map(ps_output_map)
         .unwrap_or(0);
@@ -10458,6 +10470,9 @@ fn derive_prepared_tic_texture_plan(
     let layer_count = tic_snapshot_layer_count(&tic);
     let read_size = nexium_gpu::texture::texture_guest_size_bytes(&tic, layer_count)
         .unwrap_or_else(|| layer_size.saturating_mul(layer_count as usize));
+    if nexium_gpu::texture::texture_over_budget(read_size, &tic) {
+        return None;
+    }
     let cache_key = texture_snapshot_cache_key(mappings, backing_gpu_va, read_size);
     Some(PreparedTicTexturePlan {
         tic,
@@ -13038,6 +13053,9 @@ fn prepare_draw_batch_async(
         });
         for target in call.configured_color_rts.iter() {
             let key = target.key;
+            if std::env::var_os("NEXIUM_SKIP_RT_SNAPSHOT").is_some() {
+                break;
+            }
             if key.gpu_va == 0
                 || key.guest_size_bytes == 0
                 || key.sample_width != 1
@@ -14737,11 +14755,11 @@ fn draw_derived_dependency_ranges(
     let mut ranges = Vec::new();
     for index in [0usize, 1, 5] {
         let program = source.shader_programs[index];
-        if program.enabled || program.address_lo != 0 {
+        if program.enabled || program.address_lo != 0 || program.address_hi != 0 {
             ranges.push((
                 source
                     .program_region_gpu_va
-                    .wrapping_add(program.address_lo as u64),
+                    .wrapping_add((u64::from(program.address_hi) << 32) | u64::from(program.address_lo)),
                 SPH_SIZE + MAX_SASS_BYTES,
             ));
         }
@@ -14812,6 +14830,16 @@ fn shader_resource_fingerprint(
         ^ texture_view_metadata
             .wrapping_mul(0x85eb_ca77_c2b2_ae63)
             .rotate_left(11)
+        ^ render_scale_fingerprint()
+}
+
+fn render_scale_fingerprint() -> u64 {
+    let scale = nexium_common::render_scale::factor();
+    if scale == 1.0 {
+        0
+    } else {
+        u64::from(scale.to_bits()).wrapping_mul(0xd6e8_feb8_6659_fd93)
+    }
 }
 
 fn texture_view_metadata_fingerprint(layout: &GraphicsTextureLayout) -> u64 {
@@ -17045,11 +17073,11 @@ fn derive_draw_template(
         static OFF: OnceLock<bool> = OnceLock::new();
         !*OFF.get_or_init(|| std::env::var_os("NEXIUM_NO_DUAL_VS").is_some())
             && vsa_prog.is_enabled(0)
-            && vsa_prog.address_lo != vs_prog.address_lo
+            && vsa_prog.gpu_va(0) != vs_prog.gpu_va(0)
     };
     let vsa_key = if vsa_active { vsa_prog.address_lo } else { 0 };
     let layer_output = if gs_active && rt_key.render_layer_count() > 1 {
-        let gs_addr = program_region.wrapping_add(gs_prog.address_lo as u64);
+        let gs_addr = gs_prog.gpu_va(program_region);
         fetch_sph(gs_addr, mappings, mem_read).and_then(|sph| {
             let code = read_gpu_strict(mappings, mem_read, gs_addr + SPH_SIZE as u64, 0x200)?;
             if let Some(slot) = passthrough_float_layer_slot(&sph, &code) {
@@ -17083,9 +17111,9 @@ fn derive_draw_template(
     }
 
     let geometry_enabled = gs_active && layer_output_slot.is_none();
-    let vs_addr = program_region.wrapping_add(vs_prog.address_lo as u64);
-    let gs_addr = program_region.wrapping_add(gs_prog.address_lo as u64);
-    let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
+    let vs_addr = vs_prog.gpu_va(program_region);
+    let gs_addr = gs_prog.gpu_va(program_region);
+    let fs_addr = fs_prog.gpu_va(program_region);
     {
         use std::sync::OnceLock;
         static SKIP: OnceLock<Vec<u64>> = OnceLock::new();
@@ -17548,7 +17576,7 @@ fn derive_draw_template(
                 }
             };
             let vs_sass = if vsa_active {
-                let vsa_addr = program_region.wrapping_add(vsa_prog.address_lo as u64);
+                let vsa_addr = vsa_prog.gpu_va(program_region);
                 let merged = fetch_sass(vsa_addr, mappings, mem_read)
                     .and_then(|a| nexium_shader::merge_dual_vertex_sass(&a, &vs_sass));
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18007,6 +18035,7 @@ fn derive_draw_template(
                                 texel_buffer_mask: active_texture_layout.fs_texel_buffer_mask,
                                 writes_depth: fs_writes_depth,
                                 y_negate: draw.window_origin.lower_left(),
+                                frag_coord_scale: nexium_common::render_scale::factor(),
                                 varying_map,
                             },
                         )
@@ -25662,17 +25691,30 @@ fn fetch_sass(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Option<Vec<u8>> {
-    let start = gpu_va.wrapping_add(SPH_SIZE as u64);
-    let mut buf = vec![0u8; MAX_SASS_BYTES];
+    if nexium_shader::ampere::enabled() {
+        let binary = read_span(gpu_va, nexium_shader::ampere::MAX_PROGRAM_BYTES, mappings, mem_read)?;
+        let program = nexium_shader::ampere::translate_cached(gpu_va, &binary).ok()?;
+        return Some(program.code.clone());
+    }
+    read_span(gpu_va.wrapping_add(SPH_SIZE as u64), MAX_SASS_BYTES, mappings, mem_read)
+}
+
+fn read_span(
+    start: u64,
+    limit: usize,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; limit];
     let mut filled = 0usize;
-    while filled < MAX_SASS_BYTES {
+    while filled < limit {
         let va = start.wrapping_add(filled as u64);
         let cpu = match mappings.cpu_address_for(va) {
             Some(c) => c,
             None => break,
         };
         let page_end = (va & !0xFFF).wrapping_add(0x1000);
-        let chunk = std::cmp::min((page_end - va) as usize, MAX_SASS_BYTES - filled);
+        let chunk = std::cmp::min((page_end - va) as usize, limit - filled);
         if !mem_read(cpu, &mut buf[filled..filled + chunk]) {
             break;
         }
@@ -25694,6 +25736,9 @@ fn fetch_sph(
     let mut buf = [0u8; SPH_SIZE];
     if !mem_read(cpu, &mut buf) {
         return None;
+    }
+    if nexium_shader::ampere::enabled() {
+        return nexium_shader::ampere::header(&buf);
     }
     Some(buf)
 }

@@ -364,6 +364,9 @@ fn resolve_raw_storage_buffer(
             "raw compute buffer {descriptor_index} has invalid base/size {base:#x}/{size:#x}"
         ));
     }
+    if std::env::var_os("NEXIUM_COMPUTE_RESOURCE_TRACE").is_some() {
+        log::warn!("[compute-raw-storage] index={descriptor_index} c[{}]:{:#x} base={base:#x} size={size:#x} dynamic={} required={:#x}", descriptor.cbuf_binding, descriptor.cbuf_offset, descriptor.has_dynamic_offset, descriptor.required_size);
+    }
     Ok(ResolvedRawStorageBuffer { base, size })
 }
 
@@ -1963,6 +1966,7 @@ fn prepare_and_execute(
     let kp_snap = crate::gpu::pusher::kickprof::start();
     let code = match code_override {
         Some(code) => code.to_vec(),
+        None if nexium_shader::ampere::enabled() => ampere_code(mappings, mem_read, code_gpu)?,
         None => snapshot_code(mappings, mem_read, code_gpu)?,
     };
     let cbufs = snapshot_cbufs(qmd, mappings, mem_read);
@@ -3094,6 +3098,18 @@ fn prepare_and_execute(
             Err(ExecuteError::Submitted(reason))
         }
     }
+}
+
+fn ampere_code(
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    gpu_va: u64,
+) -> Result<Vec<u8>, String> {
+    let mut binary = vec![0u8; nexium_shader::ampere::HEADER_SIZE];
+    binary.extend_from_slice(&snapshot_code(mappings, mem_read, gpu_va)?);
+    nexium_shader::ampere::translate_cached(gpu_va, &binary)
+        .map(|program| program.code.clone())
+        .map_err(|error| format!("SM86 compute program at {gpu_va:#x}: {error}"))
 }
 
 fn snapshot_code(

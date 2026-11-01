@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crossbeam::channel::{unbounded, Sender};
@@ -83,24 +83,61 @@ fn record_gpu_lag(waited: Duration) {
 }
 
 static PENDING_GUEST_WRITES: AtomicUsize = AtomicUsize::new(0);
+static PENDING_GUEST_WRITE_RANGES: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+static NEXT_RANGE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-struct PendingGuestWriteGuard;
+struct PendingGuestWriteGuard {
+    token: u64,
+}
 
 impl PendingGuestWriteGuard {
     fn new() -> Self {
         PENDING_GUEST_WRITES.fetch_add(1, Ordering::AcqRel);
-        Self
+        Self { token: 0 }
+    }
+
+    fn with_ranges(ranges: &[(u64, u64)]) -> Self {
+        if ranges.is_empty() {
+            return Self::new();
+        }
+        let token = NEXT_RANGE_TOKEN.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut pending = PENDING_GUEST_WRITE_RANGES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pending.extend(ranges.iter().map(|&(va, len)| (token, va, len)));
+        }
+        PENDING_GUEST_WRITES.fetch_add(1, Ordering::AcqRel);
+        Self { token }
     }
 }
 
 impl Drop for PendingGuestWriteGuard {
     fn drop(&mut self) {
+        if self.token != 0 {
+            let mut pending = PENDING_GUEST_WRITE_RANGES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pending.retain(|entry| entry.0 != self.token);
+        }
         PENDING_GUEST_WRITES.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 pub(crate) fn guest_writes_pending() -> bool {
     PENDING_GUEST_WRITES.load(Ordering::Acquire) != 0
+}
+
+pub(crate) fn pending_guest_write_overlaps(gpu_va: u64, len: u64) -> bool {
+    if !guest_writes_pending() {
+        return false;
+    }
+    let end = gpu_va.saturating_add(len);
+    PENDING_GUEST_WRITE_RANGES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .any(|&(_, va, range_len)| va < end && gpu_va < va.saturating_add(range_len))
 }
 
 pub(crate) fn wait_for_pending_guest_writes(timeout: Duration) -> bool {
@@ -127,7 +164,26 @@ pub(crate) fn submit_renderer_completion(
     renderer: std::sync::Arc<nexium_gpu::Renderer>,
     completion: impl FnOnce() + Send + 'static,
 ) -> bool {
-    let guard = PendingGuestWriteGuard::new();
+    submit_renderer_completion_guarded(renderer, PendingGuestWriteGuard::new(), completion)
+}
+
+pub(crate) fn submit_renderer_completion_for_ranges(
+    renderer: std::sync::Arc<nexium_gpu::Renderer>,
+    ranges: &[(u64, u64)],
+    completion: impl FnOnce() + Send + 'static,
+) -> bool {
+    submit_renderer_completion_guarded(
+        renderer,
+        PendingGuestWriteGuard::with_ranges(ranges),
+        completion,
+    )
+}
+
+fn submit_renderer_completion_guarded(
+    renderer: std::sync::Arc<nexium_gpu::Renderer>,
+    guard: PendingGuestWriteGuard,
+    completion: impl FnOnce() + Send + 'static,
+) -> bool {
     let marker = move || {
         let target = renderer.submitted_generation();
         let completion_job = Box::new(move || {

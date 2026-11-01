@@ -2314,6 +2314,10 @@ impl GpuContext {
         }
     }
 
+    pub(crate) fn guest_memory(&self) -> GuestMemoryAccess {
+        self.guest_memory.clone()
+    }
+
     pub fn set_guest_memory_writer(&self, writer: GuestMemoryWriter) {
         self.guest_memory.set_writer(Some(writer));
     }
@@ -2422,6 +2426,14 @@ impl GpuContext {
                 reported = waited.as_secs() / 2;
                 watchdog::pusher_lock_wait_report(site, waited);
             }
+        }
+    }
+
+    pub fn select_channel(&self, channel: u32) {
+        let mut pusher = self.lock_pusher(concat!("gpu/mod.rs:", line!()));
+        pusher.select_channel(channel);
+        if let Some(mme) = self.maxwell3d.lock().mme64.as_mut() {
+            mme.set_channel(channel);
         }
     }
 
