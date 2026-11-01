@@ -18,6 +18,7 @@ pub mod log_sink;
 pub mod monitored_futex;
 pub mod nextendo;
 pub mod paths;
+pub mod render_scale;
 pub mod result;
 pub mod shader_progress;
 pub mod speed_limit;
