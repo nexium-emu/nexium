@@ -33,7 +33,7 @@ mkdir -p "$PS5_STACK"
 for repo in "${!PIN[@]}"; do
     dir="$PS5_STACK/$repo"
     [[ -d $dir/.git ]] || git clone -q "https://github.com/mihawk-99/$repo.git" "$dir"
-    git -C "$dir" fetch -q origin
+    git -C "$dir" fetch -q origin "${PIN[$repo]}"
     git -C "$dir" checkout -q "${PIN[$repo]}"
     echo "$repo at $(git -C "$dir" rev-parse --short HEAD)"
 done
