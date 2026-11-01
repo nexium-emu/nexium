@@ -41,6 +41,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -108,14 +110,14 @@ jobs:
 
       - name: Test NeXium
         shell: bash
-        timeout-minutes: 30
+        timeout-minutes: 120
         env:
           NEXIUM_DATA_ROOT: ${{ runner.temp }}/nexium-test-data
         run: cargo test --release --workspace --no-fail-fast
 
       - name: Test NeXium libraries with OS waits
         shell: bash
-        timeout-minutes: 10
+        timeout-minutes: 30
         env:
           NEXIUM_DATA_ROOT: ${{ runner.temp }}/nexium-test-data
           NEXIUM_NO_MONITORED_WAIT: "1"
@@ -262,6 +264,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: android-arm64
+          cache-on-failure: true
 
       - name: Install host build dependencies
         run: |

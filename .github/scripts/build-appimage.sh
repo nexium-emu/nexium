@@ -24,9 +24,9 @@ fi
 rustup update --no-self-update stable
 rustc --version
 cargo --version
-cmake --version | head -n 1
-"${CXX:-c++}" --version | head -n 1
-ldd --version | head -n 1
+cmake --version | sed -n 1p
+"${CXX:-c++}" --version | sed -n 1p
+ldd --version | sed -n 1p
 
 cargo build --release -p nexium-gui --bin nexium
 unset RUNNER_TEMP
