@@ -207,7 +207,48 @@ impl Hash for RtKey {
     }
 }
 
+pub fn scale_span(scale: f32, start: i32, length: u32) -> (i32, u32) {
+    if scale == 1.0 {
+        return (start, length);
+    }
+    let first = (start as f32 * scale).round() as i32;
+    let last = ((start as f32 + length as f32) * scale).round() as i32;
+    (first, (last - first).max(i32::from(length != 0)) as u32)
+}
+
+pub fn scale_offset(scale: f32, offset: vk::Offset2D) -> vk::Offset2D {
+    vk::Offset2D {
+        x: scale_span(scale, offset.x, 0).0,
+        y: scale_span(scale, offset.y, 0).0,
+    }
+}
+
+pub fn scale_rect(scale: f32, rect: vk::Rect2D) -> vk::Rect2D {
+    let (x, width) = scale_span(scale, rect.offset.x, rect.extent.width);
+    let (y, height) = scale_span(scale, rect.offset.y, rect.extent.height);
+    vk::Rect2D {
+        offset: vk::Offset2D { x, y },
+        extent: vk::Extent2D { width, height },
+    }
+}
+
 impl RtKey {
+    pub fn render_scale(&self) -> f32 {
+        if self.is_3d {
+            1.0
+        } else {
+            nexium_common::render_scale::factor()
+        }
+    }
+
+    pub fn image_extent(&self) -> vk::Extent2D {
+        let scale = self.render_scale();
+        vk::Extent2D {
+            width: nexium_common::render_scale::scale_with(scale, self.width),
+            height: nexium_common::render_scale::scale_with(scale, self.height),
+        }
+    }
+
     pub fn new(nvmap_id: u32, width: u32, height: u32, gpu_va: u64) -> Self {
         Self::with_cpu(nvmap_id, width, height, gpu_va, 0)
     }
@@ -2275,10 +2316,8 @@ impl RtCache {
             && target.height != 0
             && source.width >= target.width
             && source.height >= target.height
-            && source_image.extent.width == source.width
-            && source_image.extent.height == source.height
-            && target_image.extent.width == target.width
-            && target_image.extent.height == target.height
+            && source_image.extent == source.image_extent()
+            && target_image.extent == target.image_extent()
             && source_image.base_format == target_image.base_format
             && source_image.format == target_image.format
             && source_image.aspects == target_image.aspects
@@ -4421,10 +4460,7 @@ impl RtCache {
         let mem_props = self
             .mem_properties
             .ok_or_else(|| "RtCache: memory properties not set".to_string())?;
-        let extent = vk::Extent2D {
-            width: key.width,
-            height: key.height,
-        };
+        let extent = key.image_extent();
 
         let image_info = vk::ImageCreateInfo {
             s_type: vk::StructureType::IMAGE_CREATE_INFO,
@@ -4435,8 +4471,8 @@ impl RtCache {
             },
             format,
             extent: vk::Extent3D {
-                width: key.width,
-                height: key.height,
+                width: extent.width,
+                height: extent.height,
                 depth: if key.is_3d { key.depth.max(1) } else { 1 },
             },
             mip_levels: 1,
@@ -4946,6 +4982,38 @@ pub fn find_memory_type(
         }
     }
     None
+}
+
+pub fn allocate_image_memory(
+    device: &ash::Device,
+    props: &vk::PhysicalDeviceMemoryProperties,
+    info: &vk::MemoryAllocateInfo,
+    type_bits: u32,
+) -> Result<vk::DeviceMemory, vk::Result> {
+    match unsafe { device.allocate_memory(info, None) } {
+        Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
+            let fallback = (0..props.memory_type_count)
+                .find(|&i| {
+                    type_bits & (1 << i) != 0
+                        && !props.memory_types[i as usize]
+                            .property_flags
+                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                })
+                .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| log::warn!("[vram] device memory full; placing images in system memory"));
+            unsafe {
+                device.allocate_memory(
+                    &vk::MemoryAllocateInfo {
+                        memory_type_index: fallback,
+                        ..*info
+                    },
+                    None,
+                )
+            }
+        }
+        result => result,
+    }
 }
 
 impl Drop for RtCache {

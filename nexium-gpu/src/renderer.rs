@@ -454,15 +454,12 @@ fn shared_aurora_ssbo_key(snapshot: &crate::draw::StorageBufferSnapshot) -> Opti
     ))
 }
 
-type ReadonlySsboUploadKey = (usize, u64, usize);
+type SsboUploadKey = (usize, u64, usize, usize);
 
-fn readonly_ssbo_upload_key(
+fn ssbo_upload_key(
     snapshot: &crate::draw::StorageBufferSnapshot,
-) -> Option<ReadonlySsboUploadKey> {
-    (snapshot.readonly_noalias
-        && snapshot.data_offset == 0
-        && !snapshot.data.is_empty()
-        && snapshot.data.len() == snapshot.logical_size
+) -> Option<SsboUploadKey> {
+    (!snapshot.data.is_empty()
         && !matches!(
             snapshot.logical_size,
             AURORA_VERTEX_BUFFER_SIZE | AURORA_STORAGE_BUFFER_SIZE
@@ -471,6 +468,7 @@ fn readonly_ssbo_upload_key(
         std::sync::Arc::as_ptr(&snapshot.data) as usize,
         snapshot.guest_addr,
         snapshot.logical_size,
+        snapshot.data_offset,
     ))
 }
 
@@ -1766,6 +1764,7 @@ struct RendererInner {
     resident_vb: Option<ResidentVbCache>,
     cbuf_pool: Option<crate::cbuf_pool::CbufPool>,
     compute_guest_content_memo: HashMap<(u64, usize), ComputeGuestImageContent>,
+    compute_texture_hashes: HashMap<(u64, usize), u64>,
     min_storage_buffer_offset_alignment: u64,
     max_storage_buffer_range: u64,
     max_texel_buffer_elements: u32,
@@ -2424,10 +2423,12 @@ fn record_gpu_astc_decode(
         }
     }
     let arena = slot.astc_arena.as_mut()?;
-    let reservation = arena.reserve(device, mem_props, plan)?;
-    pipeline.record(device, cmd, arena, reservation, plan);
+    let reservation = arena
+        .reserve(device, mem_props, plan)
+        .or_else(|| arena.reserve_dedicated(device, mem_props, plan))?;
+    pipeline.record(device, cmd, reservation, plan);
     Some(TextureUploadSource::Buffer {
-        buffer: arena.output_buffer(),
+        buffer: reservation.output_buffer,
         base_offset: reservation.copy_offset,
     })
 }
@@ -3653,8 +3654,8 @@ struct CachedComputeVolume {
 }
 
 const COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS: usize = 128;
-const COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ComputeGuestImagePoolKey {
@@ -3687,7 +3688,7 @@ struct ComputeGuestUploadSpec {
 struct ComputeGuestImageContent {
     spec: ComputeGuestUploadSpec,
     source_hash: u64,
-    source: Arc<[u8]>,
+    source_len: usize,
     upload: Arc<[u8]>,
     copies: Arc<[TextureMipCopy]>,
 }
@@ -7643,6 +7644,7 @@ impl Renderer {
                 resident_vb,
                 cbuf_pool,
                 compute_guest_content_memo: HashMap::default(),
+                compute_texture_hashes: HashMap::default(),
                 min_storage_buffer_offset_alignment,
                 max_storage_buffer_range,
                 max_texel_buffer_elements,
@@ -7709,8 +7711,10 @@ impl Renderer {
             _ => { presenter.recycle(slot); return Ok(false); }
         };
         parameters.flip_y = rt_cache.present_flip_y(key).unwrap_or(parameters.flip_y);
+        let parameters = parameters.scaled(key.render_scale());
+        let extent = key.image_extent();
         let result = (|| -> Result<(), String> {
-        slot.prepare(mem_props, key.width, key.height, format)?;
+        slot.prepare(mem_props, extent.width, extent.height, format)?;
         reset_command_buffer(device, slot.cmd)?;
         begin_one_time(device, slot.cmd)?;
         transition_image(device, slot.cmd, source, layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
@@ -7718,7 +7722,7 @@ impl Renderer {
         let copy = vk::ImageCopy::default()
             .src_subresource(crate::presentation::color_layers())
             .dst_subresource(crate::presentation::color_layers())
-            .extent(vk::Extent3D { width: key.width, height: key.height, depth: 1 });
+            .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 });
         unsafe {
             device.cmd_copy_image(slot.cmd, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 slot.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
@@ -7891,7 +7895,6 @@ impl Renderer {
         if key.is_3d || key.render_layer_count() != 1 {
             return Err("color clear requires one resolved 2D layer".to_string());
         }
-        let (width, height) = (key.width, key.height);
         let clear_settle_started = std::time::Instant::now();
         self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
@@ -7964,7 +7967,7 @@ impl Renderer {
             s_type: vk::StructureType::RENDERING_INFO,
             render_area: vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D { width, height },
+                extent: key.image_extent(),
             },
             layer_count: 1,
             view_mask: 0,
@@ -8132,7 +8135,7 @@ impl Renderer {
             s_type: vk::StructureType::RENDERING_INFO,
             render_area: vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D { width, height },
+                extent: color_key.image_extent(),
             },
             layer_count: 1,
             view_mask: 0,
@@ -8342,7 +8345,7 @@ impl Renderer {
             s_type: vk::StructureType::RENDERING_INFO,
             render_area: vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D { width, height },
+                extent: key.image_extent(),
             },
             layer_count: 1,
             view_mask: 0,
@@ -8360,16 +8363,19 @@ impl Renderer {
             clear_value,
         };
         let clear_rect = vk::ClearRect {
-            rect: vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: x as i32,
-                    y: y as i32,
+            rect: crate::rt_cache::scale_rect(
+                key.render_scale(),
+                vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: x as i32,
+                        y: y as i32,
+                    },
+                    extent: vk::Extent2D {
+                        width: w,
+                        height: h,
+                    },
                 },
-                extent: vk::Extent2D {
-                    width: w,
-                    height: h,
-                },
-            },
+            ),
             base_array_layer: 0,
             layer_count: 1,
         };
@@ -8488,7 +8494,7 @@ impl Renderer {
                     let reservation = arena
                         .reserve(device, mem_props, plan)
                         .ok_or_else(|| "astc decode reservation failed".to_string())?;
-                    pipeline.record(device, cmd, &arena, reservation, plan);
+                    pipeline.record(device, cmd, reservation, plan);
                     let region = vk::BufferCopy {
                         src_offset: reservation.copy_offset,
                         dst_offset: readback_offset,
@@ -8592,10 +8598,17 @@ impl Renderer {
             let img = rt_cache.get_or_create(key, device)?;
             (img.image, img.layout)
         };
+        let extent = key.image_extent();
+        let rgba8 = resample_texels_nearest(
+            rgba8[..expected].to_vec(),
+            4,
+            (width, height),
+            (extent.width, extent.height),
+        );
         let stage = create_host_buffer(
             device,
             mem_props,
-            &rgba8[..expected],
+            &rgba8,
             vk::BufferUsageFlags::TRANSFER_SRC,
         )?;
 
@@ -8632,8 +8645,8 @@ impl Renderer {
             },
             image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
             image_extent: vk::Extent3D {
-                width,
-                height,
+                width: extent.width,
+                height: extent.height,
                 depth: 1,
             },
         };
@@ -8795,7 +8808,12 @@ impl Renderer {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 targets.dst_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[copy],
+                &[scale_image_copy(
+                    copy,
+                    source.render_scale(),
+                    source.image_extent(),
+                    destination.image_extent(),
+                )],
             );
         }
         transition_image(
@@ -9019,7 +9037,12 @@ impl Renderer {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 dst_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[copy],
+                &[scale_image_copy(
+                    copy,
+                    src_key.render_scale(),
+                    src_key.image_extent(),
+                    dst_key.image_extent(),
+                )],
             );
         }
         transition_image(
@@ -9220,7 +9243,12 @@ impl Renderer {
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     image.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[copy],
+                    &[scale_image_copy(
+                        copy,
+                        token.key.render_scale(),
+                        token.key.image_extent(),
+                        token.key.image_extent(),
+                    )],
                 );
             }
             transition_image(
@@ -9466,9 +9494,16 @@ impl Renderer {
                         depth: 1,
                     },
                 };
+                let region = scale_image_copy(
+                    region,
+                    src_key.render_scale(),
+                    src_key.image_extent(),
+                    dst_key.image_extent(),
+                );
                 device.cmd_copy_image(cmd, src_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     dst_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
             } else {
+                let blit = scale_image_blit(blit, src_key.render_scale(), dst_key.render_scale());
                 device.cmd_blit_image(cmd, src_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     dst_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
             }
@@ -9736,6 +9771,18 @@ impl Renderer {
         height: u32,
         gpu_va: u64,
     ) -> Option<Vec<u8>> {
+        let (read_width, read_height, pixels) =
+            self.readback_target_scaled_at(nvmap_id, width, height, gpu_va)?;
+        Some(resample_texels_nearest(pixels, 4, (read_width, read_height), (width, height)))
+    }
+
+    pub fn readback_target_scaled_at(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+    ) -> Option<(u32, u32, Vec<u8>)> {
         let mut inner = self.inner.lock();
         let RendererInner {
             device,
@@ -9790,6 +9837,10 @@ impl Renderer {
             !order.is_empty()
         });
 
+        let scale = key.render_scale();
+        let image_extent = key.image_extent();
+        let width = nexium_common::render_scale::scale_with(scale, width).min(image_extent.width);
+        let height = nexium_common::render_scale::scale_with(scale, height).min(image_extent.height);
         let total = (width as u64) * 4 * (height as u64);
         let stage = create_staging_owned(device, mem_props, total).ok()?;
         let cleanup = |device: &ash::Device,
@@ -9906,7 +9957,7 @@ impl Renderer {
         }
         let out = readback_to_rgba8(&raw, img.format, width, height);
         cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
-        Some(out)
+        Some((width, height, out))
     }
 
     pub fn has_color_target_touching(&self, gpu_va: u64) -> bool {
@@ -10003,8 +10054,9 @@ impl Renderer {
                 continue;
             };
             let bpp = readback_format_bpp(image.format);
-            let Some(byte_len) = (key.width as u64)
-                .checked_mul(key.height as u64)
+            let extent = image.extent;
+            let Some(byte_len) = (extent.width as u64)
+                .checked_mul(extent.height as u64)
                 .and_then(|pixels| pixels.checked_mul(key.render_layer_count() as u64))
                 .and_then(|pixels| pixels.checked_mul(bpp as u64))
             else {
@@ -10021,8 +10073,8 @@ impl Renderer {
                 write_stamp: rt_cache.writeback_stamp(key).unwrap_or(0),
                 output_index,
                 key,
-                width: key.width,
-                height: key.height,
+                width: extent.width,
+                height: extent.height,
                 bpp,
                 offset,
                 byte_len,
@@ -10189,10 +10241,20 @@ impl Renderer {
                     raw.as_mut_ptr(),
                     plan.byte_len,
                 );
+                let guest = (plan.key.width, plan.key.height);
+                if (plan.width, plan.height) != guest {
+                    let layer_len = plan.width as usize * plan.height as usize * plan.bpp;
+                    raw = raw
+                        .chunks(layer_len.max(1))
+                        .flat_map(|layer| {
+                            resample_texels_nearest(layer.to_vec(), plan.bpp, (plan.width, plan.height), guest)
+                        })
+                        .collect();
+                }
                 outputs.readbacks[plan.output_index] = Some(RawColorTargetReadback {
                     write_stamp: plan.write_stamp,
-                    width: plan.width,
-                    height: plan.height,
+                    width: guest.0,
+                    height: guest.1,
                     bpp: plan.bpp,
                     data: raw,
                 });
@@ -10235,6 +10297,11 @@ impl Renderer {
         {
             return None;
         }
+        let guest = (width, height);
+        let scale = key.render_scale();
+        let image_extent = key.image_extent();
+        let width = nexium_common::render_scale::scale_with(scale, width).min(image_extent.width);
+        let height = nexium_common::render_scale::scale_with(scale, height).min(image_extent.height);
         let bpp = 4usize;
         let total = (width as u64) * (height as u64) * bpp as u64;
         let stage = create_staging_owned(device, mem_props, total).ok()?;
@@ -10369,7 +10436,7 @@ impl Renderer {
         if format == vk::Format::D32_SFLOAT_S8_UINT {
             crate::depth::pack_d32_readback(&mut raw);
         }
-        Some((width, height, bpp, raw))
+        Some((guest.0, guest.1, bpp, resample_texels_nearest(raw, bpp, (width, height), guest)))
     }
 
     pub fn readback_target_pipelined(
@@ -10730,6 +10797,9 @@ impl Renderer {
             .unwrap_or((0, 0, key.width, key.height));
         let copy_w = copy_w.min(key.width.saturating_sub(copy_x));
         let copy_h = copy_h.min(key.height.saturating_sub(copy_y));
+        let (copy_x, copy_w) = crate::rt_cache::scale_span(key.render_scale(), copy_x as i32, copy_w);
+        let (copy_y, copy_h) = crate::rt_cache::scale_span(key.render_scale(), copy_y as i32, copy_h);
+        let (copy_x, copy_y) = (copy_x as u32, copy_y as u32);
         let Some(total) = readback_byte_len(copy_w, copy_h, readback_format) else {
             return PipelinedPresentRawReadback {
                 completion,
@@ -12908,8 +12978,8 @@ impl Renderer {
         };
         unsafe { device.cmd_begin_rendering(cmd, &render_info) };
 
-        let viewport = draw_viewport(call.vp_rect, call.depth_range, rt_extent);
-        let scissor = draw_scissor(call.scissor, rt_extent);
+        let viewport = draw_viewport(call.vp_rect, call.depth_range, rt_extent, draw_render_scale(call));
+        let scissor = draw_scissor(call.scissor, rt_extent, draw_render_scale(call));
         unsafe {
             device.cmd_set_viewport(cmd, 0, &[viewport]);
             device.cmd_set_scissor(cmd, 0, &[scissor]);
@@ -14043,8 +14113,8 @@ impl Renderer {
             Vec::<vk::DescriptorBufferInfo>::with_capacity(crate::descriptor::MAX_SSBO as usize);
         let mut descriptor_ssbo_bindings =
             Vec::<u32>::with_capacity(crate::descriptor::MAX_SSBO as usize);
-        let mut readonly_ssbo_uploads =
-            HashMap::<ReadonlySsboUploadKey, vk::DescriptorBufferInfo>::default();
+        let mut ssbo_uploads =
+            HashMap::<SsboUploadKey, vk::DescriptorBufferInfo>::default();
         let mut storage_readback_ranges = Vec::<(usize, u32, u64, usize)>::new();
         let mut shared_writer_uploads = HashMap::<(u64, usize), vk::DescriptorBufferInfo>::default();
         let mut storage_readback_staging_ranges = Vec::<(u64, usize, u64)>::new();
@@ -16810,10 +16880,10 @@ impl Renderer {
                     if snapshot.data.is_empty() {
                         continue;
                     }
-                    let readonly_key = call.storage_readback.is_none()
-                        .then(|| readonly_ssbo_upload_key(snapshot))
+                    let upload_key = call.storage_readback.is_none()
+                        .then(|| ssbo_upload_key(snapshot))
                         .flatten();
-                    if let Some(info) = readonly_key.and_then(|key| readonly_ssbo_uploads.get(&key)) {
+                    if let Some(info) = upload_key.and_then(|key| ssbo_uploads.get(&key)) {
                         ssbo_infos.push(*info);
                         ssbo_bindings.push(idx);
                         ssbo_provided[idx as usize] = true;
@@ -16869,8 +16939,8 @@ impl Renderer {
                             shared_writer_uploads.insert((snapshot.guest_addr, snapshot.logical_size), info);
                         }
                     }
-                    if let Some(key) = readonly_key {
-                        readonly_ssbo_uploads.insert(key, info);
+                    if let Some(key) = upload_key {
+                        ssbo_uploads.insert(key, info);
                     }
                     ssbo_infos.push(info);
                     ssbo_bindings.push(idx);
@@ -17331,8 +17401,8 @@ impl Renderer {
                     unsafe {
                         device.cmd_begin_rendering(cmd, &render_info);
                         if !record_state_dedup {
-                            let viewport = draw_viewport(call.vp_rect, call.depth_range, rt_extent);
-                            let scissor = draw_scissor(call.scissor, rt_extent);
+                            let viewport = draw_viewport(call.vp_rect, call.depth_range, rt_extent, draw_render_scale(call));
+                            let scissor = draw_scissor(call.scissor, rt_extent, draw_render_scale(call));
                             device.cmd_set_viewport(cmd, 0, &[viewport]);
                             device.cmd_set_scissor(cmd, 0, &[scissor]);
                         }
@@ -17356,8 +17426,8 @@ impl Renderer {
                 graphics_storage_pass.written_since_barrier |= graphics_storage_writes;
                 graphics_storage_pass.read_since_barrier |= graphics_storage_reads;
                 unsafe {
-                    let vp = draw_viewport(call.vp_rect, call.depth_range, rt_extent);
-                    let scissor = draw_scissor(call.scissor, rt_extent);
+                    let vp = draw_viewport(call.vp_rect, call.depth_range, rt_extent, draw_render_scale(call));
+                    let scissor = draw_scissor(call.scissor, rt_extent, draw_render_scale(call));
                     let viewport_key = viewport_record_key(vp);
                     let scissor_key = scissor_record_key(scissor);
                     let stencil_key = stencil_record_key(call.stencil);
@@ -18078,8 +18148,78 @@ impl RecordedGraphicsState {
     }
 }
 
-fn draw_viewport(rect: Option<[f32; 4]>, depth_range: [f32; 2], extent: vk::Extent2D) -> vk::Viewport {
-    let [x, y, width, height] = rect.unwrap_or([0.0, 0.0, extent.width as f32, extent.height as f32]);
+pub fn resample_texels_nearest(data: Vec<u8>, bpp: usize, source: (u32, u32), target: (u32, u32)) -> Vec<u8> {
+    if source == target {
+        return data;
+    }
+    let (source_width, source_height) = (source.0 as usize, source.1 as usize);
+    let (target_width, target_height) = (target.0 as usize, target.1 as usize);
+    let mut out = vec![0u8; target_width * target_height * bpp];
+    if source_width == 0 || source_height == 0 || data.len() < source_width * source_height * bpp {
+        return out;
+    }
+    let columns: Vec<usize> = (0..target_width)
+        .map(|x| ((x * 2 + 1) * source_width / (target_width * 2)).min(source_width - 1))
+        .collect();
+    for (y, row) in out.chunks_exact_mut((target_width * bpp).max(1)).enumerate() {
+        let source_y = ((y * 2 + 1) * source_height / (target_height * 2)).min(source_height - 1);
+        let source_row = &data[source_y * source_width * bpp..(source_y + 1) * source_width * bpp];
+        for (texel, &source_x) in row.chunks_exact_mut(bpp).zip(&columns) {
+            texel.copy_from_slice(&source_row[source_x * bpp..(source_x + 1) * bpp]);
+        }
+    }
+    out
+}
+
+fn scale_image_copy(copy: vk::ImageCopy, scale: f32, src: vk::Extent2D, dst: vk::Extent2D) -> vk::ImageCopy {
+    if scale == 1.0 {
+        return copy;
+    }
+    let (src_x, width) = crate::rt_cache::scale_span(scale, copy.src_offset.x, copy.extent.width);
+    let (src_y, height) = crate::rt_cache::scale_span(scale, copy.src_offset.y, copy.extent.height);
+    let dst_x = crate::rt_cache::scale_span(scale, copy.dst_offset.x, 0).0;
+    let dst_y = crate::rt_cache::scale_span(scale, copy.dst_offset.y, 0).0;
+    let room = |extent: u32, offset: i32| extent.saturating_sub(offset.max(0) as u32);
+    vk::ImageCopy {
+        src_offset: vk::Offset3D { x: src_x, y: src_y, z: copy.src_offset.z },
+        dst_offset: vk::Offset3D { x: dst_x, y: dst_y, z: copy.dst_offset.z },
+        extent: vk::Extent3D {
+            width: width.min(room(src.width, src_x)).min(room(dst.width, dst_x)),
+            height: height.min(room(src.height, src_y)).min(room(dst.height, dst_y)),
+            depth: copy.extent.depth,
+        },
+        ..copy
+    }
+}
+
+fn scale_image_blit(mut blit: vk::ImageBlit, src_scale: f32, dst_scale: f32) -> vk::ImageBlit {
+    let scale = |offset: &mut vk::Offset3D, scale: f32| {
+        offset.x = crate::rt_cache::scale_span(scale, offset.x, 0).0;
+        offset.y = crate::rt_cache::scale_span(scale, offset.y, 0).0;
+    };
+    blit.src_offsets.iter_mut().for_each(|offset| scale(offset, src_scale));
+    blit.dst_offsets.iter_mut().for_each(|offset| scale(offset, dst_scale));
+    blit
+}
+
+fn draw_render_scale(call: &crate::draw::Maxwell3dDrawCall) -> f32 {
+    let scale = call.rt_key.render_scale();
+    if scale != 1.0 && graphics_storage_only_draw(call) {
+        1.0
+    } else {
+        scale
+    }
+}
+
+fn draw_viewport(
+    rect: Option<[f32; 4]>,
+    depth_range: [f32; 2],
+    extent: vk::Extent2D,
+    scale: f32,
+) -> vk::Viewport {
+    let [x, y, width, height] = rect
+        .map(|rect| rect.map(|value| value * scale))
+        .unwrap_or([0.0, 0.0, extent.width as f32, extent.height as f32]);
     vk::Viewport { x, y, width, height, min_depth: depth_range[0], max_depth: depth_range[1] }
 }
 
@@ -19840,6 +19980,15 @@ fn texture_cache_invalidate_clear_value_enabled(value: Option<&std::ffi::OsStr>)
     })
 }
 
+fn scale_guest_rect(rect: [i32; 4], scale: f32) -> [i32; 4] {
+    if scale == 1.0 {
+        return rect;
+    }
+    let (x, width) = crate::rt_cache::scale_span(scale, rect[0].max(0), rect[2].max(0) as u32);
+    let (y, height) = crate::rt_cache::scale_span(scale, rect[1].max(0), rect[3].max(0) as u32);
+    [x, y, width as i32, height as i32]
+}
+
 fn inline_graphics_clear_rect(rect: [i32; 4], extent: vk::Extent2D) -> Option<vk::Rect2D> {
     let x = rect[0].max(0) as u32;
     let y = rect[1].max(0) as u32;
@@ -19943,7 +20092,10 @@ fn record_inline_graphics_color_clear(
         )?;
         (image.image, image.view, image.extent, image.layout)
     };
-    let region = inline_graphics_color_clear_region(color.rect, extent);
+    let region = inline_graphics_color_clear_region(
+        color.rect.map(|rect| scale_guest_rect(rect, color.key.render_scale())),
+        extent,
+    );
     if matches!(region, InlineGraphicsColorClearRegion::NoOp) {
         return Ok(());
     }
@@ -20789,7 +20941,7 @@ fn compute_guest_image_retained_bytes(resource: &crate::compute::ComputeGuestIma
 
 fn compute_guest_image_content_bytes(content: Option<&ComputeGuestImageContent>) -> usize {
     content.map_or(0, |content| {
-        content.source.len().saturating_add(content.upload.len())
+        content.upload.len()
     })
 }
 
@@ -20801,7 +20953,7 @@ fn compute_guest_content_matches(
         Arc::ptr_eq(&cached.upload, &incoming.upload)
             || (cached.spec == incoming.spec
                 && cached.source_hash == incoming.source_hash
-                && cached.source.len() == incoming.source.len())
+                && cached.source_len == incoming.source_len)
     })
 }
 
@@ -20824,7 +20976,7 @@ fn compute_guest_source_matches(
 ) -> bool {
     content.spec == *spec
         && content.source_hash == source_hash
-        && content.source.len() == source_len
+        && content.source_len == source_len
 }
 
 fn compute_guest_upload_spec(
@@ -20834,14 +20986,93 @@ fn compute_guest_upload_spec(
     force_pitch: bool,
     format: vk::Format,
 ) -> ComputeGuestUploadSpec {
+    let mut layout_tic = tic;
+    layout_tic.gpu_va = 0;
     ComputeGuestUploadSpec {
-        tic,
+        tic: layout_tic,
         effective_block_linear: effective_texture_block_linear(&tic),
         layer_count,
         pitch_size,
         force_pitch,
         format: format.as_raw(),
     }
+}
+
+fn graphics_texture_for_compute(
+    cache: &nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
+    hashes: &mut HashMap<(u64, usize), u64>,
+    tic: &crate::texture::TicEntry,
+    numeric_type: nexium_spirv::TextureNumericType,
+    content_key: Option<u64>,
+    raw: &[u8],
+) -> Option<(vk::Image, vk::ImageView)> {
+    let volume = tic_is_volume(tic);
+    let layers = tic_storage_layer_count(tic);
+    let read_size = tic_read_size(tic, tic.format.linear_size(tic.width, tic.height), layers);
+    if raw.len() != read_size {
+        return None;
+    }
+    let mip_levels = if tic.is_block_linear && !volume { tic.mip_levels() } else { 1 };
+    let key = TexCacheKey::new(TexCacheKeyData {
+        gpu_va: tic.backing_gpu_va()?,
+        guest_size: read_size as u64,
+        width: tic.width,
+        height: tic.height,
+        layers,
+        base_layer: tic_view_base_layer(tic),
+        view_layers: tic_view_layer_count(tic),
+        mip_levels,
+        base_mip: if mip_levels > 1 { tic.view_base_mip() } else { 0 },
+        view_mips: if mip_levels > 1 { tic.view_mip_levels() } else { 1 },
+        arrayed: false,
+        cube: false,
+        cube_array: false,
+        volume: false,
+        format: tic.format,
+        component_types: tic.component_types,
+        swizzle: tic.swizzle,
+        is_srgb: tic.is_srgb,
+        is_sparse: tic.is_sparse,
+        msaa_mode: tic.msaa_mode,
+        is_block_linear: tic.is_block_linear,
+        block_width_log2: tic.block_width_log2,
+        block_height_log2: tic.block_height_log2,
+        block_depth_log2: tic.block_depth_log2,
+        tile_width_spacing: tic.tile_width_spacing,
+        pitch_bytes: tic.pitch_bytes,
+        numeric_type: texture_numeric_cache_key(numeric_type),
+    });
+    let image_kind = if volume {
+        GraphicsTextureImageKind::D3
+    } else if tic_is_cube_array(tic) {
+        GraphicsTextureImageKind::CubeArray
+    } else if tic_is_cube(tic) {
+        GraphicsTextureImageKind::Cube
+    } else if tic.texture_type == 5 {
+        GraphicsTextureImageKind::D2Array
+    } else {
+        GraphicsTextureImageKind::D2
+    };
+    let key = route_texture_key_to_shader_image_kind(key, tic, image_kind).ok()?;
+    let cached = cache.get(&key)?;
+    if cached.invalidated
+        || cached.view == vk::ImageView::null()
+        || cached.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    {
+        return None;
+    }
+    let hash = match content_key {
+        Some(content_key) => {
+            if hashes.len() >= 4096 {
+                hashes.clear();
+            }
+            *hashes
+                .entry((content_key, raw.len()))
+                .or_insert_with(|| texture_content_hash(raw))
+        }
+        None => texture_content_hash(raw),
+    };
+    (cached.hash == crate::texture_mips::texture_rt_mip_hash(hash, &[])).then_some((cached.image, cached.view))
 }
 
 fn prepare_compute_guest_image_content(
@@ -20889,18 +21120,12 @@ fn prepare_compute_guest_image_content(
         force_pitch,
         format,
     )?;
-    let source: Arc<[u8]> = Arc::from(raw);
-    let upload_bytes = if upload.bytes.as_slice() == raw {
-        source.clone()
-    } else {
-        Arc::from(upload.bytes)
-    };
     profile_compute_guest_decode_reuse(false, raw.len());
     let content = ComputeGuestImageContent {
         spec,
         source_hash,
-        source,
-        upload: upload_bytes,
+        source_len: raw.len(),
+        upload: Arc::from(upload.bytes),
         copies: Arc::from(upload.copies),
     };
     if let Some(key) = content_key {
@@ -21132,15 +21357,39 @@ fn copy_compute_volume_rt_slices(
                 depth: 1,
             },
         };
+        let scale = slice.key.render_scale();
         unsafe {
-            device.cmd_copy_image(
-                cmd,
-                slice.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                destination,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
+            if scale == 1.0 {
+                device.cmd_copy_image(
+                    cmd,
+                    slice.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    destination,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            } else {
+                let end = |offset: vk::Offset3D| vk::Offset3D {
+                    x: offset.x + width as i32,
+                    y: offset.y + height as i32,
+                    z: offset.z + 1,
+                };
+                let blit = vk::ImageBlit {
+                    src_subresource: region.src_subresource,
+                    src_offsets: [region.src_offset, end(region.src_offset)],
+                    dst_subresource: region.dst_subresource,
+                    dst_offsets: [region.dst_offset, end(region.dst_offset)],
+                };
+                device.cmd_blit_image(
+                    cmd,
+                    slice.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    destination,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[scale_image_blit(blit, scale, 1.0)],
+                    vk::Filter::NEAREST,
+                );
+            }
         }
         if slice.layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
             transition_image(
@@ -23208,6 +23457,35 @@ fn execute_compute_dispatch_mode(
                         sampler: vk::Sampler::null(),
                         volume,
                     },
+                    integer_sample,
+                )
+            } else if let Some(cached) = sampled
+                .guest_bytes
+                .as_deref()
+                .filter(|_| !sampled.require_live)
+                .and_then(|raw| {
+                    let RendererInner { tex_cache, compute_texture_hashes, .. } = &mut *inner;
+                    graphics_texture_for_compute(
+                        tex_cache,
+                        compute_texture_hashes,
+                        &sampled.tic,
+                        numeric_type,
+                        sampled.content_key,
+                        raw,
+                    )
+                })
+            {
+                (
+                    ComputeSamplePlan::Live(PreparedComputeSample {
+                        binding: sampled.binding,
+                        image: cached.0,
+                        view: cached.1,
+                        sampler: vk::Sampler::null(),
+                        descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        aspects: vk::ImageAspectFlags::COLOR,
+                        alias: None,
+                    }),
                     integer_sample,
                 )
             } else {
@@ -28504,6 +28782,9 @@ fn pending_texture_for_tic(
         )
     })?;
     let read_size = tic_read_size(&tic, pitch_size, layers);
+    if crate::texture::texture_over_budget(read_size, &tic) {
+        return Ok(None);
+    }
     let key = TexCacheKey::new(TexCacheKeyData {
         gpu_va: backing_gpu_va,
         guest_size: read_size as u64,
@@ -29086,8 +29367,8 @@ fn snapshot_feedback_alias(
         },
         dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
         extent: vk::Extent3D {
-            width: key.width,
-            height: key.height,
+            width: key.image_extent().width,
+            height: key.image_extent().height,
             depth: 1,
         },
     };
@@ -29195,7 +29476,14 @@ where
         trace_configured_rt_preflight(key, format, "unpack-miss");
         return Ok(());
     };
-    let upload = TextureUploadData::base(native, key.width, key.height);
+    let extent = key.image_extent();
+    let native = resample_texels_nearest(
+        native,
+        bytes_per_pixel,
+        (key.width, key.height),
+        (extent.width, extent.height),
+    );
+    let upload = TextureUploadData::base(native, extent.width, extent.height);
     let stage = update_texture_image(
         device,
         cmd,
@@ -29500,21 +29788,22 @@ fn rt_alias_copy_geometry(
     dst_key: RtKey,
     dst_format: vk::Format,
 ) -> Option<(u32, u32, u64)> {
+    let (src, dst) = (src_key.image_extent(), dst_key.image_extent());
     let src_bpp = readback_format_bpp(src_format) as u64;
     let dst_bpp = readback_format_bpp(dst_format) as u64;
-    if src_bpp == 0 || dst_bpp == 0 || dst_key.width == 0 || dst_key.height == 0 {
+    if src_bpp == 0 || dst_bpp == 0 || dst.width == 0 || dst.height == 0 {
         return None;
     }
-    let dst_row = (dst_key.width as u64).checked_mul(dst_bpp)?;
+    let dst_row = (dst.width as u64).checked_mul(dst_bpp)?;
     if dst_row % src_bpp != 0 {
         return None;
     }
     let src_width = dst_row / src_bpp;
-    if src_width == 0 || src_width > src_key.width as u64 || dst_key.height > src_key.height {
+    if src_width == 0 || src_width > src.width as u64 || dst.height > src.height {
         return None;
     }
-    let bytes = dst_row.checked_mul(dst_key.height as u64)?;
-    Some((src_width as u32, dst_key.height, bytes))
+    let bytes = dst_row.checked_mul(dst.height as u64)?;
+    Some((src_width as u32, dst.height, bytes))
 }
 
 fn sync_sampled_color_alias(
@@ -29602,7 +29891,7 @@ fn sync_sampled_color_alias(
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 sync.dst_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[blit],
+                &[scale_image_blit(blit, sync.src_key.render_scale(), sync.dst_key.render_scale())],
                 filter,
             );
         }
@@ -29637,8 +29926,8 @@ fn sync_sampled_color_alias(
             },
             image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
             image_extent: vk::Extent3D {
-                width: sync.dst_key.width,
-                height: sync.dst_key.height,
+                width: sync.dst_key.image_extent().width,
+                height: sync.dst_key.image_extent().height,
                 depth: 1,
             },
         };
@@ -29821,7 +30110,12 @@ fn record_color_region_sync(
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             dst_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[region],
+            &[scale_image_copy(
+                region,
+                key.render_scale(),
+                sync.src_key.image_extent(),
+                key.image_extent(),
+            )],
         );
     }
     transition_image(
@@ -29923,7 +30217,11 @@ fn sync_sampled_depth_region(
         src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
         dst_subresource: subresource,
         dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-        extent: vk::Extent3D { width: sampled.width, height: sampled.height, depth: 1 },
+        extent: vk::Extent3D {
+            width: sampled.image_extent().width,
+            height: sampled.image_extent().height,
+            depth: 1,
+        },
     };
     unsafe {
         device.cmd_copy_image(
@@ -30139,8 +30437,8 @@ fn sync_sampled_depth_self(
         dst_subresource: subresource,
         dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
         extent: vk::Extent3D {
-            width: src_key.width,
-            height: src_key.height,
+            width: src_key.image_extent().width,
+            height: src_key.image_extent().height,
             depth: 1,
         },
     };
@@ -30374,8 +30672,8 @@ fn sync_sampled_depth_array(
         aspects,
     );
     let extent = vk::Extent3D {
-        width: sk.width,
-        height: sk.height,
+        width: sk.image_extent().width,
+        height: sk.image_extent().height,
         depth: 1,
     };
     for (layer, (_, image, layout, _, layer_aspects)) in sources.iter().copied().enumerate() {
@@ -30513,7 +30811,7 @@ fn sync_sampled_depth_as_color(
         )?;
         (img.image, img.view, img.layout)
     };
-    let bytes = src_key.width as u64 * src_key.height as u64 * 4;
+    let bytes = src_key.image_extent().width as u64 * src_key.image_extent().height as u64 * 4;
     let needs_pack = src_format != guest_format;
     let transfer = create_transfer_buffer_with_usage(
         device,
@@ -30544,8 +30842,8 @@ fn sync_sampled_depth_as_color(
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
     );
     let extent = vk::Extent3D {
-        width: src_key.width,
-        height: src_key.height,
+        width: src_key.image_extent().width,
+        height: src_key.image_extent().height,
         depth: 1,
     };
     let depth_copy = vk::BufferImageCopy {
@@ -32485,15 +32783,36 @@ fn copy_texture_rt_mips(
             mip.layout,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         );
+        let scale = mip.key.render_scale();
         unsafe {
-            device.cmd_copy_image(
-                cmd,
-                mip.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[mip.copy_region()],
-            );
+            if scale == 1.0 {
+                device.cmd_copy_image(
+                    cmd,
+                    mip.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[mip.copy_region()],
+                );
+            } else {
+                let region = mip.copy_region();
+                let end = vk::Offset3D { x: mip.width as i32, y: mip.height as i32, z: 1 };
+                let blit = vk::ImageBlit {
+                    src_subresource: region.src_subresource,
+                    src_offsets: [vk::Offset3D::default(), end],
+                    dst_subresource: region.dst_subresource,
+                    dst_offsets: [vk::Offset3D::default(), end],
+                };
+                device.cmd_blit_image(
+                    cmd,
+                    mip.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[scale_image_blit(blit, scale, 1.0)],
+                    vk::Filter::NEAREST,
+                );
+            }
         }
         transition_image(
             device,
@@ -32657,16 +32976,13 @@ fn create_texture_image(
             p_next: std::ptr::null(),
             _marker: std::marker::PhantomData,
         };
-        memory = unsafe {
-            device
-                .allocate_memory(&alloc, None)
-                .map_err(|error| {
-                    format!(
-                        "allocate_memory(tex): {error:?} requested_bytes={} dimensions={}x{} layers={} mips={} format={:?} memory_type={}",
-                        req.size, width, height, layers, mip_levels, format, mt,
-                    )
-                })?
-        };
+        memory = crate::rt_cache::allocate_image_memory(device, mem_props, &alloc, req.memory_type_bits)
+            .map_err(|error| {
+                format!(
+                    "allocate_memory(tex): {error:?} requested_bytes={} dimensions={}x{} layers={} mips={} format={:?} memory_type={}",
+                    req.size, width, height, layers, mip_levels, format, mt,
+                )
+            })?;
         unsafe {
             device
                 .bind_image_memory(image, memory, 0)
@@ -32850,15 +33166,46 @@ fn create_texture_image(
                     },
                 })
                 .collect();
+            let scale = slice.key.render_scale();
             unsafe {
-                device.cmd_copy_image(
-                    cmd,
-                    slice.image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &regions,
-                );
+                match regions.first() {
+                    Some(region) if scale != 1.0 => {
+                        let (top, bottom) = if yflip { (height as i32, 0) } else { (0, height as i32) };
+                        let blit = vk::ImageBlit {
+                            src_subresource: region.src_subresource,
+                            src_offsets: [
+                                vk::Offset3D { x: slice.src_x as i32, y: slice.src_y as i32, z: 0 },
+                                vk::Offset3D {
+                                    x: (slice.src_x + width) as i32,
+                                    y: (slice.src_y + height) as i32,
+                                    z: 1,
+                                },
+                            ],
+                            dst_subresource: region.dst_subresource,
+                            dst_offsets: [
+                                vk::Offset3D { x: 0, y: top, z: dst_layer as i32 },
+                                vk::Offset3D { x: width as i32, y: bottom, z: dst_layer as i32 + 1 },
+                            ],
+                        };
+                        device.cmd_blit_image(
+                            cmd,
+                            slice.image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &[scale_image_blit(blit, scale, 1.0)],
+                            vk::Filter::NEAREST,
+                        );
+                    }
+                    _ => device.cmd_copy_image(
+                        cmd,
+                        slice.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &regions,
+                    ),
+                }
             }
             if restore_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
                 transition_image(
@@ -35098,13 +35445,16 @@ fn set_dynamic_stencil_state(
     }
 }
 
-fn draw_scissor(rect: Option<[i32; 4]>, extent: vk::Extent2D) -> vk::Rect2D {
+fn draw_scissor(rect: Option<[i32; 4]>, extent: vk::Extent2D, scale: f32) -> vk::Rect2D {
     let Some([x, y, w, h]) = rect else {
         return vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
         };
     };
+    let (x, w) = crate::rt_cache::scale_span(scale, x.max(0), w.max(0) as u32);
+    let (y, h) = crate::rt_cache::scale_span(scale, y.max(0), h.max(0) as u32);
+    let (w, h) = (w as i32, h as i32);
     let x = x.max(0) as u32;
     let y = y.max(0) as u32;
     if x >= extent.width || y >= extent.height {
@@ -36270,6 +36620,7 @@ impl Drop for RendererInner {
             timestamps.destroy(&self.device);
         }
         self.rt_cache.clear(&self.device);
+        crate::gpu_health::uninstall(self.instance.handle());
         unsafe {
             if device_idle {
                 self.device.destroy_command_pool(self.cmd_pool, None);
@@ -36301,11 +36652,11 @@ mod tests {
         use super::{draw_viewport, viewport_record_key};
         use ash::vk;
         let extent = vk::Extent2D { width: 1600, height: 900 };
-        let world = draw_viewport(None, [0.0, 1.0], extent);
-        let hud = draw_viewport(None, [0.0, 0.01], extent);
+        let world = draw_viewport(None, [0.0, 1.0], extent, 1.0);
+        let hud = draw_viewport(None, [0.0, 0.01], extent, 1.0);
         assert_ne!(viewport_record_key(world), viewport_record_key(hud));
         assert_eq!(hud.max_depth, 0.01);
-        let flipped = draw_viewport(Some([0.0, 900.0, 1600.0, -900.0]), [0.75, 0.25], extent);
+        let flipped = draw_viewport(Some([0.0, 900.0, 1600.0, -900.0]), [0.75, 0.25], extent, 1.0);
         assert_eq!(flipped.height, -900.0);
         assert_eq!([flipped.min_depth, flipped.max_depth], [0.75, 0.25]);
     }
@@ -38736,6 +39087,30 @@ mod tests {
     }
 
     #[test]
+    fn scaled_spans_tile_and_texels_resample_nearest() {
+        assert_eq!(crate::rt_cache::scale_span(0.5, 0, 2560), (0, 1280));
+        assert_eq!(crate::rt_cache::scale_span(0.75, 3, 5), (2, 4));
+        assert_eq!(crate::rt_cache::scale_span(0.5, 1, 1), (1, 1));
+        assert_eq!(crate::rt_cache::scale_span(1.0, 7, 9), (7, 9));
+        assert_eq!(super::draw_scissor(Some([100, 50, 200, 100]), vk::Extent2D { width: 1280, height: 720 }, 0.5).extent.width, 100);
+        let source = vec![1u8, 2, 3, 4];
+        assert_eq!(super::resample_texels_nearest(source.clone(), 1, (2, 2), (4, 2)), vec![1, 1, 2, 2, 3, 3, 4, 4]);
+        assert_eq!(super::resample_texels_nearest(source.clone(), 2, (2, 1), (1, 1)), vec![3, 4]);
+        assert_eq!(super::resample_texels_nearest(source.clone(), 1, (2, 2), (2, 2)), source);
+        let copy = vk::ImageCopy {
+            src_offset: vk::Offset3D { x: 100, y: 0, z: 0 },
+            dst_offset: vk::Offset3D { x: 0, y: 10, z: 0 },
+            extent: vk::Extent3D { width: 300, height: 101, depth: 1 },
+            ..Default::default()
+        };
+        let small = vk::Extent2D { width: 200, height: 50 };
+        let scaled = super::scale_image_copy(copy, 0.5, vk::Extent2D { width: 400, height: 400 }, small);
+        assert_eq!((scaled.src_offset.x, scaled.dst_offset.y), (50, 5));
+        assert_eq!((scaled.extent.width, scaled.extent.height), (150, 45));
+        assert_eq!(super::scale_image_copy(copy, 1.0, small, small).extent.width, 300);
+    }
+
+    #[test]
     fn inline_graphics_clear_rect_clips_to_attachment_extent() {
         let rect = inline_graphics_clear_rect(
             [1500, 850, 200, 100],
@@ -39130,14 +39505,14 @@ mod tests {
         let match_content = ComputeGuestImageContent {
             spec: match_spec.clone(),
             source_hash: texture_content_hash(&[1, 2, 3]),
-            source: std::sync::Arc::from([1, 2, 3]),
+            source_len: 3,
             upload: std::sync::Arc::from([1, 2, 3]),
             copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
         };
         let other_content = ComputeGuestImageContent {
             spec: match_spec.clone(),
             source_hash: texture_content_hash(&[1, 2, 4]),
-            source: std::sync::Arc::from([1, 2, 4]),
+            source_len: 3,
             upload: std::sync::Arc::from([1, 2, 4]),
             copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
         };
@@ -39186,7 +39561,7 @@ mod tests {
         let content = ComputeGuestImageContent {
             spec: spec.clone(),
             source_hash: texture_content_hash(&[1, 2, 3, 4]),
-            source: std::sync::Arc::from([1, 2, 3, 4]),
+            source_len: 4,
             upload: std::sync::Arc::from([5, 6, 7, 8]),
             copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
         };
@@ -39206,6 +39581,15 @@ mod tests {
         assert!(!compute_guest_source_matches(
             &content,
             &compute_guest_upload_spec(tic, 2, 256, false, vk::Format::R8G8B8A8_UNORM),
+            texture_content_hash(&[1, 2, 3, 4]),
+            4,
+        ));
+
+        let mut moved_tic = tic;
+        moved_tic.gpu_va = moved_tic.gpu_va.wrapping_add(0x1000);
+        assert!(compute_guest_source_matches(
+            &content,
+            &compute_guest_upload_spec(moved_tic, 1, 256, false, vk::Format::R8G8B8A8_UNORM),
             texture_content_hash(&[1, 2, 3, 4]),
             4,
         ));

@@ -395,6 +395,19 @@ pub struct PresentParameters {
 }
 
 impl PresentParameters {
+    pub(crate) fn scaled(mut self, scale: f32) -> Self {
+        let scale_rect = |rect: [u32; 4]| {
+            let (x, width) = crate::rt_cache::scale_span(scale, rect[0] as i32, rect[2]);
+            let (y, height) = crate::rt_cache::scale_span(scale, rect[1] as i32, rect[3]);
+            [x as u32, y as u32, width, height]
+        };
+        if scale != 1.0 {
+            self.read_rect = self.read_rect.map(scale_rect);
+            self.crop = self.crop.map(scale_rect);
+        }
+        self
+    }
+
     fn mapping(self, width: u32, height: u32) -> ([f32; 6], [u32; 2]) {
         let [x, y, w, h] = valid_rect(self.read_rect, width, height);
         let rotated = self.transform & 4 != 0;

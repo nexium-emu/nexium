@@ -8,6 +8,7 @@ use crate::bcn_encode::BcTarget;
 pub(crate) const INPUT_ARENA_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const OUTPUT_ARENA_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DEDICATED_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
 const ARENA_ALIGNMENT: u64 = 256;
 const PUSH_CONSTANT_BYTES: u32 = 32;
 const WORKGROUP_BLOCKS: u32 = 8;
@@ -378,7 +379,6 @@ impl AstcDecodePipeline {
         &self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
-        arena: &AstcDecodeArena,
         reservation: AstcReservation,
         plan: &AstcUploadPlan,
     ) {
@@ -437,7 +437,7 @@ impl AstcDecodePipeline {
             buffer_barrier(
                 device,
                 cmd,
-                arena.output_buffer,
+                reservation.output_buffer,
                 reservation.dst_offset,
                 plan.decoded_bytes,
                 vk::PipelineStageFlags::TRANSFER,
@@ -448,7 +448,7 @@ impl AstcDecodePipeline {
         buffer_barrier(
             device,
             cmd,
-            arena.output_buffer,
+            reservation.output_buffer,
             reservation.dst_offset,
             plan.decoded_bytes,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -485,7 +485,7 @@ impl AstcDecodePipeline {
         buffer_barrier(
             device,
             cmd,
-            arena.output_buffer,
+            reservation.output_buffer,
             reservation.encoded_offset,
             plan.encoded_bytes,
             vk::PipelineStageFlags::TRANSFER,
@@ -515,6 +515,7 @@ pub(crate) struct AstcReservation {
     pub(crate) encoded_offset: u64,
     pub(crate) copy_offset: u64,
     pub(crate) output_wrapped: bool,
+    pub(crate) output_buffer: vk::Buffer,
 }
 
 struct InputChunk {
@@ -629,6 +630,7 @@ pub(crate) struct AstcDecodeArena {
     chunk_size: u64,
     chunks: Vec<InputChunk>,
     current: usize,
+    dedicated: Vec<(vk::Buffer, vk::DeviceMemory, InputChunk)>,
 }
 
 unsafe impl Send for AstcDecodeArena {}
@@ -670,6 +672,7 @@ impl AstcDecodeArena {
             chunk_size: input_size,
             chunks: Vec::new(),
             current: 0,
+            dedicated: Vec::new(),
         };
         match InputChunk::new(
             device,
@@ -701,6 +704,13 @@ impl AstcDecodeArena {
         }
         self.current = 0;
         self.output_head = 0;
+        for (buffer, memory, chunk) in self.dedicated.drain(..) {
+            chunk.destroy(device);
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+        }
     }
 
     fn input_bytes(&self) -> u64 {
@@ -769,10 +779,68 @@ impl AstcDecodeArena {
                 dst_offset
             },
             output_wrapped,
+            output_buffer: self.output_buffer,
         })
     }
 
-    pub(crate) fn destroy(self, device: &ash::Device) {
+    pub(crate) fn reserve_dedicated(
+        &mut self,
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        plan: &AstcUploadPlan,
+    ) -> Option<AstcReservation> {
+        let (dst_offset, encoded_offset, output_end) = output_layout(0, plan)?;
+        if plan.decoded_bytes == 0 || output_end > MAX_DEDICATED_OUTPUT_BYTES {
+            return None;
+        }
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC;
+        let (output_buffer, output_memory) =
+            allocate_buffer(device, mem_props, output_end, usage, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|_| {
+                    allocate_buffer(
+                        device,
+                        mem_props,
+                        output_end,
+                        usage,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                })
+                .map_err(|error| log::warn!("[astc] dedicated decode output unavailable: {error}"))
+                .ok()?;
+        let input_size = (plan.compressed.len() as u64).next_multiple_of(ARENA_ALIGNMENT).max(ARENA_ALIGNMENT);
+        let chunk = match InputChunk::new(device, mem_props, self.descriptor_layout, output_buffer, input_size) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                log::warn!("[astc] dedicated decode input unavailable: {error}");
+                unsafe {
+                    device.destroy_buffer(output_buffer, None);
+                    device.free_memory(output_memory, None);
+                }
+                return None;
+            }
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(plan.compressed.as_ptr(), chunk.mapped, plan.compressed.len());
+        }
+        let reservation = AstcReservation {
+            descriptor_set: chunk.descriptor_set,
+            src_offset: 0,
+            dst_offset,
+            encoded_offset,
+            copy_offset: if plan.target.is_some() {
+                encoded_offset
+            } else {
+                dst_offset
+            },
+            output_wrapped: false,
+            output_buffer,
+        };
+        self.dedicated.push((output_buffer, output_memory, chunk));
+        Some(reservation)
+    }
+
+    pub(crate) fn destroy(mut self, device: &ash::Device) {
+        self.reset(device);
         for chunk in self.chunks {
             chunk.destroy(device);
         }

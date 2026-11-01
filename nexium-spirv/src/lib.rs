@@ -1014,6 +1014,7 @@ pub struct Emitter {
     alpha_test_func: u32,
     alpha_test_ref: u32,
     y_negate: bool,
+    frag_coord_scale: f32,
     compute_options: Option<ComputeOptions>,
     compute_resource_vars: Vec<ComputeResourceVar>,
     ir_constant_facts: nexium_shader::IrConstantFacts,
@@ -1439,6 +1440,7 @@ impl Emitter {
             alpha_test_func: 0,
             alpha_test_ref: 0,
             y_negate: false,
+            frag_coord_scale: 1.0,
             compute_options: (stage == Stage::Compute).then(ComputeOptions::default),
             compute_resource_vars: Vec::new(),
             ir_constant_facts: nexium_shader::IrConstantFacts::default(),
@@ -5441,7 +5443,13 @@ impl Emitter {
                 .b
                 .access_chain(self.ptr_input_f32, None, fc, [idx])
                 .unwrap();
-            self.b.load(self.f32_t, None, ac, None, []).unwrap()
+            let value = self.b.load(self.f32_t, None, ac, None, []).unwrap();
+            if component < 2 && self.frag_coord_scale > 0.0 && self.frag_coord_scale != 1.0 {
+                let inverse = self.const_f32((1.0 / self.frag_coord_scale).to_bits());
+                self.b.f_mul(self.f32_t, None, value, inverse).unwrap()
+            } else {
+                value
+            }
         } else {
             let av = self.input_var(aligned_slot);
             let mut val = self.read_attr_component(av, component);
@@ -12246,7 +12254,7 @@ pub struct VertexOptions {
     pub varying_map: GraphicsVaryingMap,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FragmentOptions {
     pub dual_source: bool,
     pub num_ssbo: u32,
@@ -12258,6 +12266,7 @@ pub struct FragmentOptions {
     pub texel_buffer_mask: u32,
     pub writes_depth: bool,
     pub y_negate: bool,
+    pub frag_coord_scale: f32,
     pub varying_map: GraphicsVaryingMap,
 }
 
@@ -12515,6 +12524,7 @@ pub fn emit_fragment_full_with_options(
     emitter.alpha_test_func = alpha_test_func;
     emitter.alpha_test_ref = alpha_test_ref;
     emitter.y_negate = options.y_negate;
+    emitter.frag_coord_scale = options.frag_coord_scale;
     let (words, mask, tex_ids, sampler_arrayed) = emitter.finish_full_meta(cfg, &[]);
     (words, mask, tex_ids, vec4s * 16, sampler_arrayed)
 }

@@ -1961,7 +1961,7 @@ pub(crate) fn create_compute_guest_image(
         memory_type_index,
         ..Default::default()
     };
-    let memory = match unsafe { device.allocate_memory(&allocation, None) } {
+    let memory = match crate::rt_cache::allocate_image_memory(device, mem_props, &allocation, requirements.memory_type_bits) {
         Ok(memory) => memory,
         Err(error) => {
             unsafe { device.destroy_image(image, None) };

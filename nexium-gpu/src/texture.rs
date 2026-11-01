@@ -290,6 +290,10 @@ pub struct TicEntry {
 
 impl TicEntry {
     pub fn parse(raw: &[u8]) -> Option<TicEntry> {
+        Self::parse_with(raw, ampere_texture_headers())
+    }
+
+    pub fn parse_with(raw: &[u8], ampere: bool) -> Option<TicEntry> {
         if raw.len() < 32 {
             return None;
         }
@@ -314,7 +318,7 @@ impl TicEntry {
         ];
 
         let addr_lo = w1 as u64;
-        let addr_hi = (w2 & 0xFFFF) as u64;
+        let addr_hi = (w2 & if ampere { 0x1FFFF } else { 0xFFFF }) as u64;
         let gpu_va = (addr_hi << 32) | addr_lo;
 
         let header_version = (w2 >> 21) & 0x7;
@@ -339,7 +343,11 @@ impl TicEntry {
         let layer_base_0_2 = (w4 >> 16) & 0x7;
         let layer_base_3_7 = (w2 >> 16) & 0x1F;
         let layer_base_8_10 = (w2 >> 29) & 0x7;
-        let base_layer = layer_base_0_2 | (layer_base_3_7 << 3) | (layer_base_8_10 << 8);
+        let base_layer = if ampere {
+            0
+        } else {
+            layer_base_0_2 | (layer_base_3_7 << 3) | (layer_base_8_10 << 8)
+        };
         let texture_type = if is_buffer_header {
             6
         } else {
@@ -642,6 +650,38 @@ pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
     })
 }
 
+pub const TEXTURE_BUDGET_BYTES: usize = 512 << 20;
+
+pub fn texture_host_bytes(guest_size: usize, tic: &TicEntry) -> usize {
+    match tic.format {
+        TicFormat::Astc(..) => {
+            let texels = u64::from(tic.width) * u64::from(tic.height) * u64::from(tic.depth.max(1));
+            let mips = if tic.mip_levels() > 1 { 4 } else { 3 };
+            let block = crate::astc_gpu::bc_target().map_or(64, |target| target.block_bytes() as u64);
+            usize::try_from(texels * block * mips / 48).unwrap_or(usize::MAX)
+        }
+        _ => guest_size,
+    }
+}
+
+pub fn texture_over_budget(guest_size: usize, tic: &TicEntry) -> bool {
+    let size = texture_host_bytes(guest_size, tic);
+    if size < 64 << 20 {
+        return false;
+    }
+    let over = size > TEXTURE_BUDGET_BYTES;
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> = std::sync::OnceLock::new();
+    let reported = REPORTED.get_or_init(Default::default);
+    if reported.lock().unwrap().insert(tic.gpu_va) {
+        log::warn!(
+            "[texture-budget] {:?} {}x{}x{} mips={} at {:#x} host {:#x} bytes{}",
+            tic.format, tic.width, tic.height, tic.depth, tic.mip_levels(), tic.gpu_va, size,
+            if over { "; bound as a placeholder" } else { "" }
+        );
+    }
+    over
+}
+
 pub fn texture_guest_size_bytes(tic: &TicEntry, layers: u32) -> Option<usize> {
     if tic.is_block_linear && tic.texture_type == 2 {
         if tic.mip_levels() != 1 || tic.sample_count()? != 1 {
@@ -928,6 +968,53 @@ pub fn unswizzle_block_linear(
     )
 }
 
+static AMPERE_TEXTURE_HEADERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ampere_texture_headers(enabled: bool) {
+    AMPERE_TEXTURE_HEADERS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn ampere_texture_headers() -> bool {
+    AMPERE_TEXTURE_HEADERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static SWAPPED_GOB_SECTORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_swapped_gob_sectors(enabled: bool) {
+    SWAPPED_GOB_SECTORS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn swapped_gob_sectors() -> bool {
+    SWAPPED_GOB_SECTORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn gob_row_offset_in(swapped: bool, y_in_gob: usize) -> usize {
+    if swapped {
+        ((y_in_gob >> 2) & 1) * 128 + ((y_in_gob >> 1) & 1) * 32 + (y_in_gob & 1) * 16
+    } else {
+        ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16
+    }
+}
+
+#[inline]
+fn gob_column_offset_in(swapped: bool, x_in_gob: usize) -> usize {
+    let sector = if swapped { 64 } else { 32 };
+    ((x_in_gob >> 5) & 1) * 256 + ((x_in_gob >> 4) & 1) * sector + (x_in_gob & 15)
+}
+
+#[inline]
+fn gob_row_offset(y_in_gob: usize) -> usize {
+    gob_row_offset_in(swapped_gob_sectors(), y_in_gob)
+}
+
+#[inline]
+fn gob_column_offset(x_in_gob: usize) -> usize {
+    gob_column_offset_in(swapped_gob_sectors(), x_in_gob)
+}
+
 fn copy_block_linear_row<const SWIZZLE: bool>(
     src: &[u8],
     dst: &mut [u8],
@@ -938,13 +1025,15 @@ fn copy_block_linear_row<const SWIZZLE: bool>(
     bpp: usize,
 ) {
     let mut byte_x = 0;
+    let sector = gob_column_offset(16);
+    let span = 256 + sector + 16;
     while row_bytes - byte_x >= 64 {
         let tiled = tiled_row + ((byte_x >> 6) << x_shift);
         let linear = linear_row + byte_x;
         let (source, destination, source_len, destination_len) = if SWIZZLE {
-            (linear, tiled, 64, 304)
+            (linear, tiled, 64, span)
         } else {
-            (tiled, linear, 304, 64)
+            (tiled, linear, span, 64)
         };
         let Some(source) = src.get(source..source.saturating_add(source_len)) else {
             break;
@@ -954,20 +1043,19 @@ fn copy_block_linear_row<const SWIZZLE: bool>(
         };
         if SWIZZLE {
             destination[0..16].copy_from_slice(&source[0..16]);
-            destination[32..48].copy_from_slice(&source[16..32]);
+            destination[sector..sector + 16].copy_from_slice(&source[16..32]);
             destination[256..272].copy_from_slice(&source[32..48]);
-            destination[288..304].copy_from_slice(&source[48..64]);
+            destination[256 + sector..span].copy_from_slice(&source[48..64]);
         } else {
             destination[0..16].copy_from_slice(&source[0..16]);
-            destination[16..32].copy_from_slice(&source[32..48]);
+            destination[16..32].copy_from_slice(&source[sector..sector + 16]);
             destination[32..48].copy_from_slice(&source[256..272]);
-            destination[48..64].copy_from_slice(&source[288..304]);
+            destination[48..64].copy_from_slice(&source[256 + sector..span]);
         }
         byte_x += 64;
     }
     for byte_x in (byte_x..row_bytes).step_by(16) {
-        let tiled = tiled_row + ((byte_x >> 6) << x_shift)
-            + ((byte_x & 32) << 3) + ((byte_x & 16) << 1);
+        let tiled = tiled_row + ((byte_x >> 6) << x_shift) + gob_column_offset(byte_x & 48);
         let linear = linear_row + byte_x;
         let (source, destination) = if SWIZZLE { (linear, tiled) } else { (tiled, linear) };
         if row_bytes - byte_x >= 16
@@ -1037,7 +1125,7 @@ pub fn unswizzle_block_linear_strided_into(
         let block_row_offset = block_y * block_row_stride_bytes;
         if matches!(bpp, 1 | 2 | 4 | 8 | 16) {
             let tiled_row = block_row_offset + gob_row_in_block * GOB_SIZE
-                + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
+                + gob_row_offset(y_in_gob);
             copy_block_linear_row::<false>(
                 src, dst, y * dst_stride, tiled_row, dst_stride, 9 + block_height_log2 as usize, bpp,
             );
@@ -1049,11 +1137,7 @@ pub fn unswizzle_block_linear_strided_into(
             let x_in_gob = byte_x - gob_col * GOB_W;
             let gob_offset =
                 block_row_offset + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
-            let in_gob = ((x_in_gob >> 5) & 1) * 256
-                + ((y_in_gob >> 1) & 3) * 64
-                + ((x_in_gob >> 4) & 1) * 32
-                + (y_in_gob & 1) * 16
-                + (x_in_gob & 15);
+            let in_gob = gob_column_offset(x_in_gob) + gob_row_offset(y_in_gob);
             let src_off = gob_offset + in_gob;
             let dst_off = y * dst_stride + byte_x;
             if src_off + bpp <= src.len() && dst_off + bpp <= dst.len() {
@@ -1094,7 +1178,7 @@ pub fn swizzle_block_linear_strided(
         let block_row_offset = block_y * block_row_stride_bytes;
         if matches!(bpp, 1 | 2 | 4 | 8 | 16) {
             let tiled_row = block_row_offset + gob_row_in_block * GOB_SIZE
-                + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
+                + gob_row_offset(y_in_gob);
             copy_block_linear_row::<true>(
                 src, &mut dst, y * src_stride, tiled_row, src_stride, 9 + block_height_log2 as usize, bpp,
             );
@@ -1106,11 +1190,7 @@ pub fn swizzle_block_linear_strided(
             let x_in_gob = byte_x - gob_col * GOB_W;
             let gob_offset =
                 block_row_offset + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
-            let in_gob = ((x_in_gob >> 5) & 1) * 256
-                + ((y_in_gob >> 1) & 3) * 64
-                + ((x_in_gob >> 4) & 1) * 32
-                + (y_in_gob & 1) * 16
-                + (x_in_gob & 15);
+            let in_gob = gob_column_offset(x_in_gob) + gob_row_offset(y_in_gob);
             let dst_off = gob_offset + in_gob;
             let src_off = y * src_stride + byte_x;
             if src_off + bpp <= src.len() && dst_off + bpp <= dst.len() {
@@ -1191,7 +1271,7 @@ pub fn unswizzle_block_linear_3d_with_block_width(
             let y_in_gob = y & (GOB_H - 1);
             if matches!(bpp, 1 | 2 | 4 | 8 | 16) {
                 let tiled_row = offset_z + offset_y
-                    + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
+                    + gob_row_offset(y_in_gob);
                 copy_block_linear_row::<false>(
                     src, &mut dst, (z * height + y) * dst_stride, tiled_row, dst_stride, x_shift, bpp,
                 );
@@ -1201,11 +1281,7 @@ pub fn unswizzle_block_linear_3d_with_block_width(
                 let byte_x = x.saturating_mul(bpp);
                 let offset_x = (byte_x / GOB_W) << x_shift;
                 let x_in_gob = byte_x & (GOB_W - 1);
-                let in_gob = ((x_in_gob >> 5) & 1) * 256
-                    + ((y_in_gob >> 1) & 3) * 64
-                    + ((x_in_gob >> 4) & 1) * 32
-                    + (y_in_gob & 1) * 16
-                    + (x_in_gob & 15);
+                let in_gob = gob_column_offset(x_in_gob) + gob_row_offset(y_in_gob);
                 let src_off = offset_z + offset_y + offset_x + in_gob;
                 let dst_off = (z * height * dst_stride) + y * dst_stride + byte_x;
                 if src_off + bpp <= src.len() && dst_off + bpp <= dst.len() {
@@ -1286,7 +1362,7 @@ pub fn swizzle_block_linear_3d_with_buffer(
             let y_in_gob = y & (GOB_H - 1);
             if matches!(bpp, 1 | 2 | 4 | 8 | 16) {
                 let tiled_row = offset_z + offset_y
-                    + ((y_in_gob >> 1) & 3) * 64 + (y_in_gob & 1) * 16;
+                    + gob_row_offset(y_in_gob);
                 copy_block_linear_row::<true>(
                     src, &mut dst, (z * height + y) * src_stride, tiled_row, src_stride, x_shift, bpp,
                 );
@@ -1296,11 +1372,7 @@ pub fn swizzle_block_linear_3d_with_buffer(
                 let byte_x = x.saturating_mul(bpp);
                 let offset_x = (byte_x / GOB_W) << x_shift;
                 let x_in_gob = byte_x & (GOB_W - 1);
-                let in_gob = ((x_in_gob >> 5) & 1) * 256
-                    + ((y_in_gob >> 1) & 3) * 64
-                    + ((x_in_gob >> 4) & 1) * 32
-                    + (y_in_gob & 1) * 16
-                    + (x_in_gob & 15);
+                let in_gob = gob_column_offset(x_in_gob) + gob_row_offset(y_in_gob);
                 let dst_off = offset_z + offset_y + offset_x + in_gob;
                 let src_off = (z * height * src_stride) + y * src_stride + byte_x;
                 if src_off + bpp <= src.len() && dst_off + bpp <= dst.len() {
@@ -2410,6 +2482,35 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
 
 #[cfg(test)]
 mod tests {
+    fn tic_bytes(words: [u32; 8]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn ampere_texture_headers_have_no_layer_base_and_a_wider_address() {
+        let raw = tic_bytes([0x58d24908, 0x109f2000, 0x00640081, 0x00070020, 0xe880027f, 0x80000167, 0x03000000, 0]);
+        let maxwell = super::TicEntry::parse_with(&raw, false).unwrap();
+        let ampere = super::TicEntry::parse_with(&raw, true).unwrap();
+        assert_eq!(maxwell.base_layer, 32);
+        assert_eq!(ampere.base_layer, 0);
+        assert_eq!((ampere.gpu_va, ampere.width, ampere.height, ampere.depth), (0x81_109f_2000, 640, 360, 1));
+        let high = tic_bytes([0x58d24908, 0x109f2000, 0x00610081, 0x00070020, 0xe880027f, 0x80000167, 0x03000000, 0]);
+        assert_eq!(super::TicEntry::parse_with(&high, true).unwrap().gpu_va, 0x1_0081_109f_2000);
+        assert_eq!(super::TicEntry::parse_with(&high, false).unwrap().gpu_va, 0x81_109f_2000);
+    }
+
+    #[test]
+    fn switch2_gobs_swap_byte_offset_bits_five_and_six() {
+        for y in 0..8 {
+            for x in 0..64 {
+                let tegra = super::gob_column_offset_in(false, x) + super::gob_row_offset_in(false, y);
+                let swapped = super::gob_column_offset_in(true, x) + super::gob_row_offset_in(true, y);
+                let exchanged = (tegra & !0x60) | ((tegra & 0x20) << 1) | ((tegra & 0x40) >> 1);
+                assert_eq!(swapped, exchanged, "x={x} y={y}");
+            }
+        }
+    }
+
     fn astc_void_extent_block(index: usize) -> [u8; 16] {
         let mut block = [0u8; 16];
         let header: u64 = 0x1fc | (0b11 << 10) | (((1u64 << 52) - 1) << 12);
