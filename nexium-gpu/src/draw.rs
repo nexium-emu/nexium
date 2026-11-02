@@ -171,6 +171,7 @@ pub struct StorageBufferSnapshot {
     pub readonly_noalias: bool,
     pub resident: Option<GraphicsStorageResidentRef>,
     pub compute_alias: Option<ComputeOverlay>,
+    pub mirrored: Option<ResidentVertexRange>,
 }
 
 #[derive(Clone, Debug)]
@@ -953,6 +954,7 @@ mod tests {
             readonly_noalias: false,
             resident: None,
             compute_alias: None,
+            mirrored: None,
         };
         let cloned = snapshot.clone();
 

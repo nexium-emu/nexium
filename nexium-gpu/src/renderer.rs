@@ -1153,6 +1153,7 @@ fn create_resident_vb_cache(
         size,
         vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_DST,
         "resident vertex cache",
     )?;
@@ -1686,7 +1687,7 @@ pub fn graphics_draw_ring_bytes_upper_bound(call: &crate::draw::Maxwell3dDrawCal
         if snapshot.binding >= crate::descriptor::MAX_SSBO {
             continue;
         }
-        if snapshot.data.is_empty() && shared_aurora_ssbo_key(snapshot).is_none() {
+        if snapshot.data.is_empty() && snapshot.mirrored.is_none() && shared_aurora_ssbo_key(snapshot).is_none() {
             continue;
         }
         ssbo_provided[snapshot.binding as usize] = true;
@@ -3397,7 +3398,7 @@ const DERIVED_TEXTURE_CACHE_MAX_ITEMS: usize = 32768;
 const DERIVED_TEXTURE_CACHE_TARGET_ITEMS: usize = 24576;
 
 fn derived_texture_cache_max_bytes(vram_heap_bytes: u64) -> u64 {
-    (vram_heap_bytes / 2).clamp(DERIVED_TEXTURE_CACHE_MIN_BYTES, DERIVED_TEXTURE_CACHE_CEILING_BYTES)
+    (vram_heap_bytes / 4 * 3).clamp(DERIVED_TEXTURE_CACHE_MIN_BYTES, DERIVED_TEXTURE_CACHE_CEILING_BYTES)
 }
 
 fn derived_texture_cache_trim_bounds(
@@ -3430,21 +3431,44 @@ fn cache_uploaded_texture(
     }
 }
 
+const PRESSURE_PROTECTED_FRAMES: usize = 3;
+static PRESENT_GENERATIONS: std::sync::Mutex<VecDeque<u64>> = std::sync::Mutex::new(VecDeque::new());
+static PRESENT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_present_generation(generations: &mut VecDeque<u64>, generation: u64) {
+    generations.push_back(generation);
+    if generations.len() > PRESSURE_PROTECTED_FRAMES {
+        generations.pop_front();
+    }
+}
+
+fn pressure_protected_generation(generations: &VecDeque<u64>) -> u64 {
+    if generations.len() < PRESSURE_PROTECTED_FRAMES { u64::MAX } else { generations[0] }
+}
+
 fn trim_derived_texture_cache(
     cache: &mut nexium_common::fast_hash::FastMap<TexCacheKey, CachedTexture>,
     ranges: &mut TextureRangeIndex,
     bytes: &mut u64,
     retired: &mut Vec<CachedTexture>,
-) {
+) -> bool {
+    let pressure = crate::gpu_health::take_vram_pressure(monotonic_nanos());
+    let host_resident = |texture: &CachedTexture| {
+        pressure && texture.allocation_size >= crate::rt_cache::SYSTEM_MEMORY_IMAGE_BYTES
+    };
+    let protected_generation = pressure_protected_generation(&PRESENT_GENERATIONS.lock().unwrap());
+    let host_bytes: u64 = cache.values().filter(|texture| host_resident(texture)).map(|texture| texture.allocation_size).sum();
     let (max_bytes, target_bytes) = derived_texture_cache_trim_bounds(
-        *bytes,
+        bytes.saturating_sub(host_bytes),
         crate::gpu_health::vram_heap_bytes(),
-        crate::gpu_health::take_vram_pressure(monotonic_nanos()),
+        pressure,
     );
+    let (max_bytes, target_bytes) = (max_bytes + host_bytes, target_bytes + host_bytes);
     if *bytes <= max_bytes && cache.len() <= DERIVED_TEXTURE_CACHE_MAX_ITEMS {
-        return;
+        return pressure;
     }
     let mut candidates: Vec<_> = cache.iter()
+        .filter(|(_, texture)| !host_resident(texture) && texture.last_use_generation < protected_generation)
         .map(|(&key, texture)| (key, texture.last_use_generation))
         .collect();
     candidates.sort_unstable_by_key(|(key, generation)| (*generation, key.fingerprint));
@@ -3458,6 +3482,7 @@ fn trim_derived_texture_cache(
             retired.push(texture);
         }
     }
+    pressure
 }
 
 fn trace_gpu_memory(
@@ -3656,6 +3681,7 @@ struct CachedComputeVolume {
 const COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS: usize = 128;
 const COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES: usize = 3 * 1024 * 1024 * 1024;
+const COMPUTE_GUEST_IMAGE_SHARE_BYTES: usize = 64 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ComputeGuestImagePoolKey {
@@ -3841,6 +3867,16 @@ struct CachedComputeGuestImage {
     key: ComputeGuestImagePoolKey,
     content: Option<ComputeGuestImageContent>,
     resource: crate::compute::ComputeGuestImageResource,
+    released_frame: u64,
+}
+
+fn trim_idle_compute_guest_images(device: &ash::Device, pool: &mut VecDeque<CachedComputeGuestImage>) {
+    let frame = PRESENT_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    while pool.front().is_some_and(|entry| frame.saturating_sub(entry.released_frame) >= PRESSURE_PROTECTED_FRAMES as u64) {
+        if let Some(evicted) = pool.pop_front() {
+            evicted.resource.destroy(device);
+        }
+    }
 }
 
 struct TextureRepeatState {
@@ -5655,6 +5691,7 @@ struct UboRing {
     head: u64,
     slot_span: Vec<Option<(u64, u64)>>,
     rebar_bytes: u64,
+    uploads: HashMap<SsboUploadKey, (vk::DescriptorBufferInfo, std::sync::Arc<Vec<u8>>)>,
 }
 
 struct GraphicsStorageReadbackCompletion {
@@ -6089,6 +6126,19 @@ impl Renderer {
         self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
+    }
+
+    pub fn compute_sampled_rt_is_live(&self, key: RtKey, tic: &crate::texture::TicEntry) -> bool {
+        !tic_is_volume(tic)
+            && !tic_is_cube(tic)
+            && (tic.texture_type != 5 || tic.depth.max(1) == 1)
+            && tic.mip_levels() == 1
+            && tic.view_base_mip() == 0
+            && tic.view_mip_levels() == 1
+            && self
+                .inner
+                .try_lock()
+                .is_some_and(|inner| compute_rt_alias_for_key(&inner.rt_cache, key, tic).is_some())
     }
 
     pub fn readback_compute_storage_seed(
@@ -6829,7 +6879,16 @@ impl Renderer {
                 )
             })
             .collect();
-        crate::astc_gpu::configure(&native_bc_formats);
+        let vram_bytes = {
+            let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+            props.memory_heaps[..props.memory_heap_count as usize]
+                .iter()
+                .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|heap| heap.size)
+                .max()
+                .unwrap_or(0)
+        };
+        crate::astc_gpu::configure(&native_bc_formats, vram_bytes);
         let shader_draw_parameters_supported =
             supported_features_11.shader_draw_parameters == vk::TRUE;
         let shader_output_layer_supported = supported_features_12.shader_output_layer == vk::TRUE;
@@ -7109,6 +7168,8 @@ impl Renderer {
             } else {
                 vk::FALSE
             },
+            shader_storage_image_read_without_format: core_features
+                .shader_storage_image_read_without_format,
             shader_storage_image_write_without_format:
                 if storage_image_write_without_format_supported {
                     vk::TRUE
@@ -7685,6 +7746,9 @@ impl Renderer {
         mut parameters: crate::presentation::PresentParameters,
         release: Option<Box<dyn std::any::Any + Send>>,
     ) -> Result<bool, String> {
+        let generation = self.inner.lock().submit_state.generation.load(std::sync::atomic::Ordering::Relaxed);
+        note_present_generation(&mut PRESENT_GENERATIONS.lock().unwrap(), generation);
+        PRESENT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(presenter) = &self.presenter else { return Ok(false); };
         let Some(mut slot) = presenter.reserve() else { return Ok(false); };
         let mut inner = self.inner.lock();
@@ -9745,6 +9809,21 @@ impl Renderer {
             .newest_exact_present_key_at_vas(nvmap_id, width, height, gpu_vas)
     }
 
+    pub fn recent_render_targets(&self, limit: usize) -> Vec<RtKey> {
+        let mut inner = self.inner.lock();
+        let mut all = inner.rt_cache.debug_all();
+        all.retain(|(key, stamp)| {
+            *stamp != 0
+                && inner.rt_cache.get_existing(*key).is_some_and(|rt| matches!(rt.format,
+                    vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_UNORM
+                    | vk::Format::B8G8R8A8_SRGB | vk::Format::A2B10G10R10_UNORM_PACK32
+                    | vk::Format::B10G11R11_UFLOAT_PACK32 | vk::Format::R16G16B16A16_SFLOAT
+                    | vk::Format::R16G16_SFLOAT | vk::Format::R16_SFLOAT | vk::Format::R32_SFLOAT
+                    | vk::Format::R8_UNORM | vk::Format::R8G8_UNORM | vk::Format::R16G16_UNORM))
+        });
+        all.into_iter().rev().take(limit).map(|(key, _)| key).collect()
+    }
+
     pub fn render_target_at_va(&self, nvmap_id: u32, gpu_va: u64) -> Option<(RtKey, u64)> {
         let inner = self.inner.lock();
         let key = inner.rt_cache.find_color_key_at_va(nvmap_id, gpu_va)?;
@@ -9841,7 +9920,8 @@ impl Renderer {
         let image_extent = key.image_extent();
         let width = nexium_common::render_scale::scale_with(scale, width).min(image_extent.width);
         let height = nexium_common::render_scale::scale_with(scale, height).min(image_extent.height);
-        let total = (width as u64) * 4 * (height as u64);
+        let bpp = rt_cache.get_existing(key).map_or(4, |img| readback_format_bpp(img.format).max(1)) as u64;
+        let total = (width as u64) * bpp * (height as u64);
         let stage = create_staging_owned(device, mem_props, total).ok()?;
         let cleanup = |device: &ash::Device,
                        cmd_pool: vk::CommandPool,
@@ -11632,6 +11712,7 @@ impl Renderer {
             frame_index,
             ubo_ring,
             aurora_resident_ssbos,
+            compute_guest_image_pool,
             min_storage_buffer_offset_alignment,
             max_storage_buffer_range,
             max_texel_buffer_elements,
@@ -11663,10 +11744,12 @@ impl Renderer {
                 ubo_ring.slot_span[cur_idx] = None;
             }
         }
-        trim_derived_texture_cache(
+        if trim_derived_texture_cache(
             tex_cache, tex_cache_ranges, tex_cache_bytes,
             &mut frame_slots[cur_idx].retired_textures,
-        );
+        ) {
+            trim_idle_compute_guest_images(device, compute_guest_image_pool);
+        }
         let rt_retirement = if !rt_cache.has_pending_view_retirement()
             || rt_texture_options().no_alias_sync || rt_texture_options().no_region_sync
         {
@@ -12566,7 +12649,9 @@ impl Renderer {
         let mut ssbo_bindings: Vec<u32> = Vec::new();
         let mut ssbo_provided = [false; crate::descriptor::MAX_SSBO as usize];
         for snapshot in &call.ssbo_data {
-            if snapshot.binding >= crate::descriptor::MAX_SSBO || snapshot.data.is_empty() {
+            let assembled = snapshot.mirrored.as_ref().and_then(|range| range.assemble());
+            let data = assembled.as_deref().unwrap_or(snapshot.data.as_slice());
+            if snapshot.binding >= crate::descriptor::MAX_SSBO || data.is_empty() {
                 continue;
             }
             let idx = snapshot.binding;
@@ -12587,9 +12672,9 @@ impl Renderer {
                 ring_alloc(ubo_ring, sz_al, 16).map_err(|e| format!("ring_alloc(ssbo): {}", e))?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    snapshot.data.as_ptr(),
+                    data.as_ptr(),
                     sptr.add(snapshot.data_offset),
-                    snapshot.data.len(),
+                    data.len(),
                 );
             }
             ssbo_infos.push(vk::DescriptorBufferInfo {
@@ -13703,6 +13788,7 @@ impl Renderer {
             frame_index,
             ubo_ring,
             aurora_resident_ssbos,
+            compute_guest_image_pool,
             resident_vb,
             cbuf_pool,
             min_storage_buffer_offset_alignment,
@@ -13784,10 +13870,12 @@ impl Renderer {
                 recycled_slots |= 1 << index;
             }
         }
-        trim_derived_texture_cache(
+        if trim_derived_texture_cache(
             tex_cache, tex_cache_ranges, tex_cache_bytes,
             &mut frame_slots[cur_idx].retired_textures,
-        );
+        ) {
+            trim_idle_compute_guest_images(device, compute_guest_image_pool);
+        }
         let view_retirement_due = rt_cache.has_pending_view_retirement()
             && !rt_texture_options().no_alias_sync
             && !rt_texture_options().no_region_sync;
@@ -14113,8 +14201,6 @@ impl Renderer {
             Vec::<vk::DescriptorBufferInfo>::with_capacity(crate::descriptor::MAX_SSBO as usize);
         let mut descriptor_ssbo_bindings =
             Vec::<u32>::with_capacity(crate::descriptor::MAX_SSBO as usize);
-        let mut ssbo_uploads =
-            HashMap::<SsboUploadKey, vk::DescriptorBufferInfo>::default();
         let mut storage_readback_ranges = Vec::<(usize, u32, u64, usize)>::new();
         let mut shared_writer_uploads = HashMap::<(u64, usize), vk::DescriptorBufferInfo>::default();
         let mut storage_readback_staging_ranges = Vec::<(u64, usize, u64)>::new();
@@ -16877,14 +16963,45 @@ impl Renderer {
                         ssbo_provided[idx as usize] = true;
                         continue;
                     }
+                    if let Some(range) = snapshot.mirrored.as_ref() {
+                        let sz = snapshot.logical_size as u64;
+                        let bound = resident_vb
+                            .as_mut()
+                            .and_then(|cache| cache.resolve(range, &mut resident_vb_used))
+                            .filter(|&(_, offset)| offset % cbuf_alignment == 0);
+                        let info = match bound {
+                            Some((buffer, offset)) => vk::DescriptorBufferInfo { buffer, offset, range: sz },
+                            None => {
+                                let data = range.assemble().ok_or_else(|| {
+                                    format!("mirrored storage buffer {idx} does not cover {:#x}+{:#x}", range.cpu_va, range.len)
+                                })?;
+                                let sz_al = align_up(sz, 16);
+                                if !ring_allocation_fits(ubo_ring, sz_al, 16) {
+                                    return Err(format!(
+                                        "batched graphics ring preflight underestimated mirrored storage-buffer {idx} upload ({sz_al:#x} bytes)"
+                                    ));
+                                }
+                                let (sbuf, soff, sptr) = ring_alloc(ubo_ring, sz_al, 16)
+                                    .map_err(|e| format!("ring_alloc(ssbo): {}", e))?;
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(data.as_ptr(), sptr, data.len());
+                                }
+                                vk::DescriptorBufferInfo { buffer: sbuf, offset: soff, range: sz }
+                            }
+                        };
+                        ssbo_infos.push(info);
+                        ssbo_bindings.push(idx);
+                        ssbo_provided[idx as usize] = true;
+                        continue;
+                    }
                     if snapshot.data.is_empty() {
                         continue;
                     }
                     let upload_key = call.storage_readback.is_none()
                         .then(|| ssbo_upload_key(snapshot))
                         .flatten();
-                    if let Some(info) = upload_key.and_then(|key| ssbo_uploads.get(&key)) {
-                        ssbo_infos.push(*info);
+                    if let Some(info) = upload_key.and_then(|key| ubo_ring.uploads.get(&key).map(|(info, _)| *info)) {
+                        ssbo_infos.push(info);
                         ssbo_bindings.push(idx);
                         ssbo_provided[idx as usize] = true;
                         if record_stage_profile {
@@ -16940,7 +17057,7 @@ impl Renderer {
                         }
                     }
                     if let Some(key) = upload_key {
-                        ssbo_uploads.insert(key, info);
+                        ubo_ring.uploads.insert(key, (info, snapshot.data.clone()));
                     }
                     ssbo_infos.push(info);
                     ssbo_bindings.push(idx);
@@ -20933,10 +21050,7 @@ fn compute_guest_image_pool_key(
 }
 
 fn compute_guest_image_retained_bytes(resource: &crate::compute::ComputeGuestImageResource) -> u64 {
-    resource
-        .image
-        .allocation_size
-        .saturating_add(resource.upload.allocation_size)
+    resource.image.allocation_size
 }
 
 fn compute_guest_image_content_bytes(content: Option<&ComputeGuestImageContent>) -> usize {
@@ -21303,12 +21417,14 @@ fn recycle_compute_guest_images(
                 key,
                 content,
                 resource,
+                released_frame: PRESENT_SERIAL.load(std::sync::atomic::Ordering::Relaxed),
             });
         } else {
             resource.destroy(device);
         }
     }
 }
+
 
 fn copy_compute_volume_rt_slices(
     device: &ash::Device,
@@ -21493,6 +21609,7 @@ enum ComputeImagePlan {
         height: u32,
         depth: u32,
         is_3d: bool,
+        is_array: bool,
         format: vk::Format,
         components: vk::ComponentMapping,
         mip_levels: u32,
@@ -21538,6 +21655,7 @@ fn compute_cross_access_view_components(
         || output.height != height
         || output.depth != view_depth
         || output.is_3d != is_3d
+        || output.arrayed
     {
         return Err(format!(
             "compute sampled/storage alias {} has incompatible view/output geometry: view={}x{}x{} 3d={} mip={}/{} output={}x{}x{} 3d={}",
@@ -22824,6 +22942,29 @@ fn settle_ready_pending_computes(inner: &mut RendererInner) {
     }
 }
 
+fn settle_pending_guest_image_holder(inner: &mut RendererInner, content: &ComputeGuestImageContent) {
+    if content.upload.len() < COMPUTE_GUEST_IMAGE_SHARE_BYTES
+        || inner
+            .compute_guest_image_pool
+            .iter()
+            .any(|entry| compute_guest_content_matches(entry.content.as_ref(), content))
+    {
+        return;
+    }
+    let holder = inner.pending_computes.iter().position(|pending| {
+        pending.result.is_none()
+            && pending.resources.as_ref().is_some_and(|resources| {
+                resources
+                    .guest_image_contents
+                    .iter()
+                    .any(|held| compute_guest_content_matches(held.as_ref(), content))
+            })
+    });
+    if let Some(index) = holder {
+        settle_pending_compute(inner, index);
+    }
+}
+
 fn settle_all_pending_computes(inner: &mut RendererInner) {
     reap_compute_batch_primaries(inner);
     let pending_count = inner.pending_computes.len();
@@ -23195,6 +23336,7 @@ fn execute_compute_dispatch_mode(
     if let Err(reason) = validate_compute_dispatch(inner, &dispatch) {
         return ComputeDispatchOutcome::Unsupported(reason);
     }
+    settle_ready_pending_computes(inner);
 
     profile_compute_prep_stage(0, &mut prep_stage_started);
     let mut sample_plans = Vec::with_capacity(dispatch.sampled_rts.len());
@@ -23661,9 +23803,10 @@ fn execute_compute_dispatch_mode(
     for sampled in &dispatch.sampled_images {
         let tic = &sampled.tic;
         let is_3d = tic_is_volume(tic);
-        let depth = if is_3d { tic.depth.max(1) } else { 1 };
+        let is_array = tic.texture_type == 5;
+        let depth = if is_3d || is_array { tic.depth.max(1) } else { 1 };
         if tic.is_buffer()
-            || !matches!(tic.texture_type, 1 | 2)
+            || !matches!(tic.texture_type, 1 | 2 | 5)
             || tic.base_layer != 0
             || (is_3d && tic.mip_levels() != 1)
         {
@@ -23695,8 +23838,10 @@ fn execute_compute_dispatch_mode(
             });
             continue;
         }
-        let live_view_compatible =
-            tic.mip_levels() == 1 && tic.view_base_mip() == 0 && tic.view_mip_levels() == 1;
+        let live_view_compatible = !is_array
+            && tic.mip_levels() == 1
+            && tic.view_base_mip() == 0
+            && tic.view_mip_levels() == 1;
         let alias = if sampled.guest_bytes_authoritative || !live_view_compatible {
             None
         } else {
@@ -23802,12 +23947,13 @@ fn execute_compute_dispatch_mode(
                 sampled.binding, format, required
             ));
         }
-        let slice_pitch =
-            if is_3d && (!tic.is_block_linear || crate::pitch_oracle::is_pitch_dst(tic.gpu_va)) {
-                tic.format.linear_size(tic.width, tic.height)
-            } else {
-                sampled.guest_bytes.len()
-            };
+        let slice_pitch = if (is_3d || is_array)
+            && (!tic.is_block_linear || crate::pitch_oracle::is_pitch_dst(tic.gpu_va))
+        {
+            tic.format.linear_size(tic.width, tic.height)
+        } else {
+            sampled.guest_bytes.len()
+        };
         let content = match prepare_compute_guest_image_content(
             &inner.compute_guest_image_pool,
             &mut inner.compute_guest_content_memo,
@@ -23829,6 +23975,7 @@ fn execute_compute_dispatch_mode(
             height: tic.height,
             depth,
             is_3d,
+            is_array,
             format,
             components: texture_component_mapping(swizzle),
             mip_levels: tic.mip_levels(),
@@ -24092,6 +24239,7 @@ fn execute_compute_dispatch_mode(
             else {
                 continue;
             };
+            settle_pending_guest_image_holder(inner, content);
             let (key, retained_content, image) = acquire_compute_guest_image(
                 &inner.device,
                 &inner.mem_props,
@@ -24123,6 +24271,7 @@ fn execute_compute_dispatch_mode(
                 height,
                 depth,
                 is_3d,
+                is_array,
                 format,
                 components,
                 mip_levels,
@@ -24134,6 +24283,7 @@ fn execute_compute_dispatch_mode(
             else {
                 continue;
             };
+            settle_pending_guest_image_holder(inner, content);
             let (key, retained_content, image) = acquire_compute_guest_image(
                 &inner.device,
                 &inner.mem_props,
@@ -24143,7 +24293,7 @@ fn execute_compute_dispatch_mode(
                 *depth,
                 *is_3d,
                 false,
-                false,
+                *is_array,
                 *format,
                 *components,
                 *mip_levels,
@@ -24183,6 +24333,7 @@ fn execute_compute_dispatch_mode(
                 output.height,
                 output.depth,
                 output.is_3d,
+                output.arrayed,
                 output.format.vk_format(),
                 sampled,
                 attachable,
@@ -24591,7 +24742,7 @@ fn execute_compute_dispatch_mode(
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: output.layers(),
             },
             ..Default::default()
         });
@@ -24852,7 +25003,7 @@ fn execute_compute_dispatch_mode(
                             base_mip_level: 0,
                             level_count: 1,
                             base_array_layer: 0,
-                            layer_count: 1,
+                            layer_count: output.layers(),
                         },
                         ..Default::default()
                     })
@@ -24885,13 +25036,13 @@ fn execute_compute_dispatch_mode(
                             aspect_mask: vk::ImageAspectFlags::COLOR,
                             mip_level: 0,
                             base_array_layer: 0,
-                            layer_count: 1,
+                            layer_count: request.layers(),
                         },
                         image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
                         image_extent: vk::Extent3D {
                             width: request.width,
                             height: request.height,
-                            depth: request.depth,
+                            depth: request.extent_depth(),
                         },
                     };
                     inner.device.cmd_copy_buffer_to_image(
@@ -24922,7 +25073,7 @@ fn execute_compute_dispatch_mode(
                                 base_mip_level: 0,
                                 level_count: 1,
                                 base_array_layer: 0,
-                                layer_count: 1,
+                                layer_count: output.layers(),
                             },
                             ..Default::default()
                         })
@@ -25029,7 +25180,7 @@ fn execute_compute_dispatch_mode(
                     base_mip_level: 0,
                     level_count: 1,
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: output.layers(),
                 },
                 ..Default::default()
             });
@@ -25058,13 +25209,13 @@ fn execute_compute_dispatch_mode(
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         mip_level: 0,
                         base_array_layer: 0,
-                        layer_count: 1,
+                        layer_count: request.layers(),
                     },
                     image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
                     image_extent: vk::Extent3D {
                         width: request.width,
                         height: request.height,
-                        depth: request.depth,
+                        depth: request.extent_depth(),
                     },
                 };
                 inner.device.cmd_copy_image_to_buffer(
@@ -25589,10 +25740,10 @@ fn validate_compute_dispatch(
         if output.width == 0
             || output.height == 0
             || output.depth == 0
-            || (!output.is_3d && output.depth != 1)
+            || (!output.is_3d && !output.arrayed && output.depth != 1)
             || output.width > dimension_limit
             || output.height > dimension_limit
-            || output.depth > dimension_limit
+            || output.depth > if output.arrayed { backend.max_image_array_layers } else { dimension_limit }
         {
             return Err(format!(
                 "invalid compute storage image at binding {}: {}x{}x{}",
@@ -28746,6 +28897,16 @@ fn pending_texture_for_tic(
     tic_addr: u64,
     tic: crate::texture::TicEntry,
 ) -> Result<Option<PendingTexture>, String> {
+    let full_layers = tic_storage_layer_count(&tic);
+    let full_read_size = tic_read_size(&tic, tic.format.linear_size(tic.width, tic.height), full_layers);
+    let tic = if crate::texture::texture_over_budget(full_read_size, &tic) {
+        match crate::texture::reduced_texture(&tic, full_layers) {
+            Some(reduced) => reduced.tic,
+            None => return Ok(None),
+        }
+    } else {
+        tic
+    };
     let pitch_size = tic.format.linear_size(tic.width, tic.height);
     let volume = tic_is_volume(&tic);
     let cube = tic_is_cube(&tic);
@@ -31365,6 +31526,7 @@ fn reserve_ring_span(
     let mut retired = 0u16;
     if ubo_ring.head.saturating_add(upper) > ubo_ring.size {
         ubo_ring.head = 0;
+        ubo_ring.uploads.clear();
         if frame_slots.len() == 2 {
             let other_idx = (cur_idx + 1) % 2;
             if frame_slots[other_idx].in_flight {
@@ -31477,6 +31639,7 @@ fn ring_wrap_other(
         ubo_ring.slot_span[index] = None;
     }
     ubo_ring.head = 0;
+    ubo_ring.uploads.clear();
     Ok(())
 }
 
@@ -32238,6 +32401,7 @@ fn create_ubo_ring(
         head: 0,
         slot_span: vec![None; frame_slot_count],
         rebar_bytes: allocation.rebar_bytes,
+        uploads: HashMap::default(),
     })
 }
 
@@ -37389,6 +37553,15 @@ mod tests {
     }
 
     #[test]
+    fn vram_pressure_spares_textures_used_in_the_last_two_frames() {
+        let mut generations = VecDeque::new();
+        for (present, expected) in [(10, u64::MAX), (20, u64::MAX), (30, 10), (40, 20), (55, 30)] {
+            super::note_present_generation(&mut generations, present);
+            assert_eq!(super::pressure_protected_generation(&generations), expected);
+        }
+    }
+
+    #[test]
     fn derived_texture_cache_retains_entries_within_both_limits() {
         let key = group_memo_test_key(0x10000);
         let mut cache = nexium_common::fast_hash::FastMap::default();
@@ -40005,6 +40178,7 @@ mod tests {
             readonly_noalias: false,
             resident: None,
             compute_alias: None,
+            mirrored: None,
         }
     }
 
@@ -40022,6 +40196,7 @@ mod tests {
             readonly_noalias: false,
             resident: None,
             compute_alias: None,
+            mirrored: None,
         }
     }
 
@@ -40029,7 +40204,7 @@ mod tests {
     fn texture_cache_budget_follows_vram_and_sheds_under_pressure() {
         const GIB: u64 = 1024 * 1024 * 1024;
         assert_eq!(super::derived_texture_cache_trim_bounds(0, 16 * GIB, false), (8 * GIB, 6 * GIB));
-        assert_eq!(super::derived_texture_cache_trim_bounds(0, 6 * GIB, false), (3 * GIB, 3 * GIB / 4 * 3));
+        assert_eq!(super::derived_texture_cache_trim_bounds(0, 6 * GIB, false), (6 * GIB / 4 * 3, 6 * GIB / 4 * 3 / 4 * 3));
         assert_eq!(super::derived_texture_cache_trim_bounds(0, GIB, false), (GIB, GIB / 4 * 3));
         assert_eq!(super::derived_texture_cache_trim_bounds(0, 0, false), (GIB, GIB / 4 * 3));
         assert_eq!(super::derived_texture_cache_trim_bounds(4 * GIB, 16 * GIB, true), (3 * GIB, 3 * GIB));
@@ -40793,6 +40968,7 @@ mod tests {
             height: 16,
             depth: 16,
             is_3d: true,
+            arrayed: false,
             format: ComputeStorageFormat::R32Float,
             initial_bytes: Some(vec![0; 16 * 16 * 16 * 4]),
         };
@@ -41564,6 +41740,7 @@ mod tests {
             height: 64,
             depth: 1,
             is_3d: false,
+            arrayed: false,
             format: ComputeStorageFormat::Abgr8Unorm,
             initial_bytes: Some(vec![0; 64 * 64 * 4]),
         };

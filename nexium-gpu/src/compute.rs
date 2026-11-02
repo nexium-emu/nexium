@@ -25,7 +25,12 @@ impl ComputeSampleType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ComputeStorageFormat {
     R8Unorm,
+    R8Uint,
+    R16Unorm,
     R16Float,
+    Rg16Float,
+    Rgba16Unorm,
+    Rgba16Snorm,
     B10G11R11Float,
     Rgba16Float,
     Rgba32Float,
@@ -53,7 +58,12 @@ impl ComputeStorageFormat {
             (TicFormat::R8, ComponentType::Unorm | ComponentType::UnormForceFp16) => {
                 Some(Self::R8Unorm)
             }
+            (TicFormat::R8, ComponentType::Uint) => Some(Self::R8Uint),
+            (TicFormat::R16, ComponentType::Unorm) => Some(Self::R16Unorm),
             (TicFormat::R16, ComponentType::Float) => Some(Self::R16Float),
+            (TicFormat::R16G16, ComponentType::Float) => Some(Self::Rg16Float),
+            (TicFormat::R16G16B16A16, ComponentType::Unorm) => Some(Self::Rgba16Unorm),
+            (TicFormat::R16G16B16A16, ComponentType::Snorm) => Some(Self::Rgba16Snorm),
             (TicFormat::B10G11R11, ComponentType::Float) => Some(Self::B10G11R11Float),
             (TicFormat::R16G16B16A16, ComponentType::Float) => Some(Self::Rgba16Float),
             (TicFormat::R32G32B32A32, ComponentType::Float) => Some(Self::Rgba32Float),
@@ -72,7 +82,12 @@ impl ComputeStorageFormat {
     pub(crate) fn vk_format(self) -> vk::Format {
         match self {
             Self::R8Unorm => vk::Format::R8_UNORM,
+            Self::R8Uint => vk::Format::R8_UINT,
+            Self::R16Unorm => vk::Format::R16_UNORM,
             Self::R16Float => vk::Format::R16_SFLOAT,
+            Self::Rg16Float => vk::Format::R16G16_SFLOAT,
+            Self::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
+            Self::Rgba16Snorm => vk::Format::R16G16B16A16_SNORM,
             Self::B10G11R11Float => vk::Format::B10G11R11_UFLOAT_PACK32,
             Self::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
             Self::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
@@ -87,15 +102,16 @@ impl ComputeStorageFormat {
 
     pub fn bytes_per_pixel(self) -> usize {
         match self {
-            Self::R8Unorm => 1,
-            Self::R16Float => 2,
-            Self::B10G11R11Float
+            Self::R8Unorm | Self::R8Uint => 1,
+            Self::R16Unorm | Self::R16Float => 2,
+            Self::Rg16Float
+            | Self::B10G11R11Float
             | Self::Abgr8Unorm
             | Self::Abgr8Uint
             | Self::Rgba8Uint
             | Self::R32Uint
             | Self::R32Float => 4,
-            Self::Rgba16Float | Self::Rg32Float => 8,
+            Self::Rgba16Float | Self::Rgba16Unorm | Self::Rgba16Snorm | Self::Rg32Float => 8,
             Self::Rgba32Float => 16,
         }
     }
@@ -266,8 +282,19 @@ pub struct ComputeStorageImage {
     pub height: u32,
     pub depth: u32,
     pub is_3d: bool,
+    pub arrayed: bool,
     pub format: ComputeStorageFormat,
     pub initial_bytes: Option<Vec<u8>>,
+}
+
+impl ComputeStorageImage {
+    pub fn layers(&self) -> u32 {
+        if self.arrayed { self.depth } else { 1 }
+    }
+
+    pub fn extent_depth(&self) -> u32 {
+        if self.arrayed { 1 } else { self.depth }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -567,6 +594,7 @@ struct ComputeOutputPoolKey {
     height: u32,
     depth: u32,
     is_3d: bool,
+    arrayed: bool,
     format: vk::Format,
     sampled: bool,
     attachable: bool,
@@ -916,6 +944,7 @@ pub(crate) struct ComputeBackend {
     pub max_compute_shared_memory_size: u32,
     pub max_image_dimension_2d: u32,
     pub max_image_dimension_3d: u32,
+    pub max_image_array_layers: u32,
     pub max_uniform_buffer_range: u32,
     pub max_uniform_buffers: u32,
     pub max_storage_buffer_range: u32,
@@ -952,6 +981,7 @@ impl ComputeBackend {
             max_compute_shared_memory_size: limits.max_compute_shared_memory_size,
             max_image_dimension_2d: limits.max_image_dimension2_d,
             max_image_dimension_3d: limits.max_image_dimension3_d,
+            max_image_array_layers: limits.max_image_array_layers,
             max_uniform_buffer_range: limits.max_uniform_buffer_range,
             max_uniform_buffers: limits.max_per_stage_descriptor_uniform_buffers,
             max_storage_buffer_range: limits.max_storage_buffer_range,
@@ -1120,6 +1150,7 @@ impl ComputeBackend {
         height: u32,
         depth: u32,
         is_3d: bool,
+        arrayed: bool,
         format: vk::Format,
         sampled: bool,
         attachable: bool,
@@ -1129,6 +1160,7 @@ impl ComputeBackend {
             height,
             depth,
             is_3d,
+            arrayed,
             format,
             sampled,
             attachable,
@@ -1141,7 +1173,7 @@ impl ComputeBackend {
         self.resource_pool.stats.output_misses =
             self.resource_pool.stats.output_misses.saturating_add(1);
         create_compute_output_image(
-            device, mem_props, width, height, depth, is_3d, format, sampled, attachable,
+            device, mem_props, width, height, depth, is_3d, arrayed, format, sampled, attachable,
         )
     }
 
@@ -1190,6 +1222,7 @@ impl ComputeBackend {
                 height: resource.height,
                 depth: resource.depth,
                 is_3d: resource.is_3d,
+                arrayed: resource.arrayed,
                 attachable: resource.attachable,
                 format: resource.format,
                 sampled: resource.sampled,
@@ -1523,12 +1556,27 @@ pub(crate) struct ComputeImageResource {
     pub height: u32,
     pub depth: u32,
     pub is_3d: bool,
+    pub arrayed: bool,
     pub format: vk::Format,
     pub sampled: bool,
     pub attachable: bool,
 }
 
 impl ComputeImageResource {
+    fn view_type(&self) -> vk::ImageViewType {
+        if self.is_3d {
+            vk::ImageViewType::TYPE_3D
+        } else if self.arrayed {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        } else {
+            vk::ImageViewType::TYPE_2D
+        }
+    }
+
+    pub fn layers(&self) -> u32 {
+        if self.arrayed { self.depth } else { 1 }
+    }
+
     pub fn destroy(self, device: &ash::Device) {
         unsafe {
             device.destroy_image_view(self.view, None);
@@ -1545,10 +1593,12 @@ pub(crate) fn create_compute_output_image(
     height: u32,
     depth: u32,
     is_3d: bool,
+    arrayed: bool,
     format: vk::Format,
     sampled: bool,
     attachable: bool,
 ) -> Result<ComputeImageResource, String> {
+    let layers = if arrayed { depth } else { 1 };
     let info = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
         image_type: if is_3d {
@@ -1560,10 +1610,10 @@ pub(crate) fn create_compute_output_image(
         extent: vk::Extent3D {
             width,
             height,
-            depth,
+            depth: if arrayed { 1 } else { depth },
         },
         mip_levels: 1,
-        array_layers: 1,
+        array_layers: layers,
         samples: vk::SampleCountFlags::TYPE_1,
         tiling: vk::ImageTiling::OPTIMAL,
         usage: vk::ImageUsageFlags::STORAGE
@@ -1622,6 +1672,8 @@ pub(crate) fn create_compute_output_image(
         image,
         view_type: if is_3d {
             vk::ImageViewType::TYPE_3D
+        } else if arrayed {
+            vk::ImageViewType::TYPE_2D_ARRAY
         } else {
             vk::ImageViewType::TYPE_2D
         },
@@ -1632,7 +1684,7 @@ pub(crate) fn create_compute_output_image(
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count: layers,
         },
         ..Default::default()
     };
@@ -1655,6 +1707,7 @@ pub(crate) fn create_compute_output_image(
         height,
         depth,
         is_3d,
+        arrayed,
         format,
         sampled,
         attachable,
@@ -1672,11 +1725,7 @@ pub(crate) fn create_compute_sampled_alias_view(
     let info = vk::ImageViewCreateInfo {
         s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
         image: image.image,
-        view_type: if image.is_3d {
-            vk::ImageViewType::TYPE_3D
-        } else {
-            vk::ImageViewType::TYPE_2D
-        },
+        view_type: image.view_type(),
         format: image.format,
         components,
         subresource_range: vk::ImageSubresourceRange {
@@ -1684,7 +1733,7 @@ pub(crate) fn create_compute_sampled_alias_view(
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count: image.layers(),
         },
         ..Default::default()
     };
@@ -1818,6 +1867,7 @@ pub(crate) fn create_compute_sampled_image(
         height,
         depth,
         is_3d,
+        arrayed: false,
         format,
         sampled: true,
         attachable: false,
@@ -2023,6 +2073,7 @@ pub(crate) fn create_compute_guest_image(
             height,
             depth,
             is_3d,
+            arrayed: false,
             format,
             sampled: true,
             attachable: false,
@@ -2155,6 +2206,7 @@ mod tests {
             height: 900,
             depth: 1,
             is_3d: false,
+            arrayed: false,
             format: vk::Format::R16_SFLOAT,
             attachable: false,
             sampled: false,

@@ -4984,22 +4984,32 @@ pub fn find_memory_type(
     None
 }
 
+pub const SYSTEM_MEMORY_IMAGE_BYTES: u64 = 256 << 20;
+
 pub fn allocate_image_memory(
     device: &ash::Device,
     props: &vk::PhysicalDeviceMemoryProperties,
     info: &vk::MemoryAllocateInfo,
     type_bits: u32,
 ) -> Result<vk::DeviceMemory, vk::Result> {
+    let system_type = (0..props.memory_type_count).find(|&i| {
+        type_bits & (1 << i) != 0
+            && !props.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    });
+    if let Some(index) = system_type.filter(|_| info.allocation_size >= SYSTEM_MEMORY_IMAGE_BYTES) {
+        let system = vk::MemoryAllocateInfo {
+            memory_type_index: index,
+            ..*info
+        };
+        if let Ok(memory) = unsafe { device.allocate_memory(&system, None) } {
+            return Ok(memory);
+        }
+    }
     match unsafe { device.allocate_memory(info, None) } {
         Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
-            let fallback = (0..props.memory_type_count)
-                .find(|&i| {
-                    type_bits & (1 << i) != 0
-                        && !props.memory_types[i as usize]
-                            .property_flags
-                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                })
-                .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            let fallback = system_type.ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| log::warn!("[vram] device memory full; placing images in system memory"));
             unsafe {

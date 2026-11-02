@@ -9,6 +9,7 @@ pub(crate) const INPUT_ARENA_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const OUTPUT_ARENA_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DEDICATED_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
+const AUTO_BC3_VRAM_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 const ARENA_ALIGNMENT: u64 = 256;
 const PUSH_CONSTANT_BYTES: u32 = 32;
 const WORKGROUP_BLOCKS: u32 = 8;
@@ -36,7 +37,7 @@ fn env_recompression() -> Option<AstcRecompression> {
 
 fn recompression_target(recompression: AstcRecompression, native_bc_formats: &[vk::Format]) -> Option<BcTarget> {
     let target = match recompression {
-        AstcRecompression::Uncompressed => return None,
+        AstcRecompression::Auto | AstcRecompression::Uncompressed => return None,
         AstcRecompression::Bc1 => BcTarget::Bc1,
         AstcRecompression::Bc3 => BcTarget::Bc3,
     };
@@ -46,9 +47,13 @@ fn recompression_target(recompression: AstcRecompression, native_bc_formats: &[v
         .then_some(target)
 }
 
-pub(crate) fn configure(native_bc_formats: &[vk::Format]) {
+pub(crate) fn configure(native_bc_formats: &[vk::Format], vram_bytes: u64) {
     let mode = env_decode_mode().unwrap_or_else(nexium_common::astc::decode_mode);
-    let recompression = env_recompression().unwrap_or_else(nexium_common::astc::recompression);
+    let recompression = match env_recompression().unwrap_or_else(nexium_common::astc::recompression) {
+        AstcRecompression::Auto if vram_bytes < AUTO_BC3_VRAM_BYTES => AstcRecompression::Bc3,
+        AstcRecompression::Auto => AstcRecompression::Uncompressed,
+        recompression => recompression,
+    };
     let target = recompression_target(recompression, native_bc_formats);
     if recompression != AstcRecompression::Uncompressed && target.is_none() {
         log::warn!("[astc] this GPU cannot sample {recompression:?} textures; ASTC stays uncompressed");

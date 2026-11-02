@@ -674,12 +674,59 @@ pub fn texture_over_budget(guest_size: usize, tic: &TicEntry) -> bool {
     let reported = REPORTED.get_or_init(Default::default);
     if reported.lock().unwrap().insert(tic.gpu_va) {
         log::warn!(
-            "[texture-budget] {:?} {}x{}x{} mips={} at {:#x} host {:#x} bytes{}",
-            tic.format, tic.width, tic.height, tic.depth, tic.mip_levels(), tic.gpu_va, size,
-            if over { "; bound as a placeholder" } else { "" }
+            "[texture-budget] {:?} {}x{}x{} mips={} sparse={} at {:#x} host {:#x} bytes{}",
+            tic.format, tic.width, tic.height, tic.depth, tic.mip_levels(), tic.is_sparse, tic.gpu_va, size,
+            if over { "; over budget" } else { "" }
         );
     }
     over
+}
+
+pub const REDUCED_TEXTURE_TAG: u64 = 1 << 62;
+const REDUCED_TEXTURE_MAX_HOST_BYTES: usize = 128 << 20;
+
+pub struct ReducedTexture {
+    pub tic: TicEntry,
+    pub read_size: usize,
+    pub spans: Vec<(usize, usize, usize)>,
+}
+
+pub fn reduced_texture(tic: &TicEntry, layers: u32) -> Option<ReducedTexture> {
+    if tic.is_sparse || !tic.is_block_linear || !matches!(tic.texture_type, 1 | 3 | 5) || tic.base_layer != 0 {
+        return None;
+    }
+    let full = block_linear_mip_layout(tic)?;
+    let layers = layers.max(1);
+    for skip in 1..tic.max_mip_level {
+        let mut reduced = *tic;
+        reduced.gpu_va = tic.gpu_va | REDUCED_TEXTURE_TAG;
+        reduced.width = (tic.width >> skip).max(1);
+        reduced.height = (tic.height >> skip).max(1);
+        reduced.max_mip_level = tic.max_mip_level - skip;
+        reduced.res_min_mip_level = tic.res_min_mip_level.saturating_sub(skip);
+        reduced.res_max_mip_level = tic.res_max_mip_level.saturating_sub(skip);
+        let layout = block_linear_mip_layout(&reduced)?;
+        let tail = full.levels.get(skip as usize..)?;
+        let same_levels = layout.levels.len() == tail.len()
+            && layout.levels.iter().zip(tail).all(|(level, source)| {
+                level.guest_size == source.guest_size
+                    && level.guest_offset + tail[0].guest_offset == source.guest_offset
+            });
+        if !same_levels {
+            return None;
+        }
+        let read_size = layout.guest_size_bytes(layers);
+        if texture_host_bytes(read_size, &reduced) > REDUCED_TEXTURE_MAX_HOST_BYTES {
+            continue;
+        }
+        let spans = (0..layers as usize)
+            .map(|layer| {
+                (layer * full.layer_stride + tail[0].guest_offset, layer * layout.layer_stride, layout.layer_size)
+            })
+            .collect();
+        return Some(ReducedTexture { tic: reduced, read_size, spans });
+    }
+    None
 }
 
 pub fn texture_guest_size_bytes(tic: &TicEntry, layers: u32) -> Option<usize> {
@@ -2564,6 +2611,7 @@ mod tests {
     use super::{
         block_linear_byte_size_3d, block_linear_byte_size_3d_with_block_width,
         block_linear_mip_layout, decode_to_rgba8, decode_to_rgba8_typed, maxwell_sample_grid,
+        reduced_texture, REDUCED_TEXTURE_TAG,
         swizzle_block_linear_3d, swizzle_block_linear_strided, texture_guest_size_bytes,
         unpack_native_render_target, unpack_pitch_linear, unswizzle_block_linear_3d,
         unswizzle_block_linear_3d_with_block_width, unswizzle_block_linear_strided, ComponentType,
@@ -2785,6 +2833,44 @@ mod tests {
         assert_eq!(layout.levels[0].linear_size, 68 * 18);
         assert_eq!(layout.levels[0].guest_size, 6 * 512);
         assert_eq!(texture_guest_size_bytes(&tic, 1), Some(6 * 512));
+    }
+
+    #[test]
+    fn oversized_arrays_reduce_to_their_mip_tails() {
+        let tic = TicEntry {
+            format: TicFormat::BC1,
+            component_types: [ComponentType::Unorm; 4],
+            swizzle: [SwizzleSource::R; 4],
+            gpu_va: 0x80_0000_0000,
+            width: 8192,
+            height: 8192,
+            block_width_log2: 0,
+            block_height_log2: 4,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 0,
+            is_block_linear: true,
+            texture_type: 5,
+            depth: 4,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
+            max_mip_level: 13,
+            res_min_mip_level: 0,
+            res_max_mip_level: 13,
+        };
+        let full = block_linear_mip_layout(&tic).unwrap();
+        let reduced = reduced_texture(&tic, 4).expect("mip tail fits the budget");
+        assert_eq!((reduced.tic.width, reduced.tic.height, reduced.tic.max_mip_level), (4096, 4096, 12));
+        assert_eq!(reduced.tic.gpu_va, tic.gpu_va | REDUCED_TEXTURE_TAG);
+        let layout = block_linear_mip_layout(&reduced.tic).unwrap();
+        assert_eq!(reduced.read_size, layout.layer_stride * 4);
+        assert_eq!(reduced.spans.len(), 4);
+        assert_eq!(reduced.spans[2], (2 * full.layer_stride + full.levels[1].guest_offset, 2 * layout.layer_stride, layout.layer_size));
+        assert_eq!(layout.layer_size, full.layer_size - full.levels[1].guest_offset);
+        assert!(reduced_texture(&TicEntry { is_sparse: true, ..tic }, 4).is_none());
     }
 
     #[test]
