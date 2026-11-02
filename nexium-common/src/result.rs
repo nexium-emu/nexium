@@ -13,6 +13,7 @@ pub const KERNEL_TIMEOUT: u32 = 1 | (117 << 9);
 pub const KERNEL_INVALID_ENUM_VALUE: u32 = 1 | (120 << 9);
 pub const KERNEL_INVALID_THREAD_STATE: u32 = 1 | (125 << 9);
 pub const KERNEL_CANCELLED: u32 = 1 | (118 << 9);
+pub const KERNEL_SESSION_CLOSED: u32 = 1 | (123 << 9);
 pub const KERNEL_PORT_NOT_FOUND: u32 = 131 | (33 << 9);
 
 pub const FS_NOT_FOUND: u32 = 1 | (2 << 9) | (2 << 21);

@@ -1,4 +1,5 @@
 pub mod astc;
+pub mod memory_layout;
 pub mod async_compile;
 pub mod cache_affinity;
 pub mod constants;

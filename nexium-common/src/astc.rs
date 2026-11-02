@@ -11,6 +11,7 @@ pub enum AstcDecodeMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AstcRecompression {
     #[default]
+    Auto,
     Uncompressed,
     Bc1,
     Bc3,
@@ -51,6 +52,7 @@ impl AstcDecodeMode {
 impl AstcRecompression {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
             "uncompressed" | "none" | "off" | "rgba8" => Some(Self::Uncompressed),
             "bc1" => Some(Self::Bc1),
             "bc3" => Some(Self::Bc3),
@@ -62,15 +64,17 @@ impl AstcRecompression {
         match value {
             1 => Self::Bc1,
             2 => Self::Bc3,
-            _ => Self::Uncompressed,
+            3 => Self::Uncompressed,
+            _ => Self::Auto,
         }
     }
 
     fn to_u8(self) -> u8 {
         match self {
-            Self::Uncompressed => 0,
+            Self::Auto => 0,
             Self::Bc1 => 1,
             Self::Bc3 => 2,
+            Self::Uncompressed => 3,
         }
     }
 }
@@ -104,11 +108,17 @@ mod tests {
         assert_eq!(AstcRecompression::parse("none"), Some(AstcRecompression::Uncompressed));
         assert_eq!(AstcRecompression::parse("BC1"), Some(AstcRecompression::Bc1));
         assert_eq!(AstcRecompression::parse("bc3"), Some(AstcRecompression::Bc3));
+        assert_eq!(AstcRecompression::parse("Auto"), Some(AstcRecompression::Auto));
         assert_eq!(AstcRecompression::parse("bc7"), None);
         for mode in [AstcDecodeMode::Gpu, AstcDecodeMode::Cpu, AstcDecodeMode::CpuAsynchronous] {
             assert_eq!(AstcDecodeMode::from_u8(mode.to_u8()), mode);
         }
-        for value in [AstcRecompression::Uncompressed, AstcRecompression::Bc1, AstcRecompression::Bc3] {
+        for value in [
+            AstcRecompression::Auto,
+            AstcRecompression::Uncompressed,
+            AstcRecompression::Bc1,
+            AstcRecompression::Bc3,
+        ] {
             assert_eq!(AstcRecompression::from_u8(value.to_u8()), value);
         }
     }
