@@ -1024,6 +1024,7 @@ fn linux_take_write_watch(
     len: usize,
     spans: Option<&mut Vec<(u64, usize)>>,
     observe: bool,
+    allow_partial: bool,
 ) -> WriteWatchObservation {
     if !ARENA_WRITE_WATCH.load(Ordering::Acquire) {
         return WriteWatchObservation::unavailable();
@@ -1050,9 +1051,19 @@ fn linux_take_write_watch(
     let ranges = committed_ranges()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !is_committed(&ranges, offset, offset_hi) {
+    let fully_committed = is_committed(&ranges, offset, offset_hi);
+    if !fully_committed && !allow_partial {
         return WriteWatchObservation::unavailable();
     }
+    let committed: Vec<(u64, u64)> = if fully_committed {
+        vec![(offset, offset_hi)]
+    } else {
+        ranges
+            .iter()
+            .filter(|range| range.lo < offset_hi && range.hi > offset)
+            .map(|range| (range.lo.max(offset), range.hi.min(offset_hi)))
+            .collect()
+    };
     let generation_before = if observe {
         observed_write_snapshot_range(lo, query_len).1
     } else {
@@ -1062,13 +1073,18 @@ fn linux_take_write_watch(
     let result = DIRTY_PAGES.with(|pages| {
         let mut pages = pages.borrow_mut();
         pages.clear();
-        let scan = watch.take(host_lo, query_len, |run_lo, run_hi| {
+        let mut on_run = |run_lo: usize, run_hi: usize| {
             let mut page = lo + (run_lo - host_lo) as u64;
             let end = lo + (run_hi - host_lo) as u64;
             while page < end {
                 pages.push(page);
                 page += 4096;
             }
+        };
+        let scan = committed.iter().try_for_each(|&(sub_lo, sub_hi)| {
+            watch
+                .take(base as usize + sub_lo as usize, (sub_hi - sub_lo) as usize, &mut on_run)
+                .map(|_| ())
         });
         if let Err(errno) = scan {
             // Some pages may already have been reset without being reported.
@@ -1126,7 +1142,7 @@ pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
 
     #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
     {
-        return linux_take_write_watch(va, len, None, false).result;
+        return linux_take_write_watch(va, len, None, false, false).result;
     }
 
     #[cfg(windows)]
@@ -1184,6 +1200,22 @@ pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
     }
 }
 
+pub fn take_write_watch_spans_partial(
+    va: u64,
+    len: usize,
+    spans: &mut Vec<(u64, usize)>,
+) -> WriteWatchResult {
+    #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
+    {
+        linux_take_write_watch(va, len, Some(spans), false, true).result
+    }
+
+    #[cfg(not(all(target_os = "linux", not(target_vendor = "sony"))))]
+    {
+        take_write_watch_spans(va, len, spans)
+    }
+}
+
 pub fn take_write_watch_spans(
     va: u64,
     len: usize,
@@ -1202,7 +1234,7 @@ pub fn take_write_watch_spans(
 
     #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
     {
-        return linux_take_write_watch(va, len, Some(spans), false).result;
+        return linux_take_write_watch(va, len, Some(spans), false, false).result;
     }
 
     #[cfg(windows)]
@@ -1289,7 +1321,7 @@ pub fn take_write_watch_spans_observed(
 
     #[cfg(all(target_os = "linux", not(target_vendor = "sony")))]
     {
-        return linux_take_write_watch(va, len, Some(spans), true);
+        return linux_take_write_watch(va, len, Some(spans), true, false);
     }
 
     #[cfg(windows)]
