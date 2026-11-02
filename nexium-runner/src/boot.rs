@@ -144,6 +144,65 @@ fn aux_guest_crashed(streak: u32, fault_address_mapped: bool) -> bool {
     !fault_address_mapped && streak >= AUX_FAULT_STREAK_LIMIT
 }
 
+fn test_input_button(name: &str) -> Option<u64> {
+    let bit = match name {
+        "A" => 0,
+        "B" => 1,
+        "X" => 2,
+        "Y" => 3,
+        "L" => 6,
+        "R" => 7,
+        "ZL" => 8,
+        "ZR" => 9,
+        "PLUS" => 10,
+        "MINUS" => 11,
+        "LEFT" => 12,
+        "UP" => 13,
+        "RIGHT" => 14,
+        "DOWN" => 15,
+        _ => return None,
+    };
+    Some(1 << bit)
+}
+
+fn parse_test_input(script: &str) -> Vec<(f64, u64)> {
+    script
+        .split(',')
+        .filter_map(|step| {
+            let (at, names) = step.trim().split_once(':')?;
+            let buttons = names
+                .split('+')
+                .try_fold(0u64, |buttons, name| Some(buttons | test_input_button(&name.trim().to_ascii_uppercase())?))?;
+            Some((at.trim().parse().ok()?, buttons))
+        })
+        .collect()
+}
+
+fn run_test_input(steps: &[(f64, u64)], stop: &AtomicBool) {
+    let started = std::time::Instant::now();
+    let press = |buttons: u64| {
+        nexium_core::hid_state::get_hid_state().lock().update_input(nexium_core::hid_state::ControllerInput {
+            buttons,
+            stick_l_x: 0,
+            stick_l_y: 0,
+            stick_r_x: 0,
+            stick_r_y: 0,
+        });
+    };
+    for &(at, buttons) in steps {
+        while started.elapsed().as_secs_f64() < at {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        log::warn!("[test-input] t={at} buttons={buttons:#x}");
+        press(buttons);
+        thread::sleep(std::time::Duration::from_secs(1));
+        press(0);
+    }
+}
+
 fn core_park_enabled() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| std::env::var("NEXIUM_CORE_PARK").ok().as_deref() != Some("0"))
@@ -1505,6 +1564,19 @@ impl EmulationHandle {
                     Arc::clone(&vsync_wake),
                     nx2_poll_handle,
                 );
+                let test_input_handle = std::env::var("NEXIUM_TEST_INPUT").ok().and_then(|script| {
+                    let steps = parse_test_input(&script);
+                    let stop = Arc::clone(&vsync_stop);
+                    thread::Builder::new()
+                        .name("nexium-test-input".into())
+                        .spawn(move || run_test_input(&steps, &stop))
+                        .ok()
+                });
+                let _test_input_guard = VsyncGuard(
+                    Arc::clone(&vsync_stop),
+                    Arc::clone(&vsync_wake),
+                    test_input_handle,
+                );
 
                 log::info!("Starting emulation loop");
                 let max_cycles = u64::MAX;
@@ -2803,6 +2875,14 @@ impl Drop for EmulationHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_input_script_parses_timed_button_chords() {
+        assert_eq!(
+            parse_test_input("300:L+R, 312.5:a,bad,9:Q"),
+            vec![(300.0, (1 << 6) | (1 << 7)), (312.5, 1)]
+        );
+    }
 
     #[test]
     fn vsync_wait_preserves_deadline_and_observes_prior_cancellation() {
