@@ -12,7 +12,6 @@ const SCRATCH_BASE: u8 = 240;
 const SCRATCH_END: u8 = 255;
 const TWO_PI: u32 = 0x40C9_0FDB;
 const COPY_LIMIT: usize = 32;
-const UNIFORM_BASE: u8 = 176;
 const URZ: u8 = 63;
 const UNIFORM_PREDICATES: u8 = 239;
 const SPARE_PREDICATE: u8 = 6;
@@ -64,6 +63,7 @@ enum Target {
     Instruction(usize),
     Landing(usize),
     Copy(usize),
+    Inline(usize, usize),
 }
 
 enum Item {
@@ -125,6 +125,7 @@ pub(super) fn lower(code: &[u8]) -> Result<Vec<u8>, Error> {
         .filter_map(|(index, _)| targets[index])
         .collect();
     let (redirects, copies) = plan_copies(&instructions, &targets, &landings, &skipped);
+    let inline_body = plan_inline_callee(&instructions, &targets, &calls);
     let mut lowering = Lowering {
         items: Vec::new(),
         starts: Vec::with_capacity(instructions.len()),
@@ -135,14 +136,13 @@ pub(super) fn lower(code: &[u8]) -> Result<Vec<u8>, Error> {
         skipped,
         count: instructions.len(),
         return_to: (calls.len() == 1).then(|| calls[0] + 1),
+        inline_body,
+        inline_copy: None,
+        inline_positions: Vec::new(),
         offset: 0,
         inst: instructions[0],
         scratch: SCRATCH_BASE,
-        native_limit: if instructions.iter().any(touches_uniforms) {
-            UNIFORM_BASE
-        } else {
-            SCRATCH_BASE
-        },
+        native_limit: native_limit(&instructions),
         uniform_fields: false,
         guard: None,
     };
@@ -163,6 +163,26 @@ pub(super) fn lower(code: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(lowering.assemble())
 }
 
+fn plan_inline_callee(
+    instructions: &[Inst],
+    targets: &[Option<usize>],
+    calls: &[usize],
+) -> Option<(usize, Vec<Inst>)> {
+    let start = targets[*calls.first()?]?;
+    let end = (start..instructions.len()).find(|&index| instructions[index].opcode() == 0x950)?;
+    let unconditional = |inst: &Inst| inst.guard() == (PT, false) && inst.pred(87, 90) == (PT, false);
+    let body = start..=end;
+    let valid = !calls.is_empty()
+        && calls.iter().all(|&call| targets[call] == Some(start) && unconditional(&instructions[call]))
+        && body.clone().all(|index| !matches!(instructions[index].opcode(), 0x944 | 0x949))
+        && targets.iter().enumerate().all(|(index, target)| match target {
+            Some(target) if body.contains(target) => body.contains(&index) || (*target == start && calls.contains(&index)),
+            Some(_) => !body.contains(&index),
+            None => true,
+        });
+    valid.then(|| (start, instructions[body].to_vec()))
+}
+
 fn branch_index(index: usize, inst: &Inst, count: usize) -> Option<usize> {
     if !matches!(inst.opcode(), 0x944 | 0x947) {
         return None;
@@ -178,7 +198,31 @@ fn touches_uniforms(inst: &Inst) -> bool {
     matches!(inst.form(), 6 | 7)
         || (0x080..0x0c0).contains(&inst.alu_opcode())
         || matches!(inst.alu_opcode(), 0x1c2 | 0x1c3)
-        || matches!(inst.opcode(), 0x981 | 0x986)
+        || matches!(inst.opcode(), 0x981 | 0x986 | 0x9a8 | 0x3c4)
+        || (inst.opcode() == 0x98e && inst.reg(24) == RZ)
+}
+
+fn native_limit(instructions: &[Inst]) -> u8 {
+    if !instructions.iter().any(touches_uniforms) {
+        return SCRATCH_BASE;
+    }
+    let highest = instructions.iter().filter_map(highest_uniform).max().unwrap_or(0);
+    (UNIFORM_PREDICATES - (highest + 4).min(URZ)) & !3
+}
+
+fn highest_uniform(inst: &Inst) -> Option<u8> {
+    let fields: &[(u32, u32)] = if (0x080..0x0c0).contains(&inst.alu_opcode()) {
+        if inst.form() == 1 { &[(16, 8), (24, 8), (32, 8), (64, 8)] } else { &[(16, 8), (24, 8), (64, 8)] }
+    } else if matches!(inst.alu_opcode(), 0x1c2 | 0x1c3) || inst.opcode() == 0x3c4 {
+        &[(16, 8)]
+    } else if inst.opcode() == 0x981 || inst.form() == 6 {
+        &[(32, 6)]
+    } else if matches!(inst.opcode(), 0x986 | 0x9a8 | 0x98e) || inst.form() == 7 {
+        &[(64, 6)]
+    } else {
+        &[]
+    };
+    fields.iter().map(|&(start, len)| inst.field(start, len) as u8).filter(|&index| index < URZ).max()
 }
 
 fn uniform_datapath(inst: &Inst) -> bool {
@@ -282,6 +326,9 @@ struct Lowering {
     skipped: HashSet<usize>,
     count: usize,
     return_to: Option<usize>,
+    inline_body: Option<(usize, Vec<Inst>)>,
+    inline_copy: Option<(usize, usize)>,
+    inline_positions: Vec<HashMap<usize, usize>>,
     offset: usize,
     inst: Inst,
     scratch: u8,
@@ -330,7 +377,7 @@ impl Lowering {
 
     fn regs(&self, base: u8, count: u8) -> Result<u8, Error> {
         let end = u16::from(base) + u16::from(count);
-        let uniform = self.uniform_fields && base >= UNIFORM_BASE && end <= u16::from(UNIFORM_BASE + URZ);
+        let uniform = self.uniform_fields && base >= self.native_limit && end <= u16::from(UNIFORM_PREDICATES);
         if base == RZ || end <= u16::from(self.native_limit) || uniform {
             Ok(base)
         } else {
@@ -348,7 +395,9 @@ impl Lowering {
     fn ureg(&self, index: u8) -> Result<u8, Error> {
         match index {
             URZ => Ok(RZ),
-            index if index < URZ && self.native_limit == UNIFORM_BASE => Ok(UNIFORM_BASE + index),
+            index if index < URZ && u16::from(self.native_limit) + u16::from(index) < u16::from(UNIFORM_PREDICATES) => {
+                Ok(self.native_limit + index)
+            }
             _ => self.unsupported(),
         }
     }
@@ -477,6 +526,7 @@ impl Lowering {
                             Target::Instruction(target) => self.starts[target],
                             Target::Landing(target) => self.landings[&target],
                             Target::Copy(copy) => self.copies[copy],
+                            Target::Inline(copy, target) => self.inline_positions[copy][&target],
                         };
                         word.offset24(byte_of(target) - (byte_of(index) + 8))
                     }
@@ -514,7 +564,7 @@ impl Lowering {
         }
         match self.inst.opcode() {
             0x918 | 0x91a | 0x941 | 0x945 => Ok(()),
-            0x944 => self.branch(0x10),
+            0x944 => self.call(),
             0x947 => self.branch(0),
             0x949 => self.indirect(),
             0x950 => self.ret(),
@@ -522,6 +572,7 @@ impl Lowering {
             0x95b => self.kill(),
             0x919 => self.s2r(),
             0x805 => self.cs2r(),
+            0x822 => self.fswzadd(),
             0x321 => self.ald(),
             0x322 => self.ast(),
             0x326 => self.ipa(),
@@ -530,6 +581,11 @@ impl Lowering {
             0x981 => self.ldg(Some(self.inst.field(32, 6) as u8)),
             0x386 => self.stg(None),
             0x986 => self.stg(Some(self.inst.field(64, 6) as u8)),
+            0x3a8 => self.atomg(None),
+            0x9a8 => self.atomg(Some(self.inst.field(64, 6) as u8)),
+            0x98e => self.red(),
+            0x3c4 => self.redux(),
+            0x3a1 => self.match_all(),
             0xb60 => self.tex(),
             0xb69 => self.tmml(),
             0xb63 => self.tld4(),
@@ -561,6 +617,8 @@ impl Lowering {
             0x013 => self.iabs(),
             0x016 => self.prmt(),
             0x01a => self.sgxt(),
+            0x030 => self.hadd2(),
+            0x034 => self.hsetp2(),
             0x03e => self.f2fp(),
             0x100 => self.flo(),
             0x101 => self.brev(),
@@ -570,7 +628,9 @@ impl Lowering {
             0x1c2 => self.r2ur(),
             0x1c3 => self.s2ur(),
             0x002 => self.mov(),
+            0x003 => self.p2r(),
             0x004 => self.r2p(),
+            0x0a5 => self.uimad_wide(),
             0x007 => self.sel(false),
             0x008 => self.sel(true),
             0x009 => self.fmnmx(),
@@ -600,7 +660,8 @@ impl Lowering {
         if inst.guard() != (PT, false) {
             return self.unsupported();
         }
-        let map = |index: u64| if index as u8 >= URZ { u64::from(RZ) } else { u64::from(UNIFORM_BASE) + index };
+        let base = u64::from(self.native_limit);
+        let map = |index: u64| if index as u8 >= URZ { u64::from(RZ) } else { base + index };
         let mut vector = inst.with_field(0, 9, u64::from(vector_opcode));
         let fields: &[u32] = if inst.form() == 1 { &[16, 24, 32, 64] } else { &[16, 24, 64] };
         for &start in fields {
@@ -1268,12 +1329,19 @@ impl Lowering {
         if inst.bit(80) {
             return self.lea_high(b, carry_out);
         }
-        if inst.bit(74) || negated || (carry_out != PT && inst.bit(72)) {
+        if inst.bit(74) || (negated && carry_out != PT) || (carry_out != PT && inst.bit(72)) {
             return self.unsupported();
         }
         let dst = self.reg(inst.dst())?;
         let a = self.reg(inst.reg(24))?;
-        let word = self.with_b([Opcode::LEA_lo_reg, Opcode::LEA_lo_cbuf, Opcode::LEA_lo_imm], b.operand, false)?;
+        let word = if negated {
+            let value = self.register(b.operand)?;
+            let addend = self.scratch(1)?;
+            self.emit(Word::new(Opcode::IADD_reg).dst(addend).a(RZ).b(value).flag(48, true));
+            Word::new(Opcode::LEA_lo_reg).b(addend)
+        } else {
+            self.with_b([Opcode::LEA_lo_reg, Opcode::LEA_lo_cbuf, Opcode::LEA_lo_imm], b.operand, false)?
+        };
         let word = word
             .a(a)
             .set(39, 5, inst.field(75, 5))
@@ -1287,6 +1355,26 @@ impl Lowering {
         self.emit(word.dst(sum));
         self.compare_into(carry_out, sum, b.operand, COMPARE_LT)?;
         self.copy(dst, sum);
+        Ok(())
+    }
+
+    fn fswzadd(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        let dst = self.reg(inst.dst())?;
+        let a = self.reg(inst.reg(24))?;
+        let b = self.reg(inst.reg(64))?;
+        let table = inst.field(32, 8);
+        let lanes = (0..4).fold(0, |lanes, lane| lanes | ((table >> (6 - 2 * lane)) & 3) << (2 * lane));
+        self.emit(
+            Word::new(Opcode::FSWZADD)
+                .dst(dst)
+                .a(a)
+                .b(b)
+                .set(28, 8, lanes)
+                .flag(38, inst.bit(77))
+                .set(39, 2, inst.field(78, 2))
+                .flag(44, inst.bit(80)),
+        );
         Ok(())
     }
 
@@ -1621,6 +1709,13 @@ impl Lowering {
         if b.operand == Operand::Imm(1) {
             return self.add3(dst, a, Source::plain(Operand::Reg(RZ)), c);
         }
+        if let Operand::Imm(multiplier) = b.operand {
+            if multiplier.is_power_of_two() && !a.neg && !b.neg && !c.neg && zero(&c) {
+                let a_register = self.register(a.operand)?;
+                self.emit(Word::new(Opcode::SHL_imm).dst(dst).a(a_register).int_imm20(multiplier.trailing_zeros() as i32));
+                return Ok(());
+            }
+        }
         let negate_product = a.neg ^ b.neg;
         let a_register = self.register(a.operand)?;
         if negate_product || c.neg {
@@ -1945,6 +2040,288 @@ impl Lowering {
         Ok(())
     }
 
+    fn atomg(&mut self, uniform: Option<u8>) -> Result<(), Error> {
+        let inst = self.inst;
+        let mode = match uniform {
+            Some(_) => inst.field(64, 32) & !0x3F == 0x081E_E140 && inst.reg(24) == RZ,
+            None => inst.field(64, 32) == 0x001E_E100,
+        };
+        let offset = inst.signed_offset(40, 24);
+        if !mode || !(-0x8_0000..0x8_0000).contains(&offset) {
+            return self.unsupported();
+        }
+        let dst = self.reg(inst.dst())?;
+        let data = self.reg(inst.reg(32))?;
+        let address = self.global_address(uniform)?;
+        self.emit(
+            Word::new(Opcode::ATOM)
+                .dst(dst)
+                .a(address)
+                .b(data)
+                .set(28, 20, offset as u64 & 0xF_FFFF)
+                .flag(48, true),
+        );
+        Ok(())
+    }
+
+    fn red(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        let mode = inst.field(64, 32) & !0x0380_0000;
+        let uniform = (inst.reg(24) == RZ && mode & !0x3F == 0x0C10_E100).then(|| inst.field(64, 6) as u8);
+        let offset = inst.signed_offset(40, 24);
+        if (uniform.is_none() && mode != 0x0010_E100) || !(-0x8_0000..0x8_0000).contains(&offset) {
+            return self.unsupported();
+        }
+        let data = self.reg(inst.reg(32))?;
+        let address = self.global_address(uniform)?;
+        self.emit(
+            Word::new(Opcode::RED)
+                .dst(data)
+                .a(address)
+                .set(23, 3, inst.field(87, 3))
+                .set(28, 20, offset as u64 & 0xF_FFFF)
+                .flag(48, true),
+        );
+        Ok(())
+    }
+
+    fn active_lanes(&mut self) -> Result<u8, Error> {
+        let active = self.scratch(1)?;
+        self.emit(
+            Word::new(Opcode::VOTE)
+                .dst(active)
+                .set(39, 3, u64::from(PT))
+                .set(45, 3, u64::from(PT))
+                .set(48, 2, 1),
+        );
+        Ok(active)
+    }
+
+    fn shuffle_index(&mut self, dst: u8, source: u8, lane: Result<u8, u8>) {
+        let word = Word::new(Opcode::SHFL)
+            .dst(dst)
+            .a(source)
+            .set(48, 3, u64::from(PT))
+            .set(34, 13, 0x1F)
+            .flag(29, true);
+        self.emit(match lane {
+            Ok(register) => word.b(register),
+            Err(lane) => word.set(20, 5, u64::from(lane)).flag(28, true),
+        });
+    }
+
+    fn redux(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        let maximum = match inst.field(64, 32) {
+            0xC000 => false,
+            0x1_4000 => true,
+            _ => return self.unsupported(),
+        };
+        let target = self.ureg(inst.dst())?;
+        if inst.guard() != (PT, false) || inst.field(32, 32) != 0 || target == RZ {
+            return self.unsupported();
+        }
+        let source = self.reg(inst.reg(24))?;
+        let active = self.active_lanes()?;
+        let (value, mask) = (self.scratch(1)?, self.scratch(1)?);
+        self.move_into(target, Operand::Imm(0))?;
+        for lane in 0..32 {
+            self.shuffle_index(value, source, Err(lane));
+            self.emit(Word::new(Opcode::SHR_imm).dst(mask).a(active).int_imm20(lane as i32));
+            self.emit(
+                Word::new(Opcode::LOP3_imm)
+                    .dst(mask)
+                    .a(mask)
+                    .int_imm20(1)
+                    .c(RZ)
+                    .set(48, 8, u64::from(LUT_A & LUT_B)),
+            );
+            self.emit(Word::new(Opcode::IADD_reg).dst(mask).a(RZ).b(mask).flag(48, true));
+            self.logic(value, [value, mask, RZ], LUT_A & LUT_B, PT);
+            self.emit(if maximum {
+                Word::new(Opcode::IMNMX_reg)
+                    .dst(target)
+                    .a(target)
+                    .b(value)
+                    .set(39, 3, u64::from(PT))
+                    .flag(42, true)
+            } else {
+                Word::new(Opcode::IADD_reg).dst(target).a(target).b(value)
+            });
+        }
+        Ok(())
+    }
+
+    fn match_all(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        let target = inst.field(81, 3) as u8;
+        if inst.dst() != RZ
+            || inst.reg(24) & 1 != 0
+            || target >= SPARE_PREDICATE
+            || inst.guard() != (PT, false)
+            || inst.field(32, 32) != 0
+            || inst.field(64, 32) & !0xE_0000 != 0x200
+        {
+            return self.unsupported();
+        }
+        let source = self.regs(inst.reg(24), 2)?;
+        let saved = self.scratch(1)?;
+        self.always(Word::new(Opcode::P2R_imm).dst(saved).a(RZ).int_imm20(1 << SPARE_PREDICATE));
+        let active = self.active_lanes()?;
+        let lowest = self.scratch(1)?;
+        self.emit(Word::new(Opcode::IADD_reg).dst(lowest).a(RZ).b(active).flag(48, true));
+        self.logic(lowest, [active, lowest, RZ], LUT_A & LUT_B, PT);
+        self.emit(Word::new(Opcode::FLO_reg).dst(lowest).b(lowest));
+        let leader = self.scratch(2)?;
+        for word in 0..2 {
+            self.shuffle_index(leader + word, source + word, Ok(lowest));
+            self.emit(
+                Word::new(Opcode::ISETP_reg)
+                    .a(source + word)
+                    .b(leader + word)
+                    .set(3, 3, u64::from(SPARE_PREDICATE))
+                    .set(0, 3, u64::from(PT))
+                    .set(39, 3, u64::from(if word == 0 { PT } else { SPARE_PREDICATE }))
+                    .set(49, 3, COMPARE_EQ),
+            );
+        }
+        self.emit(
+            Word::new(Opcode::VOTE)
+                .dst(RZ)
+                .set(39, 3, u64::from(SPARE_PREDICATE))
+                .set(45, 3, u64::from(target))
+                .set(48, 2, 0),
+        );
+        self.always(Word::new(Opcode::R2P_imm).a(saved).int_imm20(1 << SPARE_PREDICATE));
+        Ok(())
+    }
+
+    fn uimad_wide(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        let (d, c) = (inst.dst(), inst.field(64, 8) as u8);
+        if inst.guard() != (PT, false)
+            || inst.field(40, 24) != 0
+            || inst.field(72, 24) != 0x0F_8E00
+            || d & 1 != 0
+            || d == URZ
+            || (c != URZ && c & 1 != 0)
+        {
+            return self.unsupported();
+        }
+        let (low, high) = (self.ureg(d)?, self.ureg(d + 1)?);
+        let (a, b) = (self.ureg(inst.reg(24))?, self.ureg(inst.reg(32))?);
+        let (c_low, c_high) = if c == URZ { (RZ, RZ) } else { (self.ureg(c)?, self.ureg(c + 1)?) };
+        let product = self.scratch(2)?;
+        self.emit(Word::new(Opcode::IMUL_reg).dst(product).a(a).b(b));
+        self.emit(Word::new(Opcode::IMUL_reg).dst(product + 1).a(a).b(b).flag(53, true));
+        self.emit(Word::new(Opcode::IADD_reg).dst(low).a(product).b(c_low).flag(47, true));
+        self.emit(Word::new(Opcode::IADD_reg).dst(high).a(product + 1).b(c_high).flag(43, true));
+        Ok(())
+    }
+
+    fn p2r(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        if inst.form() != 4 || inst.field(32, 32) > 0x7F || inst.field(64, 32) & !0x3000 != 0 {
+            return self.unsupported();
+        }
+        let dst = self.reg(inst.dst())?;
+        let merge = self.reg(inst.reg(24))?;
+        self.emit(
+            Word::new(Opcode::P2R_imm)
+                .dst(dst)
+                .a(merge)
+                .int_imm20(inst.field(32, 32) as i32)
+                .set(41, 2, inst.field(76, 2)),
+        );
+        Ok(())
+    }
+
+    fn hadd2(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        if !matches!(inst.form(), 1..=3) || inst.bit(76) || inst.bit(79) || inst.field(81, 10) != 0 || inst.bit(91) {
+            return self.unsupported();
+        }
+        let dst = self.reg(inst.dst())?;
+        let a = self.reg(inst.reg(24))?;
+        let b = self.half_operand()?;
+        let (a_swizzle, a_abs, a_neg) = (inst.field(74, 2), inst.bit(73), inst.bit(72));
+        let (b_swizzle, b_abs, b_neg) = self.half_modifiers();
+        if inst.bit(78) {
+            if a != RZ || !a_neg || a_abs || a_swizzle != 0 || b_swizzle < 2 || inst.bit(77) || inst.bit(80) {
+                return self.unsupported();
+            }
+            self.emit(
+                Word::new(Opcode::F2F_reg)
+                    .dst(dst)
+                    .b(b)
+                    .set(8, 2, 2)
+                    .set(10, 2, 1)
+                    .flag(41, b_swizzle == 3)
+                    .flag(45, b_neg)
+                    .flag(49, b_abs),
+            );
+            return Ok(());
+        }
+        self.emit(
+            Word::new(Opcode::HADD2_reg)
+                .dst(dst)
+                .a(a)
+                .b(b)
+                .set(28, 2, b_swizzle)
+                .flag(30, b_abs)
+                .flag(31, b_neg)
+                .flag(32, inst.bit(77))
+                .flag(39, inst.bit(80))
+                .flag(43, a_neg)
+                .flag(44, a_abs)
+                .set(47, 2, a_swizzle),
+        );
+        Ok(())
+    }
+
+    fn hsetp2(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        if !matches!(inst.form(), 1..=3) || inst.bit(65) || inst.bit(91) {
+            return self.unsupported();
+        }
+        let a = self.reg(inst.reg(24))?;
+        let b = self.half_operand()?;
+        let (b_swizzle, b_abs, b_neg) = self.half_modifiers();
+        self.emit(
+            Word::new(Opcode::HSETP2_reg)
+                .set(0, 3, inst.field(84, 3))
+                .set(3, 3, inst.field(81, 3))
+                .flag(6, inst.bit(80))
+                .a(a)
+                .b(b)
+                .set(28, 2, b_swizzle)
+                .flag(30, b_abs)
+                .flag(31, b_neg)
+                .set(35, 4, inst.field(76, 4))
+                .set(39, 3, inst.field(87, 3))
+                .flag(42, inst.bit(90))
+                .flag(43, inst.bit(72))
+                .flag(44, inst.bit(73))
+                .set(45, 2, inst.field(69, 2))
+                .set(47, 2, inst.field(74, 2))
+                .flag(49, inst.bit(71)),
+        );
+        Ok(())
+    }
+
+    fn half_operand(&mut self) -> Result<u8, Error> {
+        let source = self.slot32()?;
+        self.register(source.operand)
+    }
+
+    fn half_modifiers(&self) -> (u64, bool, bool) {
+        if self.inst.form() == 2 {
+            (0, false, false)
+        } else {
+            (self.inst.field(60, 2), self.inst.bit(62), self.inst.bit(63))
+        }
+    }
+
     fn s2r(&mut self) -> Result<(), Error> {
         let dst = self.reg(self.inst.dst())?;
         self.emit(Word::new(Opcode::S2R).dst(dst).set(20, 8, self.inst.field(72, 8)));
@@ -1977,7 +2354,11 @@ impl Lowering {
             return self.unsupported();
         }
         let target = self.target_index(inst.branch_target(self.offset, 34, 48))?;
+        let inline = self.inline_copy.zip(self.inline_body.as_ref().map(|(start, body)| *start..*start + body.len()));
         let target = match self.redirects.get(&(self.offset / INSTRUCTION_SIZE)) {
+            _ if inline.as_ref().is_some_and(|(_, body)| body.contains(&target)) => {
+                Target::Inline(inline.unwrap().0 .1, target)
+            }
             _ if modifiers != 0 => Target::Landing(target),
             Some(copy) => Target::Copy(*copy),
             None => Target::Instruction(target),
@@ -1990,6 +2371,16 @@ impl Lowering {
         Ok(())
     }
 
+    fn next_target(&self) -> Target {
+        let next = self.offset / INSTRUCTION_SIZE + 1;
+        match (self.inline_copy, &self.inline_body) {
+            (Some((_, copy)), Some((start, body))) if (*start..*start + body.len()).contains(&next) => {
+                Target::Inline(copy, next)
+            }
+            _ => Target::Instruction(next),
+        }
+    }
+
     fn second_condition(&mut self, condition: (u8, bool)) -> (u8, bool) {
         let (pred, negate) = self.inst.guard();
         if condition == (PT, false) {
@@ -1998,7 +2389,7 @@ impl Lowering {
         if (pred, negate) != (PT, false) {
             self.items.push(Item::Branch {
                 word: Word::new(Opcode::BRA).set(0, 5, FLOW_ALWAYS).guard(pred, !negate),
-                target: Target::Instruction(self.offset / INSTRUCTION_SIZE + 1),
+                target: self.next_target(),
             });
         }
         condition
@@ -2024,13 +2415,33 @@ impl Lowering {
         Ok(())
     }
 
-    fn ret(&mut self) -> Result<(), Error> {
-        let Some(target) = self.return_to else {
-            return self.unsupported();
+    fn call(&mut self) -> Result<(), Error> {
+        let Some((start, body)) = self.inline_body.clone().filter(|_| self.inline_copy.is_none()) else {
+            return self.branch(0x10);
         };
+        let copy = self.inline_positions.len();
+        self.inline_positions.push(HashMap::new());
+        self.inline_copy = Some((self.offset / INSTRUCTION_SIZE, copy));
+        let lowered = body.iter().enumerate().try_for_each(|(index, inst)| {
+            self.inline_positions[copy].insert(start + index, self.items.len());
+            self.lower_at(start + index, *inst)
+        });
+        self.inline_copy = None;
+        lowered
+    }
+
+    fn ret(&mut self) -> Result<(), Error> {
         if self.inst.field(82, 5) != 0x10 {
             return self.unsupported();
         }
+        let target = match (self.inline_copy, &self.inline_body) {
+            (Some((call, _)), _) => call + 1,
+            (None, Some(_)) => return self.exit(),
+            (None, None) => match self.return_to {
+                Some(target) => target,
+                None => return self.unsupported(),
+            },
+        };
         let (pred, negate) = self.second_condition(self.inst.pred(87, 90));
         self.items.push(Item::Branch {
             word: Word::new(Opcode::BRA).set(0, 5, FLOW_ALWAYS).guard(pred, negate),

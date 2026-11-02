@@ -11,6 +11,7 @@ pub use lower::Error;
 pub const HEADER_SIZE: usize = 0x80;
 pub const MAXWELL_HEADER_SIZE: usize = 0x50;
 pub const MAX_PROGRAM_BYTES: usize = HEADER_SIZE + 64 * 1024;
+pub const MAX_LARGE_PROGRAM_BYTES: usize = HEADER_SIZE + 256 * 1024;
 
 const VERSION_SHIFT: u32 = 5;
 const VERSION_MASK: u32 = 0x1F << VERSION_SHIFT;

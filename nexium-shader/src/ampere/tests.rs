@@ -235,11 +235,12 @@ fn lowers_uniform_registers_into_reserved_gprs() {
         ],
     ));
     assert_eq!(&opcodes(&words)[..3], &[Opcode::LDC, Opcode::FMUL_reg, Opcode::IADD3_reg]);
-    assert_eq!((operand::reg_dest(words[0]), (words[0] >> 48) & 7, (words[0] >> 20) & 0xFFFF), (182, 5, 0x670));
-    assert_eq!((operand::reg_dest(words[1]), operand::reg_a(words[1]), operand::reg_b(words[1])), (3, 0, 180));
+    assert_eq!((operand::reg_dest(words[0]), (words[0] >> 48) & 7, (words[0] >> 20) & 0xFFFF), (234, 5, 0x670));
+    assert_eq!(operand::reg_dest(words[0]) % 2, 0, "64-bit constant loads need an even register pair");
+    assert_eq!((operand::reg_dest(words[1]), operand::reg_a(words[1]), operand::reg_b(words[1])), (3, 0, 232));
     assert_eq!(
         (operand::reg_dest(words[2]), operand::reg_a(words[2]), operand::reg_b(words[2]), operand::reg_c(words[2])),
-        (181, 181, 180, 0xFF)
+        (233, 233, 232, 0xFF)
     );
 }
 
@@ -295,7 +296,7 @@ fn branch_with_second_predicate_skips_on_the_guard() {
 }
 
 #[test]
-fn return_branches_back_after_the_single_call() {
+fn the_single_call_runs_its_body_before_the_caller_continues() {
     let (lo, hi) = sm70_branch_offset(0, 0x20);
     let binary = binary(
         FRAGMENT,
@@ -307,15 +308,101 @@ fn return_branches_back_after_the_single_call() {
             END,
         ],
     );
-    let code = translate(&binary).unwrap().code;
+    let codes = opcodes(&lowered(&binary));
+    let body = codes.iter().position(|opcode| *opcode == Opcode::MOV32I).unwrap();
+    let exit = codes.iter().position(|opcode| *opcode == Opcode::EXIT).unwrap();
+    assert!(body < exit);
+}
+
+#[test]
+fn calls_from_several_sites_expand_the_callee_inline() {
+    let (first_lo, first_hi) = sm70_branch_offset(0, 0x40);
+    let (second_lo, second_hi) = sm70_branch_offset(0x20, 0x40);
+    let one = (0x802 | (7 << 12) | (0x3f80_0000u64 << 32), 0xF << 8);
+    let binary = binary(
+        FRAGMENT,
+        &[
+            (0x944 | (7 << 12) | first_lo, first_hi | 0x03c0_0000),
+            (0x802 | (7 << 12) | (1 << 16) | (0x4000_0000u64 << 32), 0xF << 8),
+            (0x944 | (7 << 12) | second_lo, second_hi | 0x03c0_0000),
+            EXIT,
+            one,
+            (0x950 | (7 << 12) | (4 << 24), 0x03c0_0000),
+            END,
+        ],
+    );
     let words = lowered(&binary);
-    let returns = opcodes(&words).iter().rposition(|opcode| *opcode == Opcode::BRA).unwrap() - 1;
-    assert_eq!(opcodes(&words)[returns], Opcode::BRA);
-    let offset = ((((words[returns] >> 20) & 0xFF_FFFF) as i64) << 40) >> 40;
-    let position = (returns + returns / 3 + 1) * 8;
-    let target = (position as i64 + 8 + offset) as usize;
-    let word = u64::from_le_bytes(code[target..target + 8].try_into().unwrap());
-    assert_eq!(decode_one(word).unwrap().opcode, Opcode::EXIT);
+    let ones = words
+        .iter()
+        .filter(|word| decode_one(**word).unwrap().opcode == Opcode::MOV32I && (*word >> 20) & 0xFFFF_FFFF == 0x3f80_0000)
+        .count();
+    assert_eq!(ones, 3);
+    assert_eq!(opcodes(&words).iter().filter(|opcode| **opcode == Opcode::EXIT).count(), 2);
+}
+
+#[test]
+fn power_of_two_multiplies_lower_to_shifts() {
+    let scale = (0x824 | (7 << 12) | (6 << 16) | (6 << 24) | (4u64 << 32), 0x000f_c800_078e_00ff);
+    let codes = opcodes(&lowered(&binary(VERTEX, &[scale, EXIT, END])));
+    assert_eq!(codes[0], Opcode::SHL_imm);
+    assert!(!codes.contains(&Opcode::XMAD_imm) && !codes.contains(&Opcode::IMUL32I));
+}
+
+#[test]
+fn swizzle_adds_reverse_their_lane_table_for_maxwell() {
+    let horizontal = (0x822 | (7 << 12) | (5 << 16) | (6 << 24) | (0x66u64 << 32), 0x000f_e200_0000_0007);
+    let words = lowered(&binary(FRAGMENT, &[horizontal, EXIT, END]));
+    let word = words[0];
+    assert_eq!(decode_one(word).unwrap().opcode, Opcode::FSWZADD);
+    assert_eq!((word & 0xff, (word >> 8) & 0xff, (word >> 20) & 0xff), (5, 6, 7));
+    assert_eq!((word >> 28) & 0xff, 0x99);
+}
+
+#[test]
+fn shifted_adds_with_a_negated_addend_subtract_it() {
+    let scale = (0x211 | (7 << 12) | (4 << 16) | (10 << 24) | (10u64 << 32) | (1 << 63), 0x001f_c800_078e_40ff);
+    let words = lowered(&binary(VERTEX, &[scale, EXIT, END]));
+    let codes = opcodes(&words);
+    assert_eq!(&codes[..2], &[Opcode::IADD_reg, Opcode::LEA_lo_reg]);
+    assert_eq!((words[0] >> 48) & 1, 1);
+    assert_eq!((words[1] >> 20) & 0xff, words[0] & 0xff);
+    assert_eq!(((words[1] >> 39) & 0x1f, words[1] & 0xff, (words[1] >> 8) & 0xff), (8, 4, 10));
+}
+
+#[test]
+fn half_compares_and_conversions_read_constant_buffer_halves() {
+    let convert = (0x21c0_3c00_ff0a_7630, 0x000f_e200_0000_4100);
+    let compare = (0x31c0_3f00_ff00_7634, 0x000f_ca00_04f2_4800);
+    let words = lowered(&binary(FRAGMENT, &[convert, compare, EXIT, END]));
+    assert_eq!(&opcodes(&words)[..4], &[Opcode::MOV_cbuf, Opcode::F2F_reg, Opcode::MOV_cbuf, Opcode::HSETP2_reg]);
+    assert_eq!((operand::reg_dest(words[1]), operand::reg_b(words[1])), (10, operand::reg_dest(words[0])));
+    let field = |at: u32, len: u32| (words[3] >> at) & ((1 << len) - 1);
+    assert_eq!((field(3, 3), field(0, 3), field(35, 4), field(39, 3), field(42, 1)), (1, 7, 4, 1, 1));
+    assert_eq!((field(28, 2), field(47, 2), field(8, 8), field(20, 8)), (3, 2, 0xff, operand::reg_dest(words[2]) as u64));
+}
+
+#[test]
+fn a_subroutine_called_once_expands_inline() {
+    let (call_lo, call_hi) = sm70_branch_offset(0, 0x30);
+    let one = (0x802 | (7 << 12) | (0x3f80_0000u64 << 32), 0xF << 8);
+    let binary = binary(
+        FRAGMENT,
+        &[
+            (0x944 | (7 << 12) | call_lo, call_hi | 0x03c0_0000),
+            (0x802 | (7 << 12) | (1 << 16) | (0x4000_0000u64 << 32), 0xF << 8),
+            EXIT,
+            one,
+            (0x950 | (7 << 12) | (4 << 24), 0x03c0_0000),
+            END,
+        ],
+    );
+    let words = lowered(&binary);
+    let ones = words
+        .iter()
+        .filter(|word| decode_one(**word).unwrap().opcode == Opcode::MOV32I && (*word >> 20) & 0xFFFF_FFFF == 0x3f80_0000)
+        .count();
+    assert_eq!(ones, 2);
+    assert_eq!(opcodes(&words).iter().filter(|opcode| **opcode == Opcode::EXIT).count(), 2);
 }
 
 #[test]
@@ -344,6 +431,96 @@ fn carry_chain_adds_the_low_word_carry() {
     assert_eq!((operand::isetp_dest_p(words[1]), operand::isetp_cmp(words[1])), (0, 1));
     assert_eq!((operand::reg_a(words[1]), operand::reg_b(words[1])), (operand::reg_dest(words[0]), 2));
     assert_eq!((operand::reg_dest(words[5]), operand::reg_a(words[5])), (5, operand::reg_dest(words[4])));
+}
+
+#[test]
+fn global_atomics_lower_to_maxwell_atom_and_red() {
+    let words = lowered(&binary(
+        VERTEX,
+        &[
+            (0x0000_0001_ff00_79a8, 0x0001_6600_081e_e144),
+            (0x0000_0419_ff00_798e, 0x0001_e400_0d10_e106),
+            (0x0000_0003_0e00_098e, 0x0021_e400_0010_e100),
+            EXIT,
+            END,
+        ],
+    ));
+    assert_eq!(&opcodes(&words)[..3], &[Opcode::ATOM, Opcode::RED, Opcode::RED]);
+    let fields = |word: u64| (operand::reg_dest(word), operand::reg_a(word), (word >> 28) & 0xF_FFFF, (word >> 48) & 1);
+    assert_eq!(fields(words[0]), (0, 232, 0, 1));
+    assert_eq!(operand::reg_b(words[0]), 1);
+    assert_eq!((fields(words[1]), (words[1] >> 23) & 7), ((25, 234, 4, 1), 2));
+    assert_eq!((fields(words[2]), (words[2] >> 23) & 7), ((3, 14, 0, 1), 0));
+}
+
+#[test]
+fn uniform_wide_multiply_carries_into_the_high_word() {
+    let words = lowered(&binary(VERTEX, &[(0x0000_000a_0608_72a5, 0x000f_e200_0f8e_0008), EXIT, END]));
+    assert_eq!(
+        &opcodes(&words)[..4],
+        &[Opcode::IMUL_reg, Opcode::IMUL_reg, Opcode::IADD_reg, Opcode::IADD_reg]
+    );
+    assert_eq!((operand::reg_a(words[0]), operand::reg_b(words[0]), (words[1] >> 53) & 1), (230, 234, 1));
+    assert_eq!((operand::reg_dest(words[2]), operand::reg_b(words[2]), (words[2] >> 47) & 1), (232, 232, 1));
+    assert_eq!((operand::reg_dest(words[3]), operand::reg_b(words[3]), (words[3] >> 43) & 1), (233, 233, 1));
+}
+
+#[test]
+fn warp_sum_accumulates_every_active_lane() {
+    let words = lowered(&binary(VERTEX, &[(0x0000_0000_0305_73c4, 0x000e_2200_0000_c000), EXIT, END]));
+    let ops = opcodes(&words);
+    assert_eq!(&ops[..3], &[Opcode::VOTE, Opcode::MOV32I, Opcode::SHFL]);
+    assert_eq!(ops.iter().filter(|op| **op == Opcode::SHFL).count(), 32);
+    assert_eq!((operand::reg_dest(words[1]), operand::reg_a(words[2])), (233, 3));
+    assert_eq!((ops[194 - 1], operand::reg_dest(words[194 - 1])), (Opcode::IADD_reg, 233));
+}
+
+#[test]
+fn match_all_compares_against_the_lowest_active_lane() {
+    let words = lowered(&binary(VERTEX, &[(0x0000_0000_16ff_73a1, 0x000e_2200_0000_0200), EXIT, END]));
+    assert_eq!(
+        &opcodes(&words)[..11],
+        &[
+            Opcode::P2R_imm,
+            Opcode::VOTE,
+            Opcode::IADD_reg,
+            Opcode::LOP3_reg,
+            Opcode::FLO_reg,
+            Opcode::SHFL,
+            Opcode::ISETP_reg,
+            Opcode::SHFL,
+            Opcode::ISETP_reg,
+            Opcode::VOTE,
+            Opcode::R2P_imm
+        ]
+    );
+    assert_eq!((operand::reg_a(words[5]), operand::reg_b(words[5])), (22, operand::reg_dest(words[4])));
+    assert_eq!((operand::reg_a(words[8]), (words[8] >> 39) & 7), (23, 6));
+    assert_eq!(((words[9] >> 39) & 7, (words[9] >> 45) & 7), (6, 0));
+}
+
+#[test]
+fn predicate_save_lowers_to_maxwell_p2r() {
+    let words = lowered(&binary(VERTEX, &[(0x0000_0008_ff16_7803, 0x000f_c400_0000_0000), EXIT, END]));
+    assert_eq!(opcodes(&words)[0], Opcode::P2R_imm);
+    assert_eq!((operand::reg_dest(words[0]), operand::reg_a(words[0]), (words[0] >> 20) & 0x7F), (22, 0xFF, 8));
+}
+
+#[test]
+fn half_adds_lower_to_hadd2_or_a_half_to_float_conversion() {
+    let words = lowered(&binary(
+        FRAGMENT,
+        &[
+            (0x2000_0004_ff08_7230, 0x020f_ca00_0000_4100),
+            (0x230 | (7 << 12) | (5 << 16) | (6 << 24) | (7 << 32) | (3 << 60), 1 << 10),
+            EXIT,
+            END,
+        ],
+    ));
+    assert_eq!(&opcodes(&words)[..2], &[Opcode::F2F_reg, Opcode::HADD2_reg]);
+    assert_eq!((operand::reg_dest(words[0]), operand::reg_b(words[0])), (8, 4));
+    assert_eq!(((words[0] >> 8) & 3, (words[0] >> 10) & 3, (words[0] >> 41) & 1), (2, 1, 0));
+    assert_eq!((operand::reg_a(words[1]), operand::reg_b(words[1]), (words[1] >> 28) & 3, (words[1] >> 47) & 3), (6, 7, 3, 1));
 }
 
 #[test]
