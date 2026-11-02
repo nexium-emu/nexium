@@ -3509,13 +3509,17 @@ impl Emitter {
 
     fn lower_compute_image_read(
         &mut self,
-        handle: TextureHandleOrigin,
+        resource: ComputeResourceVar,
         x: &IrValue,
         y: Option<&IrValue>,
         z: Option<&IrValue>,
         component: u8,
     ) -> Word {
-        let resource = self.compute_storage_texel_resource(handle);
+        if resource.resource.kind == ComputeResourceKind::StorageImage
+            && resource.resource.texel_format.is_none()
+        {
+            self.b.capability(Capability::StorageImageReadWithoutFormat);
+        }
         let image = self.load_compute_image(resource);
         let coords = self.compute_image_coords(resource.resource.dimension, x, y, z);
         let texel = self
@@ -6565,18 +6569,22 @@ impl Emitter {
             }
             IrOp::ImageRead {
                 handle,
+                dimension,
                 x,
                 y,
                 z,
                 component,
-                ..
-            } => Some(self.lower_compute_image_read(
-                *handle,
-                x,
-                y.as_ref(),
-                z.as_ref(),
-                *component,
-            )),
+            } => Some(if *dimension == ImageDimension::Buffer {
+                let resource = self.compute_storage_texel_resource(*handle);
+                self.lower_compute_image_read(resource, x, y.as_ref(), z.as_ref(), *component)
+            } else if let Some(resource) = self.compute_resource_vars.iter().copied().find(|resource| {
+                resource.resource.handle == *handle
+                    && resource.resource.kind == ComputeResourceKind::StorageImage
+            }) {
+                self.lower_compute_image_read(resource, x, y.as_ref(), z.as_ref(), *component)
+            } else {
+                self.lower_compute_texel_fetch(*handle, x, y.as_ref(), z.as_ref(), *component)
+            }),
             IrOp::ImageAtomic {
                 handle,
                 dimension: _,
@@ -12024,10 +12032,34 @@ fn validate_compute_options(
                             "ImageRead component {component}"
                         )));
                     }
+                    if let Some(resource) = storage_resource(*handle)
+                        .filter(|resource| resource.kind == ComputeResourceKind::StorageImage)
+                    {
+                        if *dimension != resource.dimension {
+                            return Err(ComputeEmitError::DimensionMismatch {
+                                handle: *handle,
+                                instruction: *dimension,
+                                actual: resource.dimension,
+                            });
+                        }
+                        validate_compute_coordinates(*handle, resource.dimension, y.as_ref(), z.as_ref())?;
+                        continue;
+                    }
                     if *dimension != ImageDimension::Buffer {
-                        return Err(ComputeEmitError::UnsupportedOperation(format!(
-                            "{dimension:?} storage image read"
-                        )));
+                        let resource =
+                            sampled_resource(*handle).ok_or(ComputeEmitError::MissingResource {
+                                handle: *handle,
+                                kind: ComputeResourceKind::SampledImage,
+                            })?;
+                        if !compute_resource_dimension_matches(*dimension, resource.dimension) {
+                            return Err(ComputeEmitError::DimensionMismatch {
+                                handle: *handle,
+                                instruction: *dimension,
+                                actual: resource.dimension,
+                            });
+                        }
+                        validate_compute_coordinates(*handle, resource.dimension, y.as_ref(), z.as_ref())?;
+                        continue;
                     }
                     let resource =
                         storage_resource(*handle).ok_or(ComputeEmitError::MissingResource {
@@ -20734,6 +20766,118 @@ mod tests {
             .flat_map(|function| &function.blocks)
             .flat_map(|block| &block.instructions)
             .any(|instruction| instruction.class.opcode == rspirv::spirv::Op::ImageFetch));
+    }
+
+    #[test]
+    fn compute_read_only_2d_surface_load_fetches_from_a_sampled_image() {
+        let handle = TextureHandleOrigin::Bound {
+            cbuf_word_offset: 0x40,
+        };
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::ImageRead {
+                handle,
+                dimension: ImageDimension::D2,
+                x: IrValue::ImmU32(3),
+                y: Some(IrValue::ImmU32(5)),
+                z: None,
+                component: 1,
+            },
+            Some(0),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let emitted = emit_compute(
+            &cfg,
+            &ComputeOptions {
+                resources: vec![ComputeImageResource {
+                    handle,
+                    binding: 1,
+                    kind: ComputeResourceKind::SampledImage,
+                    dimension: ImageDimension::D2,
+                    numeric_type: TextureNumericType::Float,
+                    texel_format: None,
+                }],
+                ..ComputeOptions::default()
+            },
+        )
+        .expect("read-only 2D surface load module");
+        validates_with_spirv_val_if_available(&emitted.words);
+        let module = rspirv::dr::load_words(&emitted.words).expect("valid SPIR-V");
+        let opcodes: Vec<_> = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .map(|instruction| instruction.class.opcode)
+            .collect();
+        assert!(opcodes.contains(&rspirv::spirv::Op::ImageFetch));
+        assert!(!opcodes.contains(&rspirv::spirv::Op::ImageRead));
+    }
+
+    #[test]
+    fn compute_read_write_array_surface_reads_its_storage_image() {
+        let handle = TextureHandleOrigin::Bound {
+            cbuf_word_offset: 0x40,
+        };
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::ImageRead {
+                handle,
+                dimension: ImageDimension::D2Array,
+                x: IrValue::ImmU32(3),
+                y: Some(IrValue::ImmU32(5)),
+                z: Some(IrValue::ImmU32(2)),
+                component: 1,
+            },
+            Some(0),
+        );
+        program.emit_void(IrOp::ImageWrite {
+            handle,
+            dimension: ImageDimension::D2Array,
+            x: IrValue::ImmU32(3),
+            y: Some(IrValue::ImmU32(5)),
+            z: Some(IrValue::ImmU32(2)),
+            values: [IrValue::GprIn(0), IrValue::Zero, IrValue::Zero, IrValue::Zero],
+        });
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let emitted = emit_compute(
+            &cfg,
+            &ComputeOptions {
+                resources: vec![ComputeImageResource {
+                    handle,
+                    binding: 1,
+                    kind: ComputeResourceKind::StorageImage,
+                    dimension: ImageDimension::D2Array,
+                    numeric_type: TextureNumericType::Float,
+                    texel_format: None,
+                }],
+                ..ComputeOptions::default()
+            },
+        )
+        .expect("read-write 2D-array surface module");
+        validates_with_spirv_val_if_available(&emitted.words);
+        let module = rspirv::dr::load_words(&emitted.words).expect("valid SPIR-V");
+        assert!(module.capabilities.iter().any(|instruction| {
+            instruction.operands
+                == [rspirv::dr::Operand::Capability(Capability::StorageImageReadWithoutFormat)]
+        }));
+        let opcodes: Vec<_> = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .map(|instruction| instruction.class.opcode)
+            .collect();
+        assert!(opcodes.contains(&rspirv::spirv::Op::ImageRead));
+        assert!(opcodes.contains(&rspirv::spirv::Op::ImageWrite));
     }
 
     #[test]
