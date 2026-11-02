@@ -49,6 +49,9 @@ fn complete(kernel: &mut Kernel, slot: u32) {
 
 fn back_private_region(kernel: &mut Kernel, first: u64, size: u64) -> Option<u64> {
     let size = size.next_multiple_of(PAGE);
+    if let Some(existing) = kernel.nx2_graphics.gpu.private.get(&first).filter(|memory| memory.size >= size) {
+        return Some(existing.address);
+    }
     let identity = first >= IDENTITY_FLOOR && first.checked_add(size).is_some_and(|end| end <= POOL_BASE);
     let mut candidates = Vec::with_capacity(2);
     if identity {
@@ -82,6 +85,17 @@ fn range(ctx: &IpcCtx) -> (u64, u64) {
     (first, last.saturating_sub(first).saturating_add(1))
 }
 
+fn update_mappings(kernel: &mut Kernel, update: impl Fn(&mut nexium_nvdrv::Nvdrv, bool) -> bool) -> bool {
+    if update(&mut kernel.nvdrv, false) {
+        return true;
+    }
+    if crate::kernel::svc::rewind_svc_for_retry(kernel) {
+        kernel.ipc_retry_pending = true;
+        return false;
+    }
+    update(&mut kernel.nvdrv, true)
+}
+
 pub(super) fn dispatch(kernel: &mut Kernel, ctx: &mut IpcCtx, cmd_id: u32) -> Option<Vec<u8>> {
     match cmd_id {
         11 => Some(reply_words(ctx, &[0, EVENT_IDS - 1])),
@@ -101,18 +115,23 @@ pub(super) fn dispatch(kernel: &mut Kernel, ctx: &mut IpcCtx, cmd_id: u32) -> Op
         101 => {
             let (start, last) = (long(ctx, 0), long(ctx, 2));
             let size = last.saturating_sub(start).saturating_add(1);
+            if !update_mappings(kernel, |nvdrv, wait| nvdrv.nx2_map(start, size, start, wait)) {
+                return Some(Vec::new());
+            }
             let state = &mut kernel.nx2_graphics.gpu;
             state.next_memory += 1;
             let handle = state.next_memory;
             state.memories.insert(handle, GpuMemory { address: start, size });
-            kernel.nvdrv.nx2_map(start, size, start);
             log::debug!("[nx2] gpu memory {handle} = {start:#x}+{size:#x}");
             Some(reply_words(ctx, &[handle]))
         }
         102 => {
             let (handle, slot) = (word(ctx, 0), word(ctx, 1));
-            if let Some(memory) = kernel.nx2_graphics.gpu.memories.remove(&handle) {
-                kernel.nvdrv.nx2_unmap(memory.address, memory.size);
+            if let Some(memory) = kernel.nx2_graphics.gpu.memory(handle) {
+                if !update_mappings(kernel, |nvdrv, wait| nvdrv.nx2_unmap(memory.address, memory.size, wait)) {
+                    return Some(Vec::new());
+                }
+                kernel.nx2_graphics.gpu.memories.remove(&handle);
                 log::debug!("[nx2] gpu memory {handle} destroyed");
             }
             complete(kernel, slot);
@@ -121,7 +140,12 @@ pub(super) fn dispatch(kernel: &mut Kernel, ctx: &mut IpcCtx, cmd_id: u32) -> Op
         211 => {
             let ((first, size), handle, offset, slot) = (range(ctx), word(ctx, 5), long(ctx, 6), word(ctx, 15));
             match kernel.nx2_graphics.gpu.memory(handle) {
-                Some(memory) => kernel.nvdrv.nx2_map(first, size, memory.address + offset),
+                Some(memory) => {
+                    let cpu_addr = memory.address + offset;
+                    if !update_mappings(kernel, |nvdrv, wait| nvdrv.nx2_map(first, size, cpu_addr, wait)) {
+                        return Some(Vec::new());
+                    }
+                }
                 None => log::warn!("[nx2] gpu map {first:#x}+{size:#x} of unknown memory {handle}"),
             }
             complete(kernel, slot);
@@ -134,7 +158,9 @@ pub(super) fn dispatch(kernel: &mut Kernel, ctx: &mut IpcCtx, cmd_id: u32) -> Op
         }
         213 | 215 => {
             let ((first, size), slot) = (range(ctx), word(ctx, 6));
-            kernel.nvdrv.nx2_unmap(first, size);
+            if !update_mappings(kernel, |nvdrv, wait| nvdrv.nx2_unmap(first, size, wait)) {
+                return Some(Vec::new());
+            }
             if cmd_id == 215 {
                 if let Some(backing) = kernel.nx2_graphics.gpu.private.remove(&first) {
                     let _ = kernel.address_space.unmap(backing.address, backing.size);
@@ -150,9 +176,12 @@ pub(super) fn dispatch(kernel: &mut Kernel, ctx: &mut IpcCtx, cmd_id: u32) -> Op
             } else {
                 back_private_region(kernel, first, size)
             };
-            match backing {
-                Some(backing) => kernel.nvdrv.nx2_map(first, size, backing),
-                None => kernel.nvdrv.nx2_map_sparse(first, size),
+            let mapped = match backing {
+                Some(backing) => update_mappings(kernel, |nvdrv, wait| nvdrv.nx2_map(first, size, backing, wait)),
+                None => update_mappings(kernel, |nvdrv, wait| nvdrv.nx2_map_sparse(first, size, wait)),
+            };
+            if !mapped {
+                return Some(Vec::new());
             }
             log::debug!("[nx2] gpu private region {first:#x}+{size:#x} flags={flags:#x}");
             complete(kernel, slot);

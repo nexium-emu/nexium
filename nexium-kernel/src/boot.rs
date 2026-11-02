@@ -483,7 +483,10 @@ impl BootContext {
                 let heap_size: u64 = if app.npdm.is_switch2() {
                     crate::kernel::nx2::HEAP_REGION_SIZE
                 } else {
-                    0xCC00_0000
+                    nexium_common::memory_layout::memory_layout()
+                        .application_pool_bytes()
+                        .next_multiple_of(0x20_0000)
+                        .max(0xCC00_0000)
                 };
                 let stack_region_size: u64 = 0x8000_0000;
                 let code_base: u64 = direct_base + 0x800_0000;
@@ -668,10 +671,11 @@ impl BootContext {
         } else {
             nexium_cpu::GuestIsa::AArch64
         };
-        kernel.total_memory = 0xCD50_0000;
+        kernel.total_memory = nexium_common::memory_layout::memory_layout().application_pool_bytes();
         kernel.nx2 = crate::kernel::nx2::Nx2Process::from_npdm(&app.npdm);
         if let Some(nx2) = kernel.nx2 {
             kernel.total_memory = crate::kernel::nx2::APPLICATION_POOL_SIZE;
+            nexium_cpu::set_guest_counter_frequency(crate::kernel::nx2::COUNTER_FREQUENCY);
             kernel.nvdrv.enable_switch2();
             log::info!(
                 "[nx2] Switch 2 application: core_mask={:#x} priority_mask={:#x} total_memory={:#x} (cores past {} fold onto the low cores)",

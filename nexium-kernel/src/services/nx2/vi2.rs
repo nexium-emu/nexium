@@ -35,49 +35,67 @@ fn present(kernel: &mut Kernel, image: u32, crop: u32, counter: u32, value: u32)
         log::warn!("[nx2] vi2 present of unknown image {image}");
         return;
     };
-    let (mut width, mut height) = (layout.width, layout.height);
-    let rendered = kernel
-        .nvdrv
-        .renderer()
-        .cloned()
-        .and_then(|renderer| renderer.readback_target_scaled_at(0, width, height, address));
-    let from_gpu = rendered.is_some();
-    let mut pixels = match rendered {
-        Some((read_width, read_height, pixels)) => {
-            (width, height) = (read_width, read_height);
-            pixels
-        }
-        None => {
-            let mut tiled = vec![0u8; layout.size as usize];
-            let _ = kernel.address_space.read(address, &mut tiled);
-            super::swizzle::unswizzle(&tiled, width as usize * 4, height as usize, layout.pitch as usize, layout.rows_per_block as usize)
-        }
-    };
-    let (crop_width, crop_height) = crop_extent(crop, (layout.width, layout.height), (width, height));
-    if (crop_width, crop_height) != (width, height) {
-        pixels = crop_top_left(&pixels, width, crop_width, crop_height);
-        (width, height) = (crop_width, crop_height);
-    }
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel[3] = 0xFF;
-    }
-    let presents = &mut kernel.nx2_graphics.presents;
-    *presents += 1;
-    if *presents <= 4 || *presents % 600 == 0 {
+    kernel.nx2_graphics.presents += 1;
+    let presents = kernel.nx2_graphics.presents;
+    if presents <= 4 || presents % 600 == 0 {
         log::info!(
-            "[nx2] vi2 present #{presents} image={image} at {address:#x} {width}x{height} from_gpu={from_gpu} fence=({:#x}, {value})",
+            "[nx2] vi2 present #{presents} image={image} at {address:#x} {}x{} fence=({:#x}, {value})",
+            layout.width,
+            layout.height,
             !counter
         );
     }
-    super::dump_frame(*presents, width, height, &pixels);
     super::peek_memory(kernel);
-    kernel.nvdrv.submit_frame_nonblocking(nexium_nvdrv::QueuedFrame {
-        width,
-        height,
-        pixels,
-        present_at: None,
-        depth: None,
+    let renderer = kernel.nvdrv.renderer().cloned();
+    let address_space = std::sync::Arc::clone(&kernel.address_space);
+    kernel.nvdrv.submit_present_job("nx2-present", move |submit| {
+        let drawn = crop_extent(crop, (layout.width, layout.height), (layout.width, layout.height));
+        if super::dump_directory(presents).is_none()
+            && renderer.as_ref().is_some_and(|renderer| present_on_gpu(renderer, address, drawn))
+        {
+            return;
+        }
+        if let Some(renderer) = renderer.as_ref() {
+            super::dump_render_targets(presents, renderer);
+        }
+        let (mut width, mut height) = (layout.width, layout.height);
+        let rendered = renderer.and_then(|renderer| renderer.readback_target_scaled_at(0, width, height, address));
+        let mut pixels = match rendered {
+            Some((read_width, read_height, pixels)) => {
+                (width, height) = (read_width, read_height);
+                pixels
+            }
+            None => {
+                let mut tiled = vec![0u8; layout.size as usize];
+                let _ = address_space.read(address, &mut tiled);
+                super::swizzle::unswizzle(&tiled, width as usize * 4, height as usize, layout.pitch as usize, layout.rows_per_block as usize)
+            }
+        };
+        let (crop_width, crop_height) = crop_extent(crop, (layout.width, layout.height), (width, height));
+        if (crop_width, crop_height) != (width, height) {
+            pixels = crop_top_left(&pixels, width, crop_width, crop_height);
+            (width, height) = (crop_width, crop_height);
+        }
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
+        super::dump_frame(presents, width, height, &pixels);
+        submit(nexium_nvdrv::QueuedFrame { width, height, pixels, present_at: None, depth: None });
     });
+}
+
+fn present_on_gpu(renderer: &nexium_gpu::Renderer, address: u64, (width, height): (u32, u32)) -> bool {
+    let Some((key, stamp)) = renderer.render_target_at_va(0, address) else {
+        return false;
+    };
+    let parameters = nexium_gpu::presentation::PresentParameters {
+        read_rect: Some([0, 0, width, height]),
+        crop: None,
+        flip_y: false,
+        transform: 0,
+        present_at: std::time::Instant::now(),
+    };
+    matches!(renderer.present_image(key, stamp, true, parameters, None), Ok(true))
 }
 
 fn crop_extent(crop: u32, image: (u32, u32), frame: (u32, u32)) -> (u32, u32) {

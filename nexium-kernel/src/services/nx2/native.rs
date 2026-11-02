@@ -69,6 +69,12 @@ impl ImageLayout {
 }
 
 impl NativeState {
+    pub(super) fn reserve_images(&mut self, count: u32) -> u32 {
+        let first = self.next_image + 1;
+        self.next_image += count.max(1);
+        first
+    }
+
     pub(super) fn image_address(&self, image: u32) -> Option<(u64, ImageLayout)> {
         let image = self.images.get(&image)?;
         let memory = self.memories.get(&image.memory)?;

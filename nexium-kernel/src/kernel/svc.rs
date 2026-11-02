@@ -5230,7 +5230,7 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
 }
 
 fn system_ticks_from_elapsed(elapsed: std::time::Duration) -> u64 {
-    (elapsed.as_nanos() * 19_200_000 / 1_000_000_000) as u64
+    (elapsed.as_nanos() * u128::from(nexium_cpu::guest_counter_frequency()) / 1_000_000_000) as u64
 }
 
 #[cfg(test)]
@@ -5268,7 +5268,7 @@ fn current_guest_ticks() -> u64 {
 }
 
 fn guest_clock_ns_at(at: std::time::Instant) -> u64 {
-    let now_ns = current_guest_ticks() as u128 * 1_000_000_000 / 19_200_000;
+    let now_ns = current_guest_ticks() as u128 * 1_000_000_000 / u128::from(nexium_cpu::guest_counter_frequency());
     let age = std::time::Instant::now().saturating_duration_since(at).as_nanos();
     now_ns.saturating_sub(age) as u64
 }
@@ -5568,7 +5568,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     let cmd_type = (hipc_header_raw & 0xFFFF) as u16;
 
     match cmd_type {
-        2 => {
+        2 | 15 => {
             log::debug!(
                 "session Close session={:#x} service={}",
                 session_handle,
@@ -5587,10 +5587,11 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             let services = &mut kernel.services;
             services.ssl.close_handle(session_handle, &mut services.bsd);
             kernel.sessions.remove(&session_handle);
+            let result = if cmd_type == 15 { nexium_common::result::KERNEL_SESSION_CLOSED } else { SUCCESS };
             if let Some(cpu) = cpu_mut() {
-                cpu.set_register(0, SUCCESS as u64);
+                cpu.set_register(0, result as u64);
             }
-            return SUCCESS;
+            return result;
         }
         5 | 7 => {
             log::debug!(
@@ -6400,7 +6401,7 @@ pub(crate) fn nextendo_identity(kernel: &Kernel) -> Option<nexium_common::nexten
     Some(account)
 }
 
-fn rewind_svc_for_retry(kernel: &mut Kernel) -> bool {
+pub(crate) fn rewind_svc_for_retry(kernel: &mut Kernel) -> bool {
     rewind_svc_for_retry_after(kernel, IPC_RETRY_INTERVAL)
 }
 
