@@ -421,8 +421,59 @@ impl AstcDecodeMethod {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryLayoutMethod {
+    #[default]
+    Gb4,
+    Gb6,
+    Gb8,
+    Gb10,
+    Gb12,
+}
+
+impl MemoryLayoutMethod {
+    pub fn all() -> &'static [MemoryLayoutMethod] {
+        &[
+            MemoryLayoutMethod::Gb4,
+            MemoryLayoutMethod::Gb6,
+            MemoryLayoutMethod::Gb8,
+            MemoryLayoutMethod::Gb10,
+            MemoryLayoutMethod::Gb12,
+        ]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            MemoryLayoutMethod::Gb4 => "4 GB",
+            MemoryLayoutMethod::Gb6 => "6 GB",
+            MemoryLayoutMethod::Gb8 => "8 GB",
+            MemoryLayoutMethod::Gb10 => "10 GB",
+            MemoryLayoutMethod::Gb12 => "12 GB",
+        }
+    }
+    pub fn description(&self) -> &'static str {
+        match self {
+            MemoryLayoutMethod::Gb4 => "Retail Switch",
+            MemoryLayoutMethod::Gb6 => "Extended memory",
+            MemoryLayoutMethod::Gb8 => "Development kit",
+            MemoryLayoutMethod::Gb10 => "Extended memory",
+            MemoryLayoutMethod::Gb12 => "Switch 2 sized",
+        }
+    }
+    pub fn layout(&self) -> nexium_common::memory_layout::MemoryLayout {
+        use nexium_common::memory_layout::MemoryLayout;
+        match self {
+            MemoryLayoutMethod::Gb4 => MemoryLayout::Gb4,
+            MemoryLayoutMethod::Gb6 => MemoryLayout::Gb6,
+            MemoryLayoutMethod::Gb8 => MemoryLayout::Gb8,
+            MemoryLayoutMethod::Gb10 => MemoryLayout::Gb10,
+            MemoryLayoutMethod::Gb12 => MemoryLayout::Gb12,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AstcRecompressionMethod {
+    Auto,
     Uncompressed,
     Bc1,
     Bc3,
@@ -430,13 +481,14 @@ pub enum AstcRecompressionMethod {
 
 impl Default for AstcRecompressionMethod {
     fn default() -> Self {
-        AstcRecompressionMethod::Uncompressed
+        AstcRecompressionMethod::Auto
     }
 }
 
 impl AstcRecompressionMethod {
     pub fn all() -> &'static [AstcRecompressionMethod] {
         &[
+            AstcRecompressionMethod::Auto,
             AstcRecompressionMethod::Uncompressed,
             AstcRecompressionMethod::Bc1,
             AstcRecompressionMethod::Bc3,
@@ -444,6 +496,7 @@ impl AstcRecompressionMethod {
     }
     pub fn label(&self) -> &'static str {
         match self {
+            AstcRecompressionMethod::Auto => "Auto",
             AstcRecompressionMethod::Uncompressed => "Uncompressed",
             AstcRecompressionMethod::Bc1 => "BC1",
             AstcRecompressionMethod::Bc3 => "BC3",
@@ -451,6 +504,7 @@ impl AstcRecompressionMethod {
     }
     pub fn description(&self) -> &'static str {
         match self {
+            AstcRecompressionMethod::Auto => "BC3 below 12 GB of VRAM, otherwise uncompressed",
             AstcRecompressionMethod::Uncompressed => "Best quality, uses the most VRAM",
             AstcRecompressionMethod::Bc1 => "Low quality, 1/8 of the VRAM, 1-bit alpha",
             AstcRecompressionMethod::Bc3 => "Medium quality, 1/4 of the VRAM",
@@ -459,6 +513,7 @@ impl AstcRecompressionMethod {
     pub fn recompression(&self) -> nexium_common::astc::AstcRecompression {
         use nexium_common::astc::AstcRecompression;
         match self {
+            AstcRecompressionMethod::Auto => AstcRecompression::Auto,
             AstcRecompressionMethod::Uncompressed => AstcRecompression::Uncompressed,
             AstcRecompressionMethod::Bc1 => AstcRecompression::Bc1,
             AstcRecompressionMethod::Bc3 => AstcRecompression::Bc3,
@@ -736,6 +791,8 @@ pub struct AppSettings {
     pub astc_decode: AstcDecodeMethod,
     #[serde(default)]
     pub astc_recompression: AstcRecompressionMethod,
+    #[serde(default)]
+    pub memory_layout: MemoryLayoutMethod,
     #[serde(default = "default_sync_video_framerate")]
     pub sync_video_framerate: bool,
     #[serde(default)]
@@ -1051,6 +1108,7 @@ impl Default for AppSettings {
             force_max_clocks: false,
             normal_gpu_accuracy: false,
             astc_decode: AstcDecodeMethod::default(),
+            memory_layout: MemoryLayoutMethod::default(),
             astc_recompression: AstcRecompressionMethod::default(),
             sync_video_framerate: default_sync_video_framerate(),
             library_folders: Vec::new(),
@@ -1276,7 +1334,7 @@ mod tests {
         value.as_object_mut().unwrap().remove("astc_recompression");
         let settings: AppSettings = serde_json::from_value(value).unwrap();
         assert_eq!(settings.astc_decode, AstcDecodeMethod::Gpu);
-        assert_eq!(settings.astc_recompression, AstcRecompressionMethod::Uncompressed);
+        assert_eq!(settings.astc_recompression, AstcRecompressionMethod::Auto);
         for decode in AstcDecodeMethod::all() {
             for recompression in AstcRecompressionMethod::all() {
                 let settings = AppSettings {

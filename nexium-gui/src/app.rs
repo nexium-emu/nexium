@@ -1,5 +1,6 @@
 use crate::app_settings::{
     AppSettings, AspectMode, AstcDecodeMethod, AstcRecompressionMethod, CpuBackend, FilterMode,
+    MemoryLayoutMethod,
     LogLevel, MotionRecenterButton,
 };
 use crate::audio::{
@@ -5472,7 +5473,7 @@ impl HorizonApp {
                     "Off".to_string()
                 }
             };
-            let rows: [(&str, String); 16] = [
+            let rows: [(&str, String); 17] = [
                 ("GPU", self.app_settings.gpu_device_label()),
                 ("Aspect Mode", self.app_settings.aspect.label().to_string()),
                 (
@@ -5503,6 +5504,7 @@ impl HorizonApp {
                     self.app_settings.astc_recompression.label().to_string(),
                 ),
                 ("Sync Video Framerate", on(self.app_settings.sync_video_framerate)),
+                ("Memory Layout", self.app_settings.memory_layout.label().to_string()),
             ];
             let n = rows.len();
             if !self.prefs_focus {
@@ -5716,6 +5718,18 @@ impl HorizonApp {
                             !self.app_settings.sync_video_framerate;
                         nexium_common::speed_limit::set_sync_to_video(
                             self.app_settings.sync_video_framerate,
+                        );
+                    }
+                    16 => {
+                        let all = crate::app_settings::MemoryLayoutMethod::all();
+                        let idx = all
+                            .iter()
+                            .position(|x| *x == self.app_settings.memory_layout)
+                            .unwrap_or(0);
+                        self.app_settings.memory_layout =
+                            all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
+                        nexium_common::memory_layout::set_memory_layout(
+                            self.app_settings.memory_layout.layout(),
                         );
                     }
                     _ => {}
@@ -13152,6 +13166,29 @@ fn graphics_settings_content(
         }
     });
     ui.label(egui::RichText::new(format!("{}. Re-encodes decoded ASTC textures as BC1 or BC3 so big games such as Tears of the Kingdom fit in less VRAM. BC1 keeps only on/off transparency; BC3 keeps full alpha.", cfg.astc_recompression.description())).size(10.5).color(MUTED));
+
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new("Memory Layout (applies on next boot)")
+            .size(13.0)
+            .strong()
+            .color(TEXT),
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        for method in MemoryLayoutMethod::all() {
+            if ui
+                .radio(cfg.memory_layout == *method, method.label())
+                .on_hover_text(method.description())
+                .clicked()
+            {
+                cfg.memory_layout = *method;
+                nexium_common::memory_layout::set_memory_layout(method.layout());
+                *save_needed = true;
+            }
+        }
+    });
+    ui.label(egui::RichText::new(format!("{}. Memory the console reports to Switch games: 4 GB is retail, 8 GB matches development kits. Switch 2 games always get 12 GB.", cfg.memory_layout.description())).size(10.5).color(MUTED));
 
     ui.add_space(12.0);
     ui.label(
