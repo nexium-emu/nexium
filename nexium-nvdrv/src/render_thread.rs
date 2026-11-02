@@ -459,6 +459,27 @@ impl DrawWorkBudget {
         self.reserve_until(claim, label, Instant::now(), None)
     }
 
+    fn crowded(&self, outstanding: DrawWorkCost) -> bool {
+        let over = |used: usize, limit: usize| limit != 0 && used.saturating_mul(4) >= limit.saturating_mul(3);
+        over(outstanding.groups, self.group_limit) || over(outstanding.snapshot_bytes, self.snapshot_byte_limit)
+    }
+
+    fn is_crowded(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        !state.closed && self.crowded(state.outstanding)
+    }
+
+    fn wait_for_headroom(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while !state.closed && self.crowded(state.outstanding) {
+            state = self
+                .available
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
+        }
+    }
+
     fn reserve_until(
         &self,
         claim: &DrawWorkClaim,
@@ -1424,6 +1445,14 @@ impl RenderThread {
             }
         }
         submitted
+    }
+
+    pub(crate) fn draw_queue_crowded(&self) -> bool {
+        self.draw_work_budget.is_crowded()
+    }
+
+    pub(crate) fn wait_for_draw_headroom(&self) {
+        self.draw_work_budget.wait_for_headroom();
     }
 
     pub(crate) fn submit_draw_group_named(

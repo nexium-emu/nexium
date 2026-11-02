@@ -25,6 +25,7 @@ use super::kepler_compute::ComputeTextureState;
 use crate::gpu::{vk_dispatch, GpuMappings};
 
 const MAX_CODE_BYTES: usize = 0x1_0000;
+const MAX_SM86_CODE_BYTES: usize = 0x4_0000;
 const MAX_RESOURCE_BYTES: usize = 512 * 1024 * 1024;
 
 static FRONTEND_CACHE_PROFILE_LOOKUPS: std::sync::atomic::AtomicU64 =
@@ -490,7 +491,7 @@ fn is_image_resource_descriptor(descriptor: &ComputeDescriptor) -> bool {
     )
 }
 
-const MAX_TRANSLATION_CACHE_ENTRIES: usize = 128;
+const MAX_TRANSLATION_CACHE_ENTRIES: usize = 2048;
 
 #[derive(Clone)]
 enum PendingComputeId {
@@ -633,7 +634,7 @@ fn compute_output_rt_alias(
     mappings: &GpuMappings,
 ) -> Option<nexium_gpu::compute::ComputeOutputRtAlias> {
     let tic = &target.tic;
-    if !crate::gpu::vk_dispatch::tic_can_alias_render_target_view(tic) {
+    if tic.texture_type == 5 || !crate::gpu::vk_dispatch::tic_can_alias_render_target_view(tic) {
         return None;
     }
     let samples = tic.sample_grid()?;
@@ -1965,9 +1966,9 @@ fn prepare_and_execute(
     }
     let kp_snap = crate::gpu::pusher::kickprof::start();
     let code = match code_override {
-        Some(code) => code.to_vec(),
+        Some(code) => Arc::new(code.to_vec()),
         None if nexium_shader::ampere::enabled() => ampere_code(mappings, mem_read, code_gpu)?,
-        None => snapshot_code(mappings, mem_read, code_gpu)?,
+        None => Arc::new(snapshot_code(mappings, mem_read, code_gpu, MAX_CODE_BYTES)?),
     };
     let cbufs = snapshot_cbufs(qmd, mappings, mem_read);
     crate::gpu::pusher::kickprof::add_sized(
@@ -1980,11 +1981,11 @@ fn prepare_and_execute(
     if let Some(dir) = DUMP_SASS_DIR.get_or_init(|| std::env::var_os("NEXIUM_DUMP_COMPUTE_SASS")) {
         let path = std::path::Path::new(dir).join(format!("cs_{:x}.bin", qmd[0x08]));
         if !path.exists() {
-            let _ = std::fs::write(path, &code);
+            let _ = std::fs::write(path, code.as_slice());
         }
     }
     let code_sha256 = if code_override.is_some() {
-        Sha256::digest(&code).into()
+        Sha256::digest(code.as_slice()).into()
     } else {
         memoized_code_sha256(code_gpu, &code)
     };
@@ -2032,7 +2033,7 @@ fn prepare_and_execute(
                 }
             }
         }
-        let (tic, null) = match read_tic(texture, tic_index, mappings, mem_read)? {
+        let (mut tic, null) = match read_tic(texture, tic_index, mappings, mem_read)? {
             Some(tic) => (tic, false),
             None => {
                 if !matches!(
@@ -2051,6 +2052,9 @@ fn prepare_and_execute(
         let tsc = tsc_index
             .map(|index| read_tsc(texture, index, mappings, mem_read))
             .transpose()?;
+        if need.instruction_dimension == Some(ImageDimension::D2) && tic.texture_type == 5 {
+            tic.texture_type = 1;
+        }
         let dimension = image_dimension(&tic)?;
         if let Some(instruction_dimension) = need.instruction_dimension {
             let compatible = instruction_dimension == dimension
@@ -2088,6 +2092,10 @@ fn prepare_and_execute(
                 ComputeResourceKind::StorageTexelBuffer
             }
             (ResourceAccess::Storage, _) => ComputeResourceKind::StorageImage,
+            (
+                ResourceAccess::StorageRead,
+                ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3,
+            ) => ComputeResourceKind::SampledImage,
             (ResourceAccess::StorageRead, other) => {
                 return Err(format!(
                     "Maxwell surface load has unsupported {other} TIC; only buffer views are implemented"
@@ -2646,10 +2654,7 @@ fn prepare_and_execute(
                     continue;
                 }
                 let (view_tic, layered) = sampled_view_tic(&resource.tic)?;
-                let (guest_bytes, snapshot_identity) = read_compute_sampled_image(
-                    renderer_arc, mappings, mem_read, content_key,
-                    view_tic.gpu_va, size, "filtered sampled image",
-                )?;
+                let size = resource_size(&view_tic)?;
                 let nvmap_id = mappings.nvmap_id_for(view_tic.gpu_va).ok_or_else(|| {
                     format!(
                         "filtered sampled image binding {} at {:#x} has no nvmap mapping",
@@ -2669,15 +2674,27 @@ fn prepare_and_execute(
                             descriptor.binding
                         )
                     })?;
+                let guest_bytes_authoritative =
+                    layered || overlapping_sampled.contains(&descriptor.binding);
+                let (guest_bytes, snapshot_identity) = if !guest_bytes_authoritative
+                    && renderer.compute_sampled_rt_is_live(key, &view_tic)
+                {
+                    (None, None)
+                } else {
+                    let (bytes, identity) = read_compute_sampled_image(
+                        renderer_arc, mappings, mem_read, content_key,
+                        view_tic.gpu_va, size, "filtered sampled image",
+                    )?;
+                    (Some(bytes), identity)
+                };
                 sampled_rts.push(ComputeSampledRt {
                     binding: descriptor.binding,
                     key,
                     tic: view_tic,
                     tsc,
                     sample_type: compute_sample_type(resource.metadata.numeric_type),
-                    guest_bytes: Some(guest_bytes),
-                    guest_bytes_authoritative: layered
-                        || overlapping_sampled.contains(&descriptor.binding),
+                    guest_bytes,
+                    guest_bytes_authoritative,
                     require_live: false,
                     content_key: snapshot_identity,
                 });
@@ -2685,7 +2702,7 @@ fn prepare_and_execute(
             ComputeDescriptorKind::SampledImage => {
                 if !matches!(
                     resource.metadata.dimension,
-                    ImageDimension::D2 | ImageDimension::D3
+                    ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3
                 ) {
                     return Err(format!(
                         "sampled image binding {} has unsupported dimension {}",
@@ -2724,6 +2741,7 @@ fn prepare_and_execute(
                     continue;
                 }
                 let (view_tic, layered) = sampled_view_tic(&resource.tic)?;
+                let size = resource_size(&view_tic)?;
                 let (guest_bytes, snapshot_identity) = read_compute_sampled_image(
                     renderer_arc, mappings, mem_read, content_key,
                     view_tic.gpu_va, size, "sampled image",
@@ -2815,7 +2833,7 @@ fn prepare_and_execute(
                     )
                     .into());
                 }
-                let initial_bytes = if subresource.mip_level == 0 {
+                let initial_bytes = if subresource.mip_level == 0 && resource.tic.texture_type != 5 {
                     if let Some(nvmap_id) = mappings.nvmap_id_for(gpu_va) {
                         let mut key_tic = resource.tic;
                         key_tic.gpu_va = gpu_va;
@@ -2858,6 +2876,7 @@ fn prepare_and_execute(
                     height: subresource.height,
                     depth: subresource.depth,
                     is_3d: resource.metadata.dimension == ImageDimension::D3,
+                    arrayed: resource.metadata.dimension == ImageDimension::D2Array,
                     format,
                     initial_bytes: Some(initial_bytes),
                 });
@@ -3104,22 +3123,45 @@ fn ampere_code(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     gpu_va: u64,
-) -> Result<Vec<u8>, String> {
+) -> Result<Arc<Vec<u8>>, String> {
+    static MEMO: OnceLock<Mutex<HashMap<u64, (u64, u64, Arc<Vec<u8>>)>>> = OnceLock::new();
+    let (cpu_addr, available) = mapped_range(mappings, gpu_va)
+        .ok_or_else(|| format!("Maxwell compute code at {gpu_va:#x} is unmapped"))?;
+    let generation = nexium_gpu::tex_invalidate::region_gen_range(
+        gpu_va,
+        available.min(MAX_SM86_CODE_BYTES as u64),
+    );
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some((_, _, code)) = memo
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&gpu_va)
+        .filter(|(cached_cpu, cached_generation, _)| *cached_cpu == cpu_addr && *cached_generation == generation)
+    {
+        return Ok(Arc::clone(code));
+    }
     let mut binary = vec![0u8; nexium_shader::ampere::HEADER_SIZE];
-    binary.extend_from_slice(&snapshot_code(mappings, mem_read, gpu_va)?);
-    nexium_shader::ampere::translate_cached(gpu_va, &binary)
-        .map(|program| program.code.clone())
-        .map_err(|error| format!("SM86 compute program at {gpu_va:#x}: {error}"))
+    binary.extend_from_slice(&snapshot_code(mappings, mem_read, gpu_va, MAX_SM86_CODE_BYTES)?);
+    let code = nexium_shader::ampere::translate_cached(gpu_va, &binary)
+        .map(|program| Arc::new(program.code.clone()))
+        .map_err(|error| format!("SM86 compute program at {gpu_va:#x}: {error}"))?;
+    let mut memo = memo.lock().unwrap_or_else(|error| error.into_inner());
+    if memo.len() >= 1024 {
+        memo.clear();
+    }
+    memo.insert(gpu_va, (cpu_addr, generation, Arc::clone(&code)));
+    Ok(code)
 }
 
 fn snapshot_code(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     gpu_va: u64,
+    limit: usize,
 ) -> Result<Vec<u8>, String> {
     let (cpu_addr, available) = mapped_range(mappings, gpu_va)
         .ok_or_else(|| format!("Maxwell compute code at {gpu_va:#x} is unmapped"))?;
-    let len = usize::try_from(available.min(MAX_CODE_BYTES as u64)).unwrap_or(MAX_CODE_BYTES) & !7;
+    let len = usize::try_from(available.min(limit as u64)).unwrap_or(limit) & !7;
     if len < 8 {
         return Err(format!(
             "Maxwell compute code mapping at {gpu_va:#x} is too short"
@@ -3429,6 +3471,7 @@ fn cached_compute_module(
 ) -> Result<Arc<CachedComputeModule>, String> {
     static CACHE: OnceLock<Mutex<HashMap<ModuleCacheKey, Arc<CachedComputeModule>>>> =
         OnceLock::new();
+    static FAILED: OnceLock<Mutex<HashMap<ModuleCacheKey, String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(module) = cache
         .lock()
@@ -3437,12 +3480,34 @@ fn cached_compute_module(
     {
         return Ok(Arc::clone(module));
     }
+    let failed = FAILED.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(error) = failed.lock().unwrap_or_else(|error| error.into_inner()).get(&key) {
+        return Err(error.clone());
+    }
 
-    let module = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let emitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         nexium_spirv::emit_compute(cfg, options)
     }))
-    .map_err(|_| "Maxwell compute SPIR-V emission panicked".to_string())?
-    .map_err(|error| format!("Maxwell compute SPIR-V emission failed: {error}"))?;
+    .map_err(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        format!("Maxwell compute SPIR-V emission panicked: {message}")
+    })
+    .and_then(|emitted| emitted.map_err(|error| format!("Maxwell compute SPIR-V emission failed: {error}")));
+    let module = match emitted {
+        Ok(module) => module,
+        Err(error) => {
+            let mut failed = failed.lock().unwrap_or_else(|error| error.into_inner());
+            if failed.len() >= MAX_TRANSLATION_CACHE_ENTRIES {
+                failed.clear();
+            }
+            failed.insert(key, error.clone());
+            return Err(error);
+        }
+    };
     let spirv: Arc<[u32]> = Arc::from(module.words.as_slice());
     let spirv_hash = nexium_gpu::compute::compute_spirv_hash(&spirv);
     let module = Arc::new(CachedComputeModule {
@@ -3781,7 +3846,8 @@ fn image_depth(tic: &TicEntry) -> u32 {
 fn validate_image_view(tic: &TicEntry, storage: bool) -> Result<(), String> {
     validate_pitch_linear_layout(tic)?;
     let supported_type = matches!(tic.texture_type, 1 | 2)
-        || (matches!(tic.texture_type, 3 | 5) && !storage)
+        || (tic.texture_type == 3 && !storage)
+        || (tic.texture_type == 5 && (!storage || tic.is_block_linear))
         || (tic.texture_type == 7 && tic.pitch_bytes != 0);
     let layered_2d_view = matches!(tic.texture_type, 1 | 5)
         && tic.is_block_linear
@@ -3835,13 +3901,21 @@ fn image_view_subresources(
     validate_image_view(tic, storage)?;
     let effective_block_linear =
         tic.is_block_linear && !nexium_gpu::pitch_oracle::is_pitch_dst(tic.gpu_va);
-    if effective_block_linear && tic.texture_type == 1 {
+    if effective_block_linear && (tic.texture_type == 1 || (storage && tic.texture_type == 5)) {
         let layout = block_linear_mip_layout(tic)
             .ok_or_else(|| "invalid Maxwell block-linear mip layout".to_string())?;
         let layer_offset = layout
             .layer_stride
             .checked_mul(tic.base_layer as usize)
             .ok_or_else(|| "Maxwell layered 2D view offset overflow".to_string())?;
+        let layers = if tic.texture_type == 5 {
+            tic.depth.max(1) - tic.base_layer
+        } else {
+            1
+        };
+        if layers > 1 && tic.mip_levels() > 1 {
+            return Err(format!("unsupported Maxwell compute mipmapped array storage view: {tic:?}"));
+        }
         let base = tic.view_base_mip() as usize;
         let count = if storage {
             1
@@ -3865,13 +3939,16 @@ fn image_view_subresources(
                 mip_level: level.level,
                 width: level.width,
                 height: level.height,
-                depth: 1,
+                depth: layers,
                 storage_width: level.storage_width,
                 storage_height: level.storage_height,
                 block_height_log2: level.block_height_log2,
                 stride_alignment_log2: level.stride_alignment_log2,
                 guest_offset: level.guest_offset.saturating_add(layer_offset),
-                guest_size: level.guest_size,
+                guest_size: layout
+                    .layer_stride
+                    .saturating_mul(layers as usize - 1)
+                    .saturating_add(level.guest_size),
             })
             .collect());
     }
@@ -3899,9 +3976,43 @@ fn image_view_subresources(
     }])
 }
 
+fn narrowed_mip_view(tic: TicEntry) -> TicEntry {
+    let (base, count) = (tic.view_base_mip(), tic.view_mip_levels());
+    if tic.texture_type != 1
+        || tic.depth > 1
+        || (base == 0 && count == tic.mip_levels())
+        || !tic.is_block_linear
+        || nexium_gpu::pitch_oracle::is_pitch_dst(tic.gpu_va)
+    {
+        return tic;
+    }
+    let Some(layout) = block_linear_mip_layout(&tic) else {
+        return tic;
+    };
+    let Some(levels) = layout.levels.get(base as usize..(base + count) as usize) else {
+        return tic;
+    };
+    let mut view = tic;
+    view.gpu_va = tic.gpu_va + levels[0].guest_offset as u64;
+    view.width = levels[0].width;
+    view.height = levels[0].height;
+    view.block_height_log2 = levels[0].block_height_log2;
+    view.max_mip_level = count - 1;
+    view.res_min_mip_level = 0;
+    view.res_max_mip_level = count - 1;
+    let same_layout = block_linear_mip_layout(&view).is_some_and(|narrow| {
+        narrow.levels.len() == levels.len()
+            && narrow.levels.iter().zip(levels).all(|(level, source)| {
+                level.guest_size == source.guest_size
+                    && level.guest_offset + levels[0].guest_offset == source.guest_offset
+            })
+    });
+    if same_layout { view } else { tic }
+}
+
 fn sampled_view_tic(tic: &TicEntry) -> Result<(TicEntry, bool), String> {
     if tic.texture_type != 1 || (tic.base_layer == 0 && tic.depth <= 1) {
-        return Ok((*tic, false));
+        return Ok((narrowed_mip_view(*tic), false));
     }
     if tic.base_layer >= tic.depth.max(1) {
         return Err(format!(
@@ -3925,7 +4036,7 @@ fn sampled_view_tic(tic: &TicEntry) -> Result<(TicEntry, bool), String> {
         .ok_or_else(|| "Maxwell layered 2D view address overflow".to_string())?;
     view.base_layer = 0;
     view.depth = 1;
-    Ok((view, true))
+    Ok((narrowed_mip_view(view), true))
 }
 
 fn storage_subresource(tic: &TicEntry) -> Result<ImageSubresourceLayout, String> {
@@ -4114,15 +4225,31 @@ fn linearize_storage_image(
     let mut linear = if tic.pitch_bytes != 0 {
         nexium_gpu::texture::unpack_pitch_linear(&guest_bytes, tic, subresource.depth)
             .ok_or_else(|| "invalid Maxwell pitch-linear storage layout".to_string())?
-    } else if effective_block_linear && tic.texture_type == 1 {
-        nexium_gpu::texture::unswizzle_block_linear_strided(
-            &guest_bytes,
-            subresource.storage_width,
-            subresource.storage_height,
-            format.bytes_per_pixel(),
-            subresource.block_height_log2,
-            subresource.stride_alignment_log2,
-        )
+    } else if effective_block_linear && matches!(tic.texture_type, 1 | 5) {
+        let (layer_stride, layer_size) = storage_layer_span(tic, subresource)?;
+        let layer_tight = tight_size / subresource.depth.max(1) as usize;
+        let mut linear = Vec::with_capacity(tight_size);
+        for layer in 0..subresource.depth.max(1) as usize {
+            let start = layer * layer_stride;
+            let texels = nexium_gpu::texture::unswizzle_block_linear_strided(
+                guest_bytes
+                    .get(start..start + layer_size)
+                    .ok_or_else(|| "Maxwell storage image layer is short".to_string())?,
+                subresource.storage_width,
+                subresource.storage_height,
+                format.bytes_per_pixel(),
+                subresource.block_height_log2,
+                subresource.stride_alignment_log2,
+            );
+            if texels.len() < layer_tight {
+                return Err(format!(
+                    "Maxwell storage image layer linearization is short ({:#x} < {layer_tight:#x})",
+                    texels.len()
+                ));
+            }
+            linear.extend_from_slice(&texels[..layer_tight]);
+        }
+        linear
     } else if effective_block_linear {
         nexium_gpu::texture::unswizzle_block_linear_3d(
             &guest_bytes,
@@ -4175,6 +4302,26 @@ fn delinearize_storage_image(
             subresource.block_height_log2,
             subresource.stride_alignment_log2,
         )
+    } else if effective_block_linear && tic.texture_type == 5 {
+        let (layer_stride, layer_size) = storage_layer_span(tic, subresource)?;
+        let mut guest = vec![0; subresource.guest_size];
+        for (layer, texels) in linear_bytes
+            .chunks_exact(tight_size / subresource.depth.max(1) as usize)
+            .enumerate()
+        {
+            let swizzled = nexium_gpu::texture::swizzle_block_linear_strided(
+                texels,
+                subresource.storage_width,
+                subresource.storage_height,
+                format.bytes_per_pixel(),
+                subresource.block_height_log2,
+                subresource.stride_alignment_log2,
+            );
+            let start = layer * layer_stride;
+            let len = swizzled.len().min(layer_size);
+            guest[start..start + len].copy_from_slice(&swizzled[..len]);
+        }
+        guest
     } else if effective_block_linear {
         let buffer = STORAGE_WRITEBACK_POOL.with(|pool| {
             pool.borrow_mut().take(subresource.guest_size)
@@ -4201,6 +4348,24 @@ fn delinearize_storage_image(
         ));
     }
     Ok(guest_bytes)
+}
+
+fn storage_layer_span(
+    tic: &TicEntry,
+    subresource: ImageSubresourceLayout,
+) -> Result<(usize, usize), String> {
+    let layers = subresource.depth.max(1) as usize;
+    if layers == 1 {
+        return Ok((0, subresource.guest_size));
+    }
+    let layer_stride = block_linear_mip_layout(tic)
+        .ok_or_else(|| "invalid Maxwell block-linear array layout".to_string())?
+        .layer_stride;
+    let layer_size = subresource
+        .guest_size
+        .checked_sub(layer_stride * (layers - 1))
+        .ok_or_else(|| "Maxwell storage array layers overlap".to_string())?;
+    Ok((layer_stride, layer_size))
 }
 
 fn resource_size(tic: &TicEntry) -> Result<usize, String> {
@@ -5147,7 +5312,7 @@ fn write_back_outputs(
     let write_elapsed =
         write_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     let invalidate_started = stage_started.map(|_| std::time::Instant::now());
-    for write in prepared.into_iter().take(attempted_images) {
+    for mut write in prepared.into_iter().take(attempted_images) {
         if write.target.subresource.mip_level == 0 {
             if let Some(nvmap_id) = mappings.nvmap_id_for(write.target.gpu_va) {
                 if let Some(key) =
@@ -5167,6 +5332,9 @@ fn write_back_outputs(
         );
         if write.target.gpu_va != write.target.tic.gpu_va {
             renderer.invalidate_texture_address(write.target.tic.gpu_va);
+        }
+        if write_result.is_ok() && write.target.tic.pitch_bytes == 0 {
+            vk_dispatch::seed_texture_snapshot(mappings, write.target.gpu_va, std::mem::take(&mut write.bytes));
         }
     }
     for write in prepared_texels.into_iter().take(attempted_texels) {
@@ -5914,11 +6082,11 @@ mod tests {
             }
             true
         };
-        let code = snapshot_code(&mappings, &read, 0x10100).unwrap();
+        let code = snapshot_code(&mappings, &read, 0x10100, MAX_CODE_BYTES).unwrap();
         assert_eq!(code.len(), 0x5f00);
         assert!(code.iter().enumerate().all(|(offset, byte)| *byte == offset as u8));
-        assert!(snapshot_code(&mappings, &read, 0x16000).is_err());
-        assert!(snapshot_code(&GpuMappings::new(), &read, 0x10000).is_err());
+        assert!(snapshot_code(&mappings, &read, 0x16000, MAX_CODE_BYTES).is_err());
+        assert!(snapshot_code(&GpuMappings::new(), &read, 0x10000, MAX_CODE_BYTES).is_err());
     }
 
     #[test]
@@ -6630,7 +6798,9 @@ mod tests {
         let array = TicEntry { texture_type: 5, depth: 4, ..tic };
         assert_eq!(image_dimension(&array), Ok(ImageDimension::D2Array));
         validate_image_view(&array, false).unwrap();
-        assert!(validate_image_view(&array, true).is_err());
+        validate_image_view(&array, true).unwrap();
+        assert!(validate_image_view(&TicEntry { is_block_linear: false, ..array }, true).is_err());
+        assert!(image_view_subresources(&array, true).is_err());
         assert_eq!(resource_size(&array).unwrap(), 3584 * 4);
         assert_eq!(image_view_subresources(&array, false).unwrap()[0].guest_size, 3584 * 4);
         let subresources = image_view_subresources(&tic, false).unwrap();
@@ -6718,6 +6888,44 @@ mod tests {
         tic.base_layer = 6;
         assert!(sampled_view_tic(&tic).is_err());
         assert!(validate_image_view(&tic, true).is_err());
+    }
+
+    #[test]
+    fn sampled_mip_views_read_only_their_own_levels() {
+        use nexium_gpu::texture::{SwizzleSource, TicFormat};
+
+        let tic = TicEntry {
+            format: TicFormat::R16G16,
+            component_types: [ComponentType::Float; 4],
+            swizzle: [SwizzleSource::R, SwizzleSource::G, SwizzleSource::Zero, SwizzleSource::One],
+            gpu_va: 0x1_0000_0000,
+            width: 1024,
+            height: 1024,
+            block_width_log2: 0,
+            block_height_log2: 4,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 0,
+            is_block_linear: true,
+            texture_type: 1,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
+            max_mip_level: 4,
+            res_min_mip_level: 2,
+            res_max_mip_level: 2,
+        };
+        let full = block_linear_mip_layout(&tic).unwrap();
+        let (view, layered) = sampled_view_tic(&tic).unwrap();
+        assert!(!layered);
+        assert_eq!(view.gpu_va, tic.gpu_va + full.levels[2].guest_offset as u64);
+        assert_eq!((view.width, view.height, view.mip_levels(), view.view_base_mip()), (256, 256, 1, 0));
+        assert_eq!(resource_size(&view).unwrap(), full.levels[2].guest_size);
+        let whole = TicEntry { res_min_mip_level: 0, res_max_mip_level: 4, ..tic };
+        assert_eq!(sampled_view_tic(&whole).unwrap().0, whole);
     }
 
     #[test]
@@ -6954,6 +7162,52 @@ mod tests {
             .expect("tight storage readback");
         assert_eq!(readback, tight);
         assert_eq!(&readback[..4], &[0x00, 0x40, 0x80, 0xff]);
+    }
+
+    #[test]
+    fn array_storage_image_roundtrips_each_layer_at_its_stride() {
+        use nexium_gpu::texture::{SwizzleSource, TicFormat};
+
+        let tic = TicEntry {
+            format: TicFormat::R16G16,
+            component_types: [ComponentType::Float; 4],
+            swizzle: [SwizzleSource::R, SwizzleSource::G, SwizzleSource::Zero, SwizzleSource::One],
+            gpu_va: 0x1234_0000,
+            width: 64,
+            height: 64,
+            block_width_log2: 0,
+            block_height_log2: 3,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 0,
+            is_block_linear: true,
+            texture_type: 5,
+            depth: 4,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
+            max_mip_level: 0,
+            res_min_mip_level: 0,
+            res_max_mip_level: 0,
+        };
+        validate_image_view(&tic, true).expect("2D-array storage view");
+        let format = storage_format(&tic).expect("R16G16 float storage format");
+        assert_eq!(format, ComputeStorageFormat::Rg16Float);
+        let subresource = storage_subresource(&tic).expect("array storage subresource");
+        assert_eq!(subresource.depth, 4);
+        let layer_stride = block_linear_mip_layout(&tic).unwrap().layer_stride;
+        assert_eq!(subresource.guest_size, layer_stride * 4);
+        let tight: Vec<u8> = (0..64 * 64 * 4 * 4).map(|index| (index / 4099) as u8).collect();
+
+        let guest = delinearize_storage_image(&tic, subresource, format, tight.clone())
+            .expect("block-linear array layout");
+        assert_eq!(guest.len(), subresource.guest_size);
+        assert_eq!(guest[layer_stride * 3], tight[64 * 64 * 4 * 3]);
+        let readback = linearize_storage_image(&tic, subresource, format, guest)
+            .expect("tight array readback");
+        assert_eq!(readback, tight);
     }
 
     fn pitch_r8_tic() -> TicEntry {

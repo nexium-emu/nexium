@@ -31,7 +31,7 @@ const PACKED_CBUF_SLOTS: usize = nexium_spirv::GFX_CBUF_SLOTS as usize;
 const FRAGMENT_CBUF_BASE: usize = GRAPHICS_CBUF_SLOTS;
 const GEOMETRY_CBUF_BASE: usize = GRAPHICS_CBUF_SLOTS * 2;
 const MAX_ACCUMULATED_DRAWS: usize = 2048;
-const INPUT_SNAPSHOT_CACHE_DEFAULT_MB: usize = 256;
+const INPUT_SNAPSHOT_CACHE_DEFAULT_MB: usize = 1024;
 const INPUT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 65536;
 const INPUT_CBUF_COVER_PAGE_SIZE: u64 = 4096;
 const INPUT_CBUF_COVER_MAX_PAGES: u64 = 64;
@@ -1344,6 +1344,11 @@ fn read_storage_descriptor_bytes<const N: usize>(
 fn empty_storage_buffer_data() -> Arc<Vec<u8>> {
     static DATA: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
     Arc::clone(DATA.get_or_init(|| Arc::new(vec![0u8; 16])))
+}
+
+fn mirrored_storage_buffer_data() -> Arc<Vec<u8>> {
+    static DATA: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+    Arc::clone(DATA.get_or_init(|| Arc::new(Vec::new())))
 }
 
 fn resolve_storage_buffer_descriptor(
@@ -3511,10 +3516,15 @@ impl SsboSnapshotCache {
                 self.retained_ssbos.remove(&key);
             }
         }
-        const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+        static MAX_RETAINED_BYTES: OnceLock<usize> = OnceLock::new();
+        let max_retained_bytes = *MAX_RETAINED_BYTES.get_or_init(|| {
+            nexium_memory::physical_memory_bytes()
+                .map_or(0, |bytes| (bytes / 32) as usize)
+                .max(64 * 1024 * 1024)
+        });
         let retained_bytes: usize = self.retained_ssbos.keys().map(|key| key.read_len).sum();
         if !self.retained_ssbos.contains_key(&key)
-            && key.read_len > MAX_RETAINED_BYTES.saturating_sub(retained_bytes)
+            && key.read_len > max_retained_bytes.saturating_sub(retained_bytes)
         {
             return self.read_or_insert(key, cpu_addr, mem_read);
         }
@@ -10401,6 +10411,7 @@ struct PreparedTicTexturePlan {
     backing_gpu_va: u64,
     read_size: usize,
     cache_key: Option<TextureSnapshotCacheKey>,
+    reduced_from: Option<nexium_gpu::texture::TicEntry>,
 }
 
 #[derive(Clone)]
@@ -10471,7 +10482,14 @@ fn derive_prepared_tic_texture_plan(
     let read_size = nexium_gpu::texture::texture_guest_size_bytes(&tic, layer_count)
         .unwrap_or_else(|| layer_size.saturating_mul(layer_count as usize));
     if nexium_gpu::texture::texture_over_budget(read_size, &tic) {
-        return None;
+        let reduced = nexium_gpu::texture::reduced_texture(&tic, layer_count)?;
+        return Some(PreparedTicTexturePlan {
+            tic: reduced.tic,
+            backing_gpu_va: reduced.tic.gpu_va,
+            read_size: reduced.read_size,
+            cache_key: None,
+            reduced_from: Some(tic),
+        });
     }
     let cache_key = texture_snapshot_cache_key(mappings, backing_gpu_va, read_size);
     Some(PreparedTicTexturePlan {
@@ -10479,7 +10497,68 @@ fn derive_prepared_tic_texture_plan(
         backing_gpu_va,
         read_size,
         cache_key,
+        reduced_from: None,
     })
+}
+
+struct ReducedTextureSnapshot {
+    generations: Vec<(Option<u64>, u64)>,
+    validated: Option<(u64, u64)>,
+    identity: u64,
+    data: Arc<Vec<u8>>,
+}
+
+fn reduced_texture_snapshot(
+    read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+    mappings: &GpuMappings,
+    original: &nexium_gpu::texture::TicEntry,
+    len: usize,
+) -> Option<(Arc<Vec<u8>>, u64)> {
+    static CACHE: OnceLock<Mutex<HashMap<(u64, usize), ReducedTextureSnapshot>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (original.gpu_va, len);
+    let stamp = nexium_memory::fastmem::write_watch_epoch_active().then(|| {
+        (nexium_memory::fastmem::write_watch_epoch(), nexium_gpu::tex_invalidate::bump_serial())
+    });
+    if let Some(entry) = cache
+        .lock()
+        .unwrap()
+        .get(&key)
+        .filter(|entry| stamp.is_some() && entry.validated == stamp)
+    {
+        return Some((Arc::clone(&entry.data), entry.identity));
+    }
+    let reduced = nexium_gpu::texture::reduced_texture(original, tic_snapshot_layer_count(original))?;
+    let generations: Vec<_> = reduced
+        .spans
+        .iter()
+        .map(|&(source, _, size)| {
+            let gpu_va = original.gpu_va + source as u64;
+            (
+                texture_snapshot_cache_key(mappings, gpu_va, size).and_then(take_texture_host_generation),
+                nexium_gpu::tex_invalidate::region_gen_range(gpu_va, size as u64),
+            )
+        })
+        .collect();
+    let mut cache = cache.lock().unwrap();
+    if let Some(entry) = cache.get_mut(&key).filter(|entry| {
+        entry.generations == generations && generations.iter().all(|(host, _)| host.is_some())
+    }) {
+        entry.validated = stamp;
+        return Some((Arc::clone(&entry.data), entry.identity));
+    }
+    let mut bytes = vec![0; len];
+    for (source, destination, size) in reduced.spans {
+        let chunk = read_guest(original.gpu_va.checked_add(source as u64)?, size)?;
+        bytes.get_mut(destination..destination + size)?.copy_from_slice(&chunk);
+    }
+    let data = Arc::new(bytes);
+    let identity = next_texture_snapshot_identity();
+    if cache.len() >= 16 {
+        cache.clear();
+    }
+    cache.insert(key, ReducedTextureSnapshot { generations, validated: stamp, identity, data: Arc::clone(&data) });
+    Some((data, identity))
 }
 
 fn memoized_prepared_tic_plan(
@@ -10929,7 +11008,7 @@ fn take_texture_host_generation_fresh(key: TextureSnapshotCacheKey) -> Option<u6
         let mut spans = spans.borrow_mut();
         spans.clear();
         let result =
-            nexium_memory::fastmem::take_write_watch_spans(key.cpu_va, key.len, &mut spans);
+            nexium_memory::fastmem::take_write_watch_spans_partial(key.cpu_va, key.len, &mut spans);
         let end = key.cpu_va.saturating_add(key.len as u64);
         let own_dirty = spans
             .iter()
@@ -10950,7 +11029,9 @@ fn texture_snapshot_cache() -> &'static Mutex<TextureSnapshotCache> {
     static CACHE: OnceLock<Mutex<TextureSnapshotCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
         Mutex::new(TextureSnapshotCache::new(
-            TEXTURE_SNAPSHOT_CACHE_MAX_BYTES,
+            nexium_memory::physical_memory_bytes()
+                .map_or(TEXTURE_SNAPSHOT_CACHE_MAX_BYTES, |bytes| (bytes / 8) as usize)
+                .max(TEXTURE_SNAPSHOT_CACHE_MAX_BYTES),
             TEXTURE_SNAPSHOT_CACHE_MAX_ENTRIES,
         ))
     })
@@ -10963,8 +11044,16 @@ fn texture_snapshot_cache_key(
     gpu_va: u64,
     len: usize,
 ) -> Option<TextureSnapshotCacheKey> {
-    let (cpu_va, available, nvmap_id, mapping_epoch) = mappings.cpu_range_identity_for(gpu_va)?;
-    (available >= len as u64).then_some(TextureSnapshotCacheKey {
+    let (cpu_va, mut available, nvmap_id, mapping_epoch) = mappings.cpu_range_identity_for(gpu_va)?;
+    while available < len as u64 {
+        let (next_cpu, next_available, _, _) =
+            mappings.cpu_range_identity_for(gpu_va.checked_add(available)?)?;
+        if next_available == 0 || Some(next_cpu) != cpu_va.checked_add(available) {
+            return None;
+        }
+        available += next_available;
+    }
+    Some(TextureSnapshotCacheKey {
         mapping_epoch,
         gpu_va,
         len,
@@ -11618,6 +11707,26 @@ fn snapshot_tic_descriptor_once(
         return Some((data.clone(), false));
     }
     read_guest(tic_addr, 32).map(|data| (data, true))
+}
+
+pub(crate) fn seed_texture_snapshot(mappings: &GpuMappings, gpu_va: u64, data: Vec<u8>) {
+    let len = data.len();
+    let Some(cache_key) = texture_snapshot_cache_key(mappings, gpu_va, len) else {
+        return;
+    };
+    let Some(host_generation) = take_texture_host_generation(cache_key) else {
+        return;
+    };
+    let gpu_generation = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
+    let commit_generation = texture_commit_generation(Some(cache_key));
+    texture_snapshot_cache().lock().unwrap().insert(
+        cache_key,
+        gpu_generation,
+        host_generation,
+        commit_generation,
+        next_texture_snapshot_identity(),
+        Arc::new(data),
+    );
 }
 
 pub(crate) fn fetch_compute_texture_snapshot(
@@ -12584,6 +12693,9 @@ impl PreparedDrawBatch {
             }
             for snapshot in &call.ssbo_data {
                 allocations.data(&snapshot.data);
+                for chunk in snapshot.mirrored.iter().flat_map(|range| &range.chunks) {
+                    allocations.data(&chunk.data);
+                }
             }
         }
         allocations.list
@@ -13164,6 +13276,7 @@ fn prepare_draw_batch_async(
                         backing_gpu_va,
                         read_size,
                         cache_key,
+                        reduced_from,
                     }) = prepared_tic.and_then(|plan| plan.texture)
                     {
                         if texture_type_debug_enabled() {
@@ -13272,6 +13385,26 @@ fn prepare_draw_batch_async(
                                 == fermi_exact_snapshot_lease
                         {
                             0
+                        } else if let Some(original) = reduced_from {
+                            if snapshot.contains_key(&backing_gpu_va) {
+                                0
+                            } else if let Some((data, identity)) =
+                                reduced_texture_snapshot(read_guest, mappings, &original, read_size)
+                            {
+                                let size = data.len();
+                                trusted_texture_snapshot_identities.insert(
+                                    backing_gpu_va,
+                                    TrustedTextureSnapshotIdentity {
+                                        identity,
+                                        data: Arc::downgrade(&data),
+                                    },
+                                );
+                                snapshot.insert(backing_gpu_va, data);
+                                snapshot_generations.insert((backing_gpu_va, read_size), identity);
+                                size
+                            } else {
+                                0
+                            }
                         } else {
                             snapshot_texture_once(
                                 &mut snapshot,
@@ -19729,6 +19862,7 @@ fn execute_one_inner<'d>(
         let mut data_offset = 0usize;
         let mut compute_alias = None;
         let mut pending_resident = None;
+        let mut mirrored = None;
         let stage = if usize::from(d.cbuf_binding) < FRAGMENT_CBUF_BASE {
             vs_cbuf_group
         } else if usize::from(d.cbuf_binding) < GEOMETRY_CBUF_BASE {
@@ -19888,7 +20022,7 @@ fn execute_one_inner<'d>(
             if let Some(buf_cpu) = buf_cpu.filter(|_| pending_resident.is_none()) {
                 let read_size = window_size
                     .min(remaining as usize)
-                    .clamp(16, 8 * 1024 * 1024);
+                    .clamp(16, 32 * 1024 * 1024);
                 let key = SsboSnapshotCacheKey {
                     storage_binding: idx as u32,
                     descriptor_binding: d.cbuf_binding,
@@ -19913,8 +20047,24 @@ fn execute_one_inner<'d>(
                     && alias_spans[idx].is_some_and(|span| {
                         !writable_spans.iter().any(|write| span.overlaps(*write))
                     });
+                let owned_by_graphics_storage = graphics_storage_residency
+                    && super::engines::maxwell_compute::raw_storage_cache_key(mappings, guest_addr, logical_size)
+                        .is_some_and(super::graphics_storage::owns_overlapping);
+                let mirrored_range = (retain_readonly
+                    && resident_vb_enabled()
+                    && ssbo_writes.mask == 0
+                    && compute_alias.is_none()
+                    && !owned_by_graphics_storage)
+                    .then(|| {
+                        ssbo_snapshot_cache.mirror_resident_range(mappings, idx as u32, 0, read_gpu, read_size, mem_read)
+                    })
+                    .flatten()
+                    .filter(|range| range.compute_overlays.is_empty());
                 let data = if requires_fresh_pointer_data {
                     ssbo_snapshot_cache.read_uncached(buf_cpu, read_size, mem_read)
+                } else if let Some(range) = mirrored_range {
+                    mirrored = Some(range);
+                    Some(mirrored_storage_buffer_data())
                 } else if retain_readonly {
                     ssbo_snapshot_cache.read_retained_ssbo(
                         key, buf_cpu, mappings.generation(), mem_read,
@@ -19950,7 +20100,7 @@ fn execute_one_inner<'d>(
         }
         let resident = if pending_resident.is_some() {
             pending_resident
-        } else if graphics_storage_residency && idx < 8 && d.indirect.is_none() {
+        } else if graphics_storage_residency && idx < 8 && d.indirect.is_none() && mirrored.is_none() {
             resolved
                 .and(bytes.as_ref())
                 .and_then(|data| {
@@ -20030,6 +20180,7 @@ fn execute_one_inner<'d>(
             data: bytes.unwrap_or_else(empty_storage_buffer_data),
             compute_alias: compute_alias.filter(|_| resident.is_none()),
             resident,
+            mirrored,
         });
         ssbo_meta.push((dbg_base, dbg_slack, dbg_readok));
     }
@@ -25692,8 +25843,16 @@ fn fetch_sass(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Option<Vec<u8>> {
     if nexium_shader::ampere::enabled() {
-        let binary = read_span(gpu_va, nexium_shader::ampere::MAX_PROGRAM_BYTES, mappings, mem_read)?;
-        let program = nexium_shader::ampere::translate_cached(gpu_va, &binary).ok()?;
+        use nexium_shader::ampere::{Error, MAX_LARGE_PROGRAM_BYTES, MAX_PROGRAM_BYTES};
+        let binary = read_span(gpu_va, MAX_PROGRAM_BYTES, mappings, mem_read)?;
+        let program = match nexium_shader::ampere::translate_cached(gpu_va, &binary) {
+            Err(Error::MissingEnd) if binary.len() == MAX_PROGRAM_BYTES => {
+                let binary = read_span(gpu_va, MAX_LARGE_PROGRAM_BYTES, mappings, mem_read)?;
+                nexium_shader::ampere::translate_cached(gpu_va, &binary)
+            }
+            translated => translated,
+        }
+        .ok()?;
         return Some(program.code.clone());
     }
     read_span(gpu_va.wrapping_add(SPH_SIZE as u64), MAX_SASS_BYTES, mappings, mem_read)
@@ -27735,6 +27894,19 @@ mod tests {
         let mut gap = GpuMappings::new();
         gap.add(0x101000, 4096, 0x20000, 7);
         assert!(super::snapshot_sparse_graphics_texture(&raw, &gap, &read).is_err());
+    }
+
+    #[test]
+    fn texture_snapshot_keys_span_cpu_contiguous_mappings() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x100000, 0x1000, 0x20000, 7);
+        mappings.add(0x101000, 0x1000, 0x21000, 8);
+        let key = super::texture_snapshot_cache_key(&mappings, 0x100800, 0x1000).unwrap();
+        assert_eq!((key.gpu_va, key.cpu_va, key.len, key.nvmap_id), (0x100800, 0x20800, 0x1000, 7));
+        let mut split = GpuMappings::new();
+        split.add(0x100000, 0x1000, 0x20000, 7);
+        split.add(0x101000, 0x1000, 0x40000, 8);
+        assert!(super::texture_snapshot_cache_key(&split, 0x100800, 0x1000).is_none());
     }
 
     #[test]

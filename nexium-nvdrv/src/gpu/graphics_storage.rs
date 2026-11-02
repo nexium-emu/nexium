@@ -192,6 +192,11 @@ fn keys_overlap(a: ComputeRawStorageKey, b: ComputeRawStorageKey) -> bool {
         || ranges_overlap(a.cpu_addr, a.size, b.cpu_addr, b.size)
 }
 
+pub(crate) fn owns_overlapping(key: ComputeRawStorageKey) -> bool {
+    let registry = registry().lock().unwrap_or_else(|error| error.into_inner());
+    registry.owned.iter().any(|owned| keys_overlap(owned.key, key))
+}
+
 fn contained_offset(outer: ComputeRawStorageKey, inner: ComputeRawStorageKey) -> Option<u64> {
     let offset = inner.gpu_va.checked_sub(outer.gpu_va)?;
     let end = offset.checked_add(inner.size)?;

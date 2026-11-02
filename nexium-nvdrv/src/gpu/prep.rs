@@ -3239,8 +3239,17 @@ pub(crate) fn spawn_prep_thread(
                 let mut fermi_2d = resources.fermi_2d.lock();
                 let mut kepler_compute = resources.kepler_compute.lock();
                 let mut kepler_memory = resources.kepler_memory.lock();
-                let mappings = resources.mappings.read_recursive();
+                let mut mappings = resources.mappings.read_recursive();
                 for event in burst.drain(..) {
+                    let render_thread = crate::render_thread::maybe_render_thread()
+                        .filter(|render_thread| render_thread.draw_queue_crowded());
+                    if render_thread.is_some() || resources.mappings.is_locked_exclusive() {
+                        drop(mappings);
+                        if let Some(render_thread) = render_thread {
+                            render_thread.wait_for_draw_headroom();
+                        }
+                        mappings = resources.mappings.read_recursive();
+                    }
                     if worker_failed.load(Ordering::Acquire) {
                         match event {
                             PrepEvent::KickEnd { on_complete, .. } => {

@@ -6158,6 +6158,17 @@ impl Nvdrv {
         enqueue_bounded_frame(&self.frame_queue, &self.stats, frame);
     }
 
+    pub fn submit_present_job(&self, label: &'static str, job: impl FnOnce(&dyn Fn(QueuedFrame)) + Send + 'static) -> bool {
+        self.queue_buffer_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let frame_queue = Arc::clone(&self.frame_queue);
+        let stats = Arc::clone(&self.stats);
+        crate::render_thread::present_thread().submit_named(
+            label,
+            Box::new(move || job(&|frame| enqueue_bounded_frame(&frame_queue, &stats, frame))),
+        )
+    }
+
     pub fn submit_frame_nonblocking(&self, frame: QueuedFrame) -> bool {
         self.queue_buffer_active
             .store(true, std::sync::atomic::Ordering::Relaxed);

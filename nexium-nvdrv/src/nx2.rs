@@ -73,6 +73,7 @@ pub fn apply_characteristics(gc: &mut [u8]) {
 }
 
 const MAPPING_OWNER: u32 = u32::MAX;
+const MAPPING_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 
 impl Nvdrv {
     pub fn enable_switch2(&mut self) {
@@ -85,42 +86,56 @@ impl Nvdrv {
         nexium_gpu::texture::set_ampere_texture_headers(true);
     }
 
-    pub fn nx2_map(&mut self, gpu_va: u64, size: u64, cpu_addr: u64) {
-        let update = self.gpu.mappings.write().add_as_gpu_mapping(
-            MAPPING_OWNER,
-            gpu_va,
-            size,
-            cpu_addr,
-            0,
-            None,
-            None,
-            true,
-        );
-        self.invalidate_texture_mapping_update(&update);
-    }
-
-    pub fn nx2_map_sparse(&mut self, gpu_va: u64, size: u64) {
-        let update = self
-            .gpu
-            .mappings
-            .write()
-            .add_sparse_as_gpu_with_metadata(MAPPING_OWNER, gpu_va, size);
-        self.invalidate_texture_mapping_update(&update);
-    }
-
-    pub fn nx2_unmap(&mut self, gpu_va: u64, size: u64) -> bool {
-        let removed = self
-            .gpu
-            .mappings
-            .write()
-            .remove_all_contained_with_metadata(MAPPING_OWNER, gpu_va, size);
-        match removed {
-            Ok(removed) => {
-                self.invalidate_texture_mapping_update(&removed.update);
-                true
-            }
-            Err(()) => false,
+    fn nx2_mappings(&self, wait: bool) -> Option<parking_lot::RwLockWriteGuard<'_, crate::gpu::GpuMappings>> {
+        if wait {
+            Some(self.gpu.mappings.write())
+        } else {
+            self.gpu.mappings.try_write_for(MAPPING_WAIT)
         }
+    }
+
+    pub fn nx2_map(&mut self, gpu_va: u64, size: u64, cpu_addr: u64, wait: bool) -> bool {
+        let Some(update) = self.nx2_mappings(wait).map(|mut mappings| {
+            mappings.add_as_gpu_mapping(MAPPING_OWNER, gpu_va, size, cpu_addr, 0, None, None, true)
+        }) else {
+            return false;
+        };
+        self.invalidate_texture_mapping_update(&update);
+        true
+    }
+
+    pub fn nx2_map_sparse(&mut self, gpu_va: u64, size: u64, wait: bool) -> bool {
+        let Some(update) = self
+            .nx2_mappings(wait)
+            .map(|mut mappings| mappings.add_sparse_as_gpu_with_metadata(MAPPING_OWNER, gpu_va, size))
+        else {
+            return false;
+        };
+        self.invalidate_texture_mapping_update(&update);
+        true
+    }
+
+    pub fn nx2_unmap(&mut self, gpu_va: u64, size: u64, wait: bool) -> bool {
+        let Some(removed) = self
+            .nx2_mappings(wait)
+            .map(|mut mappings| mappings.remove_all_contained_with_metadata(MAPPING_OWNER, gpu_va, size))
+        else {
+            return false;
+        };
+        if let Ok(removed) = removed {
+            self.invalidate_texture_mapping_update(&removed.update);
+        }
+        true
+    }
+
+    pub fn nx2_allocate_syncpoint(&mut self) -> u32 {
+        let id = self.next_syncpoint_id;
+        self.next_syncpoint_id = self.next_syncpoint_id.wrapping_add(1).max(1);
+        id
+    }
+
+    pub fn nx2_increment_syncpoint(&mut self, id: u32) -> u32 {
+        self.increment_syncpoint(id, 1)
     }
 
     pub fn nx2_syncpoint_value(&self, id: u32) -> u32 {
