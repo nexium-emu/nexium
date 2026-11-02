@@ -67,6 +67,18 @@ pub fn nce_register_post_handlers(entries: &[(u64, u64)]) {
     }
 }
 
+static GUEST_COUNTER_HZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(19_200_000);
+
+pub fn set_guest_counter_frequency(hz: u64) {
+    GUEST_COUNTER_HZ.store(hz, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "backend-rustarmic")]
+    ::rustarmic::CpuContext::set_counter_frequency(hz);
+}
+
+pub fn guest_counter_frequency() -> u64 {
+    GUEST_COUNTER_HZ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn nce_host_counter_hz() -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
