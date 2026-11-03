@@ -2,7 +2,14 @@ use rspirv::dr::{Function, Instruction, Module, Operand};
 use rspirv::spirv::{Op, Word};
 use std::collections::{HashMap, HashSet};
 
+type Dominance = (HashMap<Word, usize>, Vec<Vec<usize>>, Vec<bool>, Vec<Vec<bool>>);
+
 fn escaping_edge(function: &Function) -> Option<(usize, usize)> {
+    let (labels, successors, reachable, dominators) = dominance(function);
+    escaping_edge_in(function, &labels, &successors, &reachable, &dominators)
+}
+
+fn dominance(function: &Function) -> Dominance {
     let labels: HashMap<Word, usize> = function
         .blocks
         .iter()
@@ -43,6 +50,16 @@ fn escaping_edge(function: &Function) -> Option<(usize, usize)> {
         }
     }
     let dominators = super::structured_dominators(&reachable, &predecessors);
+    (labels, successors, reachable, dominators)
+}
+
+fn escaping_edge_in(
+    function: &Function,
+    labels: &HashMap<Word, usize>,
+    successors: &[Vec<usize>],
+    reachable: &[bool],
+    dominators: &[Vec<bool>],
+) -> Option<(usize, usize)> {
     let loops: Vec<_> = function
         .blocks
         .iter()
@@ -224,7 +241,299 @@ fn split_tail(
     Ok(ids)
 }
 
+fn phi_value(inst: &Instruction, parent: Word) -> Option<Word> {
+    inst.operands.chunks_exact(2).find_map(|pair| match (&pair[0], &pair[1]) {
+        (Operand::IdRef(value), Operand::IdRef(from)) if *from == parent => Some(*value),
+        _ => None,
+    })
+}
+
+fn sink_tail(
+    function: &mut Function,
+    source: usize,
+    target: usize,
+    bound: &mut Word,
+    in_place: bool,
+) -> Option<HashMap<Word, Word>> {
+    let label = |function: &Function, index: usize| {
+        function.blocks[index].label.as_ref()?.result_id
+    };
+    let (labels, _, _, dominators) = dominance(function);
+    let plain = |block: &rspirv::dr::Block| {
+        block.instructions.last().is_some_and(|term| term.class.opcode == Op::Branch)
+            && !block.instructions.iter().any(|inst| {
+                matches!(inst.class.opcode, Op::SelectionMerge | Op::LoopMerge)
+            })
+    };
+    if in_place && !plain(&function.blocks[source]) {
+        return None;
+    }
+    let tail = &function.blocks[if in_place { source } else { target }];
+    let term = tail.instructions.last()?;
+    if term.class.opcode != Op::Branch
+        || tail.instructions.iter().any(|inst| {
+            matches!(inst.class.opcode, Op::SelectionMerge | Op::LoopMerge)
+        })
+    {
+        return None;
+    }
+    let Operand::IdRef(join) = term.operands[0] else {
+        return None;
+    };
+    let merge = function
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(header, block)| {
+            let inst = block.instructions.iter().find(|inst| inst.class.opcode == Op::SelectionMerge)?;
+            let Operand::IdRef(merge) = inst.operands[0] else {
+                return None;
+            };
+            let merge = *labels.get(&merge)?;
+            (dominators[source][header] && !dominators[source][merge]).then_some((header, merge))
+        })
+        .max_by_key(|&(header, _)| dominators[header].iter().filter(|&&d| d).count())?
+        .1;
+    let mut chain = vec![merge];
+    loop {
+        let block = &function.blocks[*chain.last()?];
+        let (term, body) = block.instructions.split_last()?;
+        if term.class.opcode != Op::Branch || body.iter().any(|inst| inst.class.opcode != Op::Phi) {
+            return None;
+        }
+        let Operand::IdRef(next) = term.operands[0] else {
+            return None;
+        };
+        if next == join {
+            break;
+        }
+        if chain.len() > 64 {
+            return None;
+        }
+        chain.push(*labels.get(&next)?);
+    }
+    let target_label = label(function, target)?;
+    let source_label = label(function, source)?;
+    let tail_label = if in_place { source_label } else { target_label };
+    let join_index = labels[&join];
+    let last_label = label(function, *chain.last()?)?;
+    let chain_labels: Vec<Word> =
+        chain.iter().map(|&index| label(function, index)).collect::<Option<_>>()?;
+    let predecessors = |function: &Function, block: Word| -> Vec<Word> {
+        function
+            .blocks
+            .iter()
+            .filter(|candidate| {
+                candidate.instructions.last().is_some_and(|term| {
+                    super::structured_branch_targets(term).contains(&block)
+                })
+            })
+            .filter_map(|candidate| candidate.label.as_ref()?.result_id)
+            .collect()
+    };
+    let chain_preds: Vec<Vec<Word>> =
+        chain_labels.iter().map(|&block| predecessors(function, block)).collect();
+    struct Feed {
+        join_phi: usize,
+        result_type: Option<Word>,
+        from_tail: Word,
+        values: Vec<Word>,
+        phis: Vec<Option<usize>>,
+    }
+    let mut feeds = Vec::new();
+    for (join_phi, inst) in function.blocks[join_index].instructions.iter().enumerate() {
+        if inst.class.opcode != Op::Phi {
+            continue;
+        }
+        let from_tail = phi_value(inst, tail_label)?;
+        let mut values = vec![0; chain.len()];
+        let mut phis = vec![None; chain.len()];
+        values[chain.len() - 1] = phi_value(inst, last_label)?;
+        for position in (0..chain.len()).rev() {
+            let value = values[position];
+            phis[position] = function.blocks[chain[position]]
+                .instructions
+                .iter()
+                .position(|inst| inst.class.opcode == Op::Phi && inst.result_id == Some(value));
+            if position > 0 {
+                values[position - 1] = match phis[position] {
+                    Some(phi) => phi_value(
+                        &function.blocks[chain[position]].instructions[phi],
+                        chain_labels[position - 1],
+                    )?,
+                    None => value,
+                };
+            }
+        }
+        feeds.push(Feed { join_phi, result_type: inst.result_type, from_tail, values, phis });
+    }
+    let mut copy = function.blocks[if in_place { source } else { target }].clone();
+    let mut ids = HashMap::new();
+    if !in_place {
+        for inst in copy.label.iter().chain(&copy.instructions) {
+            if let Some(id) = inst.result_id {
+                ids.insert(id, *bound);
+                *bound = bound.checked_add(1)?;
+            }
+        }
+        for inst in &mut copy.instructions {
+            trim_phi(inst, |parent| parent == source_label).ok()?;
+        }
+    }
+    let copy_label = if in_place { source_label } else { ids[&target_label] };
+    for inst in copy.label.iter_mut().chain(&mut copy.instructions) {
+        if let Some(id) = &mut inst.result_id {
+            *id = *ids.get(id).unwrap_or(id);
+        }
+        for operand in &mut inst.operands {
+            if let Operand::IdRef(id) = operand {
+                if let Some(replacement) = ids.get(id) {
+                    *id = *replacement;
+                }
+            }
+        }
+    }
+    let mut fed = HashMap::new();
+    for feed in &feeds {
+        if let Some(phi) = feed.phis[0] {
+            if fed.insert(phi, feed.from_tail).is_some_and(|other| other != feed.from_tail) {
+                return None;
+            }
+        }
+    }
+    let mut undefs = Vec::new();
+    let mut merge_entries = Vec::new();
+    for (position, inst) in function.blocks[merge].instructions.iter().enumerate() {
+        if inst.class.opcode != Op::Phi {
+            continue;
+        }
+        let value = match fed.get(&position) {
+            Some(from_tail) => *ids.get(from_tail).unwrap_or(from_tail),
+            None => {
+                let undef = *bound;
+                *bound = bound.checked_add(1)?;
+                undefs.push(Instruction::new(Op::Undef, inst.result_type, Some(undef), vec![]));
+                undef
+            }
+        };
+        merge_entries.push((position, value));
+    }
+    let mut new_phis: Vec<(usize, Instruction)> = Vec::new();
+    let mut join_rewrites = Vec::new();
+    let mut chain_rewrites = Vec::new();
+    for feed in &feeds {
+        if feed.phis[0].is_some() && feed.phis[1..].iter().all(Option::is_some) {
+            continue;
+        }
+        let tail_value = *ids.get(&feed.from_tail).unwrap_or(&feed.from_tail);
+        let (mut current, mut changed) = match feed.phis[0] {
+            Some(_) => (feed.values[0], false),
+            None => {
+                let id = *bound;
+                *bound = bound.checked_add(1)?;
+                let mut operands: Vec<Operand> = chain_preds[0]
+                    .iter()
+                    .flat_map(|&parent| [Operand::IdRef(feed.values[0]), Operand::IdRef(parent)])
+                    .collect();
+                operands.extend([Operand::IdRef(tail_value), Operand::IdRef(copy_label)]);
+                new_phis.push((chain[0], Instruction::new(Op::Phi, feed.result_type, Some(id), operands)));
+                (id, true)
+            }
+        };
+        for position in 1..chain.len() {
+            if !changed {
+                current = feed.values[position];
+                continue;
+            }
+            match feed.phis[position] {
+                Some(phi) => {
+                    chain_rewrites.push((chain[position], phi, chain_labels[position - 1], current));
+                    current = feed.values[position];
+                    changed = false;
+                }
+                None => {
+                    let id = *bound;
+                    *bound = bound.checked_add(1)?;
+                    let operands = chain_preds[position]
+                        .iter()
+                        .flat_map(|&parent| {
+                            let value = if parent == chain_labels[position - 1] {
+                                current
+                            } else {
+                                feed.values[position]
+                            };
+                            [Operand::IdRef(value), Operand::IdRef(parent)]
+                        })
+                        .collect();
+                    new_phis.push((
+                        chain[position],
+                        Instruction::new(Op::Phi, feed.result_type, Some(id), operands),
+                    ));
+                    current = id;
+                }
+            }
+        }
+        if changed {
+            join_rewrites.push((feed.join_phi, current));
+        }
+    }
+    let last = copy.instructions.len() - 1;
+    copy.instructions[last].operands[0] = Operand::IdRef(label(function, merge)?);
+    copy.instructions.splice(last..last, undefs);
+    for (position, value) in merge_entries {
+        function.blocks[merge].instructions[position]
+            .operands
+            .extend([Operand::IdRef(value), Operand::IdRef(copy_label)]);
+    }
+    for (block, phi, parent, value) in chain_rewrites {
+        for pair in function.blocks[block].instructions[phi].operands.chunks_exact_mut(2) {
+            if pair[1] == Operand::IdRef(parent) {
+                pair[0] = Operand::IdRef(value);
+            }
+        }
+    }
+    for (join_phi, value) in join_rewrites {
+        for pair in function.blocks[join_index].instructions[join_phi].operands.chunks_exact_mut(2) {
+            if pair[1] == Operand::IdRef(last_label) {
+                pair[0] = Operand::IdRef(value);
+            }
+        }
+    }
+    for (block, phi) in new_phis.into_iter().rev() {
+        function.blocks[block].instructions.insert(0, phi);
+    }
+    if !in_place {
+        for operand in &mut function.blocks[source].instructions.last_mut()?.operands {
+            if *operand == Operand::IdRef(target_label) {
+                *operand = Operand::IdRef(copy_label);
+            }
+        }
+    }
+    for inst in &mut function.blocks[target].instructions {
+        trim_phi(inst, |parent| parent != source_label).ok()?;
+    }
+    if in_place {
+        function.blocks[source] = copy;
+    } else {
+        function.blocks.push(copy);
+    }
+    Some(ids)
+}
+
 pub(super) fn repair(module: &mut Module) -> Result<(), String> {
+    let original = std::env::var_os("NEXIUM_DUMP_SPIRV").map(|dir| (dir, module.clone()));
+    let result = repair_functions(module);
+    if let (Err(_), Some((dir, original))) = (&result, original) {
+        use rspirv::binary::Assemble;
+        let words = original.assemble();
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let path = std::path::Path::new(&dir).join(format!("tail_failed_{:08x}.spv", words.len()));
+        let _ = std::fs::write(path, bytes);
+    }
+    result
+}
+
+fn repair_functions(module: &mut Module) -> Result<(), String> {
     let mut bound = module.header.as_ref().ok_or("missing SPIR-V header")?.bound;
     let mut mappings = Vec::new();
     for function in &mut module.functions {
@@ -235,6 +544,12 @@ pub(super) fn repair(module: &mut Module) -> Result<(), String> {
         while let Some((source, target)) = escaping_edge(function) {
             if function.blocks.len() >= limit {
                 return Err("selection tail split exceeded block budget".into());
+            }
+            if let Some(ids) = sink_tail(function, source, target, &mut bound, true)
+                .or_else(|| sink_tail(function, source, target, &mut bound, false))
+            {
+                mappings.push(ids);
+                continue;
             }
             mappings.push(split_tail(function, source, target, &mut bound)?);
         }
@@ -458,6 +773,132 @@ mod tests {
             assert!(crate::validate_structured_cfg(&words).is_ok());
             crate::tests::validates_with_spirv_val_if_available(&words);
         }
+    }
+
+    #[test]
+    #[ignore = "set NEXIUM_TAIL_REPRO to a tail_failed_*.spv dump"]
+    fn replay_failed_tail_dump() {
+        let path = std::env::var("NEXIUM_TAIL_REPRO").unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_words(&words, &mut loader).unwrap();
+        let mut module = loader.module();
+        repair_functions(&mut module).unwrap();
+        let words = module.assemble();
+        assert!(crate::phi_preds_consistent(&words));
+        crate::validate_structured_cfg(&words).unwrap();
+        crate::tests::validates_with_spirv_val_if_available(&words);
+    }
+
+    #[test]
+    fn escaping_tail_sinks_into_the_inner_merge_chain() {
+        let mut b = Builder::new();
+        b.set_version(1, 0);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void = b.type_void();
+        let float = b.type_float(32, None);
+        let boolean = b.type_bool();
+        let ptr = b.type_pointer(None, StorageClass::Output, float);
+        let output = b.variable(ptr, None, StorageClass::Output, None);
+        b.decorate(output, Decoration::Location, [Operand::LiteralBit32(0)]);
+        let conditions: [Word; 4] = std::array::from_fn(|_| b.constant_true(boolean));
+        let values: [Word; 3] =
+            std::array::from_fn(|i| b.constant_bit32(float, ((i + 1) as f32).to_bits()));
+        let ty = b.type_function(void, vec![]);
+        let main = b.begin_function(void, None, FunctionControl::NONE, ty).unwrap();
+        let [outer, inner, other, merge, tail, join] = std::array::from_fn(|_| b.id());
+        b.begin_block(Some(outer)).unwrap();
+        b.selection_merge(join, SelectionControl::NONE).unwrap();
+        b.branch_conditional(conditions[0], tail, inner, []).unwrap();
+        b.begin_block(Some(inner)).unwrap();
+        b.selection_merge(merge, SelectionControl::NONE).unwrap();
+        b.branch_conditional(conditions[1], tail, other, []).unwrap();
+        b.begin_block(Some(other)).unwrap();
+        b.branch(merge).unwrap();
+        b.begin_block(Some(merge)).unwrap();
+        let forwarded = b.phi(float, None, [(values[2], other)]).unwrap();
+        b.branch(join).unwrap();
+        b.begin_block(Some(tail)).unwrap();
+        let shared = b.phi(float, None, [(values[0], outer), (values[1], inner)]).unwrap();
+        b.branch(join).unwrap();
+        b.begin_block(Some(join)).unwrap();
+        let result = b.phi(float, None, [(shared, tail), (forwarded, merge)]).unwrap();
+        b.store(output, result, None, []).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::Fragment, main, "main", [output]);
+        b.execution_mode(main, ExecutionMode::OriginUpperLeft, []);
+        let original = b.module();
+        let mut repaired = original.clone();
+        assert!(escaping_edge(&original.functions[0]).is_some());
+        repair(&mut repaired).unwrap();
+        assert!(escaping_edge(&repaired.functions[0]).is_none());
+        assert_eq!(repaired.functions[0].blocks.len(), original.functions[0].blocks.len() + 1);
+        for mask in 0..4 {
+            assert_eq!(evaluate(&repaired, conditions, mask), evaluate(&original, conditions, mask));
+        }
+        let words = repaired.assemble();
+        assert!(crate::phi_preds_consistent(&words));
+        assert!(crate::validate_structured_cfg(&words).is_ok());
+        crate::tests::validates_with_spirv_val_if_available(&words);
+    }
+
+    #[test]
+    fn plain_escaping_block_retargets_to_its_merge_with_a_new_phi() {
+        let mut b = Builder::new();
+        b.set_version(1, 0);
+        b.capability(Capability::Shader);
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void = b.type_void();
+        let float = b.type_float(32, None);
+        let boolean = b.type_bool();
+        let ptr = b.type_pointer(None, StorageClass::Output, float);
+        let output = b.variable(ptr, None, StorageClass::Output, None);
+        b.decorate(output, Decoration::Location, [Operand::LiteralBit32(0)]);
+        let conditions: [Word; 4] = std::array::from_fn(|_| b.constant_true(boolean));
+        let values: [Word; 3] =
+            std::array::from_fn(|i| b.constant_bit32(float, ((i + 1) as f32).to_bits()));
+        let ty = b.type_function(void, vec![]);
+        let main = b.begin_function(void, None, FunctionControl::NONE, ty).unwrap();
+        let [outer, early, inner, escape, other, merge, join] = std::array::from_fn(|_| b.id());
+        b.begin_block(Some(outer)).unwrap();
+        b.selection_merge(join, SelectionControl::NONE).unwrap();
+        b.branch_conditional(conditions[0], early, inner, []).unwrap();
+        b.begin_block(Some(early)).unwrap();
+        b.branch(join).unwrap();
+        b.begin_block(Some(inner)).unwrap();
+        b.selection_merge(merge, SelectionControl::NONE).unwrap();
+        b.branch_conditional(conditions[1], escape, other, []).unwrap();
+        b.begin_block(Some(escape)).unwrap();
+        b.branch(join).unwrap();
+        b.begin_block(Some(other)).unwrap();
+        b.branch(merge).unwrap();
+        b.begin_block(Some(merge)).unwrap();
+        b.branch(join).unwrap();
+        b.begin_block(Some(join)).unwrap();
+        let result = b
+            .phi(float, None, [(values[0], early), (values[1], escape), (values[2], merge)])
+            .unwrap();
+        b.store(output, result, None, []).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(ExecutionModel::Fragment, main, "main", [output]);
+        b.execution_mode(main, ExecutionMode::OriginUpperLeft, []);
+        let original = b.module();
+        let mut repaired = original.clone();
+        assert!(escaping_edge(&original.functions[0]).is_some());
+        repair(&mut repaired).unwrap();
+        assert!(escaping_edge(&repaired.functions[0]).is_none());
+        assert_eq!(repaired.functions[0].blocks.len(), original.functions[0].blocks.len());
+        for mask in 0..4 {
+            assert_eq!(evaluate(&repaired, conditions, mask), evaluate(&original, conditions, mask));
+        }
+        let words = repaired.assemble();
+        assert!(crate::phi_preds_consistent(&words));
+        assert!(crate::validate_structured_cfg(&words).is_ok());
+        crate::tests::validates_with_spirv_val_if_available(&words);
     }
 
     fn shared_tail_shader_with_loop() -> (Module, [Word; 4]) {

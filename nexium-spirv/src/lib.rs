@@ -55,6 +55,8 @@ const GRAPHICS_SPIRV_ENV_OPTIONS: &[&str] = &[
     "NEXIUM_FS_COLOR_ATTR",
 ];
 
+const PRED_SLOTS: usize = 24;
+
 const FRAGMENT_DEBUG_SPIRV_ENV_OPTIONS: &[&str] = &[
     "NEXIUM_FS_SAMPLE_SLOT",
     "NEXIUM_FS_SAMPLE_COMPONENT",
@@ -983,9 +985,9 @@ pub struct Emitter {
     bool_t: Word,
     bool_true: Word,
     bool_false: Word,
-    pred_regs: [Option<Word>; 9],
+    pred_regs: [Option<Word>; PRED_SLOTS],
     pred_value_to_word: HashMap<(ValueId, u8), Word>,
-    block_pred_exits: HashMap<BlockId, [Option<Word>; 9]>,
+    block_pred_exits: HashMap<BlockId, [Option<Word>; PRED_SLOTS]>,
     ssbo_vars: Vec<Option<Word>>,
     ptr_storage_u32: Option<Word>,
     return_block: Option<Word>,
@@ -1378,7 +1380,7 @@ impl Emitter {
             bool_t,
             bool_true,
             bool_false,
-            pred_regs: [None; 9],
+            pred_regs: [None; PRED_SLOTS],
             pred_value_to_word: HashMap::new(),
             block_pred_exits: HashMap::new(),
             ssbo_vars: vec![
@@ -3265,6 +3267,10 @@ impl Emitter {
                 ImageDimension::D2 | ImageDimension::D2Array => rspirv::spirv::Dim::Dim2D,
                 ImageDimension::D3 => rspirv::spirv::Dim::Dim3D,
                 ImageDimension::Cube => rspirv::spirv::Dim::DimCube,
+                ImageDimension::CubeArray => {
+                    self.b.capability(Capability::ImageCubeArray);
+                    rspirv::spirv::Dim::DimCube
+                }
             };
             match resource.kind {
                 ComputeResourceKind::UniformTexelBuffer => {
@@ -3320,7 +3326,10 @@ impl Emitter {
             let image_t =
                 self.b
                     .type_image(scalar_t, dimension, 2,
-                        u32::from(resource.dimension == ImageDimension::D2Array),
+                        u32::from(matches!(
+                            resource.dimension,
+                            ImageDimension::D2Array | ImageDimension::CubeArray
+                        )),
                         0, sampled, image_format, None);
             let sampled_image_t = (resource.kind == ComputeResourceKind::CombinedSampledImage)
                 .then(|| self.b.type_sampled_image(image_t));
@@ -3455,7 +3464,10 @@ impl Emitter {
                     .composite_construct(self.ivec2_t, None, [x, y])
                     .unwrap()
             }
-            ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube => {
+            ImageDimension::D2Array
+            | ImageDimension::D3
+            | ImageDimension::Cube
+            | ImageDimension::CubeArray => {
                 let y_value = self.lower_value(y.expect("3D image operation requires Y"));
                 let y = self.as_i32(y_value);
                 let z_value = self.lower_value(z.expect("3D image operation requires Z"));
@@ -3550,6 +3562,7 @@ impl Emitter {
         u: &IrValue,
         v: Option<&IrValue>,
         w: Option<&IrValue>,
+        layer: Option<&IrValue>,
         implicit_lod: bool,
         explicit_lod: Option<&IrValue>,
         texel_offset: Option<&(IrValue, IrValue, IrValue)>,
@@ -3579,6 +3592,15 @@ impl Emitter {
                 let w = self.lower_value(w.expect("3D filtered sample requires W"));
                 self.b
                     .composite_construct(self.vec3_t, None, [u, v, w])
+                    .unwrap()
+            }
+            ImageDimension::CubeArray => {
+                let v = self.lower_value(v.expect("cube-array sample requires V"));
+                let w = self.lower_value(w.expect("cube-array sample requires W"));
+                let layer =
+                    self.compute_array_layer(layer.expect("cube-array sample requires a layer"));
+                self.b
+                    .composite_construct(self.vec4_t, None, [u, v, w, layer])
                     .unwrap()
             }
             ImageDimension::Buffer => unreachable!("buffer images cannot be filtered"),
@@ -3614,7 +3636,7 @@ impl Emitter {
                     let z = constant(self, z);
                     self.b.constant_composite(self.ivec3_t, [x, y, z])
                 }
-                ImageDimension::Cube | ImageDimension::Buffer => {
+                ImageDimension::Cube | ImageDimension::CubeArray | ImageDimension::Buffer => {
                     unreachable!("validated compute sample offset dimension")
                 }
             }
@@ -3712,7 +3734,7 @@ impl Emitter {
             let component_count = match resource.resource.dimension {
                 ImageDimension::D1 | ImageDimension::Buffer => 1,
                 ImageDimension::D2 | ImageDimension::Cube => 2,
-                ImageDimension::D2Array | ImageDimension::D3 => 3,
+                ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::CubeArray => 3,
             };
             if component as u32 >= component_count {
                 self.const_u32(0)
@@ -3720,7 +3742,9 @@ impl Emitter {
                 let result_t = match resource.resource.dimension {
                     ImageDimension::D1 | ImageDimension::Buffer => self.u32_t,
                     ImageDimension::D2 | ImageDimension::Cube => self.uvec2_t,
-                    ImageDimension::D2Array | ImageDimension::D3 => self.uvec3_t,
+                    ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::CubeArray => {
+                        self.uvec3_t
+                    }
                 };
                 let dimensions = if resource.resource.dimension == ImageDimension::Buffer {
                     self.b.image_query_size(result_t, None, image).unwrap()
@@ -6494,6 +6518,7 @@ impl Emitter {
                 u,
                 v,
                 w,
+                layer,
                 implicit_lod,
                 explicit_lod,
                 texel_offset,
@@ -6510,6 +6535,7 @@ impl Emitter {
                         u,
                         v.as_ref(),
                         w.as_ref(),
+                        layer.as_ref(),
                         *implicit_lod,
                         explicit_lod.as_ref(),
                         texel_offset.as_ref(),
@@ -9244,6 +9270,11 @@ impl Emitter {
                     merge,
                     latch: block.id,
                     real_merge,
+                    merge_has_phis: real_merge.is_some_and(|merge| {
+                        let merge = cfg.block(merge);
+                        !merge.pred_phis.is_empty()
+                            || merge.program.instructions.iter().any(|inst| matches!(inst.op, IrOp::Phi { .. }))
+                    }),
                 },
             );
         }
@@ -9325,11 +9356,11 @@ impl Emitter {
     }
 
     fn restore_pred_regs(&mut self, cfg: &Cfg, predecessors: &[Vec<BlockId>], block: &BasicBlock) {
-        self.pred_regs = [None; 9];
+        self.pred_regs = [None; PRED_SLOTS];
         let Some(preds) = predecessors.get(block.id as usize) else {
             return;
         };
-        for pred_index in 0..7u8 {
+        for pred_index in (0..7u8).chain(16..23) {
             if block.pred_phis.iter().any(|phi| phi.pred == pred_index) {
                 continue;
             }
@@ -9393,7 +9424,7 @@ impl Emitter {
             let id = self.b.phi(self.bool_t, None, pairs).unwrap();
             self.value_to_word.insert(phi.result, id);
             self.pred_value_to_word.insert((phi.result, phi.pred), id);
-            if phi.pred < 7 {
+            if phi.pred != 7 && (phi.pred as usize) < PRED_SLOTS {
                 self.pred_regs[phi.pred as usize] = Some(id);
             }
         }
@@ -9462,8 +9493,9 @@ impl Emitter {
                 .unwrap(),
             None => safety_cond,
         };
+        let bail = (unconditional && info.merge_has_phis).then(|| self.b.id());
         let exit_target = if unconditional {
-            info.merge
+            bail.unwrap_or(info.merge)
         } else {
             let next = latch_id + 1;
             self.block_labels
@@ -9496,6 +9528,10 @@ impl Emitter {
         }
         let header = self.block_labels[&header_id];
         self.b.branch(header).unwrap();
+        if let Some(bail) = bail {
+            self.b.begin_block(Some(bail)).unwrap();
+            self.b.ret().unwrap();
+        }
         if unconditional && info.real_merge.is_none() {
             self.b.begin_block(Some(info.merge)).unwrap();
             let virtual_merge = self.block_labels.len() as BlockId;
@@ -11548,6 +11584,7 @@ struct LoopInfo {
     merge: Word,
     latch: BlockId,
     real_merge: Option<BlockId>,
+    merge_has_phis: bool,
 }
 
 fn is_bounded_unconditional_backedge(block: &BasicBlock) -> bool {
@@ -11610,7 +11647,11 @@ fn validate_compute_coordinates(
 ) -> Result<(), ComputeEmitError> {
     if matches!(
         dimension,
-        ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube
+        ImageDimension::D2
+            | ImageDimension::D2Array
+            | ImageDimension::D3
+            | ImageDimension::Cube
+            | ImageDimension::CubeArray
     ) && y.is_none()
     {
         return Err(ComputeEmitError::MissingCoordinate {
@@ -11619,7 +11660,11 @@ fn validate_compute_coordinates(
             coordinate: "Y",
         });
     }
-    if matches!(dimension, ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube) && z.is_none() {
+    if matches!(
+        dimension,
+        ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube | ImageDimension::CubeArray
+    ) && z.is_none()
+    {
         return Err(ComputeEmitError::MissingCoordinate {
             handle,
             dimension,
@@ -11859,11 +11904,19 @@ fn validate_compute_options(
                     dimension,
                     v,
                     w,
+                    layer,
                     dref,
                     texel_offset,
                     component,
                     ..
                 } => {
+                    if (*dimension == ImageDimension::CubeArray) != layer.is_some()
+                        || (*dimension == ImageDimension::CubeArray && dref.is_some())
+                    {
+                        return Err(ComputeEmitError::UnsupportedOperation(format!(
+                            "invalid compute {dimension:?} sample layer"
+                        )));
+                    }
                     if *component > 3 {
                         return Err(ComputeEmitError::UnsupportedOperation(format!(
                             "SampleTexHandle component {component}"
@@ -15277,6 +15330,30 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn unconditional_latch_guard_skips_shared_merge_phis() {
+        let mut phi_program = nexium_shader::IrProgram::new();
+        phi_program.emit(
+            IrOp::Phi {
+                sources: vec![(0, IrValue::ImmF32(1.0)), (2, IrValue::ImmF32(2.0))],
+            },
+            Some(0),
+        );
+        let pred = |idx| nexium_shader::Predicate { idx, negate: false };
+        let words = emit_fragment(&Cfg {
+            blocks: vec![
+                empty_cfg_block(0, BranchKind::Conditional { target: 4, pred: pred(0) }),
+                empty_cfg_block(1, BranchKind::FallThrough),
+                empty_cfg_block(2, BranchKind::Conditional { target: 4, pred: pred(1) }),
+                empty_cfg_block(3, BranchKind::Unconditional { target: 2 }),
+                cfg_block(4, BranchKind::Exit, phi_program),
+            ],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        });
+        assert!(phi_preds_consistent(&words));
+        validates_with_naga(&words);
+    }
     #[test]
     fn conditional_loop_break_uses_real_merge_and_keeps_cleanup_path() {
         let words = emit_fragment(&conditional_loop_with_break_and_cleanup_cfg());
@@ -19852,6 +19929,7 @@ mod tests {
                 u: IrValue::ImmF32(0.25),
                 v: Some(IrValue::ImmF32(0.75)),
                 w: None,
+                layer: None,
                 implicit_lod: true,
                 lod_bias: Some(IrValue::ImmF32(1.0)),
                 explicit_lod: None,
@@ -19932,7 +20010,7 @@ mod tests {
                 } else {
                     IrOp::SampleTexHandle { sample_site: Some(7), handle,
                         dimension: ImageDimension::D2Array, u: IrValue::ImmF32(0.25),
-                        v: Some(IrValue::ImmF32(0.75)), w: Some(IrValue::ImmU32(0xabcd_0002)),
+                        v: Some(IrValue::ImmF32(0.75)), w: Some(IrValue::ImmU32(0xabcd_0002)), layer: None,
                         implicit_lod: false, lod_bias: None, explicit_lod: Some(IrValue::Zero),
                         texel_offset: None, dref: Some(IrValue::ImmF32(0.5)), component: lane }
                 }, Some(lane));
@@ -19980,6 +20058,7 @@ mod tests {
                         u: IrValue::ImmF32(0.25),
                         v: Some(IrValue::ImmF32(0.75)),
                         w: None,
+                        layer: None,
                         implicit_lod: false,
                         lod_bias: None,
                         explicit_lod: Some(IrValue::ImmF32(1.0)),
