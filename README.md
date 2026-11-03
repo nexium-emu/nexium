@@ -11,7 +11,7 @@ A Nintendo Switch 1 & 2 emulator written in Rust.
 [![CI](https://github.com/nexium-emu/nexium/actions/workflows/ci.yml/badge.svg)](https://github.com/nexium-emu/nexium/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support%20NeXium-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/nexium_emu)
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/HmhB4BBrv9)
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/wyPAFNA9gw)
 
 </div>
 
@@ -19,7 +19,7 @@ NeXium runs Switch homebrew and some commercial software, and loads decrypted Ni
 
 Website: https://nexium-emu.org
 
-Discord: https://discord.gg/HmhB4BBrv9
+Discord: https://discord.gg/wyPAFNA9gw
 
 ## Legal
 
@@ -88,7 +88,7 @@ If you like NeXium and want to get me a coffee (or beer) while I code, it goes s
 
 **https://ko-fi.com/nexium_emu**
 
-Thanks to all the testers who put time into quality builds and bug reports, and to everyone who supports the project. Special thanks to Collecting, who is working hard on new titles with me. If a donation isn't in the cards, joining the [Discord](https://discord.gg/HmhB4BBrv9) and testing builds helps just as much.
+Thanks to all the testers who put time into quality builds and bug reports, and to everyone who supports the project. Special thanks to Collecting, who is working hard on new titles with me. If a donation isn't in the cards, joining the [Discord](https://discord.gg/wyPAFNA9gw) and testing builds helps just as much.
 
 ## Thanks
 
