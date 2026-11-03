@@ -80,6 +80,10 @@ impl NativeState {
         let memory = self.memories.get(&image.memory)?;
         Some((memory.address + image.offset, image.layout))
     }
+
+    pub(super) fn memory_address(&self, memory: u32) -> Option<u64> {
+        self.memories.get(&memory).map(|memory| memory.address).filter(|address| *address != 0)
+    }
 }
 
 fn preference(ctx: &IpcCtx) -> (ImageLayout, u32) {

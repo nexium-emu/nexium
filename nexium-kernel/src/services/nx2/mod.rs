@@ -29,7 +29,7 @@ pub struct Graphics {
     presents: u64,
     video: std::collections::HashMap<String, vdec::Decoder>,
     video_sessions: u32,
-    decoder_images: std::collections::HashMap<u32, (u32, u32, u64)>,
+    decoder_images: std::collections::HashMap<u32, (u32, u32, u64, u32)>,
 }
 
 pub(crate) fn dispatch(kernel: &mut Kernel, ctx: &mut IpcCtx, port_name: &str, cmd_id: u32) -> Option<Vec<u8>> {
@@ -127,26 +127,29 @@ fn dump_render_targets(index: u64, renderer: &nexium_gpu::Renderer) {
     let (Some(_), Ok(spec)) = (dump_directory(index), std::env::var("NEXIUM_NX2_DUMP_RTS")) else {
         return;
     };
-    let targets: Vec<(u32, u32, u64)> = match spec.strip_prefix("recent:") {
+    let targets: Vec<(u32, u32, u64, String)> = match spec.strip_prefix("recent:") {
         Some(count) => renderer
-            .recent_render_targets(count.parse().unwrap_or(32))
+            .recent_render_targets(usize::MAX)
             .into_iter()
-            .filter(|key| key.depth <= 1 && !key.is_3d && key.sample_width <= 1 && key.sample_height <= 1)
-            .filter(|key| u64::from(key.width) * u64::from(key.height) <= 2560 * 1440)
-            .map(|key| (key.width, key.height, key.gpu_va))
+            .filter(|(key, _)| key.depth <= 1 && !key.is_3d && key.sample_width <= 1 && key.sample_height <= 1)
+            .filter(|(key, _)| key.width >= 320 && u64::from(key.width) * u64::from(key.height) <= 2560 * 1440)
+            .take(count.parse().unwrap_or(32))
+            .map(|(key, format)| (key.width, key.height, key.gpu_va, format))
             .collect(),
         None => spec
             .split(',')
             .filter_map(|item| {
                 let (size, address) = item.trim().split_once('@')?;
                 let (width, height) = size.split_once('x')?;
-                Some((width.parse().ok()?, height.parse().ok()?, u64::from_str_radix(address.trim_start_matches("0x"), 16).ok()?))
+                Some((width.parse().ok()?, height.parse().ok()?, u64::from_str_radix(address.trim_start_matches("0x"), 16).ok()?, String::new()))
             })
             .collect(),
     };
-    for (width, height, address) in targets {
+    for (width, height, address, format) in targets {
         if let Some((read_width, read_height, rgba)) = renderer.readback_target_scaled_at(0, width, height, address) {
-            write_dump(index, &format!("rt-{address:x}-{width}x{height}-{index:05}.ppm"), read_width, read_height, &rgba);
+            write_dump(index, &format!("rt-{address:x}-{width}x{height}-{format}-{index:05}.ppm"), read_width, read_height, &rgba);
+            let alpha: Vec<u8> = rgba.chunks_exact(4).flat_map(|pixel| [pixel[3], pixel[3], pixel[3], 255]).collect();
+            write_dump(index, &format!("rt-{address:x}-{width}x{height}-{format}-alpha-{index:05}.ppm"), read_width, read_height, &alpha);
         }
     }
 }
@@ -166,14 +169,10 @@ fn write_dump(index: u64, name: &str, width: u32, height: u32, rgba: &[u8]) {
     }
 }
 
-fn peek_memory(kernel: &Kernel) {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let (Some(spec), Some(directory)) = (std::env::var_os("NEXIUM_NX2_PEEK"), std::env::var_os("NEXIUM_NX2_FRAME_DUMP")) else {
+fn peek_memory(kernel: &Kernel, index: u64) {
+    let (Some(spec), Some(directory)) = (std::env::var_os("NEXIUM_NX2_PEEK"), dump_directory(index)) else {
         return;
     };
-    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
     for item in spec.to_string_lossy().split(',') {
         let Some((address, length)) = item.split_once(':') else {
             continue;
@@ -186,7 +185,7 @@ fn peek_memory(kernel: &Kernel) {
         log::info!("[nx2] peek gpu {address:#x} -> cpu {cpu:#x}");
         let mut bytes = vec![0u8; length as usize];
         let _ = kernel.address_space.read(cpu, &mut bytes);
-        let path = std::path::Path::new(&directory).join(format!("peek-{address:x}.bin"));
+        let path = directory.join(format!("peek-{address:x}-{index:05}.bin"));
         if let Err(error) = std::fs::write(&path, &bytes) {
             log::warn!("[nx2] could not write {}: {error}", path.display());
         }

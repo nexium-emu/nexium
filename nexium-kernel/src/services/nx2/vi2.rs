@@ -45,7 +45,7 @@ fn present(kernel: &mut Kernel, image: u32, crop: u32, counter: u32, value: u32)
             !counter
         );
     }
-    super::peek_memory(kernel);
+    super::peek_memory(kernel, presents);
     let renderer = kernel.nvdrv.renderer().cloned();
     let address_space = std::sync::Arc::clone(&kernel.address_space);
     kernel.nvdrv.submit_present_job("nx2-present", move |submit| {
