@@ -1,13 +1,13 @@
-pub(super) const PT: u8 = 7;
+pub(crate) const PT: u8 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Inst {
+pub(crate) struct Inst {
     pub lo: u64,
     pub hi: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Operand {
+pub(crate) enum Operand {
     Reg(u8),
     UReg(u8),
     Imm(u32),
@@ -15,7 +15,7 @@ pub(super) enum Operand {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Source {
+pub(crate) struct Source {
     pub operand: Operand,
     pub neg: bool,
     pub abs: bool,

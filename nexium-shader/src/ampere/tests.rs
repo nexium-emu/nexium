@@ -121,6 +121,55 @@ fn lowers_textured_fragment() {
 }
 
 #[test]
+fn surface_reductions_lower_to_a_discarded_surface_atomic() {
+    let binary = binary(FRAGMENT, &[(0x6000_0c00_0400_759f, 0x000f_e200_0010_e000), EXIT, END]);
+    let words = lowered(&binary);
+    let ops = opcodes(&words);
+    let at = ops.iter().position(|op| *op == Opcode::SUATOM).expect("lowers to SUATOM");
+    assert_eq!(ops[at - 1], Opcode::MOV_cbuf);
+    let atom = words[at];
+    assert_eq!((atom & 0xff, (atom >> 8) & 0xff, (atom >> 20) & 0xff), (0xff, 4, 0));
+    assert_eq!(((atom >> 29) & 0xf, (atom >> 33) & 7, (atom >> 54) & 1), (0, 3, 1));
+    assert_eq!((atom >> 39) & 0xff, u64::from(operand::reg_dest(words[at - 1])));
+}
+
+#[test]
+fn half_texture_results_pack_two_channels_per_register() {
+    let binary = binary(
+        FRAGMENT,
+        &[
+            (0x0000_00ff_0006_7326, 0x040e_0200_000e_001f),
+            (0x0000_00ff_0001_7326, 0x000e_6200_000e_0020),
+            (0x0000_00ff_0005_7326, 0x000e_a200_000e_0021),
+            (0x0000_0006_0006_7308, 0x001e_6400_0000_1000),
+            (0x0000_0001_0604_7220, 0x042f_e200_0041_c000),
+            (0x0000_0005_0605_7220, 0x004f_c800_0041_c000),
+            (0x3080_0805_0400_7b60, 0x100f_c200_041e_8f02),
+            EXIT,
+            END,
+        ],
+    );
+    let words = lowered(&binary);
+    assert_eq!(
+        &opcodes(&words)[7..15],
+        &[
+            Opcode::TEX_b,
+            Opcode::F2F_reg,
+            Opcode::F2F_reg,
+            Opcode::LEA_lo_reg,
+            Opcode::F2F_reg,
+            Opcode::F2F_reg,
+            Opcode::LEA_lo_reg,
+            Opcode::EXIT
+        ]
+    );
+    let staging = operand::reg_dest(words[7]);
+    assert_eq!((operand::reg_b(words[8]), operand::reg_b(words[9])), (staging + 1, staging));
+    assert_eq!((operand::reg_dest(words[10]), operand::reg_dest(words[13])), (0, 2));
+    assert_eq!((operand::reg_b(words[11]), operand::reg_b(words[12])), (staging + 3, staging + 2));
+}
+
+#[test]
 fn splits_scalar_texture_sources() {
     let binary = binary(
         FRAGMENT,

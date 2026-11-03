@@ -194,7 +194,7 @@ fn branch_index(index: usize, inst: &Inst, count: usize) -> Option<usize> {
     valid.then_some(target as usize / INSTRUCTION_SIZE)
 }
 
-fn touches_uniforms(inst: &Inst) -> bool {
+pub(crate) fn touches_uniforms(inst: &Inst) -> bool {
     matches!(inst.form(), 6 | 7)
         || (0x080..0x0c0).contains(&inst.alu_opcode())
         || matches!(inst.alu_opcode(), 0x1c2 | 0x1c3)
@@ -210,7 +210,7 @@ fn native_limit(instructions: &[Inst]) -> u8 {
     (UNIFORM_PREDICATES - (highest + 4).min(URZ)) & !3
 }
 
-fn highest_uniform(inst: &Inst) -> Option<u8> {
+pub(crate) fn highest_uniform(inst: &Inst) -> Option<u8> {
     let fields: &[(u32, u32)] = if (0x080..0x0c0).contains(&inst.alu_opcode()) {
         if inst.form() == 1 { &[(16, 8), (24, 8), (32, 8), (64, 8)] } else { &[(16, 8), (24, 8), (64, 8)] }
     } else if matches!(inst.alu_opcode(), 0x1c2 | 0x1c3) || inst.opcode() == 0x3c4 {
@@ -223,6 +223,10 @@ fn highest_uniform(inst: &Inst) -> Option<u8> {
         &[]
     };
     fields.iter().map(|&(start, len)| inst.field(start, len) as u8).filter(|&index| index < URZ).max()
+}
+
+fn to_half(source: u8, dst: u8) -> Word {
+    Word::new(Opcode::F2F_reg).dst(dst).b(source).set(8, 2, 1).set(10, 2, 2)
 }
 
 fn uniform_datapath(inst: &Inst) -> bool {
@@ -593,6 +597,7 @@ impl Lowering {
             0xb6f => self.txq(),
             0xb97 => self.suld(),
             0xb9b => self.sust(),
+            0x59f => self.sured(),
             0x984 => self.shared(true),
             0x388 => self.shared(false),
             0xb1d => self.barrier(),
@@ -982,21 +987,32 @@ impl Lowering {
         let low = self.slot32()?;
         let low = self.register(low.operand)?;
         let high = self.scratch(2)?;
-        let to_half = |source: u8, dst: u8| Word::new(Opcode::F2F_reg).dst(dst).b(source).set(8, 2, 1).set(10, 2, 2);
         if inst.bit(78) {
             self.copy(high, self.reg(inst.reg(64))?);
         } else {
             self.emit(to_half(self.reg(inst.reg(24))?, high));
         }
         self.emit(to_half(low, high + 1));
+        self.emit_half2_join(dst, high, high + 1);
+        Ok(())
+    }
+
+    fn emit_half2_join(&mut self, dst: u8, high: u8, low: u8) {
         self.emit(
             Word::new(Opcode::LEA_lo_reg)
                 .dst(dst)
                 .a(high)
-                .b(high + 1)
+                .b(low)
                 .set(39, 5, 16)
                 .set(48, 3, u64::from(PT)),
         );
+    }
+
+    fn pack_half2(&mut self, dst: u8, low: u8, high: u8) -> Result<(), Error> {
+        let halves = self.scratch(2)?;
+        self.emit(to_half(high, halves));
+        self.emit(to_half(low, halves + 1));
+        self.emit_half2_join(dst, halves, halves + 1);
         Ok(())
     }
 
@@ -2592,23 +2608,47 @@ impl Lowering {
         }
         let offsets = inst.bit(76);
         let compare = inst.bit(78);
+        let half_results = inst.field(79, 2) != 0;
         let extras = u8::from(lod >= 2) + u8::from(offsets) + u8::from(compare);
         let components = self.texture_components(coordinates, extras)?;
-        let targets = self.texture_targets(mask)?;
         let coordinate_base = self.vector(&components[..usize::from(coordinates)])?;
         let handle = self.texture_handle(&components[usize::from(coordinates)..])?;
-        self.texture_result(
-            Word::new(Opcode::TEX_b)
-                .a(coordinate_base)
-                .b(handle)
-                .set(28, 3, tex_type)
-                .set(31, 4, u64::from(mask))
-                .flag(36, offsets)
-                .set(37, 3, lod)
-                .flag(50, compare)
-                .set(51, 3, u64::from(PT)),
-            &targets,
-        )
+        let word = Word::new(Opcode::TEX_b)
+            .a(coordinate_base)
+            .b(handle)
+            .set(28, 3, tex_type)
+            .set(31, 4, u64::from(mask))
+            .flag(36, offsets)
+            .set(37, 3, lod)
+            .flag(50, compare)
+            .set(51, 3, u64::from(PT));
+        if half_results {
+            return self.texture_half_result(word, mask);
+        }
+        let targets = self.texture_targets(mask)?;
+        self.texture_result(word, &targets)
+    }
+
+    fn texture_half_result(&mut self, word: Word, mask: u8) -> Result<(), Error> {
+        let count = mask.count_ones() as u8;
+        let (dst0, dst1) = (self.inst.dst(), self.inst.reg(64));
+        let staging = self.scratch(count)?;
+        self.emit(word.dst(staging));
+        for index in 0..count.div_ceil(2) {
+            let target = match index {
+                0 => dst0,
+                _ if dst1 != RZ => dst1,
+                _ => offset_register(dst0, 1),
+            };
+            let target = self.reg(target)?;
+            if target == RZ {
+                continue;
+            }
+            let low = staging + 2 * index;
+            let high = if 2 * index + 1 < count { low + 1 } else { RZ };
+            self.pack_half2(target, low, high)?;
+        }
+        Ok(())
     }
 
     fn tld4(&mut self) -> Result<(), Error> {
@@ -2617,7 +2657,7 @@ impl Lowering {
         let offsets = inst.field(76, 2) as u8;
         if inst.field(61, 3) != 1
             || offsets == 3
-            || inst.field(78, 2) != 0
+            || inst.bit(78)
             || inst.field(81, 3) != u64::from(PT)
             || inst.bit(59)
             || inst.bit(89)
@@ -2626,20 +2666,21 @@ impl Lowering {
             return self.unsupported();
         }
         let components = self.texture_components(2, offsets)?;
-        let targets = self.texture_targets(mask)?;
         let coordinate_base = self.vector(&components[..2])?;
         let handle = self.texture_handle(&components[2..])?;
-        self.texture_result(
-            Word::new(Opcode::TLD4_b)
-                .a(coordinate_base)
-                .b(handle)
-                .set(28, 3, 2)
-                .set(31, 4, u64::from(mask))
-                .set(36, 2, u64::from(offsets))
-                .set(38, 2, inst.field(87, 2))
-                .set(51, 3, u64::from(PT)),
-            &targets,
-        )
+        let word = Word::new(Opcode::TLD4_b)
+            .a(coordinate_base)
+            .b(handle)
+            .set(28, 3, 2)
+            .set(31, 4, u64::from(mask))
+            .set(36, 2, u64::from(offsets))
+            .set(38, 2, inst.field(87, 2))
+            .set(51, 3, u64::from(PT));
+        if inst.field(79, 2) != 0 {
+            return self.texture_half_result(word, mask);
+        }
+        let targets = self.texture_targets(mask)?;
+        self.texture_result(word, &targets)
     }
 
     fn tld(&mut self) -> Result<(), Error> {
@@ -2652,22 +2693,23 @@ impl Lowering {
             _ => return self.unsupported(),
         };
         let mask = inst.field(72, 4) as u8;
-        if mask == 0 || inst.field(87, 3) != 1 || inst.field(76, 5) != 0 || inst.field(81, 3) != u64::from(PT) || inst.bit(59) {
+        if mask == 0 || inst.field(87, 3) != 1 || inst.field(76, 3) != 0 || inst.field(81, 3) != u64::from(PT) || inst.bit(59) {
             return self.unsupported();
         }
         let components = self.texture_components(coordinates, 0)?;
-        let targets = self.texture_targets(mask)?;
         let coordinate_base = self.vector(&components)?;
         let handle = self.texture_handle(&[])?;
-        self.texture_result(
-            Word::new(Opcode::TLD_b)
-                .a(coordinate_base)
-                .b(handle)
-                .set(28, 3, tex_type)
-                .set(31, 4, u64::from(mask))
-                .set(51, 3, u64::from(PT)),
-            &targets,
-        )
+        let word = Word::new(Opcode::TLD_b)
+            .a(coordinate_base)
+            .b(handle)
+            .set(28, 3, tex_type)
+            .set(31, 4, u64::from(mask))
+            .set(51, 3, u64::from(PT));
+        if inst.field(79, 2) != 0 {
+            return self.texture_half_result(word, mask);
+        }
+        let targets = self.texture_targets(mask)?;
+        self.texture_result(word, &targets)
     }
 
     fn txq(&mut self) -> Result<(), Error> {
@@ -2712,6 +2754,28 @@ impl Lowering {
                 .set(20, 4, mask)
                 .set(33, 3, dimension)
                 .c(handle),
+        );
+        Ok(())
+    }
+
+    fn sured(&mut self) -> Result<(), Error> {
+        let inst = self.inst;
+        let dimension = inst.field(61, 3);
+        if inst.field(73, 3) != 0 || inst.field(59, 2) != 0 {
+            return self.unsupported();
+        }
+        let coordinates = self.surface_coordinates(dimension)?;
+        let data = self.reg(inst.reg(32))?;
+        let handle = self.texture_handle(&[])?;
+        self.emit(
+            Word::new(Opcode::SUATOM)
+                .dst(RZ)
+                .a(coordinates)
+                .b(data)
+                .set(29, 4, inst.field(87, 3))
+                .set(33, 3, dimension)
+                .c(handle)
+                .flag(54, true),
         );
         Ok(())
     }
