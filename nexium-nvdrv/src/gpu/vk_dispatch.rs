@@ -7649,6 +7649,8 @@ fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
             | nexium_gpu::texture::TicFormat::Z32
             | nexium_gpu::texture::TicFormat::Z16
             | nexium_gpu::texture::TicFormat::Z24S8
+            | nexium_gpu::texture::TicFormat::S8Z24
+            | nexium_gpu::texture::TicFormat::X8Z24
             | nexium_gpu::texture::TicFormat::G24R8
             | nexium_gpu::texture::TicFormat::B10G11R11
             | nexium_gpu::texture::TicFormat::Unknown(47)
@@ -18418,11 +18420,11 @@ fn derive_draw_template(
     enq_phase_started = super::pusher::kickprof::start();
     let mut enq_tex_sub = super::pusher::kickprof::start();
     let vs_spirv = bundle.vs_spirv.clone();
-    let solid_fs_probe = fs_solid_probe_matches(fs_addr);
-    let fs_spirv = if solid_fs_probe {
-        std::sync::Arc::new(solid_red_fs_spirv())
-    } else {
-        bundle.fs_spirv.clone()
+    let solid_fs_mask = fs_solid_probe_mask(fs_addr);
+    let solid_fs_probe = solid_fs_mask.is_some();
+    let fs_spirv = match solid_fs_mask {
+        Some(mask) => std::sync::Arc::new(solid_fs_spirv(mask)),
+        None => bundle.fs_spirv.clone(),
     };
     let fs_hash = effective_fragment_pipeline_hash(bundle.fs_hash, &fs_spirv, solid_fs_probe);
     let geometry = if geometry_enabled {
@@ -25916,9 +25918,9 @@ fn ps_writes_depth(sph: [u8; SPH_SIZE]) -> bool {
     sph[0x4c] & 2 != 0
 }
 
-fn fs_solid_probe_matches(fs_addr: u64) -> bool {
+fn fs_solid_probe_mask(fs_addr: u64) -> Option<u32> {
     use std::sync::OnceLock;
-    static CFG: OnceLock<(bool, bool, Vec<u64>)> = OnceLock::new();
+    static CFG: OnceLock<(bool, bool, Vec<(u64, u32)>)> = OnceLock::new();
     let (enabled, all, list) = CFG.get_or_init(|| {
         let Ok(raw) = std::env::var("NEXIUM_FS_SOLID") else {
             return (false, false, Vec::new());
@@ -25928,12 +25930,31 @@ fn fs_solid_probe_matches(fs_addr: u64) -> bool {
             Vec::new()
         } else {
             raw.split(',')
-                .filter_map(|part| parse_env_u64(part.trim()))
+                .filter_map(|part| {
+                    let (address, mask) = part.trim().split_once(':').unwrap_or((part.trim(), "1"));
+                    Some((parse_env_u64(address)?, mask.parse().ok()?))
+                })
                 .collect()
         };
         (true, all, list)
     });
-    *enabled && (*all || list.contains(&fs_addr))
+    if !*enabled {
+        return None;
+    }
+    if *all {
+        return Some(1);
+    }
+    list.iter().find(|(address, _)| *address == fs_addr).map(|&(_, mask)| mask)
+}
+
+fn solid_fs_spirv(mask: u32) -> Vec<u32> {
+    let mut words = solid_red_fs_spirv();
+    if let Some(at) = words.iter().position(|&word| word == (7 << 16) | 44) {
+        for channel in 0..3 {
+            words[at + 3 + channel] = if mask >> channel & 1 != 0 { 7 } else { 8 };
+        }
+    }
+    words
 }
 
 fn effective_fragment_pipeline_hash(bundle_hash: u64, spirv: &[u32], overridden: bool) -> u64 {
@@ -34686,6 +34707,13 @@ mod tests {
             effective_fragment_pipeline_hash(bundle_hash, &spirv, true),
             replacement_hash
         );
+        let composite = |words: &[u32]| {
+            let at = words.iter().position(|&word| word == (7 << 16) | 44).unwrap();
+            words[at + 3..at + 7].to_vec()
+        };
+        assert_eq!(composite(&spirv), [7, 8, 8, 7]);
+        assert_eq!(composite(&super::solid_fs_spirv(1)), [7, 8, 8, 7]);
+        assert_eq!(composite(&super::solid_fs_spirv(6)), [8, 7, 7, 7]);
     }
 
     #[test]
@@ -37742,6 +37770,9 @@ mod tests {
             super::with_tic_rt_alias_layout(RtKey::new(1, 1, 1, tic.gpu_va), &tic).layout_signature,
             1
         );
+        for format in [TicFormat::S8Z24, TicFormat::X8Z24, TicFormat::Z24S8] {
+            assert!(tic_can_alias_render_target_view(&nexium_gpu::texture::TicEntry { format, ..tic }));
+        }
     }
 
     #[test]

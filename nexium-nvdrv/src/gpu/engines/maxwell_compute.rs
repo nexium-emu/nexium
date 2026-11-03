@@ -316,6 +316,8 @@ fn raw_storage_buffer_pointer_va(
         .ok_or_else(|| "raw compute buffer pointer address overflow".to_string())
 }
 
+const NULL_RAW_STORAGE_BYTES: usize = 4096;
+
 fn resolve_raw_storage_buffer(
     descriptor_index: usize,
     descriptor: nexium_shader::StorageBufferAddr,
@@ -360,7 +362,10 @@ fn resolve_raw_storage_buffer(
             u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize,
         )
     };
-    if base == 0 || size == 0 || size > MAX_RESOURCE_BYTES {
+    if base == 0 || size == 0 {
+        return Ok(ResolvedRawStorageBuffer { base: 0, size: 0 });
+    }
+    if size > MAX_RESOURCE_BYTES {
         return Err(format!(
             "raw compute buffer {descriptor_index} has invalid base/size {base:#x}/{size:#x}"
         ));
@@ -1979,7 +1984,7 @@ fn prepare_and_execute(
     static DUMP_SASS_DIR: std::sync::OnceLock<Option<std::ffi::OsString>> =
         std::sync::OnceLock::new();
     if let Some(dir) = DUMP_SASS_DIR.get_or_init(|| std::env::var_os("NEXIUM_DUMP_COMPUTE_SASS")) {
-        let path = std::path::Path::new(dir).join(format!("cs_{:x}.bin", qmd[0x08]));
+        let path = std::path::Path::new(dir).join(format!("cs_{code_gpu:x}.bin"));
         if !path.exists() {
             let _ = std::fs::write(path, code.as_slice());
         }
@@ -2080,7 +2085,11 @@ fn prepare_and_execute(
             (ResourceAccess::Sampled, _) => ComputeResourceKind::SampledImage,
             (
                 ResourceAccess::FilteredSample,
-                ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube,
+                ImageDimension::D2
+                | ImageDimension::D2Array
+                | ImageDimension::D3
+                | ImageDimension::Cube
+                | ImageDimension::CubeArray,
             ) => ComputeResourceKind::CombinedSampledImage,
             (ResourceAccess::FilteredSample, other) => {
                 return Err(
@@ -2242,6 +2251,11 @@ fn prepare_and_execute(
             mem_read,
         )?;
         resolved_storage_buffers.push(storage);
+        if storage.size == 0 {
+            raw_storage_ranges.push((0, 0));
+            raw_storage_keys.push(None);
+            continue;
+        }
         let base = storage.base;
         let size = raw_storage_snapshot_size(
             storage.size, *descriptor, frontend.writable_storage_buffers[index],
@@ -2356,6 +2370,20 @@ fn prepare_and_execute(
     let mut output_targets: Vec<OutputTarget> = Vec::new();
 
     for (index, &(aligned, byte_len)) in raw_storage_ranges.iter().enumerate() {
+        if byte_len == 0 {
+            texel_buffers.push(ComputeTexelBuffer {
+                bindings: vec![nexium_spirv::COMPUTE_STORAGE_BUFFER_BINDING_BASE + index as u32],
+                bytes: vec![0; NULL_RAW_STORAGE_BYTES],
+                byte_len: NULL_RAW_STORAGE_BYTES,
+                format: ComputeTexelFormat::R32Uint,
+                raw: true,
+                raw_storage_key: None,
+                writable: false,
+                requires_atomics: false,
+                graphics_storage: None,
+            });
+            continue;
+        }
         let raw_storage_key = raw_storage_keys[index];
         let bytes =
             if raw_storage_leases[index].is_some() {
@@ -2590,7 +2618,11 @@ fn prepare_and_execute(
                 if resource.metadata.kind != ComputeResourceKind::CombinedSampledImage
                     || !matches!(
                         resource.metadata.dimension,
-                        ImageDimension::D2 | ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube
+                        ImageDimension::D2
+                            | ImageDimension::D2Array
+                            | ImageDimension::D3
+                            | ImageDimension::Cube
+                            | ImageDimension::CubeArray
                     )
                     || (resource.metadata.dimension == ImageDimension::Cube
                         && resource.tic.depth != 1)
@@ -2602,7 +2634,7 @@ fn prepare_and_execute(
                     )
                     .into());
                 }
-                if resource.metadata.dimension == ImageDimension::Cube
+                if matches!(resource.metadata.dimension, ImageDimension::Cube | ImageDimension::CubeArray)
                     && (resource.tic.width != resource.tic.height
                         || resource.tic.block_width_log2 != 0
                         || resource.tic.block_depth_log2 != 0
@@ -2799,13 +2831,9 @@ fn prepare_and_execute(
                     .into());
                 }
                 if let Some(target) = output_targets.iter().copied().find(|target| {
-                    mapped_resources_overlap(
-                        gpu_va,
-                        cpu_addr,
-                        guest_size,
-                        target.gpu_va,
-                        target.cpu_addr,
-                        target.guest_size,
+                    storage_images_overlap(
+                        (&resource.tic, subresource, gpu_va, cpu_addr, guest_size),
+                        (&target.tic, target.subresource, target.gpu_va, target.cpu_addr, target.guest_size),
                     )
                 }) {
                     return Err(format!(
@@ -2944,7 +2972,9 @@ fn prepare_and_execute(
             let value = value.trim();
             !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
         })
-    }) {
+    }) && std::env::var_os("NEXIUM_DRAW_TRACE_TRIGGER_FILE")
+        .is_none_or(|path| std::path::Path::new(&path).is_file())
+    {
         let sampled_rt_summary = dispatch
             .sampled_rts
             .iter()
@@ -3747,6 +3777,7 @@ fn null_tic(dimension: Option<ImageDimension>) -> TicEntry {
         is_block_linear: true,
         texture_type: match dimension {
             Some(ImageDimension::Cube) => 3,
+            Some(ImageDimension::CubeArray) => 8,
             Some(ImageDimension::D3) => 2,
             Some(ImageDimension::D1) => 0,
             _ => 1,
@@ -3826,6 +3857,7 @@ fn image_dimension(tic: &TicEntry) -> Result<ImageDimension, String> {
             7 if tic.pitch_bytes != 0 => ImageDimension::D2,
             2 => ImageDimension::D3,
             3 => ImageDimension::Cube,
+            8 => ImageDimension::CubeArray,
             other => {
                 return Err(format!(
                     "unsupported Maxwell compute TIC texture type {other}"
@@ -3846,7 +3878,7 @@ fn image_depth(tic: &TicEntry) -> u32 {
 fn validate_image_view(tic: &TicEntry, storage: bool) -> Result<(), String> {
     validate_pitch_linear_layout(tic)?;
     let supported_type = matches!(tic.texture_type, 1 | 2)
-        || (tic.texture_type == 3 && !storage)
+        || (matches!(tic.texture_type, 3 | 8) && !storage)
         || (tic.texture_type == 5 && (!storage || tic.is_block_linear))
         || (tic.texture_type == 7 && tic.pitch_bytes != 0);
     let layered_2d_view = matches!(tic.texture_type, 1 | 5)
@@ -3881,7 +3913,7 @@ fn validate_image_view(tic: &TicEntry, storage: bool) -> Result<(), String> {
     let effective_block_linear =
         tic.is_block_linear && !nexium_gpu::pitch_oracle::is_pitch_dst(tic.gpu_va);
     if mip_levels > 1
-        && (!matches!(tic.texture_type, 1 | 3 | 5)
+        && (!matches!(tic.texture_type, 1 | 3 | 5 | 8)
             || !effective_block_linear
             || tic.block_width_log2 != 0
             || tic.block_depth_log2 != 0
@@ -3913,9 +3945,6 @@ fn image_view_subresources(
         } else {
             1
         };
-        if layers > 1 && tic.mip_levels() > 1 {
-            return Err(format!("unsupported Maxwell compute mipmapped array storage view: {tic:?}"));
-        }
         let base = tic.view_base_mip() as usize;
         let count = if storage {
             1
@@ -3953,7 +3982,7 @@ fn image_view_subresources(
             .collect());
     }
 
-    if !matches!(tic.texture_type, 3 | 5)
+    if !matches!(tic.texture_type, 3 | 5 | 8)
         && (tic.view_base_mip() != 0 || tic.view_mip_levels() != 1 || tic.mip_levels() != 1)
     {
         return Err(format!(
@@ -4368,6 +4397,57 @@ fn storage_layer_span(
     Ok((layer_stride, layer_size))
 }
 
+fn storage_layer_gap(target: &OutputTarget) -> Result<Option<(usize, usize)>, String> {
+    storage_subresource_layer_gap(&target.tic, target.subresource)
+}
+
+fn storage_subresource_layer_gap(
+    tic: &TicEntry,
+    subresource: ImageSubresourceLayout,
+) -> Result<Option<(usize, usize)>, String> {
+    if !matches!(tic.texture_type, 3 | 5 | 8)
+        || subresource.depth <= 1
+        || !tic.is_block_linear
+        || nexium_gpu::pitch_oracle::is_pitch_dst(tic.gpu_va)
+    {
+        return Ok(None);
+    }
+    let (layer_stride, layer_size) = storage_layer_span(tic, subresource)?;
+    Ok((layer_size < layer_stride).then_some((layer_stride, layer_size)))
+}
+
+fn storage_layer_ranges(
+    tic: &TicEntry,
+    subresource: ImageSubresourceLayout,
+    guest_size: usize,
+) -> Vec<(u64, usize)> {
+    match storage_subresource_layer_gap(tic, subresource) {
+        Ok(Some((stride, size))) => (0..subresource.depth as u64)
+            .map(|layer| (layer * stride as u64, size))
+            .collect(),
+        _ => vec![(0, guest_size)],
+    }
+}
+
+fn storage_images_overlap(
+    a: (&TicEntry, ImageSubresourceLayout, u64, u64, usize),
+    b: (&TicEntry, ImageSubresourceLayout, u64, u64, usize),
+) -> bool {
+    let b_ranges = storage_layer_ranges(b.0, b.1, b.4);
+    storage_layer_ranges(a.0, a.1, a.4).into_iter().any(|(a_offset, a_size)| {
+        b_ranges.iter().any(|&(b_offset, b_size)| {
+            mapped_resources_overlap(
+                a.2 + a_offset,
+                a.3 + a_offset,
+                a_size,
+                b.2 + b_offset,
+                b.3 + b_offset,
+                b_size,
+            )
+        })
+    })
+}
+
 fn resource_size(tic: &TicEntry) -> Result<usize, String> {
     validate_pitch_linear_layout(tic)?;
     let depth = image_depth(tic) as usize;
@@ -4394,6 +4474,9 @@ fn resource_size(tic: &TicEntry) -> Result<usize, String> {
     } else if effective_block_linear && tic.texture_type == 3 {
         texture_guest_size_bytes(tic, 6)
             .ok_or_else(|| "invalid Maxwell block-linear cube allocation".to_string())?
+    } else if effective_block_linear && tic.texture_type == 8 {
+        texture_guest_size_bytes(tic, tic.depth.max(1) * 6)
+            .ok_or_else(|| "invalid Maxwell block-linear cube-array allocation".to_string())?
     } else if effective_block_linear {
         block_linear_byte_size_3d(
             storage_width,
@@ -4405,7 +4488,12 @@ fn resource_size(tic: &TicEntry) -> Result<usize, String> {
             tic.tile_width_spacing,
         )
     } else {
-        let layers = match tic.texture_type { 3 => 6, 5 => tic.depth.max(1) as usize, _ => depth };
+        let layers = match tic.texture_type {
+            3 => 6,
+            5 => tic.depth.max(1) as usize,
+            8 => tic.depth.max(1) as usize * 6,
+            _ => depth,
+        };
         tight_layer
             .checked_mul(layers)
             .ok_or_else(|| "Maxwell compute resource depth size overflow".to_string())?
@@ -4902,7 +4990,20 @@ fn write_storage_image_guest(
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Result<(), String> {
     if write.target.tic.pitch_bytes == 0 {
-        if mem_write(write.target.cpu_addr, &write.bytes) {
+        let written = match storage_layer_gap(&write.target)? {
+            Some((layer_stride, layer_size)) => write
+                .bytes
+                .chunks(layer_stride)
+                .enumerate()
+                .all(|(layer, chunk)| {
+                    mem_write(
+                        write.target.cpu_addr + (layer * layer_stride) as u64,
+                        &chunk[..layer_size.min(chunk.len())],
+                    )
+                }),
+            None => mem_write(write.target.cpu_addr, &write.bytes),
+        };
+        if written {
             return Ok(());
         }
         return Err(format!(
@@ -5333,7 +5434,10 @@ fn write_back_outputs(
         if write.target.gpu_va != write.target.tic.gpu_va {
             renderer.invalidate_texture_address(write.target.tic.gpu_va);
         }
-        if write_result.is_ok() && write.target.tic.pitch_bytes == 0 {
+        if write_result.is_ok()
+            && write.target.tic.pitch_bytes == 0
+            && matches!(storage_layer_gap(&write.target), Ok(None))
+        {
             vk_dispatch::seed_texture_snapshot(mappings, write.target.gpu_va, std::mem::take(&mut write.bytes));
         }
     }
@@ -6795,12 +6899,17 @@ mod tests {
         assert_eq!(layout.layer_stride, 3584);
         assert_eq!(texture_guest_size_bytes(&tic, 6), Some(3584 * 6));
         assert_eq!(resource_size(&tic).unwrap(), 3584 * 6);
+        let cube_array = TicEntry { texture_type: 8, depth: 2, ..tic };
+        assert_eq!(image_dimension(&cube_array), Ok(ImageDimension::CubeArray));
+        validate_image_view(&cube_array, false).unwrap();
+        assert!(validate_image_view(&cube_array, true).is_err());
+        assert_eq!(resource_size(&cube_array).unwrap(), 3584 * 12);
         let array = TicEntry { texture_type: 5, depth: 4, ..tic };
         assert_eq!(image_dimension(&array), Ok(ImageDimension::D2Array));
         validate_image_view(&array, false).unwrap();
         validate_image_view(&array, true).unwrap();
         assert!(validate_image_view(&TicEntry { is_block_linear: false, ..array }, true).is_err());
-        assert!(image_view_subresources(&array, true).is_err());
+        assert_eq!(image_view_subresources(&array, true).unwrap()[0].guest_size, 3584 * 3 + 2048);
         assert_eq!(resource_size(&array).unwrap(), 3584 * 4);
         assert_eq!(image_view_subresources(&array, false).unwrap()[0].guest_size, 3584 * 4);
         let subresources = image_view_subresources(&tic, false).unwrap();
@@ -7208,6 +7317,80 @@ mod tests {
         let readback = linearize_storage_image(&tic, subresource, format, guest)
             .expect("tight array readback");
         assert_eq!(readback, tight);
+    }
+
+    #[test]
+    fn mipmapped_array_storage_writeback_skips_other_mips() {
+        use nexium_gpu::texture::{SwizzleSource, TicFormat};
+
+        let tic = TicEntry {
+            format: TicFormat::R16G16,
+            component_types: [ComponentType::Float; 4],
+            swizzle: [SwizzleSource::R, SwizzleSource::G, SwizzleSource::Zero, SwizzleSource::One],
+            gpu_va: 0x1234_0000,
+            width: 64,
+            height: 64,
+            block_width_log2: 0,
+            block_height_log2: 3,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 0,
+            is_block_linear: true,
+            texture_type: 5,
+            depth: 3,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
+            max_mip_level: 2,
+            res_min_mip_level: 1,
+            res_max_mip_level: 1,
+        };
+        validate_image_view(&tic, true).expect("mipmapped 2D-array storage view");
+        let format = storage_format(&tic).unwrap();
+        let subresource = storage_subresource(&tic).expect("mip 1 array subresource");
+        assert_eq!((subresource.mip_level, subresource.width, subresource.depth), (1, 32, 3));
+        let target = OutputTarget {
+            resource_index: 0,
+            binding: 0,
+            tic,
+            subresource,
+            gpu_va: tic.gpu_va + subresource.guest_offset as u64,
+            cpu_addr: 0x10_0000,
+            guest_size: subresource.guest_size,
+            format,
+        };
+        let (layer_stride, layer_size) = storage_layer_gap(&target)
+            .unwrap()
+            .expect("mip 1 layers leave gaps for the other mips");
+        let tight = vec![0xabu8; 32 * 32 * 4 * 3];
+        let bytes = delinearize_storage_image(&tic, subresource, format, tight).unwrap();
+        let write = PreparedWrite { target, bytes };
+        let spans = std::cell::RefCell::new(Vec::new());
+        write_storage_image_guest(&write, &|addr, data| {
+            spans.borrow_mut().push((addr, data.len()));
+            true
+        })
+        .expect("per-layer writeback");
+        let expected: Vec<_> = (0..3)
+            .map(|layer| (0x10_0000 + (layer * layer_stride) as u64, layer_size))
+            .collect();
+        assert_eq!(spans.into_inner(), expected);
+
+        let mip2_tic = TicEntry { res_min_mip_level: 2, res_max_mip_level: 2, ..tic };
+        let mip2 = storage_subresource(&mip2_tic).expect("mip 2 array subresource");
+        let mip1_va = tic.gpu_va + subresource.guest_offset as u64;
+        let mip2_va = tic.gpu_va + mip2.guest_offset as u64;
+        assert!(ranges_overlap(mip1_va, subresource.guest_size, mip2_va, mip2.guest_size));
+        assert!(!storage_images_overlap(
+            (&tic, subresource, mip1_va, mip1_va, subresource.guest_size),
+            (&mip2_tic, mip2, mip2_va, mip2_va, mip2.guest_size),
+        ));
+        assert!(storage_images_overlap(
+            (&tic, subresource, mip1_va, mip1_va, subresource.guest_size),
+            (&tic, subresource, mip1_va, mip1_va, subresource.guest_size),
+        ));
     }
 
     fn pitch_r8_tic() -> TicEntry {

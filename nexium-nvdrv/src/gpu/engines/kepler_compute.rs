@@ -331,14 +331,20 @@ impl KeplerCompute {
                     }
                 }
                 super::maxwell_compute::MaxwellComputeOutcome::Unsupported(reason) => {
-                    use std::sync::atomic::{AtomicU64, Ordering};
                     backend = "unsupported";
-                    static RECOMPILER_SKIPS: AtomicU64 = AtomicU64::new(0);
-                    let skipped = RECOMPILER_SKIPS.fetch_add(1, Ordering::Relaxed);
-                    if skipped < 24 {
+                    static RECOMPILER_SKIPS: std::sync::Mutex<
+                        std::collections::BTreeMap<String, u64>,
+                    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+                    let skipped = {
+                        let mut skips = RECOMPILER_SKIPS.lock().unwrap();
+                        let count = skips.entry(reason.to_string()).or_default();
+                        *count += 1;
+                        *count
+                    };
+                    if skipped.is_power_of_two() {
                         log::warn!(
-                            "[compute-recompiler-skip #{}] program={:#x} reason={}",
-                            skipped + 1,
+                            "[compute-recompiler-skip x{}] program={:#x} reason={}",
+                            skipped,
                             self.launch_description[0x08],
                             reason
                         );
