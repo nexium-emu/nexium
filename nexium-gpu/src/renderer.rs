@@ -9809,19 +9809,15 @@ impl Renderer {
             .newest_exact_present_key_at_vas(nvmap_id, width, height, gpu_vas)
     }
 
-    pub fn recent_render_targets(&self, limit: usize) -> Vec<RtKey> {
+    pub fn recent_render_targets(&self, limit: usize) -> Vec<(RtKey, String)> {
         let mut inner = self.inner.lock();
         let mut all = inner.rt_cache.debug_all();
-        all.retain(|(key, stamp)| {
-            *stamp != 0
-                && inner.rt_cache.get_existing(*key).is_some_and(|rt| matches!(rt.format,
-                    vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_UNORM
-                    | vk::Format::B8G8R8A8_SRGB | vk::Format::A2B10G10R10_UNORM_PACK32
-                    | vk::Format::B10G11R11_UFLOAT_PACK32 | vk::Format::R16G16B16A16_SFLOAT
-                    | vk::Format::R16G16_SFLOAT | vk::Format::R16_SFLOAT | vk::Format::R32_SFLOAT
-                    | vk::Format::R8_UNORM | vk::Format::R8G8_UNORM | vk::Format::R16G16_UNORM))
-        });
-        all.into_iter().rev().take(limit).map(|(key, _)| key).collect()
+        all.retain(|(_, stamp)| *stamp != 0);
+        all.into_iter()
+            .rev()
+            .take(limit)
+            .filter_map(|(key, _)| Some((key, format!("{:?}", inner.rt_cache.get_existing(key)?.format))))
+            .collect()
     }
 
     pub fn render_target_at_va(&self, nvmap_id: u32, gpu_va: u64) -> Option<(RtKey, u64)> {
@@ -12117,7 +12113,7 @@ impl Renderer {
                 .unwrap_or_default();
             let mip_overlay_needs_validation =
                 texture_mip_overlay_needs_validation(tex_cache.get(&key), &rt_mips);
-            let volume_slices = if key.volume
+            let volume_slices = if texture_layers_from_render_targets(&key, &tic, sampled_rt_key_for_slot(call, slot).is_some())
                 && !identity_volume
                 && numeric_type == nexium_spirv::TextureNumericType::Float
             {
@@ -15376,7 +15372,7 @@ impl Renderer {
                     record_tex_sub_add(0, rp_sub_t0);
                     let rp_sub_t0 = record_detail_profile.then(std::time::Instant::now);
                     let identity_volume = key.volume && volume_identity_enabled();
-                    let volume_slices = if key.volume
+                    let volume_slices = if texture_layers_from_render_targets(&key, &tic, sampled_rt_key_for_slot(call, slot).is_some())
                         && !identity_volume
                         && numeric_type == nexium_spirv::TextureNumericType::Float
                     {
@@ -23343,8 +23339,8 @@ fn execute_compute_dispatch_mode(
     for sampled in &dispatch.sampled_rts {
         let numeric_type = sampled.sample_type.spirv_type();
         let is_3d = tic_is_volume(&sampled.tic);
-        let is_cube = tic_is_cube(&sampled.tic);
-        let is_array = sampled.tic.texture_type == 5;
+        let is_cube = tic_is_cube(&sampled.tic) || tic_is_cube_array(&sampled.tic);
+        let is_array = sampled.tic.texture_type == 5 || tic_is_cube_array(&sampled.tic);
         let depth = if is_3d || is_array { sampled.tic.depth.max(1) } else { 1 };
         let cross_access_output = compute_cross_access_output_index(&dispatch, sampled.binding);
         let live_view_compatible = sampled.tic.mip_levels() == 1
@@ -23661,7 +23657,10 @@ fn execute_compute_dispatch_mode(
                         sampled.binding
                     ));
                 }
-                if is_cube && (sampled.tic.width != sampled.tic.height || sampled.tic.depth != 1) {
+                if is_cube
+                    && (sampled.tic.width != sampled.tic.height
+                        || (!is_array && sampled.tic.depth != 1))
+                {
                     return ComputeDispatchOutcome::Unsupported(format!(
                         "compute guest cube binding {} has non-square or layered extent {}x{}x{}",
                         sampled.binding, sampled.tic.width, sampled.tic.height, sampled.tic.depth
@@ -23678,7 +23677,7 @@ fn execute_compute_dispatch_mode(
                 } else {
                     raw.len()
                 };
-                let layer_count = if is_cube { 6 } else { depth };
+                let layer_count = if is_cube { 6 * depth } else { depth };
                 let content = match prepare_compute_guest_image_content(
                     &inner.compute_guest_image_pool,
                     &mut inner.compute_guest_content_memo,
@@ -28414,6 +28413,20 @@ fn trace_volume_rt_skip(
             tic.tile_width_spacing
         );
     }
+}
+
+fn texture_layers_from_render_targets(
+    key: &TexCacheKey,
+    tic: &crate::texture::TicEntry,
+    rt_backed: bool,
+) -> bool {
+    key.volume
+        || (rt_backed
+            && key.arrayed
+            && key.layers > 1
+            && tic.texture_type == 5
+            && tic.base_layer == 0
+            && tic.mip_levels() == 1)
 }
 
 fn find_volume_rt_slices(
@@ -33262,7 +33275,7 @@ fn create_texture_image(
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: if volume { 1 } else { layers },
             };
             device.cmd_clear_color_image(
                 cmd,
@@ -33276,7 +33289,7 @@ fn create_texture_image(
             device, cmd, image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            aspect, 0, 1, 0, 1,
+            aspect, 0, 1, 0, if volume { 1 } else { layers },
         );
         for slice in slices {
             if slice.layer >= layers || slice.format != format {
@@ -33315,13 +33328,13 @@ fn create_texture_image(
                     dst_subresource: vk::ImageSubresourceLayers {
                         aspect_mask: aspect,
                         mip_level: 0,
-                        base_array_layer: 0,
+                        base_array_layer: if volume { 0 } else { dst_layer },
                         layer_count: 1,
                     },
                     dst_offset: vk::Offset3D {
                         x: 0,
                         y: if yflip { height - 1 - y } else { y } as i32,
-                        z: dst_layer as i32,
+                        z: if volume { dst_layer as i32 } else { 0 },
                     },
                     extent: vk::Extent3D {
                         width,
@@ -33347,8 +33360,12 @@ fn create_texture_image(
                             ],
                             dst_subresource: region.dst_subresource,
                             dst_offsets: [
-                                vk::Offset3D { x: 0, y: top, z: dst_layer as i32 },
-                                vk::Offset3D { x: width as i32, y: bottom, z: dst_layer as i32 + 1 },
+                                vk::Offset3D { x: 0, y: top, z: if volume { dst_layer as i32 } else { 0 } },
+                                vk::Offset3D {
+                                    x: width as i32,
+                                    y: bottom,
+                                    z: if volume { dst_layer as i32 + 1 } else { 1 },
+                                },
                             ],
                         };
                         device.cmd_blit_image(

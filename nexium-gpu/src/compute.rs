@@ -1921,12 +1921,18 @@ pub(crate) fn create_compute_guest_image(
     if upload_bytes.is_empty() {
         return Err("compute guest sampled image has no upload bytes".to_string());
     }
-    if is_cube && (is_3d || depth != 1 || width != height) {
+    if is_cube && (is_3d || (!is_array && depth != 1) || width != height) {
         return Err(format!(
             "invalid compute guest cube image: extent={width}x{height}x{depth} 3d={is_3d} levels={mip_levels}"
         ));
     }
-    let array_layers = if is_cube { 6 } else if is_array { depth.max(1) } else { 1 };
+    let array_layers = if is_cube {
+        6 * depth.max(1)
+    } else if is_array {
+        depth.max(1)
+    } else {
+        1
+    };
     let image_depth = if is_3d { depth } else { 1 };
     let aspect = crate::renderer::texture_image_aspect(format);
     let mip_levels = mip_levels.max(1);
@@ -2032,6 +2038,8 @@ pub(crate) fn create_compute_guest_image(
         image,
         view_type: if is_3d {
             vk::ImageViewType::TYPE_3D
+        } else if is_cube && is_array {
+            vk::ImageViewType::CUBE_ARRAY
         } else if is_cube {
             vk::ImageViewType::CUBE
         } else if is_array {

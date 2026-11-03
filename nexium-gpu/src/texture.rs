@@ -650,7 +650,11 @@ pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
     })
 }
 
-pub const TEXTURE_BUDGET_BYTES: usize = 512 << 20;
+pub fn texture_budget_bytes() -> usize {
+    usize::try_from(crate::gpu_health::vram_heap_bytes() / 8)
+        .unwrap_or(usize::MAX)
+        .max(512 << 20)
+}
 
 pub fn texture_host_bytes(guest_size: usize, tic: &TicEntry) -> usize {
     match tic.format {
@@ -669,7 +673,7 @@ pub fn texture_over_budget(guest_size: usize, tic: &TicEntry) -> bool {
     if size < 64 << 20 {
         return false;
     }
-    let over = size > TEXTURE_BUDGET_BYTES;
+    let over = size > texture_budget_bytes();
     static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> = std::sync::OnceLock::new();
     let reported = REPORTED.get_or_init(Default::default);
     if reported.lock().unwrap().insert(tic.gpu_va) {
@@ -683,7 +687,6 @@ pub fn texture_over_budget(guest_size: usize, tic: &TicEntry) -> bool {
 }
 
 pub const REDUCED_TEXTURE_TAG: u64 = 1 << 62;
-const REDUCED_TEXTURE_MAX_HOST_BYTES: usize = 128 << 20;
 
 pub struct ReducedTexture {
     pub tic: TicEntry,
@@ -716,7 +719,7 @@ pub fn reduced_texture(tic: &TicEntry, layers: u32) -> Option<ReducedTexture> {
             return None;
         }
         let read_size = layout.guest_size_bytes(layers);
-        if texture_host_bytes(read_size, &reduced) > REDUCED_TEXTURE_MAX_HOST_BYTES {
+        if texture_host_bytes(read_size, &reduced) > texture_budget_bytes() {
             continue;
         }
         let spans = (0..layers as usize)
