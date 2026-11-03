@@ -124,6 +124,7 @@ pub enum ImageDimension {
     D2Array,
     D3,
     Cube,
+    CubeArray,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -173,6 +174,7 @@ impl fmt::Display for ImageDimension {
             Self::D2Array => "2d-array",
             Self::D3 => "3d",
             Self::Cube => "cube",
+            Self::CubeArray => "cube-array",
         })
     }
 }
@@ -580,6 +582,7 @@ pub enum Op {
         u: Value,
         v: Option<Value>,
         w: Option<Value>,
+        layer: Option<Value>,
         implicit_lod: bool,
         lod_bias: Option<Value>,
         explicit_lod: Option<Value>,
@@ -1301,6 +1304,7 @@ impl Inst {
                 u,
                 v,
                 w,
+                layer,
                 implicit_lod,
                 lod_bias,
                 explicit_lod,
@@ -1308,12 +1312,16 @@ impl Inst {
                 dref,
                 component,
             } => {
-                let coords = match (v, w) {
-                    (None, None) => format!("({u})"),
-                    (Some(v), None) => format!("({u}, {v})"),
-                    (Some(v), Some(w)) => format!("({u}, {v}, {w})"),
-                    (None, Some(w)) => format!("({u}, ?, {w})"),
+                let mut coords = match (v, w) {
+                    (None, None) => format!("({u}"),
+                    (Some(v), None) => format!("({u}, {v}"),
+                    (Some(v), Some(w)) => format!("({u}, {v}, {w}"),
+                    (None, Some(w)) => format!("({u}, ?, {w}"),
                 };
+                if let Some(layer) = layer {
+                    coords.push_str(&format!(", {layer}"));
+                }
+                coords.push(')');
                 write!(f, "TexSampHandle")?;
                 if let Some(site) = sample_site {
                     write!(f, "#{site}")?;

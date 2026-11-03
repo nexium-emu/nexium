@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+pub(crate) mod sm86;
+
 use super::bindless_texture_id_pair;
 use super::decode::decode_one;
 use super::ir::{
@@ -1026,21 +1028,38 @@ impl Translator {
         pred: Option<Predicate>,
     ) -> Option<Vec<(usize, Value)>> {
         let coord = reg_a(raw);
+        let coords = [0u8, 1, 2, 3].map(|index| coord.wrapping_add(index));
+        let dst = reg_dest(raw);
+        let targets: Vec<u8> = (0..form.mask.count_ones() as u8).map(|index| dst.wrapping_add(index)).collect();
+        self.emit_texture_sample_regs(tex_id, compute_handle, form, coords, &targets, defs, pred)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_texture_sample_regs(
+        &mut self,
+        tex_id: u32,
+        compute_handle: Option<(TextureHandleOrigin, ImageDimension)>,
+        form: TextureSampleForm,
+        coords: [u8; 4],
+        targets: &[u8],
+        defs: Option<&ValueDefs>,
+        pred: Option<Predicate>,
+    ) -> Option<Vec<(usize, Value)>> {
         let arrayed = matches!(form.tex_type, 3 | 7);
-        let u = self.read_reg(coord.wrapping_add(u8::from(arrayed)));
+        let u = self.read_reg(coords[usize::from(arrayed)]);
         let v = match form.tex_type {
             0 => Value::Zero,
-            3 | 7 => self.read_reg(coord.wrapping_add(2)),
-            _ => self.read_reg(coord.wrapping_add(1)),
+            3 | 7 => self.read_reg(coords[2]),
+            _ => self.read_reg(coords[1]),
         };
         let array = match form.tex_type {
-            3 | 7 => Some(self.read_reg(coord)),
+            3 | 7 => Some(self.read_reg(coords[0])),
             _ => None,
         };
-        let volume = (form.tex_type == 4).then(|| self.read_reg(coord.wrapping_add(2)));
+        let volume = (form.tex_type == 4).then(|| self.read_reg(coords[2]));
         let cube = match form.tex_type {
-            6 => Some(self.read_reg(coord.wrapping_add(2))),
-            7 => Some(self.read_reg(coord.wrapping_add(3))),
+            6 => Some(self.read_reg(coords[2])),
+            7 => Some(self.read_reg(coords[3])),
             _ => None,
         };
         let explicit_lod = if form.implicit_lod {
@@ -1115,17 +1134,17 @@ impl Translator {
         };
         let dref = form.dref_reg.map(|reg| self.read_reg(reg));
         let sample_site = self.program.next_value_id();
-        let mut dst = reg_dest(raw);
+        let mut target = targets.iter().copied();
         let mut samples = Vec::new();
         for component in 0..4u8 {
             if (form.mask >> component) & 1 == 0 {
                 continue;
             }
+            let dst = target.next()?;
             let old_value = self.read_reg(dst);
             let instruction_index = self.program.instructions.len();
             if dref.is_some() && component == 3 {
                 self.write_reg(dst, Op::Mov(Value::ImmF32(1.0)), pred);
-                dst = dst.wrapping_add(1);
                 continue;
             }
             let op = if let Some((handle, dimension)) = compute_handle {
@@ -1140,9 +1159,10 @@ impl Translator {
                         ImageDimension::D3 => Some(
                             volume.expect("3D compute texture sample must have a W coordinate"),
                         ),
-                        ImageDimension::Cube => cube,
+                        ImageDimension::Cube | ImageDimension::CubeArray => cube,
                         _ => None,
                     },
+                    layer: (dimension == ImageDimension::CubeArray).then_some(array).flatten(),
                     implicit_lod: form.implicit_lod,
                     lod_bias,
                     explicit_lod,
@@ -1169,7 +1189,6 @@ impl Translator {
             };
             self.write_reg(dst, op, pred);
             samples.push((instruction_index, old_value));
-            dst = dst.wrapping_add(1);
         }
         Some(samples)
     }
@@ -1321,6 +1340,226 @@ impl Translator {
             },
             pred,
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_ldc(
+        &mut self,
+        raw: u64,
+        mode: LdcMode,
+        dest: u8,
+        src_reg: u8,
+        size: u32,
+        binding: u8,
+        byte_offset: i32,
+        pred: Option<Predicate>,
+    ) -> bool {
+        if matches!(mode, LdcMode::Il | LdcMode::Isl) {
+            log::warn!("LDC addressing mode {mode:?} is unsupported raw={raw:#018x}",);
+            self.program.emit_void(Op::Unimplemented {
+                opcode: Opcode::LDC,
+                raw,
+            });
+            self.unimplemented_count += 1;
+            return false;
+        }
+        if size == 5 && dest != RZ && dest & 1 != 0 {
+            log::warn!(
+                "LDC B64 requires an even destination register raw={raw:#018x} dest=R{dest}",
+            );
+            self.program.emit_void(Op::Unimplemented {
+                opcode: Opcode::LDC,
+                raw,
+            });
+            self.unimplemented_count += 1;
+            return false;
+        }
+        let count = match size {
+            0..=4 => 1u32,
+            5 => 2,
+            6 => 4,
+            _ => {
+                log::warn!(
+                    "LDC with unsupported size raw={:#018x} size={}",
+                    raw,
+                    size,
+                );
+                self.program.emit_void(Op::Unimplemented {
+                    opcode: Opcode::LDC,
+                    raw,
+                });
+                self.unimplemented_count += 1;
+                return false;
+            }
+        };
+        let index = if src_reg != RZ {
+            self.read_reg(src_reg)
+        } else {
+            Value::Zero
+        };
+        for w in 0..count {
+            let bo = (byte_offset as u32).wrapping_add(w * 4);
+            let cb_id = match mode {
+                LdcMode::Default if src_reg == RZ => self.program.emit(
+                    Op::LoadCbuf {
+                        binding: binding,
+                        byte_offset: bo,
+                    },
+                    None,
+                ),
+                LdcMode::Default => self.program.emit(
+                    Op::LoadCbufIndexed {
+                        binding: binding,
+                        byte_offset: bo,
+                        index,
+                        address_mode: CbufAddressMode::Default,
+                    },
+                    None,
+                ),
+                LdcMode::Is => self.program.emit(
+                    Op::LoadCbufIndexed {
+                        binding: binding,
+                        byte_offset: bo,
+                        index,
+                        address_mode: CbufAddressMode::Segmented,
+                    },
+                    None,
+                ),
+                LdcMode::Il | LdcMode::Isl => unreachable!(),
+            };
+            let dst = if dest == RZ {
+                RZ
+            } else {
+                dest.wrapping_add(w as u8)
+            };
+            let value = if size < 4 {
+                let address = self.emit_iadd_value(index, Value::ImmU32(bo), false, false);
+                let shifted = self.emit_value(Op::IShl {
+                    a: address,
+                    b: Value::ImmU32(3),
+                });
+                let position = self.emit_value(Op::ILop {
+                    a: shifted,
+                    b: Value::ImmU32(if size < 2 { 24 } else { 16 }),
+                    op: LogicOp::And,
+                    not_a: false,
+                    not_b: false,
+                });
+                let control = self.emit_iadd_value(
+                    position,
+                    Value::ImmU32(if size < 2 { 8 << 8 } else { 16 << 8 }),
+                    false,
+                    false,
+                );
+                self.emit_value(Op::Bfe {
+                    a: Value::Inst(cb_id),
+                    b: control,
+                    signed: size & 1 != 0,
+                })
+            } else {
+                Value::Inst(cb_id)
+            };
+            self.write_reg(dst, Op::Mov(value), pred);
+        }
+        true
+    }
+
+    pub(super) fn emit_s2r(&mut self, raw: u64, dest: u8, sr: u32, pred: Option<Predicate>) -> bool {
+        if self.stage == ShaderStage::Compute {
+            match sr {
+                0 => {
+                    self.write_reg(dest, Op::SubgroupLaneId, pred);
+                }
+                0x20 => {
+                    let x = self.emit_value(Op::LocalInvocationId { component: 0 });
+                    let y = self.emit_value(Op::LocalInvocationId { component: 1 });
+                    let z = self.emit_value(Op::LocalInvocationId { component: 2 });
+                    let xy = self.emit_value(Op::Bfi {
+                        base: x,
+                        insert: y,
+                        control: Value::ImmU32((8 << 8) | 16),
+                    });
+                    let packed = self.emit_value(Op::Bfi {
+                        base: xy,
+                        insert: z,
+                        control: Value::ImmU32((6 << 8) | 26),
+                    });
+                    self.write_reg(dest, Op::Mov(packed), pred);
+                }
+                0x21..=0x23 => {
+                    self.write_reg(
+                        dest,
+                        Op::LocalInvocationId {
+                            component: (sr - 0x21) as u8,
+                        },
+                        pred,
+                    );
+                }
+                0x25..=0x27 => {
+                    self.write_reg(
+                        dest,
+                        Op::WorkgroupId {
+                            component: (sr - 0x25) as u8,
+                        },
+                        pred,
+                    );
+                }
+                0x38..=0x3c => {
+                    let kind = match sr {
+                        0x38 => SubgroupMask::Eq,
+                        0x39 => SubgroupMask::Lt,
+                        0x3a => SubgroupMask::Le,
+                        0x3b => SubgroupMask::Gt,
+                        0x3c => SubgroupMask::Ge,
+                        _ => unreachable!(),
+                    };
+                    self.write_reg(dest, Op::SubgroupMask { kind }, pred);
+                }
+                _ => {
+                    log::debug!("unsupported compute S2R sr={} raw={:#018x}", sr, raw);
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::S2R,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+            }
+        } else {
+            match sr {
+                0 => {
+                    self.write_reg(dest, Op::SubgroupLaneId, pred);
+                }
+                0x38..=0x3c => {
+                    let kind = match sr {
+                        0x38 => SubgroupMask::Eq,
+                        0x39 => SubgroupMask::Lt,
+                        0x3a => SubgroupMask::Le,
+                        0x3b => SubgroupMask::Gt,
+                        0x3c => SubgroupMask::Ge,
+                        _ => unreachable!(),
+                    };
+                    self.write_reg(dest, Op::SubgroupMask { kind }, pred);
+                }
+                0x1d if self.stage == ShaderStage::Geometry => {
+                    self.write_reg(dest, Op::GeometryInvocationInfo, pred);
+                }
+                18 => {
+                    self.write_reg(dest, Op::YDirection, pred);
+                }
+                19 if self.stage == ShaderStage::Fragment => {
+                    self.write_reg(dest, Op::HelperInvocation, pred);
+                }
+                30 | 31 => {
+                    self.write_reg(dest, Op::Mov(Value::ImmU32(0x3F80_0000)), pred);
+                }
+                _ => {
+                    log::debug!("S2R sr={} â†’ 0 (approx) raw={:#018x}", sr, raw);
+                    self.write_reg(dest, Op::Mov(Value::ImmU32(0)), pred);
+                }
+            }
+        }
+        true
     }
 
     fn emit_f2f(&mut self, raw: u64, src: Value, pred: Option<Predicate>) -> bool {
@@ -4178,6 +4417,9 @@ impl Translator {
                         3 if form.bias_reg.is_none() => ImageDimension::D2Array,
                         4 => ImageDimension::D3,
                         6 if form.dref_reg.is_none() => ImageDimension::Cube,
+                        7 if form.dref_reg.is_none() && form.bias_reg.is_none() => {
+                            ImageDimension::CubeArray
+                        }
                         _ => {
                             self.program.emit_void(Op::Unimplemented {
                                 opcode: Opcode::TEX_b,
@@ -4788,6 +5030,7 @@ impl Translator {
                             u,
                             v,
                             w,
+                            layer: None,
                             implicit_lod,
                             lod_bias: None,
                             explicit_lod,
@@ -5244,117 +5487,10 @@ impl Translator {
             }
 
             Opcode::LDC => {
-                let mode = ldc_mode(raw);
-                if matches!(mode, LdcMode::Il | LdcMode::Isl) {
-                    log::warn!("LDC addressing mode {mode:?} is unsupported raw={raw:#018x}",);
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::LDC,
-                        raw,
-                    });
-                    self.unimplemented_count += 1;
-                    return false;
-                }
-                let dest = reg_dest(raw);
-                let src_reg = ldc_src_reg(raw);
-                let size = ldc_size(raw);
-                if size == 5 && dest != RZ && dest & 1 != 0 {
-                    log::warn!(
-                        "LDC B64 requires an even destination register raw={raw:#018x} dest=R{dest}",
-                    );
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::LDC,
-                        raw,
-                    });
-                    self.unimplemented_count += 1;
-                    return false;
-                }
-                let count = match size {
-                    0..=4 => 1u32,
-                    5 => 2,
-                    6 => 4,
-                    _ => {
-                        log::warn!(
-                            "LDC with unsupported size raw={:#018x} size={}",
-                            raw,
-                            size,
-                        );
-                        self.program.emit_void(Op::Unimplemented {
-                            opcode: Opcode::LDC,
-                            raw,
-                        });
-                        self.unimplemented_count += 1;
-                        return false;
-                    }
-                };
                 let r = ldc_ref(raw);
-                let index = if src_reg != RZ {
-                    self.read_reg(src_reg)
-                } else {
-                    Value::Zero
-                };
-                for w in 0..count {
-                    let bo = (r.byte_offset as u32).wrapping_add(w * 4);
-                    let cb_id = match mode {
-                        LdcMode::Default if src_reg == RZ => self.program.emit(
-                            Op::LoadCbuf {
-                                binding: r.binding,
-                                byte_offset: bo,
-                            },
-                            None,
-                        ),
-                        LdcMode::Default => self.program.emit(
-                            Op::LoadCbufIndexed {
-                                binding: r.binding,
-                                byte_offset: bo,
-                                index,
-                                address_mode: CbufAddressMode::Default,
-                            },
-                            None,
-                        ),
-                        LdcMode::Is => self.program.emit(
-                            Op::LoadCbufIndexed {
-                                binding: r.binding,
-                                byte_offset: bo,
-                                index,
-                                address_mode: CbufAddressMode::Segmented,
-                            },
-                            None,
-                        ),
-                        LdcMode::Il | LdcMode::Isl => unreachable!(),
-                    };
-                    let dst = if dest == RZ {
-                        RZ
-                    } else {
-                        dest.wrapping_add(w as u8)
-                    };
-                    let value = if size < 4 {
-                        let address = self.emit_iadd_value(index, Value::ImmU32(bo), false, false);
-                        let shifted = self.emit_value(Op::IShl {
-                            a: address,
-                            b: Value::ImmU32(3),
-                        });
-                        let position = self.emit_value(Op::ILop {
-                            a: shifted,
-                            b: Value::ImmU32(if size < 2 { 24 } else { 16 }),
-                            op: LogicOp::And,
-                            not_a: false,
-                            not_b: false,
-                        });
-                        let control = self.emit_iadd_value(
-                            position,
-                            Value::ImmU32(if size < 2 { 8 << 8 } else { 16 << 8 }),
-                            false,
-                            false,
-                        );
-                        self.emit_value(Op::Bfe {
-                            a: Value::Inst(cb_id),
-                            b: control,
-                            signed: size & 1 != 0,
-                        })
-                    } else {
-                        Value::Inst(cb_id)
-                    };
-                    self.write_reg(dst, Op::Mov(value), pred);
+                let (mode, dest, src_reg, size) = (ldc_mode(raw), reg_dest(raw), ldc_src_reg(raw), ldc_size(raw));
+                if !self.emit_ldc(raw, mode, dest, src_reg, size, r.binding, r.byte_offset, pred) {
+                    return false;
                 }
             }
 
@@ -5943,7 +6079,7 @@ impl Translator {
                 let (y, z) = match dimension {
                     ImageDimension::D1 | ImageDimension::Buffer => (None, None),
                     ImageDimension::D2 => (Some(self.read_reg(coord.wrapping_add(1))), None),
-                    ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube => (
+                    ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube | ImageDimension::CubeArray => (
                         Some(self.read_reg(coord.wrapping_add(1))),
                         Some(self.read_reg(coord.wrapping_add(2))),
                     ),
@@ -6103,7 +6239,7 @@ impl Translator {
                 let (y, z) = match dimension {
                     ImageDimension::D1 | ImageDimension::Buffer => (None, None),
                     ImageDimension::D2 => (Some(self.read_reg(coord.wrapping_add(1))), None),
-                    ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube => (
+                    ImageDimension::D2Array | ImageDimension::D3 | ImageDimension::Cube | ImageDimension::CubeArray => (
                         Some(self.read_reg(coord.wrapping_add(1))),
                         Some(self.read_reg(coord.wrapping_add(2))),
                     ),
@@ -6888,101 +7024,8 @@ impl Translator {
             }
 
             Opcode::S2R => {
-                let dest = reg_dest(raw);
-                let sr = ((raw >> 20) & 0xFF) as u32;
-                if self.stage == ShaderStage::Compute {
-                    match sr {
-                        0 => {
-                            self.write_reg(dest, Op::SubgroupLaneId, pred);
-                        }
-                        0x20 => {
-                            let x = self.emit_value(Op::LocalInvocationId { component: 0 });
-                            let y = self.emit_value(Op::LocalInvocationId { component: 1 });
-                            let z = self.emit_value(Op::LocalInvocationId { component: 2 });
-                            let xy = self.emit_value(Op::Bfi {
-                                base: x,
-                                insert: y,
-                                control: Value::ImmU32((8 << 8) | 16),
-                            });
-                            let packed = self.emit_value(Op::Bfi {
-                                base: xy,
-                                insert: z,
-                                control: Value::ImmU32((6 << 8) | 26),
-                            });
-                            self.write_reg(dest, Op::Mov(packed), pred);
-                        }
-                        0x21..=0x23 => {
-                            self.write_reg(
-                                dest,
-                                Op::LocalInvocationId {
-                                    component: (sr - 0x21) as u8,
-                                },
-                                pred,
-                            );
-                        }
-                        0x25..=0x27 => {
-                            self.write_reg(
-                                dest,
-                                Op::WorkgroupId {
-                                    component: (sr - 0x25) as u8,
-                                },
-                                pred,
-                            );
-                        }
-                        0x38..=0x3c => {
-                            let kind = match sr {
-                                0x38 => SubgroupMask::Eq,
-                                0x39 => SubgroupMask::Lt,
-                                0x3a => SubgroupMask::Le,
-                                0x3b => SubgroupMask::Gt,
-                                0x3c => SubgroupMask::Ge,
-                                _ => unreachable!(),
-                            };
-                            self.write_reg(dest, Op::SubgroupMask { kind }, pred);
-                        }
-                        _ => {
-                            log::debug!("unsupported compute S2R sr={} raw={:#018x}", sr, raw);
-                            self.program.emit_void(Op::Unimplemented {
-                                opcode: Opcode::S2R,
-                                raw,
-                            });
-                            self.unimplemented_count += 1;
-                            return false;
-                        }
-                    }
-                } else {
-                    match sr {
-                        0 => {
-                            self.write_reg(dest, Op::SubgroupLaneId, pred);
-                        }
-                        0x38..=0x3c => {
-                            let kind = match sr {
-                                0x38 => SubgroupMask::Eq,
-                                0x39 => SubgroupMask::Lt,
-                                0x3a => SubgroupMask::Le,
-                                0x3b => SubgroupMask::Gt,
-                                0x3c => SubgroupMask::Ge,
-                                _ => unreachable!(),
-                            };
-                            self.write_reg(dest, Op::SubgroupMask { kind }, pred);
-                        }
-                        0x1d if self.stage == ShaderStage::Geometry => {
-                            self.write_reg(dest, Op::GeometryInvocationInfo, pred);
-                        }
-                        18 => {
-                            self.write_reg(dest, Op::YDirection, pred);
-                        }
-                        19 if self.stage == ShaderStage::Fragment => {
-                            self.write_reg(dest, Op::HelperInvocation, pred);
-                        }
-                        30 | 31 => {
-                            self.write_reg(dest, Op::Mov(Value::ImmU32(0x3F80_0000)), pred);
-                        }
-                        _ => {
-                            log::debug!("S2R sr={} â†’ 0 (approx) raw={:#018x}", sr, raw);
-                            self.write_reg(dest, Op::Mov(Value::ImmU32(0)), pred);
-                        }
-                    }
+                if !self.emit_s2r(raw, reg_dest(raw), ((raw >> 20) & 0xFF) as u32, pred) {
+                    return false;
                 }
             }
 
@@ -9712,6 +9755,7 @@ mod tests {
                         u: Value::GprIn(0),
                         v: Some(Value::GprIn(1)),
                         w: None,
+                        layer: None,
                         implicit_lod: false,
                         lod_bias: None,
                         explicit_lod: Some(Value::Zero),
@@ -9724,6 +9768,33 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn compute_cube_array_sample_keeps_the_layer_register() {
+        let mut translator = Translator::new_compute();
+        for raw in [
+            0x4c98_0788_05e7_000a,
+            0x5c98_0780_0ff7_000b,
+            0x4c47_0208_15a7_0a0a,
+            0xdeb8_0020_f0a7_0009,
+        ] {
+            assert!(translator.translate(raw), "raw={raw:#018x}");
+        }
+        assert_eq!(translator.unimplemented_count, 0);
+        assert!(translator.program.instructions.iter().any(|instruction| matches!(
+            instruction.op,
+            Op::SampleTexHandle {
+                dimension: ImageDimension::CubeArray,
+                u: Value::GprIn(1),
+                v: Some(Value::GprIn(2)),
+                w: Some(Value::GprIn(3)),
+                layer: Some(Value::GprIn(0)),
+                implicit_lod: false,
+                explicit_lod: Some(Value::Zero),
+                ..
+            }
+        )));
     }
 
     #[test]

@@ -11,6 +11,16 @@ use super::translate::{
     resolve_cbuf_handle_origin, PendingBindlessOriginCheck, Translator, ValueDefs,
 };
 
+mod sm86;
+
+pub fn sm86_native_probe(code: &[u8], stage: ShaderStage) -> Result<Cfg, String> {
+    sm86::probe(code, stage)
+}
+
+pub fn sm86_native_probe_with_cbuf(code: &[u8], stage: ShaderStage, read_cbuf: &mut dyn FnMut(u8, u32) -> Option<u32>) -> Result<Cfg, String> {
+    sm86::probe_with_cbuf(code, stage, read_cbuf)
+}
+
 pub type BlockId = u32;
 pub const MAX_INDIRECT_BRANCH_TARGETS: usize = 32;
 
@@ -548,7 +558,7 @@ fn intern_storage_buffer(
 
 fn fold_stable_predicate_choices(cfg: &mut Cfg) {
     for block in &mut cfg.blocks {
-        let mut versions = [0u64; 8];
+        let mut versions = [0u64; 24];
         let mut choices: HashMap<u32, (Predicate, u64, Value, Value)> = HashMap::new();
         for inst in &mut block.program.instructions {
             if let Op::SelectPred { pred, if_true, if_false } = &mut inst.op {
@@ -573,13 +583,12 @@ fn fold_stable_predicate_choices(cfg: &mut Cfg) {
                 }
                 _ => {}
             }
-            for pred in 0..8 {
+            for pred in 0..24 {
                 if writes_predicate(&inst.op, pred) { versions[pred as usize] += 1; }
             }
         }
     }
 }
-
 fn shared_slot(v: Value, defs: &HashMap<u32, Op>, depth: u32) -> Option<(Value, u64, u64, u64)> {
     if depth > 24 { return None; }
     let Value::Inst(id) = v else { return None };
@@ -1280,6 +1289,9 @@ fn build_cfg_with_cbuf_stage<F>(bytes: &[u8], mut read_cbuf: F, stage: ShaderSta
 where
     F: FnMut(u8, u32) -> Option<u32>,
 {
+    if let Some(cfg) = crate::ampere::native_source(bytes).and_then(|code| sm86::build(&code, stage, &mut read_cbuf)) {
+        return cfg;
+    }
     let indirect_branches = discover_indirect_branches(bytes, &mut read_cbuf);
     let sync_targets = discover_sync_targets(bytes, &indirect_branches);
     let leaders = discover_leaders(bytes, &sync_targets, &indirect_branches);
@@ -1366,7 +1378,7 @@ fn loop_carried_phi_gaps(blocks: &[BasicBlock], preds: &[Vec<BlockId>]) -> LoopC
                 results.insert(phi.result.0);
             }
             for (&pred, id) in &block.pred_exit {
-                if pred < 7 && results.contains(&id.0) {
+                if (pred < 7 || pred >= 16) && results.contains(&id.0) {
                     pred_defs.insert(pred);
                 }
             }
@@ -1396,6 +1408,56 @@ fn build_cfg_blocks(
     topology: &[BlockInfo],
     preds: &[Vec<BlockId>],
     forced: &LoopCarriedPhis,
+) -> Cfg {
+    build_cfg_blocks_with(stage, topology, preds, forced, |t, info, value_defs| {
+        maxwell_block_body(bytes, t, info, value_defs)
+    })
+}
+
+fn maxwell_block_body(bytes: &[u8], t: &mut Translator, info: &BlockInfo, value_defs: &ValueDefs) {
+    let mut offset = info.start;
+    while offset + 8 <= info.end {
+        if is_schedule(offset) {
+            offset += 8;
+            continue;
+        }
+        if Some(offset) == info.terminator_offset {
+            break;
+        }
+        let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        t.translate_with_defs(raw, value_defs);
+        offset += 8;
+    }
+
+    if let Some(term_off) = info.terminator_offset {
+        if term_off + 8 <= bytes.len() {
+            let raw = u64::from_le_bytes(bytes[term_off..term_off + 8].try_into().unwrap());
+            if decode_one(raw).is_some_and(|decoded| decoded.opcode == Opcode::EXIT)
+                && raw & 0x1f == 13
+                && !t.emit_exit_flow_predicate(raw)
+            {
+                t.unimplemented_count += 1;
+                t.program.emit_void(Op::Unimplemented { opcode: Opcode::EXIT, raw });
+            }
+            if decode_one(raw).is_some_and(|decoded| matches!(decoded.opcode, Opcode::BRA | Opcode::JMP))
+                && bra_flow_conditional(raw)
+            {
+                t.emit_bra_flow_predicate(raw);
+            }
+        }
+        if term_off + 8 <= bytes.len() && matches!(info.branch, BranchKind::Exit) {
+            let raw = u64::from_le_bytes(bytes[term_off..term_off + 8].try_into().unwrap());
+            t.translate_with_defs(raw, value_defs);
+        }
+    }
+}
+
+fn build_cfg_blocks_with(
+    stage: ShaderStage,
+    topology: &[BlockInfo],
+    preds: &[Vec<BlockId>],
+    forced: &LoopCarriedPhis,
+    mut body: impl FnMut(&mut Translator, &BlockInfo, &ValueDefs),
 ) -> Cfg {
     let mut blocks: Vec<BasicBlock> = Vec::with_capacity(topology.len());
     let mut total_unimpl: u32 = 0;
@@ -1430,41 +1492,7 @@ fn build_cfg_blocks(
             t.program.instructions.push(phi);
         }
 
-        let mut offset = info.start;
-        while offset + 8 <= info.end {
-            if is_schedule(offset) {
-                offset += 8;
-                continue;
-            }
-            if Some(offset) == info.terminator_offset {
-                break;
-            }
-            let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-            t.translate_with_defs(raw, &value_defs);
-            offset += 8;
-        }
-
-        if let Some(term_off) = info.terminator_offset {
-            if term_off + 8 <= bytes.len() {
-                let raw = u64::from_le_bytes(bytes[term_off..term_off + 8].try_into().unwrap());
-                if decode_one(raw).is_some_and(|decoded| decoded.opcode == Opcode::EXIT)
-                    && raw & 0x1f == 13
-                    && !t.emit_exit_flow_predicate(raw)
-                {
-                    t.unimplemented_count += 1;
-                    t.program.emit_void(Op::Unimplemented { opcode: Opcode::EXIT, raw });
-                }
-                if decode_one(raw).is_some_and(|decoded| matches!(decoded.opcode, Opcode::BRA | Opcode::JMP))
-                    && bra_flow_conditional(raw)
-                {
-                    t.emit_bra_flow_predicate(raw);
-                }
-            }
-            if term_off + 8 <= bytes.len() && matches!(info.branch, BranchKind::Exit) {
-                let raw = u64::from_le_bytes(bytes[term_off..term_off + 8].try_into().unwrap());
-                t.translate_with_defs(raw, &value_defs);
-            }
-        }
+        body(&mut t, info, &value_defs);
 
         for inst in &t.program.instructions {
             value_defs.insert_inst(inst);
@@ -1790,7 +1818,7 @@ fn compute_initial_pred_state(
     let mut initial = HashMap::new();
     let mut phis = Vec::new();
     for pidx in all_preds {
-        if pidx >= 7 {
+        if pidx == 7 || (8..16).contains(&pidx) {
             continue;
         }
         let sources: Vec<(BlockId, Option<ValueId>)> = pred_ids

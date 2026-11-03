@@ -1,6 +1,6 @@
-mod lower;
+pub(crate) mod lower;
 mod maxwell;
-mod sm70;
+pub(crate) mod sm70;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,8 +80,10 @@ pub fn translate_cached(address: u64, binary: &[u8]) -> Result<Arc<Program>, Err
     }
     let result = translate(program).map(Arc::new);
     dump(address, program, result.as_deref().ok());
-    if let Err(error) = &result {
-        log::warn!("[ampere] shader at {address:#x} not translated: {error}");
+    match &result {
+        Ok(lowered) if native_enabled() => register_native(&lowered.code, &program[HEADER_SIZE..]),
+        Ok(_) => {}
+        Err(error) => log::warn!("[ampere] shader at {address:#x} not translated: {error}"),
     }
     let mut cache = cache.lock().unwrap();
     if cache.len() >= CACHE_LIMIT {
@@ -89,6 +91,36 @@ pub fn translate_cached(address: u64, binary: &[u8]) -> Result<Arc<Program>, Err
     }
     cache.insert(key, result.clone());
     result
+}
+
+pub fn native_enabled() -> bool {
+    static NATIVE: OnceLock<bool> = OnceLock::new();
+    *NATIVE.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_SM86_NATIVE").ok().as_deref(),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
+}
+
+fn native_sources() -> &'static Mutex<HashMap<u64, Arc<Vec<u8>>>> {
+    static SOURCES: OnceLock<Mutex<HashMap<u64, Arc<Vec<u8>>>>> = OnceLock::new();
+    SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_native(lowered: &[u8], sm86: &[u8]) {
+    let mut sources = native_sources().lock().unwrap();
+    if sources.len() >= CACHE_LIMIT {
+        sources.clear();
+    }
+    sources.insert(fingerprint(lowered), Arc::new(sm86.to_vec()));
+}
+
+pub fn native_source(lowered: &[u8]) -> Option<Arc<Vec<u8>>> {
+    if !native_enabled() {
+        return None;
+    }
+    native_sources().lock().unwrap().get(&fingerprint(lowered)).cloned()
 }
 
 #[cfg(test)]
