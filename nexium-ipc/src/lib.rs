@@ -494,32 +494,24 @@ impl IpcCtx {
             }
             cursor += 8;
         }
-        for _ in 0..hipc.num_send_buffers() {
-            if cursor + 12 > buf.len() {
-                return Err(IpcError::BufferTooSmall {
-                    have: buf.len(),
-                    need: cursor + 12,
-                });
+        let mut send_buffers = Vec::new();
+        let mut recv_buffers = Vec::new();
+        let mut exch_buffers = Vec::new();
+        for (count, list) in [
+            (hipc.num_send_buffers(), &mut send_buffers),
+            (hipc.num_recv_buffers(), &mut recv_buffers),
+            (hipc.num_exch_buffers(), &mut exch_buffers),
+        ] {
+            for _ in 0..count {
+                if cursor + 12 > buf.len() {
+                    return Err(IpcError::BufferTooSmall {
+                        have: buf.len(),
+                        need: cursor + 12,
+                    });
+                }
+                list.push(parse_abc_descriptor(&buf, cursor));
+                cursor += 12;
             }
-            cursor += 12;
-        }
-        for _ in 0..hipc.num_recv_buffers() {
-            if cursor + 12 > buf.len() {
-                return Err(IpcError::BufferTooSmall {
-                    have: buf.len(),
-                    need: cursor + 12,
-                });
-            }
-            cursor += 12;
-        }
-        for _ in 0..hipc.num_exch_buffers() {
-            if cursor + 12 > buf.len() {
-                return Err(IpcError::BufferTooSmall {
-                    have: buf.len(),
-                    need: cursor + 12,
-                });
-            }
-            cursor += 12;
         }
 
         let raw_data_off = cursor;
@@ -545,9 +537,9 @@ impl IpcCtx {
             send_pid: send_pid_value,
             copy_handles,
             move_handles,
-            send_buffers: Vec::new(),
-            recv_buffers: Vec::new(),
-            exch_buffers: Vec::new(),
+            send_buffers,
+            recv_buffers,
+            exch_buffers,
             send_statics: Vec::new(),
             recv_statics: Vec::new(),
             domain: None,
@@ -628,5 +620,21 @@ mod tests {
         assert_eq!(descriptor.mode, 1);
         assert_eq!(descriptor.addr, 0xa0_00ff_fd90);
         assert_eq!(descriptor.size, 60);
+    }
+
+    #[test]
+    fn tipc_requests_keep_their_buffer_descriptors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&((16u32 + 109) | (1 << 20)).to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&0x400u32.to_le_bytes());
+        buf.extend_from_slice(&0x1234_5000u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        let ctx = super::IpcCtx::parse(buf, false).unwrap();
+        assert_eq!(ctx.send_buffers.len(), 1);
+        assert_eq!((ctx.send_buffers[0].addr, ctx.send_buffers[0].size), (0x1234_5000, 0x400));
+        assert_eq!(ctx.input_data()[..8], [7, 0, 0, 0, 9, 0, 0, 0]);
     }
 }
