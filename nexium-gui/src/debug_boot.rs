@@ -2,11 +2,16 @@ use nexium_core::boot::{BootConfig, BootContext};
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(windows)]
+mod memory_guard;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("debug,wgpu_core=warn,naga=warn"),
     )
     .init();
+    #[cfg(windows)]
+    memory_guard::install();
     let nro_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "space-nx-master/space-nx.nro".to_string());

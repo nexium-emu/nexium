@@ -25,6 +25,8 @@ mod input;
 mod motion_input;
 mod library;
 mod log_viewer;
+#[cfg(windows)]
+mod memory_guard;
 mod native_game;
 mod nextendo;
 mod mods;
@@ -180,6 +182,8 @@ fn main() -> Result<(), eframe::Error> {
 
     #[cfg(windows)]
     fault_logger::install();
+    #[cfg(windows)]
+    memory_guard::install();
 
     nexium_common::async_compile::set_enabled(settings.async_shaders);
     nexium_common::fast_gpu_time::set_enabled(settings.fast_gpu_time);

@@ -67,7 +67,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 sdl3 = { version = "0.20.0", default-features = false, features = ["build-from-source-static"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # Child X11 window + shape for the native Vulkan game surface. Already in the
 # tree through winit; only the `shape` feature is new.
