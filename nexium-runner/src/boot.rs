@@ -15,6 +15,7 @@ const METROID_DREAD_TITLE_ID: u64 = 0x0100_9380_1237_C000;
 const SWITCH_SPORTS_TITLE_ID: u64 = 0x0100_D2F0_0D5C_0000;
 const MINECRAFT_DUNGEONS_2_TITLE_ID: u64 = 0x0100_A7C0_1B79_2000;
 const TEARS_OF_THE_KINGDOM_TITLE_ID: u64 = 0x0100_F2C0_115B_6000;
+const MARIO_KART_WORLD_TITLE_ID: u64 = 0x0400_C3F0_0006_E000;
 
 pub fn emu_alive() -> bool {
     EMU_ALIVE.load(Ordering::Acquire)
@@ -1069,7 +1070,8 @@ impl EmulationHandle {
                 nexium_nvdrv::gpu::configure_fast_gpu_time(title_id == SWITCH_SPORTS_TITLE_ID);
                 nexium_nvdrv::gpu::configure_gpu_accuracy();
                 nexium_nvdrv::gpu::configure_retained_ssbos(
-                    title_id == TEARS_OF_THE_KINGDOM_TITLE_ID,
+                    title_id == TEARS_OF_THE_KINGDOM_TITLE_ID
+                        || title_id == MARIO_KART_WORLD_TITLE_ID,
                 );
                 nexium_core::services::am::set_title_nifm_offline(
                     title_id == MINECRAFT_DUNGEONS_2_TITLE_ID
@@ -1641,6 +1643,12 @@ impl EmulationHandle {
                             halts
                         );
                         last_loop_log = std::time::Instant::now();
+                    }
+
+                    if nexium_gpu::gpu_health::device_lost()
+                        && !stop_flag_clone.swap(true, Ordering::Relaxed)
+                    {
+                        log::error!("Stopping emulation: Vulkan device lost");
                     }
 
                     if stop_flag_clone.load(Ordering::Relaxed) {
