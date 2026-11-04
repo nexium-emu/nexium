@@ -71,6 +71,68 @@ fn stuck_backtrace_due() -> bool {
     due
 }
 
+fn wait_histogram_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var_os("NEXIUM_WAIT_HISTOGRAM").is_some())
+}
+
+fn normalize_wait_detail(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len());
+    let mut chars = detail.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '0' && chars.peek() == Some(&'x') {
+            chars.next();
+            while chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                chars.next();
+            }
+            out.push('X');
+        } else if c.is_ascii_digit() {
+            while chars.peek().is_some_and(|c| c.is_ascii_digit() || *c == '.') {
+                chars.next();
+            }
+            out.push('N');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn record_wait_histogram(threads: &[nexium_kernel::kernel::ThreadWaitEntry]) {
+    type Histogram = (Option<std::time::Instant>, u64, Vec<(String, u64)>);
+    static STATE: std::sync::Mutex<Histogram> =
+        std::sync::Mutex::new((None, 0, Vec::new()));
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    let started = *state.0.get_or_insert_with(std::time::Instant::now);
+    state.1 += 1;
+    for thread in threads {
+        let key = format!(
+            "tid{} {} {}",
+            thread.tid,
+            thread.status,
+            normalize_wait_detail(&thread.detail)
+        );
+        match state.2.iter_mut().find(|entry| entry.0 == key) {
+            Some(entry) => entry.1 += 1,
+            None => state.2.push((key, 1)),
+        }
+    }
+    if started.elapsed() < std::time::Duration::from_secs(10) {
+        return;
+    }
+    let samples = state.1.max(1);
+    let mut rows: Vec<(String, u64)> = state.2.drain(..).collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, count) in rows {
+        let share = count as f64 * 100.0 / samples as f64;
+        if share >= 5.0 {
+            log::warn!("[wait-hist] {share:5.1}% {key}");
+        }
+    }
+    state.0 = Some(std::time::Instant::now());
+    state.1 = 0;
+}
+
 fn core_status_enabled() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| std::env::var_os("NEXIUM_CORE_STATUS").is_some())
@@ -2392,6 +2454,9 @@ impl EmulationHandle {
                                     snap.instruction_bytes = instr_buf;
                                 }
                                 snap.threads = guard.thread_wait_tree();
+                                if wait_histogram_enabled() {
+                                    record_wait_histogram(&snap.threads);
+                                }
                                 let mem_req = *mem_request_clone.lock();
                                 if mem_req != 0 {
                                     snap.mem_request_address = mem_req;
