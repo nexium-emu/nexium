@@ -241,6 +241,8 @@ pub struct ComputeTexelBuffer {
     pub writable: bool,
     pub requires_atomics: bool,
     pub graphics_storage: Option<(ComputeRawStorageKey, u64)>,
+    pub retain: bool,
+    pub patches: Vec<(u64, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +287,32 @@ pub struct ComputeStorageImage {
     pub arrayed: bool,
     pub format: ComputeStorageFormat,
     pub initial_bytes: Option<Vec<u8>>,
+    pub resident: Option<ResidentStorageRequest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeRtSeed {
+    pub binding: u32,
+    pub key: crate::rt_cache::RtKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeLayerSource {
+    pub binding: u32,
+    pub layer: u32,
+    pub key: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeProducerLink {
+    pub binding: u32,
+    pub key: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentStorageRequest {
+    pub key: u64,
+    pub claimed: bool,
 }
 
 impl ComputeStorageImage {
@@ -326,6 +354,12 @@ pub struct ComputeDispatch {
     pub sampled_rts: Vec<ComputeSampledRt>,
     pub sampled_images: Vec<ComputeSampledImage>,
     pub outputs: Vec<ComputeStorageImage>,
+    pub forwarded_sources: Vec<ComputeProducerLink>,
+    pub output_sources: Vec<ComputeProducerLink>,
+    pub output_layer_sources: Vec<ComputeLayerSource>,
+    pub output_rt_seeds: Vec<ComputeRtSeed>,
+    pub raw_storage_pin_seq: u64,
+    pub output_producers: Vec<ComputeProducerLink>,
     pub image_aliases: Vec<ComputeImageAlias>,
     pub output_rt_aliases: Vec<ComputeOutputRtAlias>,
 }
@@ -525,12 +559,12 @@ struct ComputeProgram {
 
 const COMPUTE_UNIFORM_POOL_MAX_ITEMS: usize = 4096;
 const COMPUTE_UNIFORM_POOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const COMPUTE_RAW_STORAGE_POOL_MAX_ITEMS: usize = 512;
-const COMPUTE_RAW_STORAGE_POOL_MAX_BYTES: u64 = 128 * 1024 * 1024;
-const COMPUTE_OUTPUT_POOL_MAX_ITEMS: usize = 8;
-const COMPUTE_OUTPUT_POOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const COMPUTE_READBACK_POOL_MAX_ITEMS: usize = 8;
-const COMPUTE_READBACK_POOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const COMPUTE_RAW_STORAGE_POOL_MAX_ITEMS: usize = 4096;
+const COMPUTE_RAW_STORAGE_POOL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const COMPUTE_OUTPUT_POOL_MAX_ITEMS: usize = 64;
+const COMPUTE_OUTPUT_POOL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const COMPUTE_READBACK_POOL_MAX_ITEMS: usize = 64;
+const COMPUTE_READBACK_POOL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 struct PooledResource<K, V> {
     key: K,
@@ -627,7 +661,7 @@ struct ComputeResourcePoolStats {
 impl ComputeResourcePool {
     fn new() -> Self {
         Self {
-            uploads: BoundedResourcePool::new(32, 32 * 1024 * 1024),
+            uploads: BoundedResourcePool::new(128, 1024 * 1024 * 1024),
             uniforms: BoundedResourcePool::new(
                 COMPUTE_UNIFORM_POOL_MAX_ITEMS,
                 COMPUTE_UNIFORM_POOL_MAX_BYTES,
@@ -1547,6 +1581,7 @@ fn create_compute_buffer_allocation(
     })
 }
 
+#[derive(Clone)]
 pub(crate) struct ComputeImageResource {
     pub image: vk::Image,
     pub view: vk::ImageView,
@@ -2319,6 +2354,8 @@ mod tests {
                 writable: true,
                 requires_atomics: false,
                 graphics_storage: None,
+                retain: false,
+                patches: Vec::new(),
             },
             ComputeTexelBuffer {
                 bindings: vec![32, 33, 34],
@@ -2330,6 +2367,8 @@ mod tests {
                 writable: true,
                 requires_atomics: false,
                 graphics_storage: None,
+                retain: false,
+                patches: Vec::new(),
             },
         ];
         assert_eq!(compute_buffer_binding_counts(&buffers), (11, 3));

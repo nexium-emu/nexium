@@ -37,6 +37,10 @@ pub struct Renderer {
     presenter: Option<crate::presentation::Presenter>,
     inner: Mutex<RendererInner>,
     raw_storage_resident: Arc<Mutex<ComputeRawStorageResidency>>,
+    color_bases: Arc<parking_lot::RwLock<std::collections::HashSet<u64>>>,
+    resident_claims: Arc<Mutex<HashMap<u64, ResidentClaim>>>,
+    tex_invalidation_queue: Arc<Mutex<Vec<(u64, u64)>>>,
+    raw_storage_seq: std::sync::atomic::AtomicU64,
     device: ash::Device,
     submit_timeline: vk::Semaphore,
     submit_state: Arc<SubmitState>,
@@ -1736,6 +1740,10 @@ struct RendererInner {
     rt_reinterpret_cache: HashMap<RtReinterpretKey, RtReinterpretTexture>,
     compute_volume_cache: Vec<CachedComputeVolume>,
     compute_guest_image_pool: VecDeque<CachedComputeGuestImage>,
+    resident_storage: ResidentStorageMap,
+    tex_invalidation_queue: Arc<Mutex<Vec<(u64, u64)>>>,
+    forward_images: HashMap<u64, (u64, crate::compute::ComputeImageResource)>,
+    forward_zombies: Vec<crate::compute::ComputeImageResource>,
     compute_raw_storage_cache:
         HashMap<crate::compute::ComputeRawStorageKey, CachedComputeRawStorage>,
     raw_storage_resident: Arc<Mutex<ComputeRawStorageResidency>>,
@@ -3381,6 +3389,146 @@ struct CachedTexture {
     invalidated: bool,
     allocation_size: u64,
     last_use_generation: u64,
+    pool_shape: Option<PooledTextureShape>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PooledTextureShape {
+    device: vk::Device,
+    image_type: vk::ImageType,
+    format: vk::Format,
+    extent: (u32, u32, u32),
+    mip_levels: u32,
+    array_layers: u32,
+    flags: vk::ImageCreateFlags,
+}
+
+#[derive(Default)]
+struct TextureImagePool {
+    free: HashMap<PooledTextureShape, Vec<(vk::Image, vk::DeviceMemory, u64, u64)>>,
+    order: VecDeque<(u64, PooledTextureShape)>,
+    stamp: u64,
+    count: usize,
+    bytes: u64,
+    hits: u64,
+    misses: u64,
+}
+
+const TEXTURE_IMAGE_POOL_BYTES: u64 = 512 * 1024 * 1024;
+
+static TEXTURE_IMAGE_POOL: std::sync::LazyLock<Mutex<TextureImagePool>> =
+    std::sync::LazyLock::new(|| Mutex::new(TextureImagePool::default()));
+
+fn texture_image_pool_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_TEXTURE_IMAGE_POOL").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn take_pooled_texture_image(shape: PooledTextureShape) -> Option<(vk::Image, vk::DeviceMemory)> {
+    if !texture_image_pool_enabled() {
+        return None;
+    }
+    let mut pool = TEXTURE_IMAGE_POOL.lock();
+    let taken = pool.free.get_mut(&shape).and_then(|entries| entries.pop());
+    if taken.is_some() {
+        pool.hits += 1;
+    } else {
+        pool.misses += 1;
+    }
+    if (pool.hits + pool.misses) % 8192 == 0 {
+        log::warn!(
+            "[texpool] hits={} misses={} pooled={} pooled_mib={}",
+            pool.hits,
+            pool.misses,
+            pool.count,
+            pool.bytes >> 20
+        );
+    }
+    let (image, memory, size, _) = taken?;
+    pool.count -= 1;
+    pool.bytes -= size;
+    Some((image, memory))
+}
+
+fn recycle_texture_image(device: &ash::Device, texture: &CachedTexture) -> bool {
+    let Some(shape) = texture.pool_shape else {
+        return false;
+    };
+    let size = texture.allocation_size;
+    if !texture_image_pool_enabled()
+        || size == 0
+        || size > TEXTURE_IMAGE_POOL_BYTES / 8
+        || shape.device != device.handle()
+    {
+        return false;
+    }
+    let mut pool = TEXTURE_IMAGE_POOL.lock();
+    pool.stamp += 1;
+    let stamp = pool.stamp;
+    pool.free
+        .entry(shape)
+        .or_default()
+        .push((texture.image, texture.memory, size, stamp));
+    pool.order.push_back((stamp, shape));
+    pool.count += 1;
+    pool.bytes += size;
+    while pool.bytes > TEXTURE_IMAGE_POOL_BYTES {
+        let Some((oldest, oldest_shape)) = pool.order.pop_front() else {
+            break;
+        };
+        let Some(entries) = pool.free.get_mut(&oldest_shape) else {
+            continue;
+        };
+        let Some(position) = entries.iter().position(|entry| entry.3 == oldest) else {
+            continue;
+        };
+        let (image, memory, evicted, _) = entries.swap_remove(position);
+        if entries.is_empty() {
+            pool.free.remove(&oldest_shape);
+        }
+        pool.count -= 1;
+        pool.bytes -= evicted;
+        unsafe {
+            device.destroy_image(image, None);
+            device.free_memory(memory, None);
+        }
+    }
+    if pool.order.len() > pool.count * 4 + 256 {
+        let live: HashSet<u64> = pool
+            .free
+            .values()
+            .flat_map(|entries| entries.iter().map(|entry| entry.3))
+            .collect();
+        pool.order.retain(|(stamp, _)| live.contains(stamp));
+    }
+    true
+}
+
+fn drain_texture_image_pool(device: &ash::Device) {
+    let mut pool = TEXTURE_IMAGE_POOL.lock();
+    let handle = device.handle();
+    let shapes: Vec<PooledTextureShape> = pool
+        .free
+        .keys()
+        .copied()
+        .filter(|shape| shape.device == handle)
+        .collect();
+    for shape in shapes {
+        for (image, memory, size, _) in pool.free.remove(&shape).unwrap_or_default() {
+            pool.count -= 1;
+            pool.bytes -= size;
+            unsafe {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+        }
+    }
+    pool.order.retain(|(_, shape)| shape.device != handle);
 }
 
 impl CachedTexture {
@@ -5136,11 +5284,229 @@ struct PendingComputeOutput {
     format: crate::compute::ComputeStorageFormat,
     byte_len: usize,
     rt_alias: Option<RtKey>,
+    resident: Option<u64>,
+    producer: Option<u64>,
+    borrowed: bool,
 }
 
 struct PendingComputeTexel {
     resource_index: usize,
     byte_len: usize,
+}
+
+struct ResidentStorage {
+    image: crate::compute::ComputeImageResource,
+    serial: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ResidentClaim {
+    stamp: Option<u64>,
+    claimed: bool,
+}
+
+#[derive(Default)]
+struct ResidentStorageMap {
+    entries: HashMap<u64, ResidentStorage>,
+    claims: Arc<Mutex<HashMap<u64, ResidentClaim>>>,
+    bytes: u64,
+    serial: u64,
+}
+
+const RESIDENT_STORAGE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+impl ResidentStorageMap {
+    fn take(&mut self, key: u64) -> Option<crate::compute::ComputeImageResource> {
+        let entry = self.entries.remove(&key)?;
+        self.claims.lock().remove(&key);
+        self.bytes -= entry.image.allocation_size;
+        Some(entry.image)
+    }
+}
+
+const FORWARD_IMAGES_MAX: usize = 256;
+
+fn forget_borrowed_outputs(
+    outputs: &mut [crate::compute::ComputeImageResource],
+    borrowed: &[vk::Image],
+) {
+    for output in outputs
+        .iter_mut()
+        .filter(|output| borrowed.contains(&output.image))
+    {
+        output.image = vk::Image::null();
+        output.view = vk::ImageView::null();
+        output.memory = vk::DeviceMemory::null();
+    }
+}
+
+fn forwarded_compute_source(
+    inner: &RendererInner,
+    key: u64,
+) -> Option<crate::compute::ComputeImageResource> {
+    let pending = inner.pending_computes.iter().rev().find_map(|pending| {
+        let index = pending
+            .outputs
+            .iter()
+            .position(|output| output.producer == Some(key))?;
+        Some(
+            pending
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.outputs.get(index).cloned()),
+        )
+    });
+    match pending {
+        Some(Some(image)) => Some(image),
+        _ => inner.forward_images.get(&key).map(|entry| entry.1.clone()),
+    }
+}
+
+fn forwarded_view_components(
+    binding: u32,
+    tic: &crate::texture::TicEntry,
+    sample_type: crate::compute::ComputeSampleType,
+    source: &crate::compute::ComputeImageResource,
+) -> Result<vk::ComponentMapping, String> {
+    if tic.is_buffer()
+        || tic_is_volume(tic)
+        || tic.view_base_mip() != 0
+        || tic.view_mip_levels() != 1
+        || tic.width != source.width
+        || tic.height != source.height
+        || source.layers() != if tic.texture_type == 5 { tic.depth.max(1) } else { 1 }
+        || source.is_3d
+        || !source.sampled
+    {
+        return Err(format!(
+            "forwarded compute source for binding {} does not match its view: view={}x{} mip={}/{} source={}x{} layers={} 3d={} sampled={}",
+            binding,
+            tic.width,
+            tic.height,
+            tic.view_base_mip(),
+            tic.view_mip_levels(),
+            source.width,
+            source.height,
+            source.layers(),
+            source.is_3d,
+            source.sampled
+        ));
+    }
+    let numeric_type = sample_type.spirv_type();
+    let sampled_format = color_texture_image_format_for_tic(tic, numeric_type)?;
+    if !compute_cross_access_formats_compatible(sampled_format, source.format) {
+        return Err(format!(
+            "forwarded compute source for binding {} has incompatible formats {:?}/{:?}",
+            binding, sampled_format, source.format
+        ));
+    }
+    let swizzle = texture_view_swizzle(tic.format, numeric_type, tic.swizzle);
+    Ok(texture_component_mapping(swizzle))
+}
+
+fn keep_forward_image(
+    inner: &mut RendererInner,
+    key: u64,
+    producer_id: u64,
+    image: crate::compute::ComputeImageResource,
+) {
+    if inner
+        .forward_images
+        .get(&key)
+        .is_some_and(|(existing, _)| *existing > producer_id)
+    {
+        inner.forward_zombies.push(image);
+    } else if let Some((_, old)) = inner.forward_images.insert(key, (producer_id, image)) {
+        inner.forward_zombies.push(old);
+    }
+    while inner.forward_images.len() > FORWARD_IMAGES_MAX {
+        let Some(oldest) = inner
+            .forward_images
+            .iter()
+            .min_by_key(|(_, (id, _))| *id)
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        if let Some((_, image)) = inner.forward_images.remove(&oldest) {
+            inner.forward_zombies.push(image);
+        }
+    }
+    sweep_forward_zombies(inner);
+}
+
+fn sweep_forward_zombies(inner: &mut RendererInner) {
+    if inner.forward_zombies.is_empty() {
+        return;
+    }
+    let RendererInner {
+        device,
+        compute_backend,
+        pending_computes,
+        forward_zombies,
+        ..
+    } = inner;
+    let mut free = Vec::new();
+    forward_zombies.retain(|image| {
+        let used = pending_computes.iter().any(|pending| {
+            pending.resources.is_some() && pending.forwarded_images.contains(&image.image)
+        });
+        if !used {
+            free.push(image.clone());
+        }
+        used
+    });
+    match compute_backend.as_mut() {
+        Some(backend) => {
+            backend.recycle_dispatch_resources(device, Vec::new(), Vec::new(), free, Vec::new())
+        }
+        None => {
+            for image in free {
+                image.destroy(device);
+            }
+        }
+    }
+}
+
+fn keep_resident_storage(
+    inner: &mut RendererInner,
+    key: u64,
+    image: crate::compute::ComputeImageResource,
+) {
+    let RendererInner {
+        device,
+        resident_storage: map,
+        ..
+    } = inner;
+    map.serial = map.serial.wrapping_add(1);
+    let serial = map.serial;
+    map.bytes += image.allocation_size;
+    let entry = ResidentStorage { image, serial };
+    if let Some(old) = map.entries.insert(key, entry) {
+        map.bytes -= old.image.allocation_size;
+        old.image.destroy(device);
+    }
+    map.claims.lock().insert(key, ResidentClaim::default());
+    while map.bytes > RESIDENT_STORAGE_MAX_BYTES {
+        let mut claims = map.claims.lock();
+        let Some(oldest) = map
+            .entries
+            .iter()
+            .filter(|(key, entry)| {
+                !claims.get(*key).is_some_and(|claim| claim.claimed) && entry.serial != serial
+            })
+            .min_by_key(|(_, entry)| entry.serial)
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        claims.remove(&oldest);
+        drop(claims);
+        if let Some(entry) = map.entries.remove(&oldest) {
+            map.bytes -= entry.image.allocation_size;
+            entry.image.destroy(device);
+        }
+    }
 }
 
 const COMPUTE_RAW_STORAGE_CACHE_MAX_ITEMS: usize = 1024;
@@ -5151,12 +5517,17 @@ struct CachedComputeRawStorage {
     ready: bool,
     valid: bool,
     dirty: bool,
+    invalidated_at: u64,
+    retained: bool,
 }
 
 #[derive(Default)]
 struct ComputeRawStorageResidency {
     resident: nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>,
     queued_uses: HashMap<crate::compute::ComputeRawStorageKey, usize>,
+    present: nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>,
+    retained: nexium_common::fast_hash::FastSet<crate::compute::ComputeRawStorageKey>,
+    queued_invalidations: Vec<(crate::compute::ComputeRawStorageKey, u64)>,
 }
 
 pub struct ComputeRawStorageLease {
@@ -5527,7 +5898,12 @@ fn adopt_graphics_storage_for_compute(
         let Some(entry) = inner.graphics_storage.remove(&key) else {
             return;
         };
-        inner.raw_storage_resident.lock().resident.remove(&key);
+        {
+            let mut residency = inner.raw_storage_resident.lock();
+            residency.resident.remove(&key);
+            residency.retained.remove(&key);
+            residency.present.insert(key);
+        }
         let replaced = inner.compute_raw_storage_cache.insert(
             key,
             CachedComputeRawStorage {
@@ -5535,6 +5911,8 @@ fn adopt_graphics_storage_for_compute(
                 ready: true,
                 valid: true,
                 dirty: true,
+                invalidated_at: 0,
+                retained: false,
             },
         );
         if let Some(replaced) = replaced {
@@ -5632,7 +6010,12 @@ fn adopt_graphics_storage_for_compute(
     let Some(entry) = inner.graphics_storage.remove(&key) else {
         return;
     };
-    inner.raw_storage_resident.lock().resident.remove(&key);
+    {
+        let mut residency = inner.raw_storage_resident.lock();
+        residency.resident.remove(&key);
+        residency.retained.remove(&key);
+        residency.present.insert(key);
+    }
     inner.compute_raw_storage_cache.insert(
         key,
         CachedComputeRawStorage {
@@ -5640,6 +6023,8 @@ fn adopt_graphics_storage_for_compute(
             ready: true,
             valid: true,
             dirty: true,
+            invalidated_at: 0,
+            retained: false,
         },
     );
     if graphics_storage_trace_enabled() {
@@ -5680,6 +6065,7 @@ struct PendingCompute {
     texels: Vec<PendingComputeTexel>,
     resident_raw_storage: Vec<crate::compute::ComputeRawStorageKey>,
     interlude_transitions: Vec<ComputeSampleTransition>,
+    forwarded_images: Vec<vk::Image>,
     result: Option<Result<crate::compute::ComputeDispatchResult, String>>,
 }
 
@@ -5930,6 +6316,55 @@ impl Renderer {
         })
     }
 
+    pub fn queue_raw_storage_invalidation(&self, key: crate::compute::ComputeRawStorageKey) {
+        let seq = self
+            .raw_storage_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let mut residency = self.raw_storage_resident.lock();
+        let stale: Vec<_> = residency
+            .present
+            .iter()
+            .copied()
+            .filter(|existing| {
+                compute_raw_storage_ranges_overlap(existing.cpu_addr, existing.size, key.cpu_addr, key.size)
+                    || compute_raw_storage_ranges_overlap(existing.gpu_va, existing.size, key.gpu_va, key.size)
+            })
+            .collect();
+        for existing in stale {
+            residency.resident.remove(&existing);
+            residency.retained.remove(&existing);
+        }
+        residency.queued_invalidations.push((key, seq));
+    }
+
+    pub fn pin_retained_raw_storage(
+        &self,
+        key: crate::compute::ComputeRawStorageKey,
+    ) -> Option<ComputeRawStorageLease> {
+        let mut residency = self.raw_storage_resident.lock();
+        if !residency.retained.contains(&key) {
+            return None;
+        }
+        *residency.queued_uses.entry(key).or_default() += 1;
+        Some(ComputeRawStorageLease {
+            key,
+            residency: Arc::clone(&self.raw_storage_resident),
+        })
+    }
+
+    pub fn raw_storage_reservation_blocked(
+        &self,
+        key: crate::compute::ComputeRawStorageKey,
+    ) -> bool {
+        let residency = self.raw_storage_resident.lock();
+        (residency.present.contains(&key) && !residency.resident.contains(&key))
+            || residency
+                .present
+                .iter()
+                .any(|existing| compute_raw_storage_keys_conflict(*existing, key))
+    }
+
     pub fn reserve_compute_raw_storage(
         &self,
         key: crate::compute::ComputeRawStorageKey,
@@ -5962,6 +6397,10 @@ impl Renderer {
         gpu_ranges: &[(u64, u64)],
         preserve: Option<crate::compute::ComputeRawStorageKey>,
     ) -> usize {
+        let seq = self
+            .raw_storage_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         let mut inner = self.inner.lock();
         let RendererInner {
             compute_raw_storage_cache,
@@ -5983,7 +6422,9 @@ impl Renderer {
             }
             invalidated += usize::from(entry.valid);
             entry.valid = false;
+            entry.invalidated_at = seq;
             resident.resident.remove(key);
+            resident.retained.remove(key);
         }
         invalidated
     }
@@ -6139,6 +6580,52 @@ impl Renderer {
                 .inner
                 .try_lock()
                 .is_some_and(|inner| compute_rt_alias_for_key(&inner.rt_cache, key, tic).is_some())
+    }
+
+    pub fn claim_resident_storage(&self, key: u64, stamp: u64, rt_key: Option<RtKey>) -> bool {
+        if !self
+            .resident_claims
+            .lock()
+            .get(&key)
+            .is_some_and(|claim| !claim.claimed && claim.stamp == Some(stamp))
+        {
+            return false;
+        }
+        if rt_key.is_some_and(|rt_key| {
+            (rt_key.gpu_va == 0 || self.has_color_rt_at(rt_key.gpu_va))
+                && self
+                    .inner
+                    .lock()
+                    .rt_cache
+                    .find_content_bearing_color_for_exact_alias(rt_key)
+                    .is_some()
+        }) {
+            return false;
+        }
+        match self.resident_claims.lock().get_mut(&key) {
+            Some(claim) if !claim.claimed && claim.stamp == Some(stamp) => {
+                claim.claimed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_resident_storage_stamp(&self, key: u64, stamp: u64) {
+        if let Some(claim) = self.resident_claims.lock().get_mut(&key) {
+            if !claim.claimed {
+                claim.stamp = Some(stamp);
+            }
+        }
+    }
+
+    pub fn raw_storage_pin_seq(&self) -> u64 {
+        self.raw_storage_seq
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn has_color_rt_at(&self, gpu_va: u64) -> bool {
+        self.color_bases.read().contains(&gpu_va)
     }
 
     pub fn readback_compute_storage_seed(
@@ -6432,6 +6919,7 @@ impl Renderer {
     pub fn clear_texture_cache(&self) {
         self.prewait_pending_computes_unlocked();
         let mut inner = self.inner.lock();
+        inner.tex_invalidation_queue.lock().clear();
         settle_all_pending_computes(&mut inner);
         let drained: Vec<_> = inner.tex_cache.drain().map(|(_, t)| t).collect();
         inner.tex_cache_bytes = 0;
@@ -6486,7 +6974,25 @@ impl Renderer {
         if size == 0 {
             return;
         }
-        let mut inner = self.inner.lock();
+        match self.inner.try_lock() {
+            Some(mut inner) => {
+                drain_texture_invalidations(&mut inner);
+                invalidate_texture_range_locked(&mut inner, gpu_va, size);
+            }
+            None => self.tex_invalidation_queue.lock().push((gpu_va, size)),
+        }
+    }
+}
+
+fn drain_texture_invalidations(inner: &mut RendererInner) {
+    let queued = std::mem::take(&mut *inner.tex_invalidation_queue.lock());
+    for (gpu_va, size) in queued {
+        invalidate_texture_range_locked(inner, gpu_va, size);
+    }
+}
+
+fn invalidate_texture_range_locked(inner: &mut RendererInner, gpu_va: u64, size: u64) {
+    {
         let keys = inner.tex_cache_ranges.overlapping(gpu_va, size);
         if keys.is_empty() {
             return;
@@ -6539,7 +7045,9 @@ impl Renderer {
             }
         }
     }
+}
 
+impl Renderer {
     pub fn invalidate_render_target_content(&self, key: RtKey) {
         self.inner.lock().rt_cache.mark_guest_written(key);
     }
@@ -7249,6 +7757,10 @@ impl Renderer {
         init_stage("command pool created; querying depth formats");
 
         let mut rt_cache = RtCache::new();
+        let color_bases = rt_cache.color_base_mirror();
+        let resident_storage = ResidentStorageMap::default();
+        let resident_claims = Arc::clone(&resident_storage.claims);
+        let tex_invalidation_queue: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
         rt_cache.set_mem_properties(mem_props);
         rt_cache.set_depth_formats(crate::depth::DepthFormats::query(&instance, physical_device)?);
 
@@ -7643,6 +8155,10 @@ impl Renderer {
         let renderer = Arc::new(Self {
             presenter,
             raw_storage_resident: Arc::clone(&raw_storage_resident),
+            color_bases,
+            resident_claims,
+            tex_invalidation_queue: Arc::clone(&tex_invalidation_queue),
+            raw_storage_seq: std::sync::atomic::AtomicU64::new(0),
             inner: Mutex::new(RendererInner {
                 entry,
                 instance,
@@ -7677,6 +8193,10 @@ impl Renderer {
                 rt_reinterpret_cache: HashMap::default(),
                 compute_volume_cache: Vec::new(),
                 compute_guest_image_pool: VecDeque::new(),
+                resident_storage,
+                tex_invalidation_queue,
+                forward_images: HashMap::default(),
+                forward_zombies: Vec::new(),
                 compute_raw_storage_cache: HashMap::default(),
                 raw_storage_resident,
                 compute_overlay_sources: HashMap::default(),
@@ -11678,6 +12198,7 @@ impl Renderer {
         let tex_pendings = collect_tex_pendings(call, &read_guest)?;
 
         let mut inner = self.inner.lock();
+        drain_texture_invalidations(&mut inner);
         let RendererInner {
             device,
             queue,
@@ -13751,6 +14272,7 @@ impl Renderer {
 
         let rp_t1 = std::time::Instant::now();
         let mut inner = self.inner.lock();
+        drain_texture_invalidations(&mut inner);
         let rp_lock = rp_t1.elapsed();
         let interlude_cmds = record_compute_interludes(&mut inner, interludes);
         let mut interlude_cursor = 0usize;
@@ -20761,6 +21283,12 @@ enum ComputeSamplePlan {
         output_index: usize,
         components: vk::ComponentMapping,
     },
+    Forwarded {
+        binding: u32,
+        sampler: vk::Sampler,
+        source: crate::compute::ComputeImageResource,
+        components: vk::ComponentMapping,
+    },
     Guest {
         binding: u32,
         sampler: vk::Sampler,
@@ -21205,7 +21733,25 @@ fn prepare_compute_guest_image_content(
             }
         }
     }
-    let source_hash = texture_content_hash(raw);
+    let source_hash = match content_key {
+        Some(key) => {
+            thread_local! {
+                static SOURCE_HASHES: std::cell::RefCell<HashMap<(u64, usize), u64>> =
+                    std::cell::RefCell::new(HashMap::default());
+            }
+            SOURCE_HASHES.with(|hashes| {
+                let mut hashes = hashes.borrow_mut();
+                if let Some(&hash) = hashes.get(&(key, raw.len())) {
+                    return hash;
+                }
+                if hashes.len() >= 65536 {
+                    hashes.clear();
+                }
+                *hashes.entry((key, raw.len())).or_insert_with(|| texture_content_hash(raw))
+            })
+        }
+        None => texture_content_hash(raw),
+    };
     if let Some(content) = pool.iter().rev().find_map(|entry| {
         entry
             .content
@@ -21599,6 +22145,11 @@ enum ComputeImagePlan {
         output_index: usize,
         components: vk::ComponentMapping,
     },
+    Forwarded {
+        binding: u32,
+        source: crate::compute::ComputeImageResource,
+        components: vk::ComponentMapping,
+    },
     Guest {
         binding: u32,
         width: u32,
@@ -21782,6 +22333,7 @@ struct ComputeSampleTransition {
     old_layout: vk::ImageLayout,
     aspects: vk::ImageAspectFlags,
     alias: Option<(RtKey, bool)>,
+    layers: u32,
 }
 
 #[derive(Default)]
@@ -21899,11 +22451,24 @@ impl PreparedComputeResources {
                 continue;
             };
             entry.ready = true;
-            if entry.valid {
-                resident.lock().resident.insert(key);
-            }
             if request.writable {
                 entry.dirty = true;
+                entry.retained = false;
+            }
+            if entry.valid {
+                let mut residency = resident.lock();
+                if residency.queued_invalidations.iter().any(|(queued, _)| {
+                    compute_raw_storage_ranges_overlap(queued.cpu_addr, queued.size, key.cpu_addr, key.size)
+                        || compute_raw_storage_ranges_overlap(queued.gpu_va, queued.size, key.gpu_va, key.size)
+                }) {
+                    continue;
+                }
+                residency.resident.insert(key);
+                if entry.retained {
+                    residency.retained.insert(key);
+                } else {
+                    residency.retained.remove(&key);
+                }
             }
         }
     }
@@ -21982,10 +22547,62 @@ fn compute_raw_storage_seed_is_valid(byte_len: usize, seed_len: usize, resident:
     byte_len != 0 && (seed_len == byte_len || (seed_len == 0 && resident))
 }
 
+fn note_raw_storage_refusal(key: crate::compute::ComputeRawStorageKey, reason: &'static str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RAW_REFUSAL_TRACE").is_some()) {
+        return;
+    }
+    static REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 64 || count.is_power_of_two() {
+        log::warn!(
+            "[raw-refusal] #{count} {reason} gpu={:#x}+{:#x}",
+            key.gpu_va,
+            key.size
+        );
+    }
+}
+
+fn evict_unreferenced_raw_storage(
+    inner: &mut RendererInner,
+    keys: &[crate::compute::ComputeRawStorageKey],
+    respect_queued: bool,
+) -> bool {
+    if inner
+        .pending_computes
+        .iter()
+        .filter(|pending| pending.resources.is_some())
+        .any(|pending| pending.resident_raw_storage.iter().any(|key| keys.contains(key)))
+    {
+        return false;
+    }
+    {
+        let mut residency = inner.raw_storage_resident.lock();
+        if respect_queued && keys.iter().any(|key| residency.queued_uses.contains_key(key)) {
+            return false;
+        }
+        for key in keys {
+            residency.resident.remove(key);
+            residency.present.remove(key);
+            residency.retained.remove(key);
+            note_raw_storage_refusal(*key, "evicted conflict");
+        }
+    }
+    let buffers: Vec<_> = keys
+        .iter()
+        .filter_map(|key| inner.compute_raw_storage_cache.remove(key))
+        .map(|entry| entry.resource)
+        .collect();
+    park_or_recycle_compute_buffers(inner, buffers);
+    true
+}
+
 fn acquire_compute_raw_storage(
     inner: &mut RendererInner,
     key: crate::compute::ComputeRawStorageKey,
     seed: &[u8],
+    pin_seq: u64,
+    retain: bool,
 ) -> Result<Option<PreparedComputeTexel>, String> {
     if key.size == 0 {
         return Err("compute raw storage key has an empty range".to_string());
@@ -22002,13 +22619,14 @@ fn acquire_compute_raw_storage(
                 seed.len()
             );
         }
-        if !entry.valid {
-            return Ok(None);
+        if entry.valid || (seed.is_empty() && entry.invalidated_at > pin_seq) {
+            if seed.is_empty() && !entry.ready {
+                return Err("compute raw storage cache hit is not ready".to_string());
+            }
+            return Ok(Some(PreparedComputeTexel::resident(key, entry)));
         }
-        if seed.is_empty() && !entry.ready {
-            return Err("compute raw storage cache hit is not ready".to_string());
-        }
-        return Ok(Some(PreparedComputeTexel::resident(key, entry)));
+        note_raw_storage_refusal(key, "invalid entry");
+        return Ok(None);
     }
     if graphics_storage_trace_enabled() {
         let nonzero_words = seed.chunks_exact(4).filter(|word| *word != [0u8; 4]).count();
@@ -22027,23 +22645,39 @@ fn acquire_compute_raw_storage(
             key.size
         ));
     }
-    if inner
+    let conflicts: Vec<_> = inner
         .compute_raw_storage_cache
         .keys()
         .copied()
-        .any(|existing| compute_raw_storage_keys_conflict(existing, key))
-    {
+        .filter(|existing| compute_raw_storage_keys_conflict(*existing, key))
+        .collect();
+    if !conflicts.is_empty() && !evict_unreferenced_raw_storage(inner, &conflicts, true) {
+        note_raw_storage_refusal(key, "pinned conflict");
         return Ok(None);
     }
-    let retained_bytes = inner
+    let mut retained_bytes = inner
         .compute_raw_storage_cache
         .keys()
         .fold(0u64, |total, existing| total.saturating_add(existing.size));
+    if compute_raw_storage_evict_on_full_enabled()
+        && !compute_raw_storage_cache_can_admit(
+            inner.compute_raw_storage_cache.len(),
+            retained_bytes,
+            key.size,
+        )
+    {
+        release_unreferenced_compute_raw_storage_mode(inner, true);
+        retained_bytes = inner
+            .compute_raw_storage_cache
+            .keys()
+            .fold(0u64, |total, existing| total.saturating_add(existing.size));
+    }
     if !compute_raw_storage_cache_can_admit(
         inner.compute_raw_storage_cache.len(),
         retained_bytes,
         key.size,
     ) {
+        note_raw_storage_refusal(key, "admission");
         return Ok(None);
     }
     let resource = {
@@ -22058,14 +22692,20 @@ fn acquire_compute_raw_storage(
             .ok_or_else(|| "generic Vulkan compute backend is unavailable".to_string())?
             .acquire_raw_storage_buffer(device, mem_props, seed)?
     };
-    inner.raw_storage_resident.lock().resident.remove(&key);
+    {
+        let mut residency = inner.raw_storage_resident.lock();
+        residency.resident.remove(&key);
+        residency.present.insert(key);
+    }
     inner.compute_raw_storage_cache.insert(
         key,
         CachedComputeRawStorage {
             resource,
             ready: false,
+            invalidated_at: 0,
             valid: true,
             dirty: false,
+            retained: retain,
         },
     );
     Ok(inner
@@ -22075,6 +22715,10 @@ fn acquire_compute_raw_storage(
 }
 
 fn release_unreferenced_compute_raw_storage(inner: &mut RendererInner) {
+    release_unreferenced_compute_raw_storage_mode(inner, false);
+}
+
+fn release_unreferenced_compute_raw_storage_mode(inner: &mut RendererInner, include_retained: bool) {
     reap_parked_compute_buffers(inner);
     let referenced: std::collections::HashSet<_> = inner
         .pending_computes
@@ -22084,14 +22728,15 @@ fn release_unreferenced_compute_raw_storage(inner: &mut RendererInner) {
         .collect();
     let removable: Vec<_> = {
         let mut residency = inner.raw_storage_resident.lock();
-        let removable: Vec<_> = inner
-            .compute_raw_storage_cache
-            .keys()
-            .copied()
-            .filter(|key| !referenced.contains(key) && !residency.queued_uses.contains_key(key))
-            .collect();
-        for key in &removable {
+        let mut removable = Vec::new();
+        for (key, entry) in inner.compute_raw_storage_cache.iter() {
+            if referenced.contains(key) || residency.queued_uses.contains_key(key) {
+                continue;
+            }
             residency.resident.remove(key);
+            if include_retained || !(entry.retained && entry.valid) {
+                removable.push(*key);
+            }
         }
         removable
     };
@@ -22105,6 +22750,16 @@ fn release_unreferenced_compute_raw_storage(inner: &mut RendererInner) {
                 key.gpu_va,
                 key.size
             );
+        }
+    }
+    {
+        let mut residency = inner.raw_storage_resident.lock();
+        for key in &removable {
+            residency.present.remove(key);
+            residency.retained.remove(key);
+            if key.size <= 0x4000 {
+                note_raw_storage_refusal(*key, "released unreferenced");
+            }
         }
     }
     let raw_storage: Vec<_> = removable
@@ -22793,7 +23448,7 @@ fn interlude_image_barrier(
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count: transition.layers,
         },
         ..Default::default()
     }
@@ -22924,6 +23579,7 @@ fn max_unsettled_generation(entries: impl IntoIterator<Item = (bool, u64)>) -> O
 }
 
 fn settle_ready_pending_computes(inner: &mut RendererInner) {
+    sweep_forward_zombies(inner);
     reap_compute_batch_primaries(inner);
     let pending_count = inner.pending_computes.len();
     for index in 0..pending_count {
@@ -22993,6 +23649,14 @@ fn settle_pending_compute_record(
             pending.id
         ));
     };
+    let borrowed: Vec<vk::Image> = pending
+        .outputs
+        .iter()
+        .zip(&resources.outputs)
+        .filter(|(meta, _)| meta.borrowed)
+        .map(|(_, output)| output.image)
+        .collect();
+    forget_borrowed_outputs(&mut resources.outputs, &borrowed);
     let mut foreign_fences = Vec::new();
     let mut foreign_generation = 0u64;
     for key in pending.texels.iter().filter_map(|meta| {
@@ -23137,17 +23801,34 @@ fn settle_pending_compute_record(
     let guest_images = std::mem::take(&mut resources.guest_images);
     let guest_image_keys = std::mem::take(&mut resources.guest_image_keys);
     let guest_image_contents = std::mem::take(&mut resources.guest_image_contents);
-    let mut adopted: Vec<(usize, RtKey)> = pending
+    let mut adopted: Vec<(usize, Option<RtKey>, Option<u64>, Option<u64>)> = pending
         .outputs
         .iter()
         .enumerate()
-        .filter_map(|(index, meta)| meta.rt_alias.map(|key| (index, key)))
-        .filter(|(index, _)| *index < resources.outputs.len())
+        .filter(|(_, meta)| {
+            meta.rt_alias.is_some()
+                || meta.resident.is_some()
+                || meta.producer.is_some()
+                || meta.borrowed
+        })
+        .map(|(index, meta)| (index, meta.rt_alias, meta.resident, meta.producer))
+        .filter(|(index, _, _, _)| *index < resources.outputs.len())
         .collect();
     adopted.sort_unstable_by(|a, b| b.0.cmp(&a.0));
     let mut adopted_count = 0usize;
-    for (index, key) in adopted {
+    for (index, alias, resident, producer) in adopted {
         let image = resources.outputs.remove(index);
+        if image.image == vk::Image::null() {
+            continue;
+        }
+        let Some(key) = alias else {
+            if let Some(key) = resident {
+                keep_resident_storage(inner, key, image);
+            } else if let Some(key) = producer {
+                keep_forward_image(inner, key, pending.id, image);
+            }
+            continue;
+        };
         let extent = vk::Extent2D {
             width: image.width,
             height: image.height,
@@ -23325,6 +24006,8 @@ fn execute_compute_dispatch_mode(
     use crate::compute::{
         ComputeDispatchOutcome, ComputeDispatchResult, ComputeImageReadback, ComputeTexelReadback,
     };
+    drain_texture_invalidations(inner);
+    apply_queued_raw_storage_invalidations(inner);
 
     let dispatch_started = compute_stage_profile_enabled().then(std::time::Instant::now);
 
@@ -23335,6 +24018,7 @@ fn execute_compute_dispatch_mode(
     settle_ready_pending_computes(inner);
 
     profile_compute_prep_stage(0, &mut prep_stage_started);
+    let mut forwarded_images: Vec<vk::Image> = Vec::new();
     let mut sample_plans = Vec::with_capacity(dispatch.sampled_rts.len());
     for sampled in &dispatch.sampled_rts {
         let numeric_type = sampled.sample_type.spirv_type();
@@ -23357,11 +24041,7 @@ fn execute_compute_dispatch_mode(
         } else {
             None
         };
-        if std::env::var_os("NEXIUM_COMPUTE_ALIAS_TRACE").is_some_and(|value| {
-            let value = value.to_string_lossy();
-            let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
-        }) {
+        if compute_alias_trace_enabled() {
             match alias {
                 Some(alias) => log::warn!(
                     "[compute-alias] program={:#x} binding={} request={} tic={:?} source=live key={} fmt={:?} layout={:?} depth={} guest={} authoritative={} require_live={}",
@@ -23389,7 +24069,43 @@ fn execute_compute_dispatch_mode(
                 ),
             }
         }
-        let (plan, integer_sample) = if let Some(output_index) = cross_access_output {
+        let forwarded = match dispatch
+            .forwarded_sources
+            .iter()
+            .find(|link| link.binding == sampled.binding)
+        {
+            Some(link) => match forwarded_compute_source(inner, link.key) {
+                Some(source) => Some(source),
+                None => {
+                    return ComputeDispatchOutcome::FailedBeforeSubmit(format!(
+                        "forwarded compute producer {:#x} for sampled binding {} is gone",
+                        link.key, sampled.binding
+                    ))
+                }
+            },
+            None => None,
+        };
+        let (plan, integer_sample) = if let Some(source) = forwarded {
+            let components = match forwarded_view_components(
+                sampled.binding,
+                &sampled.tic,
+                sampled.sample_type,
+                &source,
+            ) {
+                Ok(components) => components,
+                Err(error) => return ComputeDispatchOutcome::FailedBeforeSubmit(error),
+            };
+            forwarded_images.push(source.image);
+            (
+                ComputeSamplePlan::Forwarded {
+                    binding: sampled.binding,
+                    sampler: vk::Sampler::null(),
+                    source,
+                    components,
+                },
+                texture_requires_integer_sampler(numeric_type, false),
+            )
+        } else if let Some(output_index) = cross_access_output {
             let output = &dispatch.outputs[output_index];
             let components = match compute_cross_access_view_components(
                 sampled.binding,
@@ -23762,6 +24478,17 @@ fn execute_compute_dispatch_mode(
                 output_index,
                 components,
             },
+            ComputeSamplePlan::Forwarded {
+                binding,
+                source,
+                components,
+                ..
+            } => ComputeSamplePlan::Forwarded {
+                binding,
+                sampler,
+                source,
+                components,
+            },
             ComputeSamplePlan::Guest {
                 binding,
                 width,
@@ -23837,6 +24564,34 @@ fn execute_compute_dispatch_mode(
             });
             continue;
         }
+        if let Some(link) = dispatch
+            .forwarded_sources
+            .iter()
+            .find(|link| link.binding == sampled.binding)
+        {
+            let Some(source) = forwarded_compute_source(inner, link.key) else {
+                return ComputeDispatchOutcome::FailedBeforeSubmit(format!(
+                    "forwarded compute producer {:#x} for sampled-image binding {} is gone",
+                    link.key, sampled.binding
+                ));
+            };
+            let components = match forwarded_view_components(
+                sampled.binding,
+                tic,
+                sampled.sample_type,
+                &source,
+            ) {
+                Ok(components) => components,
+                Err(error) => return ComputeDispatchOutcome::FailedBeforeSubmit(error),
+            };
+            forwarded_images.push(source.image);
+            image_plans.push(ComputeImagePlan::Forwarded {
+                binding: sampled.binding,
+                source,
+                components,
+            });
+            continue;
+        }
         let live_view_compatible = !is_array
             && tic.mip_levels() == 1
             && tic.view_base_mip() == 0
@@ -23848,11 +24603,7 @@ fn execute_compute_dispatch_mode(
                 .key
                 .and_then(|key| compute_rt_alias_for_key(&inner.rt_cache, key, &tic))
         };
-        if std::env::var_os("NEXIUM_COMPUTE_ALIAS_TRACE").is_some_and(|value| {
-            let value = value.to_string_lossy();
-            let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
-        }) {
+        if compute_alias_trace_enabled() {
             match alias {
                 Some(alias) => log::warn!(
                     "[compute-image-alias] program={:#x} binding={} request={} tic={:?} source=live key={} fmt={:?} layout={:?} depth={} guest={} authoritative={} require_live={}",
@@ -23989,6 +24740,7 @@ fn execute_compute_dispatch_mode(
         ComputeSamplePlan::Live(sample) => Some(sample),
         ComputeSamplePlan::CachedVolume { .. }
         | ComputeSamplePlan::CrossAccess { .. }
+        | ComputeSamplePlan::Forwarded { .. }
         | ComputeSamplePlan::Guest { .. } => None,
     }) {
         if let Some(existing) = sample_transitions
@@ -24008,12 +24760,15 @@ fn execute_compute_dispatch_mode(
                 old_layout: sample.old_layout,
                 aspects: sample.aspects,
                 alias: sample.alias,
+                layers: 1,
             });
         }
     }
     for image in image_plans.iter().filter_map(|plan| match plan {
         ComputeImagePlan::Live(image) => Some(image),
-        ComputeImagePlan::CrossAccess { .. } | ComputeImagePlan::Guest { .. } => None,
+        ComputeImagePlan::CrossAccess { .. }
+        | ComputeImagePlan::Forwarded { .. }
+        | ComputeImagePlan::Guest { .. } => None,
     }) {
         if let Some(existing) = sample_transitions
             .iter_mut()
@@ -24032,10 +24787,151 @@ fn execute_compute_dispatch_mode(
                 old_layout: image.old_layout,
                 aspects: image.aspects,
                 alias: image.alias,
+                layers: 1,
             });
         }
     }
 
+    for image in forwarded_images.iter().copied() {
+        match sample_transitions
+            .iter()
+            .find(|existing| existing.image == image)
+        {
+            Some(existing) if existing.old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
+                return ComputeDispatchOutcome::Unsupported(format!(
+                    "forwarded compute image has conflicting layout {:?}",
+                    existing.old_layout
+                ));
+            }
+            Some(_) => {}
+            None => sample_transitions.push(ComputeSampleTransition {
+                image,
+                old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                aspects: vk::ImageAspectFlags::COLOR,
+                alias: None,
+                layers: sample_plans
+                    .iter()
+                    .find_map(|plan| match plan {
+                        ComputeSamplePlan::Forwarded { source, .. } if source.image == image => {
+                            Some(source.layers())
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        image_plans.iter().find_map(|plan| match plan {
+                            ComputeImagePlan::Forwarded { source, .. }
+                                if source.image == image =>
+                            {
+                                Some(source.layers())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or(1),
+            }),
+        }
+    }
+    let mut borrowed_outputs: Vec<Option<crate::compute::ComputeImageResource>> =
+        Vec::with_capacity(dispatch.outputs.len());
+    for output in &dispatch.outputs {
+        let source = match dispatch
+            .output_sources
+            .iter()
+            .find(|link| link.binding == output.binding)
+        {
+            Some(link) => match forwarded_compute_source(inner, link.key) {
+                Some(source)
+                    if source.width == output.width
+                        && source.height == output.height
+                        && source.format == output.format.vk_format()
+                        && source.layers() == output.layers()
+                        && !forwarded_images.contains(&source.image) =>
+                {
+                    Some(source)
+                }
+                _ => {
+                    return ComputeDispatchOutcome::FailedBeforeSubmit(format!(
+                        "forwarded storage producer {:#x} for binding {} is gone or mismatched",
+                        link.key, output.binding
+                    ))
+                }
+            },
+            None => None,
+        };
+        borrowed_outputs.push(source);
+    }
+    forwarded_images.extend(borrowed_outputs.iter().flatten().map(|source| source.image));
+    let mut layer_copies: Vec<(usize, Vec<(u32, crate::compute::ComputeImageResource)>)> =
+        Vec::new();
+    for (index, output) in dispatch.outputs.iter().enumerate() {
+        let mut sources = Vec::new();
+        for source in dispatch
+            .output_layer_sources
+            .iter()
+            .filter(|source| source.binding == output.binding)
+        {
+            match forwarded_compute_source(inner, source.key) {
+                Some(image)
+                    if image.width == output.width
+                        && image.height == output.height
+                        && image.format == output.format.vk_format()
+                        && image.layers() == 1
+                        && source.layer < output.layers() =>
+                {
+                    sources.push((source.layer, image));
+                }
+                _ => {
+                    return ComputeDispatchOutcome::FailedBeforeSubmit(format!(
+                        "forwarded layer producer {:#x} for binding {} layer {} is gone or mismatched",
+                        source.key, output.binding, source.layer
+                    ))
+                }
+            }
+        }
+        if !sources.is_empty() {
+            forwarded_images.extend(sources.iter().map(|(_, image)| image.image));
+            layer_copies.push((index, sources));
+        }
+    }
+    let mut rt_seed_copies: Vec<(usize, vk::Image, vk::ImageLayout)> = Vec::new();
+    for (index, output) in dispatch.outputs.iter().enumerate() {
+        let Some(seed) = dispatch
+            .output_rt_seeds
+            .iter()
+            .find(|seed| seed.binding == output.binding)
+        else {
+            continue;
+        };
+        if output.initial_bytes.is_none() || output.is_3d || output.arrayed || output.depth != 1 {
+            continue;
+        }
+        let Some((alias_key, image, layout, format, _)) = inner
+            .rt_cache
+            .find_content_bearing_color_for_exact_alias(seed.key)
+        else {
+            continue;
+        };
+        if layout == vk::ImageLayout::UNDEFINED
+            || alias_key.sample_width > 1
+            || alias_key.sample_height > 1
+            || !rt_formats_compatible(format, output.format.vk_format())
+            || rt_seed_copies.iter().any(|(_, existing, _)| *existing == image)
+            || forwarded_images.contains(&image)
+        {
+            continue;
+        }
+        let Some(extent) = inner
+            .rt_cache
+            .get_existing(alias_key)
+            .map(|existing| existing.extent)
+        else {
+            continue;
+        };
+        if extent.width != output.width || extent.height != output.height {
+            continue;
+        }
+        rt_seed_copies.push((index, image, layout));
+    }
     let interlude_transitions: Vec<ComputeSampleTransition> = if interlude {
         sample_transitions
             .iter()
@@ -24130,7 +25026,13 @@ fn execute_compute_dispatch_mode(
                     if let Some((graphics_key, generation)) = texel.graphics_storage {
                         adopt_graphics_storage_for_compute(inner, graphics_key, generation, key);
                     }
-                    if let Some(resource) = acquire_compute_raw_storage(inner, key, &texel.bytes)? {
+                    if let Some(resource) = acquire_compute_raw_storage(
+                        inner,
+                        key,
+                        &texel.bytes,
+                        dispatch.raw_storage_pin_seq,
+                        texel.retain && !texel.writable,
+                    )? {
                         resource
                     } else {
                         if texel.bytes.len() != texel.byte_len {
@@ -24313,6 +25215,7 @@ fn execute_compute_dispatch_mode(
                 device,
                 mem_props,
                 compute_backend,
+                resident_storage,
                 ..
             } = &mut *inner;
             let backend = compute_backend.as_mut().unwrap();
@@ -24324,23 +25227,54 @@ fn execute_compute_dispatch_mode(
                 || dispatch
                     .image_aliases
                     .iter()
-                    .any(|alias| alias.storage_binding == output.binding);
-            resources.outputs.push(backend.acquire_output_image(
-                device,
-                mem_props,
-                output.width,
-                output.height,
-                output.depth,
-                output.is_3d,
-                output.arrayed,
-                output.format.vk_format(),
-                sampled,
-                attachable,
-            )?);
+                    .any(|alias| alias.storage_binding == output.binding)
+                || dispatch
+                    .output_producers
+                    .iter()
+                    .any(|link| link.binding == output.binding);
+            if let Some(source) = borrowed_outputs[resources.outputs.len()].clone() {
+                resources.outputs.push(source);
+                resources.output_uploads.push(None);
+                resources.readbacks.push(backend.acquire_readback_buffer(
+                    device,
+                    mem_props,
+                    *output_len as u64,
+                )?);
+                continue;
+            }
+            let reused = output
+                .resident
+                .filter(|_| !sampled && !attachable)
+                .and_then(|request| resident_storage.take(request.key));
+            if reused.is_none() && output.resident.is_some_and(|request| request.claimed) {
+                return Err(format!(
+                    "compute output binding {} lost its resident storage image",
+                    output.binding
+                ));
+            }
+            let rt_seeded = rt_seed_copies
+                .iter()
+                .any(|(index, _, _)| *index == resources.outputs.len());
+            resources.outputs.push(match reused {
+                Some(image) => image,
+                None => backend.acquire_output_image(
+                    device,
+                    mem_props,
+                    output.width,
+                    output.height,
+                    output.depth,
+                    output.is_3d,
+                    output.arrayed,
+                    output.format.vk_format(),
+                    sampled,
+                    attachable,
+                )?,
+            });
             resources.output_uploads.push(
                 output
                     .initial_bytes
                     .as_deref()
+                    .filter(|_| !rt_seeded)
                     .map(|bytes| {
                         backend.acquire_upload_buffer(device, mem_props, bytes)
                     })
@@ -24353,42 +25287,54 @@ fn execute_compute_dispatch_mode(
             )?);
         }
         for plan in &sample_plans {
-            let ComputeSamplePlan::CrossAccess {
-                output_index,
-                components,
-                ..
-            } = plan
-            else {
-                continue;
+            let (source, components) = match plan {
+                ComputeSamplePlan::CrossAccess {
+                    output_index,
+                    components,
+                    ..
+                } => (resources.outputs[*output_index].clone(), *components),
+                ComputeSamplePlan::Forwarded {
+                    source, components, ..
+                } => (source.clone(), *components),
+                _ => continue,
             };
             resources
                 .sampled_alias_views
                 .push(crate::compute::create_compute_sampled_alias_view(
                     &inner.device,
-                    &resources.outputs[*output_index],
-                    *components,
+                    &source,
+                    components,
                 )?);
         }
         for plan in &image_plans {
-            let ComputeImagePlan::CrossAccess {
-                output_index,
-                components,
-                ..
-            } = plan
-            else {
-                continue;
+            let (source, components) = match plan {
+                ComputeImagePlan::CrossAccess {
+                    output_index,
+                    components,
+                    ..
+                } => (resources.outputs[*output_index].clone(), *components),
+                ComputeImagePlan::Forwarded {
+                    source, components, ..
+                } => (source.clone(), *components),
+                _ => continue,
             };
             resources
                 .sampled_alias_views
                 .push(crate::compute::create_compute_sampled_alias_view(
                     &inner.device,
-                    &resources.outputs[*output_index],
-                    *components,
+                    &source,
+                    components,
                 )?);
         }
         Ok(())
     })();
     if let Err(error) = prepare_result {
+        let borrowed: Vec<vk::Image> = borrowed_outputs
+            .iter()
+            .flatten()
+            .map(|source| source.image)
+            .collect();
+        forget_borrowed_outputs(&mut resources.outputs, &borrowed);
         resources.destroy(&inner.device);
         if lazy {
             free_compute_descriptor_set(inner, program.descriptor_pool, program.descriptor_set);
@@ -24440,6 +25386,25 @@ fn execute_compute_dispatch_mode(
                     alias: None,
                 }
             }
+            ComputeSamplePlan::Forwarded {
+                binding,
+                sampler,
+                source,
+                ..
+            } => {
+                let view = resources.sampled_alias_views[next_alias_view];
+                next_alias_view += 1;
+                PreparedComputeSample {
+                    binding,
+                    image: source.image,
+                    view,
+                    sampler,
+                    descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    aspects: vk::ImageAspectFlags::COLOR,
+                    alias: None,
+                }
+            }
             ComputeSamplePlan::Guest {
                 binding, sampler, ..
             } => {
@@ -24482,6 +25447,21 @@ fn execute_compute_dispatch_mode(
                     view,
                     descriptor_layout: vk::ImageLayout::GENERAL,
                     old_layout: vk::ImageLayout::GENERAL,
+                    aspects: vk::ImageAspectFlags::COLOR,
+                    alias: None,
+                }
+            }
+            ComputeImagePlan::Forwarded {
+                binding, source, ..
+            } => {
+                let view = resources.sampled_alias_views[next_alias_view];
+                next_alias_view += 1;
+                PreparedComputeImage {
+                    binding,
+                    image: source.image,
+                    view,
+                    descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     aspects: vk::ImageAspectFlags::COLOR,
                     alias: None,
                 }
@@ -24718,20 +25698,34 @@ fn execute_compute_dispatch_mode(
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: transition.layers,
             },
             ..Default::default()
         });
     }
     for (request, output) in dispatch.outputs.iter().zip(&resources.outputs) {
-        if request.initial_bytes.is_some() {
+        if request.initial_bytes.is_some()
+            || dispatch
+                .output_layer_sources
+                .iter()
+                .any(|source| source.binding == request.binding)
+        {
             continue;
         }
+        let resident = request.resident.is_some_and(|request| request.claimed)
+            || dispatch
+                .output_sources
+                .iter()
+                .any(|link| link.binding == request.binding);
         image_barriers.push(vk::ImageMemoryBarrier {
             s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
             src_access_mask: vk::AccessFlags::empty(),
             dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            old_layout: vk::ImageLayout::UNDEFINED,
+            old_layout: if resident {
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            } else {
+                vk::ImageLayout::UNDEFINED
+            },
             new_layout: vk::ImageLayout::GENERAL,
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -24966,6 +25960,221 @@ fn execute_compute_dispatch_mode(
                 );
             }
         }
+        if !rt_seed_copies.is_empty() {
+            let seed_barrier = |image: vk::Image,
+                                old_layout: vk::ImageLayout,
+                                new_layout: vk::ImageLayout,
+                                src_access_mask: vk::AccessFlags,
+                                dst_access_mask: vk::AccessFlags| {
+                vk::ImageMemoryBarrier {
+                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                    src_access_mask,
+                    dst_access_mask,
+                    old_layout,
+                    new_layout,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    ..Default::default()
+                }
+            };
+            let mut before = Vec::with_capacity(rt_seed_copies.len() * 2);
+            let mut after = Vec::with_capacity(rt_seed_copies.len() * 2);
+            for &(index, rt_image, rt_layout) in &rt_seed_copies {
+                let output_image = resources.outputs[index].image;
+                before.push(seed_barrier(
+                    rt_image,
+                    rt_layout,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    compute_layout_access(rt_layout),
+                    vk::AccessFlags::TRANSFER_READ,
+                ));
+                before.push(seed_barrier(
+                    output_image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                ));
+                after.push(seed_barrier(
+                    rt_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    rt_layout,
+                    vk::AccessFlags::TRANSFER_READ,
+                    compute_layout_access(rt_layout),
+                ));
+                after.push(seed_barrier(
+                    output_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                ));
+            }
+            unsafe {
+                inner.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &before,
+                );
+                for &(index, rt_image, _) in &rt_seed_copies {
+                    let output = &resources.outputs[index];
+                    let layers = vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    };
+                    inner.device.cmd_copy_image(
+                        cmd,
+                        rt_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        output.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::ImageCopy {
+                            src_subresource: layers,
+                            src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                            dst_subresource: layers,
+                            dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                            extent: vk::Extent3D {
+                                width: output.width,
+                                height: output.height,
+                                depth: 1,
+                            },
+                        }],
+                    );
+                }
+                inner.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &after,
+                );
+            }
+        }
+        if !layer_copies.is_empty() {
+            let layer_barrier = |image: vk::Image,
+                                 layers: u32,
+                                 old_layout: vk::ImageLayout,
+                                 new_layout: vk::ImageLayout,
+                                 src_access_mask: vk::AccessFlags,
+                                 dst_access_mask: vk::AccessFlags| {
+                vk::ImageMemoryBarrier {
+                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                    src_access_mask,
+                    dst_access_mask,
+                    old_layout,
+                    new_layout,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: layers,
+                    },
+                    ..Default::default()
+                }
+            };
+            let to_transfer: Vec<_> = layer_copies
+                .iter()
+                .map(|(index, _)| {
+                    let output = &resources.outputs[*index];
+                    layer_barrier(
+                        output.image,
+                        output.layers(),
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                })
+                .collect();
+            let to_general: Vec<_> = layer_copies
+                .iter()
+                .map(|(index, _)| {
+                    let output = &resources.outputs[*index];
+                    layer_barrier(
+                        output.image,
+                        output.layers(),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )
+                })
+                .collect();
+            unsafe {
+                inner.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_transfer,
+                );
+                for (index, sources) in &layer_copies {
+                    let output = &resources.outputs[*index];
+                    for (layer, source) in sources {
+                        let copy = vk::ImageCopy {
+                            src_subresource: vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            },
+                            src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                            dst_subresource: vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: *layer,
+                                layer_count: 1,
+                            },
+                            dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                            extent: vk::Extent3D {
+                                width: output.width,
+                                height: output.height,
+                                depth: 1,
+                            },
+                        };
+                        inner.device.cmd_copy_image(
+                            cmd,
+                            source.image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            output.image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &[copy],
+                        );
+                    }
+                }
+                inner.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_general,
+                );
+            }
+        }
         if resources.output_uploads.iter().any(Option::is_some) {
             let upload_buffer_barriers: Vec<_> = resources
                 .output_uploads
@@ -25089,6 +26298,7 @@ fn execute_compute_dispatch_mode(
                 );
             }
         }
+        record_raw_storage_patches(&inner.device, cmd, &dispatch.texel_buffers, &resources.texels);
         unsafe {
             inner.device.cmd_pipeline_barrier(
                 cmd,
@@ -25154,7 +26364,7 @@ fn execute_compute_dispatch_mode(
                     base_mip_level: 0,
                     level_count: 1,
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: transition.layers,
                 },
                 ..Default::default()
             });
@@ -25357,6 +26567,16 @@ fn execute_compute_dispatch_mode(
                     .iter()
                     .find(|alias| alias.binding == request.binding)
                     .map(|alias| alias.key),
+                resident: request.resident.map(|request| request.key),
+                producer: dispatch
+                    .output_producers
+                    .iter()
+                    .find(|link| link.binding == request.binding)
+                    .map(|link| link.key),
+                borrowed: dispatch
+                    .output_sources
+                    .iter()
+                    .any(|link| link.binding == request.binding),
             })
             .collect();
         let texels = dispatch
@@ -25416,6 +26636,7 @@ fn execute_compute_dispatch_mode(
             texels,
             resident_raw_storage,
             interlude_transitions,
+            forwarded_images,
             result: None,
         });
         if let Some(started) = dispatch_started {
@@ -25426,6 +26647,7 @@ fn execute_compute_dispatch_mode(
                 started.elapsed(),
             );
         }
+        defer_drop(dispatch);
         return ComputeDispatchOutcome::Submitted(id);
     }
 
@@ -25546,7 +26768,123 @@ fn execute_compute_dispatch_mode(
             started.elapsed(),
         );
     }
+    defer_drop(dispatch);
     ComputeDispatchOutcome::Executed(result)
+}
+
+fn record_raw_storage_patches(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    requests: &[crate::compute::ComputeTexelBuffer],
+    texels: &[PreparedComputeTexel],
+) {
+    let targets: Vec<(vk::Buffer, &[(u64, Vec<u8>)])> = requests
+        .iter()
+        .zip(texels)
+        .filter(|(request, texel)| !request.patches.is_empty() && texel.resident_key.is_some())
+        .map(|(request, texel)| (texel.buffer, request.patches.as_slice()))
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let barriers = |src_access_mask: vk::AccessFlags, dst_access_mask: vk::AccessFlags| -> Vec<vk::BufferMemoryBarrier> {
+        targets
+            .iter()
+            .map(|&(buffer, _)| vk::BufferMemoryBarrier {
+                s_type: vk::StructureType::BUFFER_MEMORY_BARRIER,
+                src_access_mask,
+                dst_access_mask,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                buffer,
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+                ..Default::default()
+            })
+            .collect()
+    };
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &barriers(
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::TRANSFER_WRITE,
+            ),
+            &[],
+        );
+        for &(buffer, patches) in &targets {
+            for (offset, bytes) in patches {
+                for (index, chunk) in bytes.chunks(65536).enumerate() {
+                    device.cmd_update_buffer(cmd, buffer, offset + (index as u64) * 65536, chunk);
+                }
+            }
+        }
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &barriers(
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            ),
+            &[],
+        );
+    }
+}
+
+fn apply_queued_raw_storage_invalidations(inner: &mut RendererInner) {
+    let queued = {
+        let mut residency = inner.raw_storage_resident.lock();
+        if residency.queued_invalidations.is_empty() {
+            return;
+        }
+        std::mem::take(&mut residency.queued_invalidations)
+    };
+    for (key, seq) in queued {
+        for (existing, entry) in inner.compute_raw_storage_cache.iter_mut() {
+            if !compute_raw_storage_ranges_overlap(existing.cpu_addr, existing.size, key.cpu_addr, key.size)
+                && !compute_raw_storage_ranges_overlap(existing.gpu_va, existing.size, key.gpu_va, key.size)
+            {
+                continue;
+            }
+            entry.valid = false;
+            entry.retained = false;
+            entry.invalidated_at = entry.invalidated_at.max(seq);
+        }
+    }
+}
+
+fn compute_alias_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("NEXIUM_COMPUTE_ALIAS_TRACE").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    })
+}
+
+fn defer_drop<T: Send + 'static>(value: T) {
+    static DROPPER: std::sync::LazyLock<
+        Option<std::sync::mpsc::Sender<Box<dyn std::any::Any + Send>>>,
+    > = std::sync::LazyLock::new(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Box<dyn std::any::Any + Send>>();
+        std::thread::Builder::new()
+            .name("nexium-gpu-drop".into())
+            .spawn(move || while receiver.recv().is_ok() {})
+            .ok()
+            .map(|_| sender)
+    });
+    if let Some(sender) = DROPPER.as_ref() {
+        let _ = sender.send(Box::new(value));
+    }
 }
 
 fn validate_compute_dispatch(
@@ -25630,10 +26968,27 @@ fn validate_compute_dispatch(
                     && inner
                         .compute_raw_storage_cache
                         .get(&key)
-                        .is_some_and(|entry| entry.ready && entry.valid)
+                        .is_some_and(|entry| {
+                            entry.ready
+                                && (entry.valid
+                                    || entry.invalidated_at > dispatch.raw_storage_pin_seq)
+                        })
             });
             if !compute_raw_storage_seed_is_valid(buffer.byte_len, buffer.bytes.len(), resident) {
-                return Err("compute raw storage buffer has no valid seed".to_string());
+                let entry = buffer
+                    .raw_storage_key
+                    .and_then(|key| inner.compute_raw_storage_cache.get(&key));
+                return Err(format!(
+                    "compute raw storage buffer has no valid seed: key={:?} byte_len={:#x} seed={:#x} entry={:?} pin_seq={} resident_set={}",
+                    buffer.raw_storage_key.map(|key| (key.gpu_va, key.size)),
+                    buffer.byte_len,
+                    buffer.bytes.len(),
+                    entry.map(|entry| (entry.ready, entry.valid, entry.dirty, entry.invalidated_at)),
+                    dispatch.raw_storage_pin_seq,
+                    buffer.raw_storage_key.is_some_and(|key| {
+                        inner.raw_storage_resident.lock().resident.contains(&key)
+                    })
+                ));
             }
             if buffer.byte_len % 4 != 0 {
                 return Err("raw compute storage buffer is not word-aligned".to_string());
@@ -28430,6 +29785,38 @@ fn texture_layers_from_render_targets(
 }
 
 fn find_volume_rt_slices(
+    rt_cache: &RtCache,
+    tic: &crate::texture::TicEntry,
+    pitch_size: usize,
+    layers: u32,
+    base_key: Option<RtKey>,
+) -> Option<Vec<VolumeRtSlice>> {
+    type MissKey = (crate::texture::TicEntry, usize, u32, Option<RtKey>);
+    thread_local! {
+        static MISSES: std::cell::RefCell<std::collections::HashMap<MissKey, (u64, usize)>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (*tic, pitch_size, layers, base_key);
+    let version = (rt_cache.structure_generation(), rt_cache.drawn_count());
+    if MISSES.with(|misses| misses.borrow().get(&key) == Some(&version)) {
+        return None;
+    }
+    let found = find_volume_rt_slices_uncached(rt_cache, tic, pitch_size, layers, base_key);
+    MISSES.with(|misses| {
+        let mut misses = misses.borrow_mut();
+        if found.is_some() {
+            misses.remove(&key);
+        } else {
+            if misses.len() >= 4096 {
+                misses.clear();
+            }
+            misses.insert(key, version);
+        }
+    });
+    found
+}
+
+fn find_volume_rt_slices_uncached(
     rt_cache: &RtCache,
     tic: &crate::texture::TicEntry,
     pitch_size: usize,
@@ -31470,8 +32857,12 @@ fn recycle_frame_slot(
     for t in slot.retired_textures.drain(..) {
         unsafe {
             device.destroy_image_view(t.view, None);
-            device.destroy_image(t.image, None);
-            device.free_memory(t.memory, None);
+        }
+        if !recycle_texture_image(device, &t) {
+            unsafe {
+                device.destroy_image(t.image, None);
+                device.free_memory(t.memory, None);
+            }
         }
     }
     for buffer in slot.retired_texel_buffers.drain(..) {
@@ -33129,10 +34520,23 @@ fn create_texture_image(
         p_queue_family_indices: std::ptr::null(),
         _marker: std::marker::PhantomData,
     };
-    let image = unsafe {
-        device
-            .create_image(&img_info, None)
-            .map_err(|e| format!("create_image(tex {}x{}): {:?}", width, height, e))?
+    let pool_shape = PooledTextureShape {
+        device: device.handle(),
+        image_type: img_info.image_type,
+        format,
+        extent: (img_info.extent.width, img_info.extent.height, img_info.extent.depth),
+        mip_levels,
+        array_layers: img_info.array_layers,
+        flags: img_info.flags,
+    };
+    let pooled = take_pooled_texture_image(pool_shape);
+    let image = match pooled {
+        Some((image, _)) => image,
+        None => unsafe {
+            device
+                .create_image(&img_info, None)
+                .map_err(|e| format!("create_image(tex {}x{}): {:?}", width, height, e))?
+        },
     };
     let req = unsafe { device.get_image_memory_requirements(image) };
     let mut memory = vk::DeviceMemory::null();
@@ -33140,30 +34544,34 @@ fn create_texture_image(
     let mut stage = None;
     let mut copies = Vec::new();
     let preparation = (|| -> Result<(), String> {
-        let mt = find_memory_type(
-            mem_props,
-            req.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .ok_or_else(|| "no DEVICE_LOCAL for texture image".to_string())?;
-        let alloc = vk::MemoryAllocateInfo {
-            s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-            allocation_size: req.size,
-            memory_type_index: mt,
-            p_next: std::ptr::null(),
-            _marker: std::marker::PhantomData,
-        };
-        memory = crate::rt_cache::allocate_image_memory(device, mem_props, &alloc, req.memory_type_bits)
-            .map_err(|error| {
-                format!(
-                    "allocate_memory(tex): {error:?} requested_bytes={} dimensions={}x{} layers={} mips={} format={:?} memory_type={}",
-                    req.size, width, height, layers, mip_levels, format, mt,
-                )
-            })?;
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .map_err(|e| format!("bind_image_memory(tex): {:?}", e))?;
+        if let Some((_, pooled_memory)) = pooled {
+            memory = pooled_memory;
+        } else {
+            let mt = find_memory_type(
+                mem_props,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or_else(|| "no DEVICE_LOCAL for texture image".to_string())?;
+            let alloc = vk::MemoryAllocateInfo {
+                s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+                allocation_size: req.size,
+                memory_type_index: mt,
+                p_next: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            };
+            memory = crate::rt_cache::allocate_image_memory(device, mem_props, &alloc, req.memory_type_bits)
+                .map_err(|error| {
+                    format!(
+                        "allocate_memory(tex): {error:?} requested_bytes={} dimensions={}x{} layers={} mips={} format={:?} memory_type={}",
+                        req.size, width, height, layers, mip_levels, format, mt,
+                    )
+                })?;
+            unsafe {
+                device
+                    .bind_image_memory(image, memory, 0)
+                    .map_err(|e| format!("bind_image_memory(tex): {:?}", e))?;
+            }
         }
 
         stage = if volume_slices.is_none() && !matches!(source, TextureUploadSource::Deferred) {
@@ -33459,6 +34867,7 @@ fn create_texture_image(
             invalidated: false,
             allocation_size: req.size,
             last_use_generation: 0,
+            pool_shape: Some(pool_shape),
         },
         stage.and_then(|stage| stage.dedicated),
     ))
@@ -36512,6 +37921,24 @@ impl Drop for RendererInner {
         } else {
             std::mem::forget(parked_compute_buffers);
         }
+        let resident_storage = std::mem::take(&mut self.resident_storage);
+        let forward_images = std::mem::take(&mut self.forward_images);
+        let forward_zombies = std::mem::take(&mut self.forward_zombies);
+        if device_idle {
+            for (_, entry) in resident_storage.entries {
+                entry.image.destroy(&self.device);
+            }
+            for (_, (_, image)) in forward_images {
+                image.destroy(&self.device);
+            }
+            for image in forward_zombies {
+                image.destroy(&self.device);
+            }
+        } else {
+            std::mem::forget(resident_storage);
+            std::mem::forget(forward_images);
+            std::mem::forget(forward_zombies);
+        }
         let cached_compute_raw_storage = std::mem::take(&mut self.compute_raw_storage_cache);
         self.raw_storage_resident.lock().resident.clear();
         if device_idle {
@@ -36682,6 +38109,7 @@ impl Drop for RendererInner {
             }
             slot.fence = vk::Fence::null();
         }
+        drain_texture_image_pool(&self.device);
         self.utility_slot.retired_dsets.clear();
         for (buffer, memory) in self.utility_slot.retired_buffers.drain(..) {
             unsafe {
@@ -37204,6 +38632,7 @@ mod tests {
             invalidated: false,
             allocation_size: 4096,
             last_use_generation: 0,
+            pool_shape: None,
         };
         let mip = TextureRtMip {
             level: 0,
@@ -37283,6 +38712,7 @@ mod tests {
             invalidated: false,
             allocation_size: 4096,
             last_use_generation: 0,
+            pool_shape: None,
         };
         let base = TextureRtMip {
             level: 0,
@@ -37566,6 +38996,7 @@ mod tests {
             invalidated: false,
             allocation_size: size,
             last_use_generation,
+            pool_shape: None,
         }
     }
 
@@ -40898,6 +42329,7 @@ mod tests {
             invalidated: false,
             allocation_size: 4096,
             last_use_generation: 0,
+            pool_shape: None,
         };
         assert!(!sampled_texture_needs_upload(
             texture.invalidated, Some((texture.gen, texture.hash)), 7, 42, true, true,
@@ -40988,6 +42420,7 @@ mod tests {
             arrayed: false,
             format: ComputeStorageFormat::R32Float,
             initial_bytes: Some(vec![0; 16 * 16 * 16 * 4]),
+            resident: None,
         };
 
         assert!(
@@ -41760,6 +43193,7 @@ mod tests {
             arrayed: false,
             format: ComputeStorageFormat::Abgr8Unorm,
             initial_bytes: Some(vec![0; 64 * 64 * 4]),
+            resident: None,
         };
         assert!(
             compute_cross_access_view_components(1, &tic, ComputeSampleType::Float, &output)

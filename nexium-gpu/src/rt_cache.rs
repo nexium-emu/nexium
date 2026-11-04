@@ -590,6 +590,7 @@ fn same_d24_depth_allocation_covering(existing: RtKey, want: RtKey) -> bool {
 pub struct RtCache {
     cache: HashMap<RtKey, GpuImage>,
     color_gpu_base_index: HashMap<u64, Vec<RtKey>>,
+    color_base_mirror: std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<u64>>>,
     color_cpu_base_index: HashMap<u64, Vec<RtKey>>,
     color_gpu_page_index: HashMap<u64, Vec<RtKey>>,
     color_nvmap_index: HashMap<u32, Vec<RtKey>>,
@@ -906,6 +907,7 @@ impl RtCache {
         Self {
             cache: HashMap::default(),
             color_gpu_base_index: HashMap::default(),
+            color_base_mirror: Default::default(),
             color_cpu_base_index: HashMap::default(),
             color_nvmap_index: HashMap::default(),
             color_gpu_page_index: HashMap::default(),
@@ -1014,6 +1016,7 @@ impl RtCache {
         if !base.contains(&key) {
             base.push(key);
         }
+        self.color_base_mirror.write().insert(key.gpu_va);
         if key.cpu_addr != 0 {
             let base = self.color_cpu_base_index.entry(key.cpu_addr).or_default();
             if !base.contains(&key) {
@@ -1040,6 +1043,9 @@ impl RtCache {
             return;
         }
         remove_lookup_key(&mut self.color_gpu_base_index, key.gpu_va, key);
+        if !self.color_gpu_base_index.contains_key(&key.gpu_va) {
+            self.color_base_mirror.write().remove(&key.gpu_va);
+        }
         if key.cpu_addr != 0 {
             remove_lookup_key(&mut self.color_cpu_base_index, key.cpu_addr, key);
         }
@@ -1336,8 +1342,24 @@ impl RtCache {
         Some((canonical, image))
     }
 
+    pub fn color_keys_in_range(&self, gpu_va: u64, len: u64) -> Vec<RtKey> {
+        let end = gpu_va.saturating_add(len);
+        self.cache
+            .keys()
+            .copied()
+            .filter(|key| key.gpu_va >= gpu_va && key.gpu_va < end)
+            .collect()
+    }
+
+    pub fn color_base_mirror(
+        &self,
+    ) -> std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<u64>>> {
+        std::sync::Arc::clone(&self.color_base_mirror)
+    }
+
     fn clear_color_lookup_index(&mut self) {
         self.color_gpu_base_index.clear();
+        self.color_base_mirror.write().clear();
         self.color_cpu_base_index.clear();
         self.color_gpu_page_index.clear();
         self.color_nvmap_index.clear();
@@ -1840,6 +1862,10 @@ impl RtCache {
 
     pub fn structure_generation(&self) -> u64 {
         self.structure_generation
+    }
+
+    pub fn drawn_count(&self) -> usize {
+        self.drawn_stamp.len()
     }
 
     pub fn resolve_drawn_color_exact(

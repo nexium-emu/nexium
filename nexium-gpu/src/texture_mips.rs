@@ -112,6 +112,26 @@ pub fn find_texture_rt_mips(
     base_key: RtKey,
     format: vk::Format,
 ) -> Vec<TextureRtMip> {
+    if std::env::var("NEXIUM_RT_MIP_WHY")
+        .ok()
+        .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+        == Some(tic.gpu_va)
+    {
+        log::warn!(
+            "[rt-mip-why] tic={:#x} type={} depth={} mips={} candidate={} nvmap_color={} key={} tic={}x{} bpp_ok={} guest_size={}",
+            tic.gpu_va,
+            tic.texture_type,
+            tic.depth,
+            tic.view_mip_levels(),
+            texture_rt_mip_candidate(tic),
+            rt_cache.has_color_for_nvmap(base_key.nvmap_id),
+            base_key.label(),
+            tic.width,
+            tic.height,
+            crate::renderer::exact_rt_copy_format_bpp(format) == Some(tic.format.src_bpp()),
+            base_key.guest_size_bytes
+        );
+    }
     if !texture_rt_mip_candidate(tic)
         || !rt_cache.has_color_for_nvmap(base_key.nvmap_id)
         || base_key.gpu_va != tic.gpu_va
@@ -154,7 +174,13 @@ pub fn find_texture_rt_mips(
                 width: padded_width as u32,
                 ..want
             };
-            let mut candidates = [Some((want, 0)), Some((padded, 0)), None, None];
+            let mut candidates = [
+                Some((want, 0)),
+                Some((padded, 0)),
+                None,
+                None,
+                (layers > 1).then_some((RtKey { array_stride_bytes: layout.layer_stride as u64, ..want }, 0)),
+            ];
             if layers > 1 {
                 let level_va = tic.gpu_va.checked_add(mip.guest_offset as u64);
                 let level_cpu = base_key.cpu_addr.checked_add(mip.guest_offset as u64);
@@ -176,6 +202,31 @@ pub fn find_texture_rt_mips(
                         ..layered
                     }, layer));
                 }
+            }
+            if layer < 2
+                && std::env::var("NEXIUM_RT_MIP_WHY")
+                    .ok()
+                    .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+                    == Some(tic.gpu_va)
+            {
+                let wanted: Vec<String> = candidates
+                    .iter()
+                    .flatten()
+                    .map(|(want, src_layer)| {
+                        format!(
+                            "{:?}@{}:{}",
+                            want,
+                            src_layer,
+                            texture_rt_mip_source(rt_cache, *want, format).is_some()
+                        )
+                    })
+                    .collect();
+                let present: Vec<String> = rt_cache
+                    .color_keys_in_range(tic.gpu_va, base_key.guest_size_bytes)
+                    .iter()
+                    .map(|key| format!("{key:?}"))
+                    .collect();
+                log::warn!("[rt-mip-why] layer={layer} wanted={wanted:?} present={present:?}");
             }
             let source = candidates.into_iter().flatten().filter_map(|(want, src_layer)| {
                 texture_rt_mip_source(rt_cache, want, format)
