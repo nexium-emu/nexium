@@ -484,7 +484,71 @@ struct ObservedWriteChunk {
     pages: [u64; 16],
 }
 
-type ObservedWriteChunks = nexium_common::fast_hash::FastMap<u64, ObservedWriteChunk>;
+const OBSERVED_WRITE_BLOCK_SHIFT: u64 = 21;
+
+#[derive(Default)]
+struct ObservedWriteChunks {
+    map: nexium_common::fast_hash::FastMap<u64, ObservedWriteChunk>,
+    blocks: nexium_common::fast_hash::FastMap<u64, u64>,
+}
+
+impl std::ops::Deref for ObservedWriteChunks {
+    type Target = nexium_common::fast_hash::FastMap<u64, ObservedWriteChunk>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for ObservedWriteChunks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+impl ObservedWriteChunks {
+    fn note_write(&mut self, guest_va: u64, serial: u64) {
+        let chunk = self.map.entry(guest_va & OBSERVED_WRITE_PAGE_MASK).or_default();
+        chunk.generation = chunk.generation.max(serial);
+        let page = &mut chunk.pages[((guest_va >> 12) & 15) as usize];
+        *page = (*page).max(serial);
+        let block = self
+            .blocks
+            .entry(guest_va >> OBSERVED_WRITE_BLOCK_SHIFT)
+            .or_insert(0);
+        *block = (*block).max(serial);
+    }
+
+    fn generation_in(&self, va: u64, end: u64) -> u64 {
+        const CHUNK: u64 = 1 << OBSERVED_WRITE_PAGE_SHIFT;
+        const BLOCK: u64 = 1 << OBSERVED_WRITE_BLOCK_SHIFT;
+        let mut page = va & OBSERVED_WRITE_PAGE_MASK;
+        let last = (end - 1) & OBSERVED_WRITE_PAGE_MASK;
+        let mut generation = 0;
+        loop {
+            if page & (BLOCK - 1) == 0 && last - page >= BLOCK - CHUNK {
+                generation = generation.max(
+                    self.blocks
+                        .get(&(page >> OBSERVED_WRITE_BLOCK_SHIFT))
+                        .copied()
+                        .unwrap_or(0),
+                );
+                if last - page == BLOCK - CHUNK {
+                    break;
+                }
+                page += BLOCK;
+                continue;
+            }
+            generation = generation.max(self.map.get(&page).map_or(0, |chunk| chunk.generation));
+            if page == last {
+                break;
+            }
+            page += CHUNK;
+        }
+        generation
+    }
+}
+
 static OBSERVED_WRITE_CHUNKS: OnceLock<Mutex<ObservedWriteChunks>> = OnceLock::new();
 
 fn observed_write_chunks() -> &'static Mutex<ObservedWriteChunks> {
@@ -590,10 +654,7 @@ fn record_observed_write_pages(base: *mut u8, addresses: &[usize]) {
         .wrapping_add(1);
     for &address in addresses {
         let guest_va = (address as u64).saturating_sub(base_addr);
-        let chunk = chunks.entry(guest_va & OBSERVED_WRITE_PAGE_MASK).or_default();
-        chunk.generation = chunk.generation.max(serial);
-        let page = &mut chunk.pages[((guest_va >> 12) & 15) as usize];
-        *page = (*page).max(serial);
+        chunks.note_write(guest_va, serial);
     }
     OBSERVED_WRITE_SERIAL.store(serial, Ordering::Release);
 }
@@ -610,17 +671,7 @@ pub fn observed_write_snapshot_range(va: u64, len: usize) -> (u64, u64) {
     let generation = if len == 0 {
         0
     } else if let Some(end) = va.checked_add(len as u64) {
-        let mut page = va & OBSERVED_WRITE_PAGE_MASK;
-        let last = (end - 1) & OBSERVED_WRITE_PAGE_MASK;
-        let mut generation = 0;
-        loop {
-            generation = generation.max(chunks.get(&page).map_or(0, |chunk| chunk.generation));
-            if page == last {
-                break;
-            }
-            page += 1u64 << OBSERVED_WRITE_PAGE_SHIFT;
-        }
-        generation
+        chunks.generation_in(va, end)
     } else {
         u64::MAX
     };
@@ -726,10 +777,7 @@ fn record_observed_write_vas(pages: &[u64]) {
         .load(Ordering::Relaxed)
         .wrapping_add(1);
     for &guest_va in pages {
-        let chunk = chunks.entry(guest_va & OBSERVED_WRITE_PAGE_MASK).or_default();
-        chunk.generation = chunk.generation.max(serial);
-        let page = &mut chunk.pages[((guest_va >> 12) & 15) as usize];
-        *page = (*page).max(serial);
+        chunks.note_write(guest_va, serial);
     }
     OBSERVED_WRITE_SERIAL.store(serial, Ordering::Release);
 }
@@ -2001,6 +2049,30 @@ mod tests {
                         .then_some((page, written))
                 }).collect();
                 assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn observed_write_block_generations_match_chunk_scan() {
+        let mut chunks = ObservedWriteChunks::default();
+        let writes = [(0x1000u64, 3u64), (0x1ff000, 5), (0x200000, 9), (0x5f0000, 2), (0x600000, 4), (0x9ff000, 7)];
+        for (page, serial) in writes {
+            chunks.note_write(page, serial);
+        }
+        for va in (0..0xa00000u64).step_by(0x37000) {
+            for len in [1u64, 0x1000, 0x10000, 0x1ff000, 0x200000, 0x400001, 0xa00000] {
+                let end = va + len;
+                let expected = writes
+                    .iter()
+                    .filter(|&&(page, _)| {
+                        page & OBSERVED_WRITE_PAGE_MASK <= (end - 1) & OBSERVED_WRITE_PAGE_MASK
+                            && page & OBSERVED_WRITE_PAGE_MASK >= va & OBSERVED_WRITE_PAGE_MASK
+                    })
+                    .map(|&(_, serial)| serial)
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(chunks.generation_in(va, end), expected, "va={va:#x} len={len:#x}");
             }
         }
     }
