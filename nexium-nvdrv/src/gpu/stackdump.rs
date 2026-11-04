@@ -201,10 +201,17 @@ mod imp {
     }
 
     fn walk(process: Handle, thread: Handle) -> Vec<u64> {
+        let mut pcs = Vec::with_capacity(MAX_FRAMES);
+        walk_into(process, thread, &mut pcs);
+        pcs
+    }
+
+    fn walk_into(process: Handle, thread: Handle, pcs: &mut Vec<u64>) {
+        pcs.clear();
         let mut context = Context { bytes: [0u8; 1232] };
         context.bytes[0x30..0x34].copy_from_slice(&CONTEXT_FULL.to_le_bytes());
         if unsafe { GetThreadContext(thread, &mut context) } == 0 {
-            return Vec::new();
+            return;
         }
         let rip = u64::from_le_bytes(context.bytes[0xF8..0x100].try_into().unwrap());
         let rsp = u64::from_le_bytes(context.bytes[0x98..0xA0].try_into().unwrap());
@@ -217,7 +224,6 @@ mod imp {
         bytes[44..48].copy_from_slice(&ADDR_MODE_FLAT.to_le_bytes());
         bytes[48..56].copy_from_slice(&rsp.to_le_bytes());
         bytes[60..64].copy_from_slice(&ADDR_MODE_FLAT.to_le_bytes());
-        let mut pcs = Vec::with_capacity(MAX_FRAMES);
         for _ in 0..MAX_FRAMES {
             let ok = unsafe {
                 StackWalk64(
@@ -245,7 +251,43 @@ mod imp {
             }
             pcs.push(pc);
         }
-        pcs
+    }
+
+    pub fn sample_threads(
+        tids: &[u32],
+        samples: usize,
+        interval: std::time::Duration,
+    ) -> Vec<Vec<Vec<u64>>> {
+        let mut out: Vec<Vec<Vec<u64>>> =
+            tids.iter().map(|_| Vec::with_capacity(samples)).collect();
+        let process = unsafe { GetCurrentProcess() };
+        if !ensure_symbols(process) {
+            return out;
+        }
+        let handles: Vec<Handle> = tids
+            .iter()
+            .map(|&tid| unsafe { OpenThread(THREAD_ACCESS, 0, tid) })
+            .collect();
+        let mut scratch: Vec<u64> = Vec::with_capacity(MAX_FRAMES);
+        for _ in 0..samples {
+            std::thread::sleep(interval);
+            for (index, &handle) in handles.iter().enumerate() {
+                if handle.is_null() || unsafe { SuspendThread(handle) } == u32::MAX {
+                    continue;
+                }
+                walk_into(process, handle, &mut scratch);
+                unsafe { ResumeThread(handle) };
+                if !scratch.is_empty() {
+                    out[index].push(scratch.clone());
+                }
+            }
+        }
+        for handle in handles {
+            if !handle.is_null() {
+                unsafe { CloseHandle(handle) };
+            }
+        }
+        out
     }
 
     pub fn exe_module_base() -> u64 {
@@ -436,6 +478,24 @@ pub fn exe_module_base() -> u64 {
 #[cfg(not(windows))]
 pub fn sample_thread(_tid: u32, _samples: usize, _interval: std::time::Duration) -> Vec<Vec<u64>> {
     Vec::new()
+}
+
+#[cfg(windows)]
+pub fn sample_threads(
+    tids: &[u32],
+    samples: usize,
+    interval: std::time::Duration,
+) -> Vec<Vec<Vec<u64>>> {
+    imp::sample_threads(tids, samples, interval)
+}
+
+#[cfg(not(windows))]
+pub fn sample_threads(
+    tids: &[u32],
+    _samples: usize,
+    _interval: std::time::Duration,
+) -> Vec<Vec<Vec<u64>>> {
+    tids.iter().map(|_| Vec::new()).collect()
 }
 
 #[cfg(not(windows))]

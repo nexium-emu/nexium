@@ -42,6 +42,7 @@ static DETAIL: AtomicU64 = AtomicU64::new(0);
 static PROGRESS: AtomicU64 = AtomicU64::new(0);
 static WORKER_TID: AtomicU32 = AtomicU32::new(0);
 static RENDER_TID: AtomicU32 = AtomicU32::new(0);
+static PREP_TID: AtomicU32 = AtomicU32::new(0);
 static RENDER_LABEL: AtomicCell<&'static str> = AtomicCell::new("-");
 static RENDER_DETAIL: AtomicU64 = AtomicU64::new(0);
 static RENDER_PROGRESS: AtomicU64 = AtomicU64::new(0);
@@ -57,6 +58,10 @@ pub fn render_phase(label: &'static str, detail: u64) {
 
 pub fn register_render_thread() {
     RENDER_TID.store(current_thread_id(), Ordering::Relaxed);
+}
+
+pub fn register_prep_thread() {
+    PREP_TID.store(current_thread_id(), Ordering::Relaxed);
 }
 
 #[inline]
@@ -177,41 +182,62 @@ fn install_sampler() {
         .name("nexium-gpu-sampler".to_string())
         .spawn(move || {
             std::thread::sleep(Duration::from_secs(start_s));
-            let sample_render = std::env::var("NEXIUM_GPU_SAMPLER_THREAD")
-                .ok()
-                .is_some_and(|value| value.eq_ignore_ascii_case("render"));
-            let tid = if sample_render {
-                RENDER_TID.load(Ordering::Relaxed)
-            } else {
-                WORKER_TID.load(Ordering::Relaxed)
-            };
+            let sampled = std::env::var("NEXIUM_GPU_SAMPLER_THREAD")
+                .unwrap_or_else(|_| "worker".to_string())
+                .to_ascii_lowercase();
             let interval = Duration::from_millis(interval_ms);
             let samples = (duration_s * 1000 / interval_ms) as usize;
+            let targets: Vec<(String, u32)> = sampled
+                .split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .flat_map(|name| match name.strip_prefix("file:") {
+                    Some(path) => std::fs::read_to_string(path)
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| {
+                            let tid = line.split_whitespace().next()?.parse::<u32>().ok()?;
+                            Some((format!("tid{tid}"), tid))
+                        })
+                        .collect::<Vec<_>>(),
+                    None => {
+                        let tid = match name.as_str() {
+                            "render" => RENDER_TID.load(Ordering::Relaxed),
+                            "prep" => PREP_TID.load(Ordering::Relaxed),
+                            _ => WORKER_TID.load(Ordering::Relaxed),
+                        };
+                        vec![(name, tid)]
+                    }
+                })
+                .collect();
+            let tids: Vec<u32> = targets.iter().map(|(_, tid)| *tid).collect();
             log::warn!(
-                "[gpu-sampler] sampling worker tid={} samples={} interval_ms={}",
-                tid,
+                "[gpu-sampler] sampling {:?} samples={} interval_ms={}",
+                targets,
                 samples,
                 interval_ms
             );
-            let stacks = super::stackdump::sample_thread(tid, samples, interval);
-            let path = std::env::temp_dir().join("nexium-gpu-samples.txt");
-            let mut text = format!("base {:x}\n", super::stackdump::exe_module_base());
-            for stack in &stacks {
-                for (index, pc) in stack.iter().enumerate() {
-                    if index != 0 {
-                        text.push(' ');
+            let sampled = super::stackdump::sample_threads(&tids, samples, interval);
+            for ((name, _), stacks) in targets.into_iter().zip(sampled) {
+                let path = std::env::temp_dir().join(format!("nexium-gpu-samples-{name}.txt"));
+                let mut text = format!("base {:x}\n", super::stackdump::exe_module_base());
+                for stack in &stacks {
+                    for (index, pc) in stack.iter().enumerate() {
+                        if index != 0 {
+                            text.push(' ');
+                        }
+                        text.push_str(&format!("{:x}", pc));
                     }
-                    text.push_str(&format!("{:x}", pc));
+                    text.push('\n');
                 }
-                text.push('\n');
-            }
-            match std::fs::write(&path, text) {
-                Ok(()) => log::warn!(
-                    "[gpu-sampler] wrote {} samples to {}",
-                    stacks.len(),
-                    path.display()
-                ),
-                Err(error) => log::error!("[gpu-sampler] write failed: {error}"),
+                match std::fs::write(&path, text) {
+                    Ok(()) => log::warn!(
+                        "[gpu-sampler] wrote {} samples to {}",
+                        stacks.len(),
+                        path.display()
+                    ),
+                    Err(error) => log::error!("[gpu-sampler] write failed: {error}"),
+                }
             }
         });
     if let Err(error) = spawned {
