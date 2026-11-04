@@ -70,6 +70,10 @@ fn dump(address: u64, binary: &[u8], program: Option<&Program>) {
     }
 }
 
+pub fn program_len(binary: &[u8]) -> usize {
+    binary.len().min(lower::end_of_program(binary))
+}
+
 pub fn translate_cached(address: u64, binary: &[u8]) -> Result<Arc<Program>, Error> {
     static CACHE: OnceLock<Mutex<HashMap<(u64, u64), Result<Arc<Program>, Error>>>> = OnceLock::new();
     let program = &binary[..binary.len().min(lower::end_of_program(binary))];
