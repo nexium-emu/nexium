@@ -41,7 +41,7 @@ fn slot_event(kernel: &mut Kernel, slot: u32) -> u32 {
     if let Some(existing) = kernel.nx2_graphics.syncpt.slots.get(&slot) {
         return existing.event;
     }
-    let event = new_event(kernel);
+    let event = new_event(kernel, "nx2_syncpt_slot");
     kernel.nx2_graphics.syncpt.slots.insert(slot, Slot { event, wait: None });
     event
 }
@@ -120,8 +120,8 @@ pub(super) fn attach_page(kernel: &mut Kernel, ctx: &mut IpcCtx) -> Vec<u8> {
     let header = [PAGE_VERSION, 0, count, VALUES as u32, RW_SUMMARY as u32, RO_SUMMARY as u32, RW_ARMED as u32, RO_ACKNOWLEDGED as u32];
     let bytes: Vec<u8> = header.iter().flat_map(|value| value.to_le_bytes()).collect();
     let _ = kernel.address_space.write(ro, &bytes);
-    let request = new_event(kernel);
-    let reply = new_event(kernel);
+    let request = new_event(kernel, "nx2_syncpt_request");
+    let reply = new_event(kernel, "nx2_syncpt_reply");
     kernel.nx2_graphics.syncpt.page = Some(SharedPage { rw, ro, count, reply });
     log::info!("[nx2] syncpoint page rw={rw:#x} ro={ro:#x} count={count} version={}", word(ctx, 0));
     build_ipc_response_copy(ctx, 0, &[], &[request, reply])

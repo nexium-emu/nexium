@@ -37,7 +37,7 @@ fn event(kernel: &mut Kernel, id: u32) -> u32 {
     if let Some(&handle) = kernel.nx2_graphics.gpu.events.get(&id) {
         return handle;
     }
-    let handle = new_event(kernel);
+    let handle = new_event(kernel, "nx2_gpu");
     kernel.nx2_graphics.gpu.events.insert(id, handle);
     handle
 }

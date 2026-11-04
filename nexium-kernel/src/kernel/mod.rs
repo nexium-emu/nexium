@@ -134,6 +134,7 @@ pub struct Kernel {
     bufferqueue_event_generation: u64,
     pub nvdrv_sync_events: HashSet<u32>,
     pub gpu_fence_events: HashMap<u32, (u32, u32)>,
+    pub debug_event_tags: HashMap<u32, &'static str>,
     pub gpu_fence_armed: HashMap<u32, std::time::Instant>,
     pub gpu_event_tokens: HashMap<(u32, u32), u32>,
     pub last_hid_tick: std::time::Instant,
@@ -436,6 +437,7 @@ impl Kernel {
             bufferqueue_event_generation: 0,
             nvdrv_sync_events: HashSet::new(),
             gpu_fence_events: HashMap::new(),
+            debug_event_tags: HashMap::new(),
             gpu_fence_armed: HashMap::new(),
             gpu_event_tokens: HashMap::new(),
             last_hid_tick: std::time::Instant::now(),
@@ -661,6 +663,9 @@ impl Kernel {
         }
         if self.audio_buffer_events.values().any(|&h| h == handle) {
             tags.push("audout");
+        }
+        if let Some(tag) = self.debug_event_tags.get(&handle) {
+            tags.push(tag);
         }
         if self.event_signals.get(&handle).copied().unwrap_or(false) {
             tags.push("signaled");

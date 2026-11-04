@@ -83,7 +83,7 @@ fn chat(kernel: &mut Kernel, ctx: &mut IpcCtx, cmd_id: u32) -> Option<Vec<u8>> {
     match cmd_id {
         1 => Some(reply_words(ctx, &[1])),
         11 => {
-            let event = new_event(kernel);
+            let event = new_event(kernel, "nx2_cmd11");
             Some(build_ipc_response_copy(ctx, 0, &[], &[event]))
         }
         _ => None,
@@ -123,6 +123,82 @@ fn dump_frame(index: u64, width: u32, height: u32, rgba: &[u8]) {
     write_dump(index, &format!("frame-{index:05}.ppm"), width, height, rgba);
 }
 
+fn dark_dump_due(index: u64, width: u32, height: u32, rgba: &[u8]) -> bool {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(limit) = std::env::var("NEXIUM_NX2_DUMP_DARK")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if COUNT.load(std::sync::atomic::Ordering::Relaxed) >= limit
+        || (last != 0 && index < last + 300)
+        || index < std::env::var("NEXIUM_NX2_DUMP_DARK_FROM").ok().and_then(|value| value.parse().ok()).unwrap_or(0)
+        || width < 64
+        || height < 64
+        || rgba.len() < (width as usize) * (height as usize) * 4
+    {
+        return false;
+    }
+    let (mut sum, mut squares, mut samples) = (0u64, 0u64, 0u64);
+    for y in (height * 3 / 10..height * 9 / 10).step_by(8) {
+        let (x0, x1) = if std::env::var_os("NEXIUM_NX2_DUMP_DARK_LEFT").is_some() { (20, 70) } else { (45, 95) };
+        for x in (width * x0 / 100..width * x1 / 100).step_by(8) {
+            let pixel = ((y * width + x) * 4) as usize;
+            let value = u64::from(rgba[pixel]) + u64::from(rgba[pixel + 1]) + u64::from(rgba[pixel + 2]);
+            sum += value;
+            squares += value * value;
+            samples += 1;
+        }
+    }
+    if samples == 0 {
+        return false;
+    }
+    let mean = sum / samples;
+    let variance = (squares / samples).saturating_sub(mean * mean);
+    let flat = std::env::var_os("NEXIUM_NX2_DUMP_FLAT").is_some() && mean >= 15 && variance < 16;
+    if mean >= 15 && !flat {
+        return false;
+    }
+    LAST.store(index, std::sync::atomic::Ordering::Relaxed);
+    COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+fn dump_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("NEXIUM_NX2_FRAME_DUMP").map(Into::into)
+}
+
+fn dump_dark_frame(index: u64, renderer: &nexium_gpu::Renderer, width: u32, height: u32, rgba: &[u8]) {
+    let Some(root) = dump_root() else {
+        return;
+    };
+    let directory = root.join(format!("dark-{index:05}"));
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    write_dump_to(&directory, &format!("frame-{index:05}.ppm"), width, height, rgba);
+    for (key, format) in renderer.recent_render_targets(64) {
+        if key.depth > 1 || key.is_3d || key.width < 64 || u64::from(key.width) * u64::from(key.height) > 2560 * 1440 {
+            continue;
+        }
+        if let Some((read_width, read_height, pixels)) =
+            renderer.readback_target_scaled_at(0, key.width, key.height, key.gpu_va)
+        {
+            write_dump_to(
+                &directory,
+                &format!("rt-{:x}-{}x{}-{format}.ppm", key.gpu_va, key.width, key.height),
+                read_width,
+                read_height,
+                &pixels,
+            );
+        }
+    }
+    log::warn!("[nx2] dark frame {index} dumped to {}", directory.display());
+}
+
 fn dump_render_targets(index: u64, renderer: &nexium_gpu::Renderer) {
     let (Some(_), Ok(spec)) = (dump_directory(index), std::env::var("NEXIUM_NX2_DUMP_RTS")) else {
         return;
@@ -158,6 +234,10 @@ fn write_dump(index: u64, name: &str, width: u32, height: u32, rgba: &[u8]) {
     let Some(directory) = dump_directory(index) else {
         return;
     };
+    write_dump_to(directory, name, width, height, rgba);
+}
+
+fn write_dump_to(directory: &std::path::Path, name: &str, width: u32, height: u32, rgba: &[u8]) {
     let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
     ppm.reserve(rgba.len() / 4 * 3);
     for pixel in rgba.chunks_exact(4) {
@@ -239,9 +319,10 @@ fn reply_longs(ctx: &IpcCtx, values: &[u64]) -> Vec<u8> {
     build_ipc_response(ctx, 0, &data, &[])
 }
 
-fn new_event(kernel: &mut Kernel) -> u32 {
+fn new_event(kernel: &mut Kernel, tag: &'static str) -> u32 {
     let handle = kernel.handles.create_handle(HandleType::Event);
     kernel.event_signals.insert(handle, false);
+    kernel.debug_event_tags.insert(handle, tag);
     handle
 }
 

@@ -10,11 +10,11 @@ pub(super) fn dispatch(kernel: &mut Kernel, ctx: &mut IpcCtx, cmd_id: u32) -> Op
         1 | 3 => Some(reply_words(ctx, &[DISPLAY_COUNT])),
         5 => Some(reply_words(ctx, &[TIMESTAMP_RECORDERS])),
         11 => {
-            let handle = new_event(kernel);
+            let handle = new_event(kernel, "vi2_cmd11");
             Some(build_ipc_response_copy(ctx, 0, &[], &[handle]))
         }
         31 | 32 => {
-            let handle = new_event(kernel);
+            let handle = new_event(kernel, "vi2_vsync");
             kernel.vsync_handles.insert(handle);
             log::info!("[nx2] vi2 cmd={cmd_id} arg={:#x} vsync event {handle:#x}", word(ctx, 0));
             Some(build_ipc_response_copy(ctx, 0, &[], &[handle]))
@@ -47,6 +47,7 @@ fn present(kernel: &mut Kernel, image: u32, crop: u32, counter: u32, value: u32)
     }
     super::peek_memory(kernel, presents);
     let renderer = kernel.nvdrv.renderer().cloned();
+    let renderer_for_dark = renderer.clone();
     let address_space = std::sync::Arc::clone(&kernel.address_space);
     kernel.nvdrv.submit_present_job("nx2-present", move |submit| {
         let drawn = crop_extent(crop, (layout.width, layout.height), (layout.width, layout.height));
@@ -78,6 +79,11 @@ fn present(kernel: &mut Kernel, image: u32, crop: u32, counter: u32, value: u32)
         }
         for pixel in pixels.chunks_exact_mut(4) {
             pixel[3] = 0xFF;
+        }
+        if let Some(renderer) = renderer_for_dark.as_ref() {
+            if super::dark_dump_due(presents, width, height, &pixels) {
+                super::dump_dark_frame(presents, renderer, width, height, &pixels);
+            }
         }
         super::dump_frame(presents, width, height, &pixels);
         submit(nexium_nvdrv::QueuedFrame { width, height, pixels, present_at: None, depth: None });

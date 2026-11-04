@@ -83,7 +83,7 @@ fn ready_event(kernel: &mut Kernel, name: &str) -> u32 {
     let event = match decoder(kernel, name).event {
         Some(event) => event,
         None => {
-            let event = new_event(kernel);
+            let event = new_event(kernel, "nx2_vdec");
             decoder(kernel, name).event = Some(event);
             event
         }
