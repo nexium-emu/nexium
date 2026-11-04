@@ -923,6 +923,50 @@ fn ioctl_profile_record(device: NvDevice, cmd: u16, result: u32, elapsed_ns: u64
 
 pub type AsyncMemoryRead = Arc<dyn Fn(u64, &mut [u8]) -> bool + Send + Sync>;
 pub type AsyncMemoryWrite = Arc<dyn Fn(u64, &[u8]) -> bool + Send + Sync>;
+
+const UNCHANGED_WRITE_MIN_BYTES: usize = 64 << 10;
+const UNCHANGED_WRITE_PAGE: u64 = 0x1000;
+
+fn write_changed_pages(
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    address: u64,
+    bytes: &[u8],
+) -> bool {
+    if bytes.len() < UNCHANGED_WRITE_MIN_BYTES {
+        return mem_write(address, bytes);
+    }
+    let mut current = vec![0u8; bytes.len()];
+    if !mem_read(address, &mut current) {
+        return mem_write(address, bytes);
+    }
+    let mut run: Option<usize> = None;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let page_end = ((address + offset as u64) | (UNCHANGED_WRITE_PAGE - 1)) + 1;
+        let end = ((page_end - address) as usize).min(bytes.len());
+        let changed = current[offset..end] != bytes[offset..end];
+        match (changed, run) {
+            (true, None) => run = Some(offset),
+            (false, Some(start)) => {
+                if !mem_write(address + start as u64, &bytes[start..offset]) {
+                    return false;
+                }
+                run = None;
+            }
+            _ => {}
+        }
+        offset = end;
+    }
+    match run {
+        Some(start) => mem_write(address + start as u64, &bytes[start..]),
+        None => true,
+    }
+}
+
+fn skip_unchanged_writes(mem_read: AsyncMemoryRead, mem_write: AsyncMemoryWrite) -> AsyncMemoryWrite {
+    Arc::new(move |address, bytes| write_changed_pages(&*mem_read, &*mem_write, address, bytes))
+}
 pub type PresentPrepared = Box<dyn FnOnce() + Send>;
 pub type AsyncMemoryCopy = Arc<dyn Fn(u64, u64, usize) -> bool + Send + Sync>;
 
@@ -2287,6 +2331,7 @@ impl Nvdrv {
         mem_write: AsyncMemoryWrite,
         mem_copy: AsyncMemoryCopy,
     ) {
+        let mem_write = skip_unchanged_writes(Arc::clone(&mem_read), mem_write);
         let sync_prep = std::env::var("NEXIUM_SYNC_PREP_THREAD").ok();
         let async_gpu = std::env::var("NEXIUM_ASYNC_GPU").ok();
         let gpu_pipeline = std::env::var("NEXIUM_GPU_PIPELINE").ok();
@@ -6331,6 +6376,34 @@ impl Default for Nvdrv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn large_writes_skip_unchanged_pages() {
+        let memory = std::sync::Mutex::new(vec![7u8; 0x30000]);
+        let writes = std::sync::Mutex::new(Vec::new());
+        let read = |address: u64, out: &mut [u8]| {
+            let memory = memory.lock().unwrap();
+            out.copy_from_slice(&memory[address as usize..address as usize + out.len()]);
+            true
+        };
+        let write = |address: u64, bytes: &[u8]| {
+            writes.lock().unwrap().push((address, bytes.len()));
+            memory.lock().unwrap()[address as usize..address as usize + bytes.len()].copy_from_slice(bytes);
+            true
+        };
+        let mut data = vec![7u8; 0x20000];
+        data[0x1800] = 1;
+        data[0x5000] = 2;
+        data[0x5fff] = 3;
+        assert!(super::write_changed_pages(&read, &write, 0x8800, &data));
+        assert_eq!(*writes.lock().unwrap(), vec![(0xa000, 0x1000), (0xd000, 0x2000)]);
+        let mut expected = vec![7u8; 0x30000];
+        expected[0x8800..0x28800].copy_from_slice(&data);
+        assert_eq!(*memory.lock().unwrap(), expected);
+        writes.lock().unwrap().clear();
+        assert!(super::write_changed_pages(&read, &write, 0x100, &[9u8; 0x100]));
+        assert_eq!(*writes.lock().unwrap(), vec![(0x100, 0x100)]);
+    }
+
     use super::*;
 
     /// Serialises tests that map at the first GPU VA, since texture

@@ -2479,6 +2479,7 @@ pub(crate) struct SsboSnapshotCache {
     input_mutation_epoch: u64,
     resource_mutation_epoch: u64,
     constbuf_write_log: Vec<(u64, u64)>,
+    constbuf_write_log_epoch: u64,
     last_packed_cbuf: Option<(CbufPackKey, nexium_gpu::draw::GraphicsCbufPayload)>,
     entries: FastMap<SsboSnapshotCacheKey, Arc<Vec<u8>>>,
     full_watch_ranges: SerialMap<SsboSnapshotCacheKey, HostWatchRange>,
@@ -3349,6 +3350,7 @@ impl SsboSnapshotCache {
             input_mutation_epoch: 0,
             resource_mutation_epoch: 0,
             constbuf_write_log: Vec::new(),
+            constbuf_write_log_epoch: 0,
             last_packed_cbuf: None,
             entries: FastMap::default(),
             full_watch_ranges: SerialMap::default(),
@@ -6947,6 +6949,7 @@ impl SsboSnapshotCache {
 
     pub(crate) fn begin_constbuf_write_log(&mut self) {
         self.constbuf_write_log.clear();
+        self.constbuf_write_log_epoch = self.constbuf_write_log_epoch.wrapping_add(1);
     }
 
     pub(crate) fn note_constbuf_write(&mut self, gpu_va: u64, len: usize) {
@@ -8130,7 +8133,7 @@ pub(crate) fn enqueue_draws<'d>(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
     mut compute_probe: Option<&mut ComputeGraphicsProbe>,
-    template_memo: &mut DrawTemplateMemoSet<'d>,
+    template_memo: &mut DrawTemplateMemoSet,
 ) -> bool {
     ssbo_snapshot_cache.refresh_deferred_writes(mappings);
     ssbo_snapshot_cache.attach_cbuf_pool(renderer);
@@ -9331,6 +9334,7 @@ fn flush_accum_with_boundary(
         mappings,
         &read_guest,
         mem_read,
+        mem_write,
         snapshot_cache,
         packetizer,
         hard_after || guest_writeback,
@@ -9779,6 +9783,7 @@ fn flush_batch(
     mappings: &GpuMappings,
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
     snapshot_cache: &mut SsboSnapshotCache,
     packetizer: &mut PreparedDrawPacketizer,
     hard_after: bool,
@@ -9836,6 +9841,7 @@ fn flush_batch(
                     mappings,
                     read_guest,
                     mem_read,
+                    mem_write,
                     snapshot_cache,
                     &mut prepared_texture_snapshots,
                     chunk_bytes,
@@ -10911,7 +10917,7 @@ fn texture_probe_interval() -> u64 {
         std::env::var("NEXIUM_TEXTURE_PROBE_INTERVAL")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(4)
+            .unwrap_or(if nexium_shader::ampere::enabled() { 16 } else { 4 })
             .max(1)
     })
 }
@@ -11742,8 +11748,101 @@ pub(crate) fn fetch_compute_texture_snapshot(
     if cache_key.is_none() || !nexium_memory::fastmem::write_watch_available() {
         return read_guest(gpu_va, len).map(|data| (Arc::new(data), None));
     }
+    if let Some(key) = cache_key.filter(|_| len >= LARGE_COMPUTE_TEXTURE_BYTES) {
+        return fetch_large_compute_texture(read_guest, gpu_va, len, key);
+    }
     fetch_texture_snapshot(read_guest, gpu_va, len, cache_key, Some(renderer))
         .map(|(data, _, _, _, identity)| (data, identity))
+}
+
+pub(crate) fn guest_range_generations(
+    mappings: &GpuMappings,
+    gpu_va: u64,
+    len: usize,
+) -> Option<(u64, u64, u64)> {
+    if !nexium_memory::fastmem::write_watch_available() {
+        return None;
+    }
+    let key = texture_snapshot_cache_key(mappings, gpu_va, len)?;
+    let host = take_texture_host_generation_fresh(key)?;
+    Some((
+        nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64),
+        texture_commit_generation(Some(key)),
+        host,
+    ))
+}
+
+pub(crate) fn guest_range_stamp(
+    mappings: &GpuMappings,
+    gpu_va: u64,
+    len: usize,
+    fresh: bool,
+) -> Option<u64> {
+    if !nexium_memory::fastmem::write_watch_available() {
+        return None;
+    }
+    let key = texture_snapshot_cache_key(mappings, gpu_va, len)?;
+    let host = if fresh {
+        take_texture_host_generation_fresh(key)?
+    } else {
+        take_texture_host_generation(key)?
+    };
+    let gpu = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
+    let commit = texture_commit_generation(Some(key));
+    let mut stamp = 0xcbf29ce484222325u64;
+    for part in [gpu, commit, host, key.mapping_epoch, key.cpu_va] {
+        stamp ^= part;
+        stamp = stamp.wrapping_mul(0x100000001b3);
+    }
+    Some(stamp)
+}
+
+const LARGE_COMPUTE_TEXTURE_BYTES: usize = 64 << 20;
+const LARGE_COMPUTE_TEXTURE_BUDGET: usize = 4 << 30;
+
+fn large_compute_texture_generations(
+    gpu_va: u64,
+    len: usize,
+    key: TextureSnapshotCacheKey,
+) -> Option<(u64, u64, u64)> {
+    Some((
+        nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64),
+        texture_commit_generation(Some(key)),
+        take_texture_host_generation(key)?,
+    ))
+}
+
+fn fetch_large_compute_texture(
+    read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+    gpu_va: u64,
+    len: usize,
+    key: TextureSnapshotCacheKey,
+) -> Option<(Arc<Vec<u8>>, Option<u64>)> {
+    type Entry = (TextureSnapshotCacheKey, (u64, u64, u64), Arc<Vec<u8>>, u64);
+    static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+    let before = large_compute_texture_generations(gpu_va, len, key);
+    if let Some(before) = before {
+        let mut cache = CACHE.lock().unwrap();
+        if let Some(index) = cache.iter().position(|entry| entry.0 == key && entry.1 == before) {
+            let entry = cache.remove(index);
+            let found = (Arc::clone(&entry.2), Some(entry.3));
+            cache.push(entry);
+            return Some(found);
+        }
+    }
+    let data = Arc::new(read_guest(gpu_va, len)?);
+    let after = large_compute_texture_generations(gpu_va, len, key);
+    let Some(stamp) = before.filter(|before| Some(*before) == after) else {
+        return Some((data, None));
+    };
+    let identity = next_texture_snapshot_identity();
+    let mut cache = CACHE.lock().unwrap();
+    cache.retain(|entry| entry.0 != key);
+    cache.push((key, stamp, Arc::clone(&data), identity));
+    while cache.iter().map(|entry| entry.2.len()).sum::<usize>() > LARGE_COMPUTE_TEXTURE_BUDGET {
+        cache.remove(0);
+    }
+    Some((data, Some(identity)))
 }
 
 /// Decides whether one guest read of a texture can be accepted without a retry.
@@ -13093,6 +13192,7 @@ fn prepare_draw_batch_async(
     mappings: &GpuMappings,
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
     snapshot_cache: &mut SsboSnapshotCache,
     prepared_texture_snapshots: &mut PreparedTextureSnapshotMemo,
     ring_upper_bytes: u64,
@@ -13167,7 +13267,7 @@ fn prepare_draw_batch_async(
         });
         for target in call.configured_color_rts.iter() {
             let key = target.key;
-            if std::env::var_os("NEXIUM_SKIP_RT_SNAPSHOT").is_some() {
+            if crate::env_flag_set!("NEXIUM_SKIP_RT_SNAPSHOT") {
                 break;
             }
             if key.gpu_va == 0
@@ -13281,6 +13381,15 @@ fn prepare_draw_batch_async(
                         reduced_from,
                     }) = prepared_tic.and_then(|plan| plan.texture)
                     {
+                        if has_pending_small_rt_writebacks() && matches!(tic.texture_type, 3 | 8) && !crate::env_flag_set!("NEXIUM_NO_DRAW_RT_WB") {
+                            writeback_small_rts_overlapping(
+                                renderer,
+                                mappings,
+                                mem_write,
+                                backing_gpu_va,
+                                read_size as u64,
+                            );
+                        }
                         if texture_type_debug_enabled() {
                             use std::sync::{Mutex, OnceLock};
                             static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> =
@@ -13377,6 +13486,13 @@ fn prepare_draw_batch_async(
                                     read_size,
                                 );
                             }
+                        }
+                        if super::pusher::kickprof::enabled() {
+                            super::engines::maxwell_compute::note_draw_texture_forward_candidate(
+                                mappings,
+                                backing_gpu_va,
+                                read_size,
+                            );
                         }
                         let n = if fermi_exact_snapshot_lease.is_some()
                             && call
@@ -16229,6 +16345,38 @@ pub(crate) fn writeback_small_rts(
     writeback.targets_written != 0
 }
 
+pub(crate) fn writeback_small_rts_overlapping(
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    gpu_va: u64,
+    len: u64,
+) -> bool {
+    let pending = {
+        let mut reg = small_rt_registry().lock().unwrap();
+        if reg.entries.is_empty() {
+            return false;
+        }
+        let end = gpu_va.saturating_add(len);
+        reg.drain_matching(|key, _| {
+            key.gpu_va < end && gpu_va < key.gpu_va.saturating_add(key.guest_size_bytes.max(1))
+        })
+    };
+    if pending.entries.is_empty() {
+        return false;
+    }
+    writeback_small_rt_entries(
+        renderer,
+        mappings,
+        mem_write,
+        pending,
+        std::time::Duration::from_millis(250),
+        "compute-sampled-rt-writeback",
+    )
+    .targets_written
+        != 0
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CpuReadableRtWritebackMode {
     Off,
@@ -16439,7 +16587,7 @@ fn execute_one<'d>(
     derived_state_cache: &mut DrawDerivedStateCache,
     resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
     storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
-    template_memo: &mut DrawTemplateMemoSet<'d>,
+    template_memo: &mut DrawTemplateMemoSet,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
@@ -16483,8 +16631,9 @@ fn draw_template_reuse_enabled() -> bool {
     })
 }
 
-pub(crate) struct DrawTemplateMemo<'d> {
-    draw: &'d DrawCall,
+pub(crate) struct DrawTemplateMemo {
+    draw: Box<DrawCall>,
+    log_epoch: u64,
     mapping_generation: u64,
     meta_generation: u64,
     handle_slots: [u32; 2],
@@ -16495,9 +16644,15 @@ pub(crate) struct DrawTemplateMemo<'d> {
 }
 
 #[derive(Default)]
-pub(crate) struct DrawTemplateMemoSet<'d> {
-    entries: Vec<DrawTemplateMemo<'d>>,
+pub(crate) struct DrawTemplateMemoSet {
+    entries: Vec<DrawTemplateMemo>,
     clock: u64,
+}
+
+impl DrawTemplateMemoSet {
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 fn draw_template_memo_entries() -> usize {
@@ -16507,7 +16662,7 @@ fn draw_template_memo_entries() -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .map(|entries| entries.clamp(1, 256))
-            .unwrap_or(16)
+            .unwrap_or(if nexium_shader::ampere::enabled() { 64 } else { 16 })
     })
 }
 
@@ -16608,10 +16763,14 @@ fn template_handle_slots(template: &DrawTemplate, bindless_slot: u32) -> [u32; 2
 }
 
 fn template_handles_unchanged(
-    memo: &DrawTemplateMemo<'_>,
+    memo: &DrawTemplateMemo,
     draw: &DrawCall,
     write_log: &[(u64, u64)],
+    write_log_epoch: u64,
 ) -> bool {
+    if memo.log_epoch != write_log_epoch {
+        return false;
+    }
     let groups = [memo.template.fs_cbuf_group, memo.template.vs_cbuf_group];
     let pending = write_log.get(memo.write_log_index..).unwrap_or(&[]);
     for (index, group) in groups.into_iter().enumerate() {
@@ -18996,7 +19155,7 @@ fn execute_one_inner<'d>(
     derived_state_cache: &mut DrawDerivedStateCache,
     resident_cbuf_arena: &mut ResidentCbufArenaBuilder,
     storage_writeback_targets: &mut Vec<GraphicsStorageWritebackTarget>,
-    template_memo: &mut DrawTemplateMemoSet<'d>,
+    template_memo: &mut DrawTemplateMemoSet,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
@@ -19014,7 +19173,7 @@ fn execute_one_inner<'d>(
             let mut texture_miss = false;
             let mut found = None;
             for (index, memo) in template_memo.entries.iter().enumerate() {
-                if memo.state_key != state_key || !draw_template_state_matches(memo.draw, draw) {
+                if memo.state_key != state_key || !draw_template_state_matches(&memo.draw, draw) {
                     continue;
                 }
                 state_matched = true;
@@ -19029,6 +19188,7 @@ fn execute_one_inner<'d>(
                         memo,
                         draw,
                         &ssbo_snapshot_cache.constbuf_write_log,
+                        ssbo_snapshot_cache.constbuf_write_log_epoch,
                     );
                 if handles_unchanged {
                     super::pusher::kickprof::count(super::pusher::kickprof::TMPL_TEX_SKIP, 1);
@@ -19050,6 +19210,7 @@ fn execute_one_inner<'d>(
                     let memo = &mut template_memo.entries[index];
                     memo.last_used = clock;
                     memo.write_log_index = ssbo_snapshot_cache.constbuf_write_log.len();
+                    memo.log_epoch = ssbo_snapshot_cache.constbuf_write_log_epoch;
                     let template = memo.template.clone();
                     super::pusher::kickprof::add(
                         super::pusher::kickprof::TMPL_CLONE_REUSE,
@@ -19072,7 +19233,7 @@ fn execute_one_inner<'d>(
                                 .iter()
                                 .max_by_key(|memo| memo.last_used)
                             {
-                                draw_template_state_mismatch_groups(recent.draw, draw);
+                                draw_template_state_mismatch_groups(&recent.draw, draw);
                             }
                         }
                     } else if texture_miss {
@@ -19116,7 +19277,8 @@ fn execute_one_inner<'d>(
                 let kp_clone = super::pusher::kickprof::start();
                 template_memo.clock = template_memo.clock.wrapping_add(1);
                 let entry = DrawTemplateMemo {
-                    draw,
+                    draw: Box::new(draw.clone()),
+                    log_epoch: ssbo_snapshot_cache.constbuf_write_log_epoch,
                     mapping_generation: mappings.generation(),
                     meta_generation: TEX_META_GEN.load(std::sync::atomic::Ordering::Acquire),
                     handle_slots: template_handle_slots(
@@ -25846,15 +26008,40 @@ fn fetch_sass(
 ) -> Option<Vec<u8>> {
     if nexium_shader::ampere::enabled() {
         use nexium_shader::ampere::{Error, MAX_LARGE_PROGRAM_BYTES, MAX_PROGRAM_BYTES};
-        let binary = read_span(gpu_va, MAX_PROGRAM_BYTES, mappings, mem_read)?;
+        thread_local! {
+            static SASS_MEMO: std::cell::RefCell<FastMap<u64, (Vec<u8>, Vec<u8>)>> =
+                std::cell::RefCell::new(FastMap::default());
+        }
+        let memo_len = SASS_MEMO.with(|memo| memo.borrow().get(&gpu_va).map(|entry| entry.0.len()));
+        if let Some(len) = memo_len {
+            let current = read_span(gpu_va, len, mappings, mem_read)?;
+            let hit = SASS_MEMO.with(|memo| {
+                memo.borrow()
+                    .get(&gpu_va)
+                    .filter(|entry| entry.0 == current)
+                    .map(|entry| entry.1.clone())
+            });
+            if hit.is_some() {
+                return hit;
+            }
+        }
+        let mut binary = read_span(gpu_va, MAX_PROGRAM_BYTES, mappings, mem_read)?;
         let program = match nexium_shader::ampere::translate_cached(gpu_va, &binary) {
             Err(Error::MissingEnd) if binary.len() == MAX_PROGRAM_BYTES => {
-                let binary = read_span(gpu_va, MAX_LARGE_PROGRAM_BYTES, mappings, mem_read)?;
+                binary = read_span(gpu_va, MAX_LARGE_PROGRAM_BYTES, mappings, mem_read)?;
                 nexium_shader::ampere::translate_cached(gpu_va, &binary)
             }
             translated => translated,
         }
         .ok()?;
+        binary.truncate(nexium_shader::ampere::program_len(&binary));
+        SASS_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() >= 4096 {
+                memo.clear();
+            }
+            memo.insert(gpu_va, (binary, program.code.clone()));
+        });
         return Some(program.code.clone());
     }
     read_span(gpu_va.wrapping_add(SPH_SIZE as u64), MAX_SASS_BYTES, mappings, mem_read)

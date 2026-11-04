@@ -7,7 +7,9 @@ use nexium_gpu::compute::{
     ComputeDispatch, ComputeDispatchOutcome, ComputeDispatchResult, ComputeImageAlias,
     ComputeRawStorageKey, ComputeSampleType, ComputeSampledImage, ComputeSampledRt,
     ComputeStorageFormat, ComputeStorageImage, ComputeTexelBuffer, ComputeTexelFormat,
-    ComputeUniformBuffer, ComputeUniformTexelBuffer,
+    ComputeLayerSource, ComputeProducerLink, ComputeRtSeed, ComputeUniformBuffer,
+    ComputeUniformTexelBuffer,
+    ResidentStorageRequest,
 };
 use nexium_gpu::rt_cache::RtKey;
 use nexium_gpu::texture::{
@@ -84,6 +86,9 @@ struct OutputTarget {
     cpu_addr: u64,
     guest_size: usize,
     format: ComputeStorageFormat,
+    resident_key: Option<u64>,
+    producer_key: Option<u64>,
+    read_only: bool,
 }
 
 struct PreparedWrite {
@@ -624,6 +629,541 @@ fn deferred_raw_storage_pin_enabled() -> bool {
     })
 }
 
+const FORWARD_MAX_BYTES: usize = 16 << 20;
+
+fn forward_denied(program: u64) -> bool {
+    static RANGES: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    RANGES
+        .get_or_init(|| {
+            let parse = |text: &str| u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
+            std::env::var("NEXIUM_FORWARD_DENY")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter_map(|item| match item.trim().split_once('-') {
+                            Some((lo, hi)) => Some((parse(lo)?, parse(hi)?)),
+                            None => parse(item).map(|address| (address, address)),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|&(lo, hi)| (lo..=hi).contains(&program))
+}
+
+fn note_forward_use(program: u64, path: u32, gpu_va: u64) {
+    if !crate::env_flag_set!("NEXIUM_FORWARD_USE_TRACE") {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Option<HashSet<(u64, u32, u64)>>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|error| error.into_inner());
+    if seen.get_or_insert_with(HashSet::new).insert((program, path, gpu_va)) {
+        log::warn!("[forward-use] prog={program:#x} path={path} producer_va={gpu_va:#x}");
+    }
+}
+
+fn forward_mode() -> u32 {
+    static MODE: OnceLock<u32> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("NEXIUM_FORWARD_MODE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+const RETAINED_RAW_MIN_BYTES: u64 = 256 << 10;
+
+fn retained_raw_storage_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("NEXIUM_RETAINED_RAW").ok().as_deref() {
+        Some("0") | Some("false") | Some("off") | Some("no") => false,
+        Some(_) => true,
+        None => nexium_shader::ampere::enabled(),
+    })
+}
+
+const RETAINED_RAW_MAX_MISSES: u32 = 3;
+
+type RetainedRawStamp = (u64, u64, u64);
+
+fn retained_raw_patches(
+    key: ComputeRawStorageKey,
+    host_generation: u64,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Option<Vec<(u64, Vec<u8>)>> {
+    let size = usize::try_from(key.size).ok()?;
+    let mut spans = Vec::new();
+    nexium_memory::fastmem::observed_write_spans_since(key.cpu_addr, size, host_generation, &mut spans);
+    let end = key.cpu_addr.checked_add(key.size)?;
+    let mut patches = Vec::new();
+    let mut total = 0usize;
+    for (address, len) in spans {
+        let start = address.max(key.cpu_addr);
+        let stop = address.saturating_add(len as u64).min(end);
+        if stop <= start {
+            continue;
+        }
+        let offset = (start - key.cpu_addr) & !3;
+        let offset_end = ((stop - key.cpu_addr + 3) & !3).min(key.size);
+        let length = usize::try_from(offset_end.checked_sub(offset)?).ok()?;
+        total += length;
+        if total > size / 2 || patches.len() >= 1024 {
+            return None;
+        }
+        let mut bytes = vec![0u8; length];
+        if !mem_read(key.cpu_addr + offset, &mut bytes) {
+            return None;
+        }
+        patches.push((offset, bytes));
+    }
+    Some(patches)
+}
+
+thread_local! {
+    static RETAINED_RAW_STAMPS: std::cell::RefCell<HashMap<ComputeRawStorageKey, (Option<RetainedRawStamp>, u32)>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+fn retained_raw_stamp(key: ComputeRawStorageKey) -> Option<RetainedRawStamp> {
+    RETAINED_RAW_STAMPS.with(|stamps| stamps.borrow().get(&key).and_then(|entry| entry.0))
+}
+
+fn retained_raw_misses(key: ComputeRawStorageKey) -> u32 {
+    RETAINED_RAW_STAMPS.with(|stamps| stamps.borrow().get(&key).map_or(0, |entry| entry.1))
+}
+
+fn with_retained_raw_entry(
+    key: ComputeRawStorageKey,
+    update: impl FnOnce(&mut (Option<RetainedRawStamp>, u32)),
+) {
+    RETAINED_RAW_STAMPS.with(|stamps| {
+        let mut stamps = stamps.borrow_mut();
+        if stamps.len() >= 4096 && !stamps.contains_key(&key) {
+            stamps.clear();
+        }
+        update(stamps.entry(key).or_insert((None, 0)));
+    });
+}
+
+fn remember_retained_raw_stamp(key: ComputeRawStorageKey, stamp: RetainedRawStamp) {
+    with_retained_raw_entry(key, |entry| entry.0 = Some(stamp));
+}
+
+fn trace_retained_raw_miss(key: ComputeRawStorageKey) {
+    thread_local! {
+        static LAST: std::cell::RefCell<HashMap<ComputeRawStorageKey, (u64, u64, u64)>> =
+            std::cell::RefCell::new(HashMap::default());
+    }
+    let now = (
+        nexium_gpu::tex_invalidate::region_gen_range(key.gpu_va, key.size),
+        nexium_memory::fastmem::observed_write_generation_range(key.cpu_addr, key.size as usize),
+        nexium_memory::fastmem::observed_write_pages_changed_since(key.cpu_addr, key.size as usize, 0) as u64,
+    );
+    let previous = LAST.with(|last| last.borrow_mut().insert(key, now));
+    let dirty_pages = previous.map_or(u64::MAX, |previous| {
+        nexium_memory::fastmem::observed_write_pages_changed_since(key.cpu_addr, key.size as usize, previous.1)
+            as u64
+    });
+    log::warn!(
+        "[retain-miss] {:#x}+{:#x} gpu_changed={} host_changed={} dirty_pages={} of {}",
+        key.gpu_va,
+        key.size,
+        previous.is_some_and(|previous| previous.0 != now.0),
+        previous.is_some_and(|previous| previous.1 != now.1),
+        dirty_pages,
+        key.size.div_ceil(4096)
+    );
+}
+
+fn note_retained_raw_miss(key: ComputeRawStorageKey) {
+    with_retained_raw_entry(key, |entry| {
+        entry.0 = None;
+        entry.1 += 1;
+    });
+}
+
+fn gpu_rt_seed_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_GPU_RT_SEED").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn compute_forward_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("NEXIUM_COMPUTE_FORWARD").ok().as_deref() {
+        Some("0") | Some("false") | Some("off") | Some("no") => false,
+        Some(_) => true,
+        None => nexium_shader::ampere::enabled(),
+    })
+}
+
+fn producer_key(gpu_va: u64, len: usize) -> u64 {
+    (gpu_va ^ (len as u64).rotate_left(40)).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1
+}
+
+pub(crate) fn note_draw_texture_forward_candidate(mappings: &GpuMappings, gpu_va: u64, len: usize) {
+    if len == 0 || !has_pending_writebacks() {
+        return;
+    }
+    let Some((cpu_addr, _)) = mapped_range(mappings, gpu_va) else {
+        return;
+    };
+    if !unlanded_pending_writeback_overlaps(gpu_va, cpu_addr, len) {
+        return;
+    }
+    let exact = pending_forward_source(gpu_va, cpu_addr, len).is_ok_and(|target| {
+        target.gpu_va == gpu_va && target.guest_size == len
+    });
+    if !exact && crate::env_flag_set!("NEXIUM_TEXFWD_TRACE") {
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count < 200 || count.is_power_of_two() {
+            let pending = pending_writebacks()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let outputs: Vec<String> = pending
+                .iter()
+                .filter(|record| !pending_writeback_has_landed(record))
+                .flat_map(|record| {
+                    record
+                        .output_targets
+                        .iter()
+                        .filter(|target| {
+                            !target.read_only
+                                && mapped_resources_overlap(
+                                    gpu_va,
+                                    cpu_addr,
+                                    len,
+                                    target.gpu_va,
+                                    target.cpu_addr,
+                                    target.guest_size,
+                                )
+                        })
+                        .map(move |target| {
+                            format!(
+                                "prog={:#x} out={:#x}+{:#x} {}x{}x{} fmt={:?} type={} mips={} base_mip={} off={:#x}",
+                                record.program_gpu_va,
+                                target.gpu_va,
+                                target.guest_size,
+                                target.tic.width,
+                                target.tic.height,
+                                target.tic.depth,
+                                target.tic.format,
+                                target.tic.texture_type,
+                                target.tic.mip_levels(),
+                                target.tic.view_base_mip(),
+                                target.gpu_va.wrapping_sub(gpu_va)
+                            )
+                        })
+                        .chain(record.texel_targets.iter().filter(|target| {
+                            mapped_resources_overlap(
+                                gpu_va,
+                                cpu_addr,
+                                len,
+                                target.gpu_va,
+                                target.cpu_addr,
+                                target.guest_size,
+                            )
+                        }).map(|target| format!("raw={:#x}+{:#x}", target.gpu_va, target.guest_size)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            log::warn!("[texfwd] #{count} tex={gpu_va:#x}+{len:#x} outputs={outputs:?}");
+        }
+    }
+    crate::gpu::pusher::kickprof::count_sized(
+        if exact {
+            crate::gpu::pusher::kickprof::KC_TEXFWD_EXACT
+        } else {
+            crate::gpu::pusher::kickprof::KC_TEXFWD_OVL
+        },
+        1,
+        len,
+    );
+}
+
+fn pending_forward_source(gpu_va: u64, cpu_addr: u64, len: usize) -> Result<OutputTarget, String> {
+    let pending = pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let record = pending
+        .iter()
+        .rev()
+        .find(|record| pending_writeback_record_overlaps(record, gpu_va, cpu_addr, len))
+        .ok_or("no overlapping record")?;
+    if pending_writeback_has_landed(record) {
+        return Err("latest record landed".into());
+    }
+    if record.dma.is_some() {
+        return Err("latest record is dma".into());
+    }
+    if record.texel_targets.iter().any(|target| {
+        mapped_resources_overlap(
+            gpu_va,
+            cpu_addr,
+            len,
+            target.gpu_va,
+            target.cpu_addr,
+            target.guest_size,
+        )
+    }) {
+        return Err("latest record writes a texel buffer here".into());
+    }
+    let overlapping: Vec<&OutputTarget> = record
+        .output_targets
+        .iter()
+        .filter(|target| {
+            !target.read_only
+                && mapped_resources_overlap(
+                gpu_va,
+                cpu_addr,
+                len,
+                target.gpu_va,
+                target.cpu_addr,
+                target.guest_size,
+            )
+        })
+        .collect();
+    let [target] = overlapping.as_slice() else {
+        return Err(format!("{} overlapping outputs", overlapping.len()));
+    };
+    if target.producer_key.is_none() {
+        return Err(format!(
+            "output not a producer: {}x{}x{} type={} pitch={} size={:#x}",
+            target.subresource.width,
+            target.subresource.height,
+            target.subresource.depth,
+            target.tic.texture_type,
+            target.tic.pitch_bytes,
+            target.guest_size
+        ));
+    }
+    if target.gpu_va != gpu_va || target.cpu_addr != cpu_addr || target.guest_size != len {
+        return Err(format!(
+            "range differs: output {:#x}+{:#x} view {:#x}+{:#x}",
+            target.gpu_va, target.guest_size, gpu_va, len
+        ));
+    }
+    Ok(**target)
+}
+
+fn forward_source_checked(
+    resolved: &[ResolvedResource],
+    resource: &ResolvedResource,
+    mappings: &GpuMappings,
+) -> Result<(u64, usize, u64), String> {
+    if resource.null || resource.tic.is_sparse {
+        return Err("null or sparse".into());
+    }
+    let (view, layered) = sampled_view_tic(&resource.tic)?;
+    if layered
+        || !matches!(view.texture_type, 1 | 5 | 7)
+        || (view.depth > 1 && view.texture_type != 5)
+        || view.pitch_bytes != 0
+        || view.mip_levels() != 1
+    {
+        return Err(format!(
+            "view shape: layered={} type={} depth={} pitch={} mips={}",
+            layered,
+            view.texture_type,
+            view.depth,
+            view.pitch_bytes,
+            view.mip_levels()
+        ));
+    }
+    let len = resource_size(&view)?;
+    let (cpu_addr, _) = mapped_range(mappings, view.gpu_va).ok_or("view unmapped")?;
+    let target = pending_forward_source(view.gpu_va, cpu_addr, len)?;
+    if target.subresource.width != view.width
+        || target.subresource.height != view.height
+        || target.format.bytes_per_pixel() != view.format.src_bpp()
+        || ComputeStorageFormat::from_tic(&view) != Some(target.format)
+        || (view.texture_type == 5) != (target.tic.texture_type == 5)
+        || target.subresource.depth != if view.texture_type == 5 { view.depth.max(1) } else { 1 }
+    {
+        return Err(format!(
+            "view {}x{} {:?}/{:?} vs output {}x{} {:?}",
+            view.width,
+            view.height,
+            view.format,
+            view.component_types,
+            target.subresource.width,
+            target.subresource.height,
+            target.format
+        ));
+    }
+    if let Some(other) = resolved.iter().find(|other| {
+        matches!(
+            other.access,
+            ResourceAccess::Storage | ResourceAccess::StorageRead | ResourceAccess::Atomic
+        ) && storage_subresource(&other.tic)
+            .map_or(other.tic.gpu_va, |mip| other.tic.gpu_va + mip.guest_offset as u64)
+            == view.gpu_va
+    }) {
+        let other_range = storage_subresource(&other.tic)
+            .map(|mip| (other.tic.gpu_va + mip.guest_offset as u64, mip.guest_size))
+            .unwrap_or((other.tic.gpu_va, 0));
+        return Err(format!(
+            "{:?} aliases {:?} binding of this dispatch: view {:#x}+{:#x} type={} storage {:#x}+{:#x} type={} pending={}",
+            resource.access,
+            other.access,
+            view.gpu_va,
+            len,
+            view.texture_type,
+            other_range.0,
+            other_range.1,
+            other.tic.texture_type,
+            mapped_range(mappings, other_range.0).is_some_and(|(cpu, _)| {
+                unlanded_pending_writeback_overlaps(other_range.0, cpu, other_range.1)
+            })
+        ));
+    }
+    Ok((view.gpu_va, len, target.producer_key.ok_or("no producer key")?))
+}
+
+fn forward_storage_source_checked(
+    resource: &ResolvedResource,
+    mappings: &GpuMappings,
+) -> Result<(u64, usize, u64), String> {
+    if resource.null || resource.tic.is_sparse {
+        return Err("null or sparse storage".into());
+    }
+    let sub = storage_subresource(&resource.tic)?;
+    if (sub.depth != 1 && resource.tic.texture_type != 5) || resource.tic.pitch_bytes != 0 {
+        return Err(format!(
+            "storage shape depth={} type={} pitch={}",
+            sub.depth, resource.tic.texture_type, resource.tic.pitch_bytes
+        ));
+    }
+    let gpu_va = resource.tic.gpu_va + sub.guest_offset as u64;
+    let (cpu_addr, _) = mapped_range(mappings, gpu_va).ok_or("storage unmapped")?;
+    let target = pending_forward_source(gpu_va, cpu_addr, sub.guest_size)?;
+    let format = storage_format(&resource.tic)?;
+    if target.subresource.width != sub.width
+        || target.subresource.height != sub.height
+        || target.subresource.depth != sub.depth
+        || target.format != format
+        || (resource.tic.texture_type == 5) != (target.tic.texture_type == 5)
+    {
+        return Err(format!(
+            "storage {}x{} {:?} type={} vs output {}x{} {:?} type={}",
+            sub.width,
+            sub.height,
+            format,
+            resource.tic.texture_type,
+            target.subresource.width,
+            target.subresource.height,
+            target.format,
+            target.tic.texture_type
+        ));
+    }
+    Ok((gpu_va, sub.guest_size, target.producer_key.ok_or("no producer key")?))
+}
+
+fn forward_storage_layers(
+    resource: &ResolvedResource,
+    mappings: &GpuMappings,
+) -> Result<(u64, usize, Vec<(u32, u64)>), String> {
+    if resource.null || resource.tic.is_sparse || resource.tic.pitch_bytes != 0 {
+        return Err("layers: null, sparse or pitch".into());
+    }
+    let sub = storage_subresource(&resource.tic)?;
+    let format = storage_format(&resource.tic)?;
+    let (stride, layer_size) = storage_layer_span(&resource.tic, sub)?;
+    let base = resource.tic.gpu_va + sub.guest_offset as u64;
+    let layers = (0..sub.depth.max(1))
+        .map(|layer| {
+            let gpu_va = base + u64::from(layer) * stride as u64;
+            let (cpu_addr, _) = mapped_range(mappings, gpu_va).ok_or("layer unmapped")?;
+            let target = pending_forward_source(gpu_va, cpu_addr, layer_size)?;
+            if target.subresource.width != sub.width
+                || target.subresource.height != sub.height
+                || target.subresource.depth != 1
+                || target.format != format
+            {
+                return Err(format!(
+                    "layer {layer} producer {}x{}x{} {:?} vs {}x{} {:?}",
+                    target.subresource.width,
+                    target.subresource.height,
+                    target.subresource.depth,
+                    target.format,
+                    sub.width,
+                    sub.height,
+                    format
+                ));
+            }
+            Ok((layer, target.producer_key.ok_or("no producer key")?))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((base, sub.guest_size, layers))
+}
+
+fn forward_source(
+    resolved: &[ResolvedResource],
+    resource: &ResolvedResource,
+    mappings: &GpuMappings,
+) -> Option<(u64, usize, u64)> {
+    if !compute_forward_enabled() {
+        return None;
+    }
+    let checked = if resource.access == ResourceAccess::StorageRead {
+        forward_storage_source_checked(resource, mappings)
+    } else {
+        forward_source_checked(resolved, resource, mappings)
+    };
+    match checked {
+        Ok(source) => Some(source),
+        Err(reason) => {
+            note_forward_reject(reason);
+            None
+        }
+    }
+}
+
+fn note_forward_reject(reason: String) {
+    if !crate::env_flag_set!("NEXIUM_FORWARD_TRACE") {
+        return;
+    }
+    static REASONS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+    let mut reasons = REASONS.lock().unwrap_or_else(|error| error.into_inner());
+    match reasons.iter_mut().find(|entry| entry.0 == reason) {
+        Some(entry) => entry.1 += 1,
+        None => reasons.push((reason, 1)),
+    }
+    if reasons.iter().map(|entry| entry.1).sum::<u64>() >= 2048 {
+        reasons.sort_by(|a, b| b.1.cmp(&a.1));
+        for (reason, count) in reasons.drain(..).take(12) {
+            log::warn!("[compute-forward] reject x{count} {reason}");
+        }
+        reasons.clear();
+    }
+}
+
+fn forwarded_producer(forwarded: &[(u64, usize, u64)], gpu_va: u64, len: usize) -> Option<u64> {
+    forwarded
+        .iter()
+        .find(|source| source.0 == gpu_va && source.1 == len)
+        .map(|source| source.2)
+}
+
+const RESIDENT_STORAGE_MIN_BYTES: usize = 1 << 20;
+
+fn resident_storage_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("NEXIUM_RESIDENT_STORAGE").ok().as_deref() {
+        Some("0") | Some("false") | Some("off") | Some("no") => false,
+        Some(_) => true,
+        None => nexium_shader::ampere::enabled(),
+    })
+}
+
 fn compute_alias_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1039,6 +1579,20 @@ pub(crate) fn take_resolved_writeback_spans() -> Vec<PendingComputeWritebackSpan
     RESOLVED_WRITEBACK_SPANS.with(|reported| std::mem::take(&mut *reported.borrow_mut()))
 }
 
+fn pending_output_exact(gpu_va: u64, len: usize) -> bool {
+    pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .filter(|record| !pending_writeback_has_landed(record))
+        .any(|record| {
+            record
+                .output_targets
+                .iter()
+                .any(|target| target.gpu_va == gpu_va && target.guest_size == len)
+        })
+}
+
 fn pending_writebacks() -> &'static Mutex<Vec<PendingComputeWriteback>> {
     static PENDING: OnceLock<Mutex<Vec<PendingComputeWriteback>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(Vec::new()))
@@ -1169,7 +1723,7 @@ fn pending_writeback_record_overlaps(
     size: usize,
 ) -> bool {
     size != 0
-        && (record.output_targets.iter().any(|target| {
+        && (record.output_targets.iter().filter(|target| !target.read_only).any(|target| {
             mapped_resources_overlap(
                 gpu_va,
                 cpu_addr,
@@ -1203,6 +1757,52 @@ fn deferred_dma_overlaps(
     })
 }
 
+fn selective_resolve_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_SELECTIVE_RESOLVE").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+fn selected_pending_writebacks(
+    pending: &[PendingComputeWriteback],
+    ranges: &[(u64, u64, usize)],
+) -> Option<Vec<bool>> {
+    if !selective_resolve_enabled() {
+        return None;
+    }
+    let mut frontier = ranges.to_vec();
+    let mut selected = vec![false; pending.len()];
+    for (index, record) in pending.iter().enumerate().rev() {
+        if !frontier.iter().any(|&(gpu_va, cpu_addr, size)| {
+            pending_writeback_record_overlaps(record, gpu_va, cpu_addr, size)
+        }) {
+            continue;
+        }
+        if record.dma.is_some() {
+            return None;
+        }
+        selected[index] = true;
+        frontier.extend(
+            record
+                .output_targets
+                .iter()
+                .filter(|target| !target.read_only)
+                .map(|target| (target.gpu_va, target.cpu_addr, target.guest_size))
+                .chain(
+                    record
+                        .texel_targets
+                        .iter()
+                        .map(|target| (target.gpu_va, target.cpu_addr, target.guest_size)),
+                ),
+        );
+    }
+    Some(selected)
+}
+
 fn pending_writeback_prefix_len(
     pending: &[PendingComputeWriteback],
     overlapping: Option<&[(u64, u64, usize)]>,
@@ -1228,6 +1828,38 @@ fn resident_raw_overlap_is_compatible(
     resident && current.is_some() && current == pending
 }
 
+fn promoted_raw_storage_key(key: ComputeRawStorageKey) -> Option<ComputeRawStorageKey> {
+    if !raw_key_promotion_enabled() || !has_pending_writebacks() {
+        return None;
+    }
+    let pending = pending_writebacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    pending
+        .iter()
+        .rev()
+        .filter(|record| !pending_writeback_has_landed(record))
+        .flat_map(|record| record.texel_targets.iter())
+        .filter_map(|target| target.raw_storage_key)
+        .find(|writer| {
+            writer.mapping_epoch == key.mapping_epoch
+                && writer.nvmap_id == key.nvmap_id
+                && writer.gpu_va == key.gpu_va
+                && writer.cpu_addr == key.cpu_addr
+                && writer.size > key.size
+        })
+}
+
+fn raw_key_promotion_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_RAW_KEY_PROMOTION").ok().as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
 fn pending_writeback_requires_raw_storage_resolution(
     gpu_va: u64,
     cpu_addr: u64,
@@ -1245,7 +1877,7 @@ fn pending_writeback_requires_raw_storage_resolution(
         .iter()
         .filter(|record| !pending_writeback_has_landed(record))
         .any(|record| {
-            record.output_targets.iter().any(|target| {
+            record.output_targets.iter().filter(|target| !target.read_only).any(|target| {
                 mapped_resources_overlap(
                     gpu_va,
                     cpu_addr,
@@ -1387,11 +2019,30 @@ fn resolve_pending_writeback_prefix_report(
         let mut pending = pending_writebacks()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let end = pending_writeback_prefix_len(&pending, overlapping);
-        if end != 0 {
-            PENDING_WRITEBACK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        match overlapping.and_then(|ranges| selected_pending_writebacks(&pending, ranges)) {
+            Some(selected) => {
+                let all = std::mem::take(&mut *pending);
+                let mut taken = Vec::new();
+                for (record, take) in all.into_iter().zip(selected) {
+                    if take {
+                        taken.push(record);
+                    } else {
+                        pending.push(record);
+                    }
+                }
+                if !taken.is_empty() {
+                    PENDING_WRITEBACK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                taken
+            }
+            None => {
+                let end = pending_writeback_prefix_len(&pending, overlapping);
+                if end != 0 {
+                    PENDING_WRITEBACK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                pending.drain(..end).collect()
+            }
         }
-        pending.drain(..end).collect()
     };
     let spans = pending_writeback_target_spans(&records);
     if records.is_empty() {
@@ -1498,6 +2149,42 @@ fn resolve_pending_writeback_prefix_report(
     retire_compute_serials(retired_serials);
     crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_RESOLVE, kp);
     spans
+}
+
+#[track_caller]
+pub(crate) fn resolve_pending_writebacks_range(
+    renderer: &nexium_gpu::Renderer,
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    cpu_addr: u64,
+    size: u64,
+) {
+    if !selective_resolve_enabled() {
+        resolve_pending_writebacks(renderer, mappings, mem_write);
+        return;
+    }
+    let started = crate::env_flag_set!("NEXIUM_RANGE_RESOLVE_TRACE").then(std::time::Instant::now);
+    let spans = resolve_pending_writebacks_overlapping_report(
+        renderer,
+        mappings,
+        mem_write,
+        &[(0, cpu_addr, usize::try_from(size).unwrap_or(usize::MAX))],
+    );
+    if let Some(started) = started.filter(|_| !spans.is_empty()) {
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count < 300 || count.is_power_of_two() {
+            log::warn!(
+                "[range-resolve] #{count} read cpu={cpu_addr:#x}+{size:#x} ms={:.3} resolved={:?}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                spans
+                    .iter()
+                    .map(|span| format!("{:#x}+{:#x}", span.gpu_va, span.len))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    report_resolved_writeback_spans(spans);
 }
 
 #[track_caller]
@@ -2263,11 +2950,16 @@ fn prepare_and_execute(
         let align = u64::from(descriptor.align.max(1));
         let aligned = base & !(align - 1);
         let slack = (base - aligned) as usize;
-        let byte_len = size
+        let mut byte_len = size
             .checked_add(slack)
             .ok_or_else(|| "raw compute buffer size overflow".to_string())?;
+        let mut key = raw_storage_cache_key(mappings, aligned, byte_len);
+        if let Some(promoted) = key.and_then(promoted_raw_storage_key) {
+            byte_len = promoted.size as usize;
+            key = Some(promoted);
+        }
         raw_storage_ranges.push((aligned, byte_len));
-        raw_storage_keys.push(raw_storage_cache_key(mappings, aligned, byte_len));
+        raw_storage_keys.push(key);
     }
     let mut raw_storage_leases: Vec<_> = raw_storage_keys
         .iter()
@@ -2279,7 +2971,10 @@ fn prepare_and_execute(
         .filter_map(|(key, lease)| if lease.is_none() { *key } else { None })
         .collect();
     if deferred_raw_storage_pin_enabled() {
-        let reserved = unpublished_raw_storage_writer_keys(&unpinned_keys);
+        let reserved: Vec<ComputeRawStorageKey> = unpublished_raw_storage_writer_keys(&unpinned_keys)
+            .into_iter()
+            .filter(|key| !renderer.raw_storage_reservation_blocked(*key))
+            .collect();
         if !reserved.is_empty() {
             for (key, lease) in raw_storage_keys.iter().zip(&mut raw_storage_leases) {
                 if let Some(key) = key.filter(|key| lease.is_none() && reserved.contains(key)) {
@@ -2316,48 +3011,194 @@ fn prepare_and_execute(
             }
         }
     }
+    if vk_dispatch::has_pending_small_rt_writebacks() {
+        for resource in resolved.iter().filter(|resource| {
+            !resource.null
+                && (matches!(resource.tic.texture_type, 3 | 5 | 8) || resource.tic.mip_levels() > 1)
+                && matches!(
+                    resource.access,
+                    ResourceAccess::Sampled | ResourceAccess::FilteredSample | ResourceAccess::StorageRead
+                )
+        }) {
+            if let Ok(size) = resource_size(&resource.tic) {
+                vk_dispatch::writeback_small_rts_overlapping(
+                    renderer_arc,
+                    mappings,
+                    mem_write,
+                    resource.tic.gpu_va,
+                    size as u64,
+                );
+            }
+        }
+    }
+    let mut forwarded: Vec<(u64, usize, u64)> = Vec::new();
+    let mut forwarded_storage: Vec<(u64, usize, u64)> = Vec::new();
+    let mut forwarded_sources: Vec<ComputeProducerLink> = Vec::new();
+    let mut output_sources: Vec<ComputeProducerLink> = Vec::new();
+    let mut forwarded_layers: Vec<(u64, usize, Vec<(u32, u64)>)> = Vec::new();
+    let mut output_layer_sources: Vec<ComputeLayerSource> = Vec::new();
+    let mut output_rt_seeds: Vec<ComputeRtSeed> = Vec::new();
     if has_pending_writebacks() {
-        let image_overlap = resolved.iter().any(|resource| {
+        let mut overlapping: Vec<(u64, u64, usize)> = Vec::new();
+        for resource in &resolved {
             let Ok(size) = resource_size(&resource.tic) else {
-                return false;
+                continue;
             };
             if resource.tic.is_sparse {
-                return sparse_texture_ranges(&resource.tic, mappings).is_ok_and(|ranges| {
-                    ranges.into_iter().any(|(gpu, cpu, len)| {
-                        cpu.is_some_and(|cpu| unlanded_pending_writeback_overlaps(gpu, cpu, len))
-                    })
-                });
+                if let Ok(ranges) = sparse_texture_ranges(&resource.tic, mappings) {
+                    overlapping.extend(ranges.into_iter().filter_map(|(gpu, cpu, len)| {
+                        cpu.filter(|&cpu| unlanded_pending_writeback_overlaps(gpu, cpu, len))
+                            .map(|cpu| (gpu, cpu, len))
+                    }));
+                }
+                continue;
             }
-            let Ok((view_tic, _)) = sampled_view_tic(&resource.tic) else {
-                return false;
-            };
-            let Some((cpu_addr, _)) = mapped_range(mappings, view_tic.gpu_va) else {
-                return false;
-            };
-            unlanded_pending_writeback_overlaps(view_tic.gpu_va, cpu_addr, size)
-        });
-        let raw_storage_overlap =
-            raw_storage_ranges
-                .iter()
-                .enumerate()
-                .any(|(index, &(gpu_va, size))| {
-                    let Some((cpu_addr, _)) = mapped_range(mappings, gpu_va) else {
-                        return false;
+            let storage_mip = (matches!(resource.access, ResourceAccess::Storage)
+                && resource.tic.mip_levels() > 1)
+                .then(|| storage_subresource(&resource.tic).ok())
+                .flatten();
+            let (gpu_va, size) = match storage_mip {
+                Some(mip) => (resource.tic.gpu_va + mip.guest_offset as u64, mip.guest_size),
+                None => {
+                    let Ok((view_tic, _)) = sampled_view_tic(&resource.tic) else {
+                        continue;
                     };
-                    let key = raw_storage_keys[index];
-                    let resident = raw_storage_leases[index].is_some();
-                    pending_writeback_requires_raw_storage_resolution(
-                        gpu_va, cpu_addr, size, key, resident,
-                    )
-                });
-        if dispatch_requires_pending_writeback_resolution(raw_storage_overlap, image_overlap) {
-            resolve_pending_writebacks(renderer, mappings, mem_write);
+                    (view_tic.gpu_va, size)
+                }
+            };
+            let Some((cpu_addr, _)) = mapped_range(mappings, gpu_va) else {
+                continue;
+            };
+            if unlanded_pending_writeback_overlaps(gpu_va, cpu_addr, size) {
+                let storage = matches!(resource.access, ResourceAccess::Storage);
+                if matches!(
+                    resource.access,
+                    ResourceAccess::Sampled
+                        | ResourceAccess::FilteredSample
+                        | ResourceAccess::StorageRead
+                ) {
+                    let mode_bit = if resource.access == ResourceAccess::StorageRead { 2 } else { 1 };
+                    let allowed = !forward_denied(code_gpu);
+                    if let Some(source) = (allowed && forward_mode() & mode_bit != 0)
+                        .then(|| forward_source(&resolved, resource, mappings))
+                        .flatten()
+                    {
+                        note_forward_use(code_gpu, mode_bit, gpu_va);
+                        crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::KC_FWD, 1);
+                        if resource.access == ResourceAccess::StorageRead {
+                            forwarded_storage.push(source);
+                        } else {
+                            forwarded.push(source);
+                        }
+                        continue;
+                    }
+                    if resource.access == ResourceAccess::StorageRead
+                        && compute_forward_enabled()
+                        && forward_mode() & 4 != 0
+                        && allowed
+                    {
+                        match forward_storage_layers(resource, mappings) {
+                            Ok(layers) => {
+                                note_forward_use(code_gpu, 4, gpu_va);
+                                crate::gpu::pusher::kickprof::count(
+                                    crate::gpu::pusher::kickprof::KC_FWD,
+                                    1,
+                                );
+                                forwarded_layers.push(layers);
+                                continue;
+                            }
+                            Err(reason) => note_forward_reject(format!("layers: {reason}")),
+                        }
+                    }
+                }
+                let exact_len = if storage {
+                    storage_subresource(&resource.tic).ok().map(|mip| mip.guest_size)
+                } else {
+                    sampled_view_tic(&resource.tic)
+                        .ok()
+                        .and_then(|(view, _)| resource_size(&view).ok())
+                };
+                crate::gpu::pusher::kickprof::count(
+                    if storage {
+                        crate::gpu::pusher::kickprof::KC_OVL_STORAGE
+                    } else {
+                        crate::gpu::pusher::kickprof::KC_OVL_SAMPLED
+                    },
+                    1,
+                );
+                if exact_len.is_some_and(|len| pending_output_exact(gpu_va, len)) {
+                    crate::gpu::pusher::kickprof::count(
+                        if storage {
+                            crate::gpu::pusher::kickprof::KC_OVL_STORAGE_EXACT
+                        } else {
+                            crate::gpu::pusher::kickprof::KC_OVL_SAMPLED_EXACT
+                        },
+                        1,
+                    );
+                }
+                overlapping.push((gpu_va, cpu_addr, size));
+            }
+        }
+        let image_count = overlapping.len();
+        for (index, &(gpu_va, size)) in raw_storage_ranges.iter().enumerate() {
+            let Some((cpu_addr, _)) = mapped_range(mappings, gpu_va) else {
+                continue;
+            };
+            let key = raw_storage_keys[index];
+            let resident = raw_storage_leases[index].is_some();
+            if pending_writeback_requires_raw_storage_resolution(gpu_va, cpu_addr, size, key, resident) {
+                crate::gpu::pusher::kickprof::count(crate::gpu::pusher::kickprof::KC_OVL_RAW, 1);
+                if crate::env_flag_set!("NEXIUM_RAW_CHAIN_TRACE") {
+                    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count < 200 || count.is_power_of_two() {
+                        let writers: Vec<String> = pending_writebacks()
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .iter()
+                            .filter(|record| !pending_writeback_has_landed(record))
+                            .flat_map(|record| {
+                                record
+                                    .output_targets
+                                    .iter()
+                                    .filter(|target| !target.read_only)
+                                    .filter(|target| mapped_resources_overlap(gpu_va, cpu_addr, size, target.gpu_va, target.cpu_addr, target.guest_size))
+                                    .map(move |target| format!("img {:#x}+{:#x}", target.gpu_va, target.guest_size))
+                                    .chain(record.texel_targets.iter().filter(|target| mapped_resources_overlap(gpu_va, cpu_addr, size, target.gpu_va, target.cpu_addr, target.guest_size)).map(move |target| {
+                                        format!(
+                                            "raw {:#x}+{:#x} key={:?}",
+                                            target.gpu_va,
+                                            target.guest_size,
+                                            target.raw_storage_key.map(|key| (key.gpu_va, key.size))
+                                        )
+                                    }))
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        log::warn!(
+                            "[raw-chain] #{count} reader {:#x}+{:#x} key={:?} resident={} writers={:?}",
+                            gpu_va,
+                            size,
+                            key.map(|key| (key.gpu_va, key.size)),
+                            resident,
+                            writers
+                        );
+                    }
+                }
+                overlapping.push((gpu_va, cpu_addr, size));
+            }
+        }
+        if dispatch_requires_pending_writeback_resolution(overlapping.len() > image_count, image_count != 0) {
+            report_resolved_writeback_spans(resolve_pending_writebacks_overlapping_report(
+                renderer, mappings, mem_write, &overlapping,
+            ));
             for (key, lease) in raw_storage_keys.iter().zip(&mut raw_storage_leases) {
                 let refreshed = key.and_then(|key| renderer.pin_compute_raw_storage(key));
                 *lease = refreshed;
             }
         }
     }
+    let raw_storage_pin_seq = renderer.raw_storage_pin_seq();
     let (image_aliases, overlapping_sampled) =
         validate_sampled_writable_aliases(&module, &resolved, mappings)?;
 
@@ -2381,16 +3222,101 @@ fn prepare_and_execute(
                 writable: false,
                 requires_atomics: false,
                 graphics_storage: None,
+                retain: false,
+                patches: Vec::new(),
             });
             continue;
         }
         let raw_storage_key = raw_storage_keys[index];
+        let retained_candidate = raw_storage_key.filter(|key| {
+            raw_storage_leases[index].is_none()
+                && retained_raw_storage_enabled()
+                && !frontend.writable_storage_buffers[index]
+                && key.size >= RETAINED_RAW_MIN_BYTES
+                && retained_raw_misses(*key) < RETAINED_RAW_MAX_MISSES
+                && !crate::gpu::graphics_storage::owns_overlapping(*key)
+                && !pending_writeback_overlaps(key.gpu_va, key.cpu_addr, key.size as usize)
+                && unpublished_raw_storage_writer_keys(std::slice::from_ref(key)).is_empty()
+        });
+        let retained_stamp = retained_candidate.and_then(|key| {
+            vk_dispatch::guest_range_generations(mappings, key.gpu_va, key.size as usize)
+        });
+        let mut patches: Vec<(u64, Vec<u8>)> = Vec::new();
+        if let (Some(key), Some(stamp)) = (retained_candidate, retained_stamp) {
+            match retained_raw_stamp(key) {
+                Some(previous) if previous == stamp => {
+                    raw_storage_leases[index] = renderer.pin_retained_raw_storage(key);
+                    crate::gpu::pusher::kickprof::count_sized(
+                        crate::gpu::pusher::kickprof::KC_RAWRETAIN,
+                        u64::from(raw_storage_leases[index].is_some()),
+                        byte_len,
+                    );
+                }
+                Some(previous) => {
+                    let patched = (previous.0 == stamp.0 && previous.1 == stamp.1)
+                        .then(|| retained_raw_patches(key, previous.2, mem_read))
+                        .flatten()
+                        .and_then(|found| {
+                            let lease = renderer.pin_retained_raw_storage(key)?;
+                            (vk_dispatch::guest_range_generations(mappings, key.gpu_va, key.size as usize)
+                                == Some(stamp))
+                            .then_some((lease, found))
+                        });
+                    match patched {
+                        Some((lease, found)) => {
+                            crate::gpu::pusher::kickprof::count_sized(
+                                crate::gpu::pusher::kickprof::KC_RAWPATCH,
+                                1,
+                                found.iter().map(|(_, bytes)| bytes.len()).sum(),
+                            );
+                            raw_storage_leases[index] = Some(lease);
+                            patches = found;
+                            remember_retained_raw_stamp(key, stamp);
+                        }
+                        None => {
+                            if crate::env_flag_set!("NEXIUM_RETAIN_TRACE") {
+                                trace_retained_raw_miss(key);
+                            }
+                            renderer.queue_raw_storage_invalidation(key);
+                            note_retained_raw_miss(key);
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        let mut retain = false;
         let bytes =
             if raw_storage_leases[index].is_some() {
                 Vec::new()
             } else {
-                read_gpu_vec(mappings, mem_read, aligned, byte_len, "raw storage buffer")
-                    .map_err(|reason| format!("{reason}; binding {index} {:?}", frontend.storage_buffers[index]))?
+                let kp = crate::gpu::pusher::kickprof::start();
+                let bytes = read_gpu_vec(mappings, mem_read, aligned, byte_len, "raw storage buffer")
+                    .map_err(|reason| format!("{reason}; binding {index} {:?}", frontend.storage_buffers[index]))?;
+                crate::gpu::pusher::kickprof::add_sized(crate::gpu::pusher::kickprof::KC_RAWREAD, kp, byte_len);
+                if let (Some(key), Some(stamp)) = (retained_candidate, retained_stamp) {
+                    if vk_dispatch::guest_range_generations(mappings, key.gpu_va, key.size as usize)
+                        == Some(stamp)
+                    {
+                        remember_retained_raw_stamp(key, stamp);
+                        retain = true;
+                    } else {
+                        note_retained_raw_miss(key);
+                    }
+                }
+                if crate::env_flag_set!("NEXIUM_RAW_READ_TRACE") && byte_len >= 1 << 20 {
+                    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count < 100 || count.is_power_of_two() {
+                        log::warn!(
+                            "[raw-read] #{count} {aligned:#x}+{byte_len:#x} key={} writable={} pending={}",
+                            raw_storage_key.is_some(),
+                            frontend.writable_storage_buffers[index],
+                            has_pending_writebacks()
+                        );
+                    }
+                }
+                bytes
             };
         let resource_index = texel_buffers.len();
         let writable = frontend.writable_storage_buffers[index];
@@ -2418,6 +3344,8 @@ fn prepare_and_execute(
             writable,
             requires_atomics: false,
             graphics_storage,
+            retain: retain && graphics_storage.is_none(),
+            patches,
         });
         if writable {
             let (cpu_addr, available) = mapped_range(mappings, aligned)
@@ -2584,6 +3512,8 @@ fn prepare_and_execute(
                         writable,
                         requires_atomics,
                         graphics_storage: None,
+                        retain: false,
+                        patches: Vec::new(),
                     });
                     if writable {
                         texel_targets.push(TexelTarget {
@@ -2708,8 +3638,16 @@ fn prepare_and_execute(
                     })?;
                 let guest_bytes_authoritative =
                     layered || overlapping_sampled.contains(&descriptor.binding);
-                let (guest_bytes, snapshot_identity) = if !guest_bytes_authoritative
-                    && renderer.compute_sampled_rt_is_live(key, &view_tic)
+                let producer = forwarded_producer(&forwarded, view_tic.gpu_va, size);
+                if let Some(key) = producer {
+                    forwarded_sources.push(ComputeProducerLink {
+                        binding: descriptor.binding,
+                        key,
+                    });
+                }
+                let (guest_bytes, snapshot_identity) = if producer.is_some()
+                    || (!guest_bytes_authoritative
+                        && renderer.compute_sampled_rt_is_live(key, &view_tic))
                 {
                     (None, None)
                 } else {
@@ -2774,10 +3712,20 @@ fn prepare_and_execute(
                 }
                 let (view_tic, layered) = sampled_view_tic(&resource.tic)?;
                 let size = resource_size(&view_tic)?;
-                let (guest_bytes, snapshot_identity) = read_compute_sampled_image(
-                    renderer_arc, mappings, mem_read, content_key,
-                    view_tic.gpu_va, size, "sampled image",
-                )?;
+                let producer = forwarded_producer(&forwarded, view_tic.gpu_va, size);
+                let (guest_bytes, snapshot_identity) = match producer {
+                    Some(key) => {
+                        forwarded_sources.push(ComputeProducerLink {
+                            binding: descriptor.binding,
+                            key,
+                        });
+                        (Arc::new(Vec::new()), None)
+                    }
+                    None => read_compute_sampled_image(
+                        renderer_arc, mappings, mem_read, content_key,
+                        view_tic.gpu_va, size, "sampled image",
+                    )?,
+                };
                 let key = mappings.nvmap_id_for(view_tic.gpu_va).and_then(|nvmap_id| {
                     mapped_range(mappings, view_tic.gpu_va).and_then(|(cpu_addr, _)| {
                         texture_rt_key(mappings, nvmap_id, &view_tic, cpu_addr)
@@ -2861,15 +3809,107 @@ fn prepare_and_execute(
                     )
                     .into());
                 }
-                let initial_bytes = if subresource.mip_level == 0 && resource.tic.texture_type != 5 {
+                let read_only = resource.access == ResourceAccess::StorageRead;
+                let borrowed = read_only
+                    .then(|| forwarded_producer(&forwarded_storage, gpu_va, guest_size))
+                    .flatten();
+                let layer_sources = read_only
+                    .then(|| {
+                        forwarded_layers
+                            .iter()
+                            .find(|entry| entry.0 == gpu_va && entry.1 == guest_size)
+                            .map(|entry| entry.2.clone())
+                    })
+                    .flatten();
+                let producer = (compute_forward_enabled()
+                    && !read_only
+                    && !compute_alias_enabled()
+                    && (subresource.depth == 1
+                        || resource.metadata.dimension == ImageDimension::D2Array)
+                    && matches!(
+                        resource.metadata.dimension,
+                        ImageDimension::D2 | ImageDimension::D2Array
+                    )
+                    && resource.tic.pitch_bytes == 0
+                    && guest_size <= FORWARD_MAX_BYTES
+                    && !image_aliases
+                        .iter()
+                        .any(|alias| alias.storage_binding == descriptor.binding))
+                .then(|| producer_key(gpu_va, guest_size));
+                let resident_key = (producer.is_none()
+                    && borrowed.is_none()
+                    && layer_sources.is_none()
+                    && resident_storage_enabled()
+                    && guest_size >= RESIDENT_STORAGE_MIN_BYTES
+                    && !compute_alias_enabled()
+                    && !image_aliases
+                        .iter()
+                        .any(|alias| alias.storage_binding == descriptor.binding))
+                .then(|| {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    (
+                        gpu_va,
+                        cpu_addr,
+                        guest_size,
+                        subresource.width,
+                        subresource.height,
+                        subresource.depth,
+                        subresource.mip_level,
+                        format,
+                        resource.metadata.dimension,
+                        resource.tic.pitch_bytes,
+                    )
+                        .hash(&mut hasher);
+                    hasher.finish()
+                });
+                let claimed = resident_key.is_some_and(|key| {
+                    let rt_key = (subresource.mip_level == 0 && resource.tic.texture_type != 5)
+                        .then(|| mappings.nvmap_id_for(gpu_va))
+                        .flatten()
+                        .and_then(|nvmap_id| {
+                            let mut key_tic = resource.tic;
+                            key_tic.gpu_va = gpu_va;
+                            storage_rt_key(mappings, nvmap_id, &key_tic, cpu_addr)
+                        });
+                    vk_dispatch::guest_range_stamp(mappings, gpu_va, guest_size, false)
+                        .is_some_and(|stamp| renderer.claim_resident_storage(key, stamp, rt_key))
+                });
+                if resident_key.is_some() {
+                    crate::gpu::pusher::kickprof::count_sized(
+                        if claimed {
+                            crate::gpu::pusher::kickprof::KC_RESHIT
+                        } else {
+                            crate::gpu::pusher::kickprof::KC_RESMISS
+                        },
+                        1,
+                        guest_size,
+                    );
+                }
+                let kp_seed = crate::gpu::pusher::kickprof::start();
+                let initial_bytes = if claimed || borrowed.is_some() || layer_sources.is_some() {
+                    None
+                } else if subresource.mip_level == 0 && resource.tic.texture_type != 5 {
                     if let Some(nvmap_id) = mappings.nvmap_id_for(gpu_va) {
                         let mut key_tic = resource.tic;
                         key_tic.gpu_va = gpu_va;
-                        let live_seed = storage_rt_key(mappings, nvmap_id, &key_tic, cpu_addr)
-                            .map(|key| renderer.readback_compute_storage_seed(key, format))
-                            .transpose()?
-                            .flatten();
-                        match live_seed {
+                        let rt_seed = storage_rt_key(mappings, nvmap_id, &key_tic, cpu_addr)
+                            .filter(|key| renderer.has_color_rt_at(key.gpu_va));
+                        let live_seed = if gpu_rt_seed_enabled() {
+                            if let Some(key) = rt_seed {
+                                output_rt_seeds.push(ComputeRtSeed {
+                                    binding: descriptor.binding,
+                                    key,
+                                });
+                            }
+                            None
+                        } else {
+                            rt_seed
+                                .map(|key| renderer.readback_compute_storage_seed(key, format))
+                                .transpose()?
+                                .flatten()
+                        };
+                        Some(match live_seed {
                             Some(live_bytes) => live_bytes,
                             None => {
                                 let guest_bytes = read_gpu_vec(
@@ -2886,17 +3926,22 @@ fn prepare_and_execute(
                                     guest_bytes,
                                 )?
                             }
-                        }
+                        })
                     } else {
                         let guest_bytes =
                             read_gpu_vec(mappings, mem_read, gpu_va, guest_size, "storage image")?;
-                        linearize_storage_image(&resource.tic, subresource, format, guest_bytes)?
+                        Some(linearize_storage_image(&resource.tic, subresource, format, guest_bytes)?)
                     }
                 } else {
                     let guest_bytes =
                         read_gpu_vec(mappings, mem_read, gpu_va, guest_size, "storage image mip")?;
-                    linearize_storage_image(&resource.tic, subresource, format, guest_bytes)?
+                    Some(linearize_storage_image(&resource.tic, subresource, format, guest_bytes)?)
                 };
+                crate::gpu::pusher::kickprof::add_sized(
+                    crate::gpu::pusher::kickprof::KC_SEED,
+                    kp_seed,
+                    initial_bytes.as_ref().map_or(0, Vec::len),
+                );
                 let resource_index = outputs.len();
                 outputs.push(ComputeStorageImage {
                     binding: descriptor.binding,
@@ -2906,8 +3951,22 @@ fn prepare_and_execute(
                     is_3d: resource.metadata.dimension == ImageDimension::D3,
                     arrayed: resource.metadata.dimension == ImageDimension::D2Array,
                     format,
-                    initial_bytes: Some(initial_bytes),
+                    initial_bytes,
+                    resident: resident_key.map(|key| ResidentStorageRequest { key, claimed }),
                 });
+                if let Some(key) = borrowed {
+                    output_sources.push(ComputeProducerLink {
+                        binding: descriptor.binding,
+                        key,
+                    });
+                }
+                for (layer, key) in layer_sources.into_iter().flatten() {
+                    output_layer_sources.push(ComputeLayerSource {
+                        binding: descriptor.binding,
+                        layer,
+                        key,
+                    });
+                }
                 output_targets.push(OutputTarget {
                     resource_index,
                     binding: descriptor.binding,
@@ -2917,6 +3976,9 @@ fn prepare_and_execute(
                     cpu_addr,
                     guest_size,
                     format,
+                    resident_key,
+                    producer_key: producer,
+                    read_only,
                 });
             }
         }
@@ -2954,6 +4016,20 @@ fn prepare_and_execute(
         sampled_rts,
         sampled_images,
         outputs,
+        forwarded_sources,
+        output_sources,
+        output_layer_sources,
+        output_rt_seeds,
+        raw_storage_pin_seq,
+        output_producers: output_targets
+            .iter()
+            .filter_map(|target| {
+                target.producer_key.map(|key| ComputeProducerLink {
+                    binding: target.binding,
+                    key,
+                })
+            })
+            .collect(),
         image_aliases,
         output_rt_aliases: if compute_alias_enabled() {
             output_targets
@@ -5222,6 +6298,57 @@ fn trace_compute_image_watch(
     );
 }
 
+fn skip_writeback_program(program_gpu_va: u64) -> bool {
+    static RANGES: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    RANGES
+        .get_or_init(|| {
+            let parse = |text: &str| u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
+            std::env::var("NEXIUM_SKIP_WB_PROG")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter_map(|item| match item.trim() {
+                            "all" => Some((0, u64::MAX)),
+                            item => match item.split_once('-') {
+                                Some((lo, hi)) => Some((parse(lo)?, parse(hi)?)),
+                                None => parse(item).map(|address| (address, address)),
+                            },
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|&(lo, hi)| (lo..=hi).contains(&program_gpu_va))
+}
+
+fn nonzero_trace_due(program_gpu_va: u64) -> bool {
+    static CONFIG: OnceLock<Option<(u64, Option<u64>)>> = OnceLock::new();
+    let Some((start_us, program)) = *CONFIG.get_or_init(|| {
+        let start = std::env::var("NEXIUM_NONZERO_TRACE").ok()?.parse::<u64>().unwrap_or(0);
+        let program = std::env::var("NEXIUM_NONZERO_PROG")
+            .ok()
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
+        Some((start * 1_000_000, program))
+    }) else {
+        return false;
+    };
+    crate::timeline_us() >= start_us && program.is_none_or(|program| program == program_gpu_va)
+}
+
+fn small_wb_trace_due() -> bool {
+    static START_US: OnceLock<Option<u64>> = OnceLock::new();
+    START_US
+        .get_or_init(|| {
+            std::env::var("NEXIUM_SMALL_WB_TRACE")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| seconds * 1_000_000)
+        })
+        .is_some_and(|start| crate::timeline_us() >= start)
+}
+
 fn write_back_outputs(
     result: ComputeDispatchResult,
     program_gpu_va: u64,
@@ -5248,7 +6375,8 @@ fn write_back_outputs(
     }
     let mut seen = HashSet::new();
     let mut prepared = Vec::with_capacity(targets.len());
-    for readback in image_readbacks {
+    let skip_images = skip_writeback_program(program_gpu_va);
+    for readback in image_readbacks.into_iter().filter(|_| !skip_images) {
         let target = targets
             .iter()
             .copied()
@@ -5264,6 +6392,9 @@ fn write_back_outputs(
                 "Maxwell compute returned output binding {} twice",
                 readback.binding
             ));
+        }
+        if target.read_only {
+            continue;
         }
         if readback.resource_index != target.resource_index
             || readback.width != target.subresource.width
@@ -5290,6 +6421,7 @@ fn write_back_outputs(
             ));
         }
         trace_compute_image_watch(program_gpu_va, &readback);
+        let kp_delin = crate::gpu::pusher::kickprof::start();
         let bytes = if target.tic.pitch_bytes != 0 {
             readback.bytes
         } else {
@@ -5301,6 +6433,60 @@ fn write_back_outputs(
             )
             .map_err(|error| format!("Maxwell output binding {}: {error}", target.binding))?
         };
+        crate::gpu::pusher::kickprof::add_sized(
+            crate::gpu::pusher::kickprof::KC_DELIN,
+            kp_delin,
+            bytes.len(),
+        );
+        if nonzero_trace_due(program_gpu_va) {
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count < 20000 && (count < 4000 || count % 16 == 0) {
+                let words = bytes.len() / 4;
+                let nonzero = bytes
+                    .chunks_exact(4)
+                    .filter(|word| *word != [0u8; 4])
+                    .count();
+                log::warn!(
+                    "[nz] t={} prog={program_gpu_va:#x} va={:#x} {}x{}x{} mip={} fmt={:?} nonzero={nonzero}/{words}",
+                    crate::timeline_us() / 1000,
+                    target.gpu_va,
+                    target.subresource.width,
+                    target.subresource.height,
+                    target.subresource.depth,
+                    target.subresource.mip_level,
+                    target.format
+                );
+            }
+        }
+        if target.subresource.width * target.subresource.height <= 16 && small_wb_trace_due() {
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count < 6000 {
+                let words: Vec<String> = bytes
+                    .chunks_exact(4)
+                    .take(8)
+                    .map(|word| {
+                        let raw = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                        let value = f32::from_bits(raw);
+                        if value.is_finite() {
+                            format!("{value:.5}")
+                        } else {
+                            format!("{raw:#x}")
+                        }
+                    })
+                    .collect();
+                log::warn!(
+                    "[small-img] #{count} t={} prog={program_gpu_va:#x} va={:#x} {}x{}x{} fmt={:?} words={words:?}",
+                    crate::timeline_us() / 1000,
+                    target.gpu_va,
+                    target.subresource.width,
+                    target.subresource.height,
+                    target.subresource.depth,
+                    target.format
+                );
+            }
+        }
         prepared.push(PreparedWrite { target, bytes });
     }
 
@@ -5330,6 +6516,33 @@ fn write_back_outputs(
                 readback.bytes.len(),
                 target.guest_size
             ));
+        }
+        if skip_writeback_program(program_gpu_va) {
+            continue;
+        }
+        if target.guest_size <= 256 && small_wb_trace_due() {
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count < 4000 {
+                let floats: Vec<String> = readback
+                    .bytes
+                    .chunks_exact(4)
+                    .take(16)
+                    .map(|word| {
+                        let value = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                        if value.is_finite() && value.abs() < 1e7 && (value == 0.0 || value.abs() > 1e-7) {
+                            format!("{value:.4}")
+                        } else {
+                            format!("{:#x}", u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                        }
+                    })
+                    .collect();
+                log::warn!(
+                    "[small-wb] #{count} prog={program_gpu_va:#x} va={:#x}+{:#x} values={floats:?}",
+                    target.gpu_va,
+                    target.guest_size
+                );
+            }
         }
         prepared_texels.push(PreparedTexelWrite {
             target,
@@ -5386,7 +6599,13 @@ fn write_back_outputs(
     let write_result = (|| {
         for write in &prepared {
             attempted_images += 1;
+            let kp_write = crate::gpu::pusher::kickprof::start();
             write_storage_image_guest(write, mem_write)?;
+            crate::gpu::pusher::kickprof::add_sized(
+                crate::gpu::pusher::kickprof::KC_GWRITE,
+                kp_write,
+                write.bytes.len(),
+            );
         }
         for write in &prepared_texels {
             attempted_texels += 1;
@@ -5439,6 +6658,16 @@ fn write_back_outputs(
             && matches!(storage_layer_gap(&write.target), Ok(None))
         {
             vk_dispatch::seed_texture_snapshot(mappings, write.target.gpu_va, std::mem::take(&mut write.bytes));
+        }
+        if let Some(key) = write.target.resident_key.filter(|_| write_result.is_ok()) {
+            if let Some(stamp) = vk_dispatch::guest_range_stamp(
+                mappings,
+                write.target.gpu_va,
+                write.target.guest_size,
+                true,
+            ) {
+                renderer.set_resident_storage_stamp(key, stamp);
+            }
         }
     }
     for write in prepared_texels.into_iter().take(attempted_texels) {
@@ -5534,7 +6763,9 @@ fn invalidate_guest_write(
         preserve_raw_storage,
     );
     let rt_started = profile.then(std::time::Instant::now);
-    renderer.invalidate_render_target_range(cpu_addr, size as u64, &aliases);
+    if !crate::env_flag_set!("NEXIUM_LANDING_NO_RT_INVALIDATE") {
+        renderer.invalidate_render_target_range(cpu_addr, size as u64, &aliases);
+    }
     let rt_elapsed = rt_started.map_or(std::time::Duration::ZERO, |s| s.elapsed());
     let alias_count = aliases.len();
     let bump_started = profile.then(std::time::Instant::now);
@@ -5607,6 +6838,26 @@ fn read_compute_sampled_image(
     len: usize,
     label: &str,
 ) -> Result<(Arc<Vec<u8>>, Option<u64>), String> {
+    if crate::env_flag_set!("NEXIUM_SAMPLED_RT_TRACE") {
+        static SEEN: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap_or_else(|error| error.into_inner());
+        let hits = seen.get_or_insert_with(HashMap::new).entry(gpu_va).or_insert(0);
+        *hits += 1;
+        if *hits == 1 || *hits % 64 == 0 {
+            let mut nonzero = 0usize;
+            let mut sample = vec![0u8; len.min(1 << 20)];
+            if let Some((cpu, _)) = mapped_range(mappings, gpu_va) {
+                if mem_read(cpu, &mut sample) {
+                    nonzero = sample.chunks_exact(4).filter(|word| *word != [0u8; 4]).count();
+                }
+            }
+            log::warn!(
+                "[sampled-guest] va={gpu_va:#x}+{len:#x} color_rt_at={} guest_nonzero_words={nonzero}/{}",
+                renderer.has_color_rt_at(gpu_va),
+                sample.len() / 4
+            );
+        }
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         std::env::var("NEXIUM_COMPUTE_SNAPSHOT_CACHE")
@@ -5619,7 +6870,11 @@ fn read_compute_sampled_image(
             Ok(data) => Some(data),
             Err(reason) => { *error.borrow_mut() = Some(reason); None }
         };
-        return vk_dispatch::fetch_compute_texture_snapshot(mappings, renderer, &read, gpu_va, len)
+        let kp = crate::gpu::pusher::kickprof::start();
+        let fetched =
+            vk_dispatch::fetch_compute_texture_snapshot(mappings, renderer, &read, gpu_va, len);
+        crate::gpu::pusher::kickprof::add_sized(crate::gpu::pusher::kickprof::KC_SAMPLED, kp, len);
+        return fetched
             .ok_or_else(|| error.into_inner().unwrap_or_else(|| format!("could not snapshot {label}")));
     }
     let bytes = read_gpu_vec(mappings, mem_read, gpu_va, len, label)?;
@@ -6306,6 +7561,9 @@ mod tests {
                     cpu_addr: 0x8000,
                     guest_size: 0x80,
                     format,
+                    resident_key: None,
+                    producer_key: None,
+                    read_only: false,
                 }],
                 texel_targets: vec![TexelTarget {
                     resource_index: 1,
@@ -7360,6 +8618,9 @@ mod tests {
             cpu_addr: 0x10_0000,
             guest_size: subresource.guest_size,
             format,
+            resident_key: None,
+            producer_key: None,
+            read_only: false,
         };
         let (layer_stride, layer_size) = storage_layer_gap(&target)
             .unwrap()
@@ -7499,6 +8760,9 @@ mod tests {
             cpu_addr: 0x8000,
             guest_size: 64,
             format,
+            resident_key: None,
+            producer_key: None,
+            read_only: false,
         };
         let write = PreparedWrite {
             target,

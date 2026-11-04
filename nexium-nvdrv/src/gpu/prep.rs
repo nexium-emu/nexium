@@ -112,37 +112,177 @@ fn eager_clear_resolve_enabled() -> bool {
 
 const DRAW_TARGET_RANGE_SLOTS: usize = 9;
 
+fn tight_draw_targets_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_TIGHT_DRAW_TARGETS").ok().as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    })
+}
+
+fn block_linear_target_bytes(
+    row_bytes: u64,
+    height: u32,
+    block_dims: u32,
+    slices: u64,
+) -> u64 {
+    let block_bytes = 64u64 << (block_dims & 0xf).min(5);
+    let block_rows = 8u64 << ((block_dims >> 4) & 0xf).min(5);
+    row_bytes
+        .div_ceil(block_bytes)
+        .saturating_mul(block_bytes)
+        .saturating_mul(u64::from(height).div_ceil(block_rows).saturating_mul(block_rows))
+        .saturating_mul(slices.max(1))
+}
+
+fn color_target_bytes(rt: &super::engines::maxwell3d::RenderTarget) -> u64 {
+    let bpp = nexium_gpu::rt_cache::rt_format_bytes(super::formats::map_surface_format(rt.format))
+        .max(1);
+    let layers = u64::from((rt.depth & 0xffff).max(1).max(rt.base_layer.saturating_add(1)));
+    if rt.tile_mode & (1 << 12) != 0 {
+        return u64::from(rt.width)
+            .saturating_mul(u64::from(rt.height))
+            .saturating_mul(layers);
+    }
+    let row_bytes = u64::from(rt.width).saturating_mul(bpp);
+    if rt.tile_mode & (1 << 16) != 0 {
+        let block_depth = 1u64 << ((rt.tile_mode >> 8) & 0xf).min(5);
+        let slices = layers.div_ceil(block_depth).saturating_mul(block_depth);
+        return block_linear_target_bytes(row_bytes, rt.height, rt.tile_mode, slices);
+    }
+    let slice = block_linear_target_bytes(row_bytes, rt.height, rt.tile_mode, 1);
+    let stride = u64::from(rt.layer_stride).saturating_mul(4);
+    if stride >= slice {
+        stride.saturating_mul(layers - 1).saturating_add(slice)
+    } else {
+        slice.saturating_mul(layers)
+    }
+}
+
 fn draw_target_ranges_array(
     draw: &super::engines::maxwell3d::DrawCall,
 ) -> ([(u64, u64); DRAW_TARGET_RANGE_SLOTS], usize) {
     const CONSERVATIVE_BYTES_PER_PIXEL: u64 = 16;
+    const ZETA_BYTES_PER_PIXEL: u64 = 8;
+    let tight = tight_draw_targets_enabled();
     let mut ranges = [(0u64, 0u64); DRAW_TARGET_RANGE_SLOTS];
     let mut count = 0usize;
-    for rt in &draw.rt {
+    let slots: u32 = if draw.is_clear || !tight {
+        0xff
+    } else {
+        (0..(draw.rt_control & 0xf).min(8) as usize)
+            .map(|location| 1u32 << ((draw.rt_control >> (4 + location * 3)) & 0x7))
+            .fold(0, |mask, bit| mask | bit)
+    };
+    for (slot, rt) in draw.rt.iter().enumerate() {
         let base = (u64::from(rt.address_hi) << 32) | u64::from(rt.address_lo);
-        if base == 0 || count == ranges.len() {
+        if base == 0 || slots & (1 << slot) == 0 || count == ranges.len() {
             continue;
         }
-        let size = u64::from(rt.width)
-            .saturating_mul(u64::from(rt.height))
-            .saturating_mul(u64::from(rt.depth.max(1)))
-            .saturating_mul(CONSERVATIVE_BYTES_PER_PIXEL)
-            .max(u64::from(rt.layer_stride).saturating_mul(u64::from(rt.depth.max(1))));
+        let size = if tight {
+            color_target_bytes(rt)
+        } else {
+            u64::from(rt.width)
+                .saturating_mul(u64::from(rt.height))
+                .saturating_mul(u64::from(rt.depth.max(1)))
+                .saturating_mul(CONSERVATIVE_BYTES_PER_PIXEL)
+                .max(u64::from(rt.layer_stride).saturating_mul(u64::from(rt.depth.max(1))))
+        };
         ranges[count] = (base, size);
         count += 1;
     }
     if draw.zeta_enable && count < ranges.len() {
         let base = (u64::from(draw.zeta.address_hi) << 32) | u64::from(draw.zeta.address_lo);
         if base != 0 {
-            let size = u64::from(draw.zeta.width)
-                .saturating_mul(u64::from(draw.zeta.height))
-                .saturating_mul(CONSERVATIVE_BYTES_PER_PIXEL)
-                .max(u64::from(draw.zeta.array_pitch));
+            let size = if tight {
+                block_linear_target_bytes(
+                    u64::from(draw.zeta.width).saturating_mul(ZETA_BYTES_PER_PIXEL),
+                    draw.zeta.height,
+                    draw.zeta.block_size,
+                    1,
+                )
+                .max(u64::from(draw.zeta.array_pitch).saturating_mul(4))
+            } else {
+                u64::from(draw.zeta.width)
+                    .saturating_mul(u64::from(draw.zeta.height))
+                    .saturating_mul(CONSERVATIVE_BYTES_PER_PIXEL)
+                    .max(u64::from(draw.zeta.array_pitch))
+            };
             ranges[count] = (base, size);
             count += 1;
         }
     }
     (ranges, count)
+}
+
+fn selective_barrier_resolve_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_SELECTIVE_RESOLVE").ok().as_deref(),
+            Some("0" | "false" | "off" | "no")
+        )
+    })
+}
+
+fn draws_written_pending_ranges(draws: &[DrawCall], ranges: &[(u64, u64)]) -> Vec<(u64, u64, usize)> {
+    let mut hits: Vec<(u64, u64, usize)> = Vec::new();
+    for draw in draws {
+        let (targets, count) = draw_target_ranges_array(draw);
+        for &(base, size) in &targets[..count] {
+            for &(address, length) in ranges {
+                if ranges_overlap(base, size, address, length)
+                    && !hits.iter().any(|hit| hit.0 == address && hit.2 == length as usize)
+                {
+                    hits.push((address, 0, length as usize));
+                }
+            }
+        }
+    }
+    hits
+}
+
+fn trace_draw_resolve(draws: &[DrawCall], written: &[(u64, u64, usize)]) {
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count >= 300 && !count.is_power_of_two() {
+        return;
+    }
+    let mut hits = Vec::new();
+    for draw in draws {
+        let (targets, target_count) = draw_target_ranges_array(draw);
+        for &(base, size) in &targets[..target_count] {
+            for &(address, _, length) in written {
+                if ranges_overlap(base, size, address, length as u64) {
+                    let slot = draw.rt.iter().position(|rt| {
+                        (u64::from(rt.address_hi) << 32) | u64::from(rt.address_lo) == base
+                    });
+                    let detail = match slot {
+                        Some(slot) => {
+                            let rt = &draw.rt[slot];
+                            format!(
+                                "rt{slot} fmt={:#x} {}x{}x{} tile={:#x} stride={:#x}",
+                                rt.format, rt.width, rt.height, rt.depth, rt.tile_mode, rt.layer_stride
+                            )
+                        }
+                        None => format!(
+                            "zeta fmt={:#x} {}x{} block={:#x}",
+                            draw.zeta.format, draw.zeta.width, draw.zeta.height, draw.zeta.block_size
+                        ),
+                    };
+                    hits.push(format!(
+                        "target={base:#x}+{size:#x} {detail} clear={} pending={address:#x}+{length:#x}",
+                        draw.is_clear
+                    ));
+                }
+            }
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    log::warn!("[draw-resolve] #{count} {:?}", hits);
 }
 
 fn draws_write_pending_compute(draws: &[DrawCall], ranges: &[(u64, u64)]) -> bool {
@@ -289,6 +429,7 @@ struct ComputeMemoryBarrier {
     spans: Arc<[super::engines::maxwell_compute::PendingComputeWritebackSpan]>,
     revision: u64,
     armed: std::cell::Cell<bool>,
+    resolved: std::cell::RefCell<Vec<bool>>,
 }
 
 impl ComputeMemoryBarrier {
@@ -313,21 +454,22 @@ impl ComputeMemoryBarrier {
             spans: spans.to_vec().into(),
             revision: 0,
             armed: std::cell::Cell::new(!spans.is_empty()),
+            resolved: Default::default(),
         }
     }
 
-    fn before_access(&self, address: u64, len: usize, resolve: impl FnOnce()) {
+    fn before_access(&self, address: u64, len: usize, resolve: impl FnOnce(u64, u64)) {
         if !self.armed.get()
             || COMPUTE_BARRIER_BYPASS.with(|bypass| bypass.get())
             || compute_barrier_disabled()
         {
             return;
         }
-        let Some(&(base, size)) = self
-            .cpu_ranges
-            .iter()
-            .find(|&&(base, size)| ranges_overlap(address, len as u64, base, size))
-        else {
+        let selective = selective_barrier_resolve_enabled();
+        let Some((index, &(base, size))) = self.cpu_ranges.iter().enumerate().find(|(index, range)| {
+            ranges_overlap(address, len as u64, range.0, range.1)
+                && !(selective && self.resolved.borrow().get(*index).copied().unwrap_or(false))
+        }) else {
             return;
         };
         if crate::env_flag_set!("NEXIUM_KC_BARRIER_TRACE") {
@@ -362,8 +504,17 @@ impl ComputeMemoryBarrier {
                 );
             }
         }
-        self.armed.set(false);
-        resolve();
+        if selective {
+            let mut resolved = self.resolved.borrow_mut();
+            resolved.resize(self.cpu_ranges.len(), false);
+            resolved[index] = true;
+            if resolved.iter().all(|done| *done) {
+                self.armed.set(false);
+            }
+        } else {
+            self.armed.set(false);
+        }
+        resolve(base, size);
     }
 
     fn invalidate_snapshots(&self, cache: &mut SsboSnapshotCache, mappings: &GpuMappings) {
@@ -570,6 +721,7 @@ pub(crate) struct PrepState {
     pub(crate) vk_batch: PendingDrawBatch,
     pub(crate) prepared_draw_packets: PreparedDrawPacketizer,
     vk_flush_completed: bool,
+    template_memo: super::vk_dispatch::DrawTemplateMemoSet,
     pub(crate) ssbo_snapshot_cache: SsboSnapshotCache,
     pending_storage_readbacks: Vec<super::vk_dispatch::PendingStorageReadback>,
     pub(crate) inline_upload: KeplerMemory,
@@ -663,6 +815,7 @@ impl PrepState {
                 true
             }
             PrepEvent::KickBegin { swept, dirty } => {
+                self.template_memo.clear();
                 self.drain_landed_compute(mappings);
                 self.publish_pending_storage_readbacks(false, mappings, mem_read, mem_write);
                 self.begin_ssbo_snapshot_epoch_with(Some((swept, dirty)));
@@ -1269,11 +1422,22 @@ impl PrepState {
                         && crate::render_thread::maybe_render_thread().is_some();
                     if eager_clear_resolve_enabled()
                         || (!deferred && draws.iter().any(|draw| !draw.is_clear))
-                        || draws_write_pending_compute_any(&draws, &memory_barrier)
+                        || (!selective_barrier_resolve_enabled()
+                            && draws_write_pending_compute_any(&draws, &memory_barrier))
                     {
                         self.resolve_pending_compute(mappings, mem_write);
                         memory_barrier.armed.set(false);
                     } else {
+                        if selective_barrier_resolve_enabled() {
+                            let written =
+                                draws_written_pending_ranges(&draws, &memory_barrier.gpu_ranges);
+                            if !written.is_empty() {
+                                if crate::env_flag_set!("NEXIUM_DRAW_RESOLVE_TRACE") {
+                                    trace_draw_resolve(&draws, &written);
+                                }
+                                self.resolve_pending_compute_overlapping(mappings, mem_write, &written);
+                            }
+                        }
                         self.invalidate_compute_snapshots(&memory_barrier, mappings);
                     }
                 }
@@ -1283,10 +1447,10 @@ impl PrepState {
                     memory_barrier.revision,
                 );
                 let barrier_renderer = self.renderer.clone();
-                let resolve_memory = || {
+                let resolve_memory = |cpu_addr: u64, size: u64| {
                     if let Some(renderer) = &barrier_renderer {
-                        super::engines::maxwell_compute::resolve_pending_writebacks(
-                            renderer, mappings, mem_write,
+                        super::engines::maxwell_compute::resolve_pending_writebacks_range(
+                            renderer, mappings, mem_write, cpu_addr, size,
                         );
                     }
                 };
@@ -1307,7 +1471,6 @@ impl PrepState {
                 kickprof::add(kickprof::DRAWS_PRE, kp_pre);
                 if let Some(r) = self.renderer.clone() {
                     self.ssbo_snapshot_cache.begin_constbuf_write_log();
-                    let mut template_memo = super::vk_dispatch::DrawTemplateMemoSet::default();
                     if replay_constbuf_writes.is_empty() {
                         let kp = kickprof::start();
                         let completed = super::vk_dispatch::enqueue_draws(
@@ -1324,7 +1487,7 @@ impl PrepState {
                             mem_read,
                             mem_write,
                             compute_probe.as_mut(),
-                            &mut template_memo,
+                            &mut self.template_memo,
                         );
                         self.vk_flush_completed &= completed;
                         draws_completed &= completed;
@@ -1365,7 +1528,7 @@ impl PrepState {
                                 mem_read,
                                 mem_write,
                                 compute_probe.as_mut(),
-                                &mut template_memo,
+                                &mut self.template_memo,
                             );
                             self.vk_flush_completed &= completed;
                             draws_completed &= completed;
@@ -2359,10 +2522,10 @@ impl PrepState {
             memory_barrier.revision,
         );
         let barrier_renderer = self.renderer.clone();
-        let resolve_memory = || {
+        let resolve_memory = |cpu_addr: u64, size: u64| {
             if let Some(renderer) = &barrier_renderer {
-                super::engines::maxwell_compute::resolve_pending_writebacks(
-                    renderer, mappings, mem_write,
+                super::engines::maxwell_compute::resolve_pending_writebacks_range(
+                    renderer, mappings, mem_write, cpu_addr, size,
                 );
             }
         };
@@ -2736,6 +2899,7 @@ impl PrepState {
             vk_batch: PendingDrawBatch::default(),
             prepared_draw_packets: PreparedDrawPacketizer::default(),
             vk_flush_completed: true,
+            template_memo: Default::default(),
             ssbo_snapshot_cache: SsboSnapshotCache::default(),
             pending_storage_readbacks: Vec::new(),
             inline_upload: KeplerMemory::new(),
@@ -3182,6 +3346,7 @@ pub(crate) fn spawn_prep_thread(
             nexium_common::thread_cpu_set::apply_current_thread_cpu_set(
                 nexium_common::thread_cpu_set::ThreadCpuSetTarget::GpuPrep,
             );
+            super::watchdog::register_prep_thread();
             #[cfg(windows)]
             unsafe {
                 #[link(name = "kernel32")]
@@ -3415,12 +3580,12 @@ mod tests {
     fn compute_memory_barrier_resolves_before_overlapping_access_only_once() {
         let barrier = super::ComputeMemoryBarrier::new(&[compute_span()], &GpuMappings::default());
         let value = std::cell::Cell::new(0);
-        barrier.before_access(0x8100, 16, || panic!("adjacent range is independent"));
-        barrier.before_access(0x8000, 0, || panic!("empty range is independent"));
-        barrier.before_access(0x7ff0, 16, || panic!("adjacent range is independent"));
-        barrier.before_access(0x7fff, 2, || value.set(42));
+        barrier.before_access(0x8100, 16, |_, _| panic!("adjacent range is independent"));
+        barrier.before_access(0x8000, 0, |_, _| panic!("empty range is independent"));
+        barrier.before_access(0x7ff0, 16, |_, _| panic!("adjacent range is independent"));
+        barrier.before_access(0x7fff, 2, |_, _| value.set(42));
         assert_eq!(value.get(), 42);
-        barrier.before_access(0x8000, 16, || panic!("already resolved"));
+        barrier.before_access(0x8000, 16, |_, _| panic!("already resolved"));
         assert!(!barrier.armed.get());
     }
 
@@ -3428,9 +3593,9 @@ mod tests {
     fn compute_memory_barrier_orders_cpu_overwrites_after_old_results() {
         let barrier = super::ComputeMemoryBarrier::new(&[compute_span()], &GpuMappings::default());
         let memory = std::cell::Cell::new(0);
-        barrier.before_access(0x8000, 4, || memory.set(10));
+        barrier.before_access(0x8000, 4, |_, _| memory.set(10));
         memory.set(20);
-        barrier.before_access(0x8000, 4, || memory.set(10));
+        barrier.before_access(0x8000, 4, |_, _| memory.set(10));
         assert_eq!(memory.get(), 20);
         assert!(super::ranges_overlap(u64::MAX - 8, 32, u64::MAX - 4, 4));
     }
@@ -3443,6 +3608,7 @@ mod tests {
         let barrier = super::ComputeMemoryBarrier::new(&[compute_span()], &mappings);
         assert!(barrier.gpu_ranges.contains(&(0x4000, 0x100)));
         let mut draw = DrawCall::default();
+        draw.rt_control = 1;
         draw.rt[0].address_lo = 0x4000;
         draw.rt[0].width = 4;
         draw.rt[0].height = 4;
@@ -3479,6 +3645,7 @@ mod tests {
             }
         }
         let mut draw = DrawCall::default();
+        draw.rt_control = 1;
         draw.rt[0].address_lo = 0x5f00;
         draw.rt[0].width = 4;
         draw.rt[0].height = 4;
@@ -3494,7 +3661,7 @@ mod tests {
         let mut mappings = GpuMappings::default();
         mappings.add(0x1000, 0x1000, 0x8000, 1);
         let first = cache.get(1, &[compute_span()], &mappings);
-        first.before_access(0x8000, 4, || {});
+        first.before_access(0x8000, 4, |_, _| {});
         let second = cache.get(1, &[compute_span()], &mappings);
         assert!(!first.armed.get());
         assert!(second.armed.get());
@@ -3505,9 +3672,9 @@ mod tests {
         let mut next_span = compute_span();
         next_span.cpu_addr = 0xa000;
         let next = cache.get(2, &[next_span], &mappings);
-        next.before_access(0x8000, 4, || panic!("old dispatch no longer pending"));
+        next.before_access(0x8000, 4, |_, _| panic!("old dispatch no longer pending"));
         let resolved = std::cell::Cell::new(false);
-        next.before_access(0xa000, 4, || resolved.set(true));
+        next.before_access(0xa000, 4, |_, _| resolved.set(true));
         assert!(resolved.get());
         let drained = cache.get(3, &[], &mappings);
         assert!(!drained.armed.get());

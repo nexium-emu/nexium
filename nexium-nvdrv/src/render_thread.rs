@@ -278,8 +278,8 @@ fn present_worker(rx: Receiver<PresentWork>, stop: Arc<AtomicBool>) {
 const DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION: usize = 16;
 const MAX_DRAW_GROUPS_PER_SUBMISSION_ENV: &str = "NEXIUM_RENDER_MAX_GROUPS_PER_SUBMISSION";
 const DRAW_GATHER_GRACE: Duration = Duration::from_micros(200);
-const DEFAULT_PENDING_DRAW_GROUP_BUDGET: usize = 256;
-const DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_PENDING_DRAW_GROUP_BUDGET: usize = 1024;
+const DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES: usize = 2048 * 1024 * 1024;
 const DRAW_BACKPRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(3);
 const DRAW_QUEUE_TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
 

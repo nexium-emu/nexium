@@ -431,7 +431,24 @@ pub(crate) mod kickprof {
     pub const TEXLAY_MEMO_STALE: usize = 268;
     pub const CLEAR_SNAPSHOT_LAZY: usize = 269;
     pub const CLEAR_SNAPSHOT_READ: usize = 270;
-    pub const COUNT: usize = 271;
+    pub const KC_SEED: usize = 271;
+    pub const KC_SAMPLED: usize = 272;
+    pub const KC_DELIN: usize = 273;
+    pub const KC_GWRITE: usize = 274;
+    pub const KC_RESHIT: usize = 275;
+    pub const KC_RESMISS: usize = 276;
+    pub const KC_OVL_STORAGE: usize = 277;
+    pub const KC_OVL_SAMPLED: usize = 278;
+    pub const KC_OVL_STORAGE_EXACT: usize = 279;
+    pub const KC_OVL_SAMPLED_EXACT: usize = 280;
+    pub const KC_FWD: usize = 281;
+    pub const KC_OVL_RAW: usize = 282;
+    pub const KC_RAWREAD: usize = 283;
+    pub const KC_RAWRETAIN: usize = 284;
+    pub const KC_TEXFWD_EXACT: usize = 285;
+    pub const KC_TEXFWD_OVL: usize = 286;
+    pub const KC_RAWPATCH: usize = 287;
+    pub const COUNT: usize = 288;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -705,6 +722,23 @@ pub(crate) mod kickprof {
         "texlaymemostale",
         "clearsnaplazy",
         "clearsnapread",
+        "kcseed",
+        "kcsampled",
+        "kcdelin",
+        "kcgwrite",
+        "kcreshit",
+        "kcresmiss",
+        "kcovlstor",
+        "kcovlsamp",
+        "kcovlstorx",
+        "kcovlsampx",
+        "kcfwd",
+        "kcovlraw",
+        "kcrawread",
+        "kcrawretain",
+        "texfwdexact",
+        "texfwdovl",
+        "kcrawpatch",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
@@ -1148,6 +1182,7 @@ pub(crate) fn write_payload_fences(
                     );
                 }
             }
+            None if gpu_va == 0 => {}
             None => log::warn!(
                 "pusher: async fence release gpu_va={:#x} not mapped; payload={:#x} dropped",
                 gpu_va,
@@ -1350,7 +1385,7 @@ impl Pusher {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
         static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_PB_CONTINUE_SYNC").is_some()) {
+        if *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_PB_CONTINUE_SYNC").is_some()) || nexium_shader::ampere::enabled() {
             return;
         }
         {
@@ -3157,7 +3192,7 @@ impl Pusher {
             MAXWELL_DMA_CLASS | FERMI_2D_CLASS | KEPLER_MEMORY_CLASS | KEPLER_COMPUTE_CLASS
         ) {
             if bound_class == KEPLER_COMPUTE_CLASS {
-                if std::env::var_os("NEXIUM_COMPUTE_METHOD_TRACE").is_some() {
+                if crate::env_flag_set!("NEXIUM_COMPUTE_METHOD_TRACE") {
                     log::warn!("[compute-method] channel={} method={method:#x} arg={arg:#x} last={}", self.channel, self.state.method_count <= 1);
                 }
                 if let Some(mme) = maxwell.mme64.as_mut() {

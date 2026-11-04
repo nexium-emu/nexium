@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use nexium_common::fast_hash::FastMap as HashMap;
+use std::collections::VecDeque;
 
 use crate::gpu::GuestMemoryAccess;
 
@@ -314,9 +315,9 @@ impl Mme64 {
         Self {
             compute: vec![0; MACRO_METHODS_START as usize],
             graphics: Program::new(),
-            compute_programs: HashMap::new(),
+            compute_programs: HashMap::default(),
             compute_active: false,
-            data_ram: HashMap::new(),
+            data_ram: HashMap::default(),
             channel: 0,
             dma: Dma::default(),
             trigger: None,
