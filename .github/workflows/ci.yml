@@ -59,7 +59,7 @@ jobs:
 
       - name: Install Vulkan runtime and Lavapipe (Windows, for GPU tests)
         if: runner.os == 'Windows'
-        uses: jakoch/install-vulkan-sdk-action@v1.7.0
+        uses: jakoch/install-vulkan-sdk-action@v1.8.1
         with:
           install_runtime_only: true
           install_lavapipe: true
