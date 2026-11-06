@@ -64,7 +64,7 @@ base64 = "0.23"
 sha2 = "0.11"
 ring = "0.17"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-sdl3 = { version = "0.20.0", default-features = false, features = ["build-from-source-static"] }
+sdl3 = { version = "0.22.0", default-features = false, features = ["build-from-source-static"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
